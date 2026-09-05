@@ -53,6 +53,14 @@ function Install-GraphDatabase {
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
 
+    # If Neo4j is managed externally (docker compose sets NEO4J_URI to a non-local
+    # host), don't run a new container
+    if ($env:NEO4J_URI -and $env:NEO4J_URI -notmatch 'localhost|127\.0\.0\.1') {
+        Write-Host " Neo4j is managed externally ($env:NEO4J_URI) - skipping local container setup." -ForegroundColor Yellow
+        Write-Host " Start it on the host with: docker compose --profile graph up -d neo4j" -ForegroundColor Gray
+        return
+      }
+
     # Resolve password: explicit param > env var > generate once
     if ([string]::IsNullOrWhiteSpace($Password)) {
         if ($env:NEO4J_PASSWORD) {

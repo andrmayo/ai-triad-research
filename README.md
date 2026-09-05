@@ -1,21 +1,23 @@
 # AI Triad Research
 
-**Status:** Private
-**Fellowship:** Berkman Klein Center, 2026
+**Status:** Private **Fellowship:** Berkman Klein Center, 2026
 
 ## Purpose
 
-Multi-perspective research platform for AI policy and safety literature. Organizes sources through a four-POV taxonomy (accelerationist, safetyist, skeptic, situations), ingests documents, generates AI-powered summaries, and detects factual conflicts across viewpoints.
+Multi-perspective research platform for AI policy and safety literature.
+Organizes sources through a four-POV taxonomy (accelerationist, safetyist,
+skeptic, situations), ingests documents, generates AI-powered summaries, and
+detects factual conflicts across viewpoints.
 
 ## Repository Structure
 
 This project uses three repositories:
 
-| Repository | Contents |
-|-----------|----------|
+| Repository                                                                         | Contents                                                                  |
+| ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
 | **[ai-triad-research](https://github.com/jpsnover/ai-triad-research)** (this repo) | PowerShell module, shared TypeScript lib, Electron apps, prompts, schemas |
-| **[ai-triad-data](https://github.com/jpsnover/ai-triad-data)** | Taxonomy, summaries, conflicts, debates |
-| **ai-triad-sources** | Ingested source documents (~680 documents: PDFs, snapshots) |
+| **[ai-triad-data](https://github.com/jpsnover/ai-triad-data)**                     | Taxonomy, summaries, conflicts, debates                                   |
+| **ai-triad-sources**                                                               | Ingested source documents (~680 documents: PDFs, snapshots)               |
 
 ```
 ai-triad-research/              CODE REPO
@@ -58,6 +60,10 @@ ai-triad-sources/               SOURCES REPO
 
 ### Setup
 
+For development, there are two ways to do spin up the platform.
+
+#### Run Directly on Host Machine
+
 ```powershell
 # 1. Clone the repos as siblings (sources repo optional unless ingesting)
 cd ~/source/repos
@@ -79,6 +85,49 @@ Test-Dependencies
 Get-Tax | Measure-Object   # Should show several hundred nodes (785 POV nodes as of 2026-07)
 ```
 
+#### Run in Dev Container
+
+The containerized version of the platform is a multi-container application
+(since Neo4j runs in its own container). The project source code is accessed via
+a volume rather than being copied into a container, which allows for live edits.
+
+To build the app image and run with neo4j:
+
+```bash
+docker compose --profile graph up -d --build
+```
+
+To build the app image and run without neo4j (default):
+
+```bash
+docker compose up -d --build
+```
+
+Useful for Development:
+
+```bash
+  docker compose logs -f app                 # watch
+bootstrap + app output
+  docker compose exec app bash               # shell
+into the running container
+  docker compose exec app pwsh               #
+PowerShell session
+  docker compose ps                          # status
+```
+
+Tear down:
+
+```bash
+  docker compose down                        #
+stop/remove containers (keeps volumes)
+  docker compose --profile graph down        # include
+the profiled neo4j service
+  docker compose --profile graph down -v     # also
+wipe volumes (pnpm-store, neo4j-data/logs)
+```
+
+#### Run in
+
 ### Data Path Configuration
 
 The file `.aitriad.json` tells the code where to find data:
@@ -97,9 +146,11 @@ The file `.aitriad.json` tells the code where to find data:
 }
 ```
 
-Note: source documents resolve under `sources_root` (a separate repo), not `data_root`.
+Note: source documents resolve under `sources_root` (a separate repo), not
+`data_root`.
 
 **Override with environment variable:**
+
 ```powershell
 $env:AI_TRIAD_DATA_ROOT = "/path/to/custom/data"
 ```
@@ -130,7 +181,8 @@ Show-POViewer          # or: POViewer
 Show-SummaryViewer     # or: SummaryViewer
 ```
 
-The Taxonomy Editor includes an integrated Edge Browser (toolbar panel) — the standalone Edge Viewer has been retired.
+The Taxonomy Editor includes an integrated Edge Browser (toolbar panel) — the
+standalone Edge Viewer has been retired.
 
 ### Core Workflow
 
@@ -162,25 +214,31 @@ Show-AITriadHelp
 
 ## Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `GEMINI_API_KEY` | Yes (primary) | Google Gemini API key |
-| `ANTHROPIC_API_KEY` | No | Anthropic Claude API key |
-| `GROQ_API_KEY` | No | Groq API key |
-| `AI_API_KEY` | No | Universal fallback key |
-| `AI_MODEL` | No | Default model override |
-| `AI_TRIAD_DATA_ROOT` | No | Override data directory path |
-| `NEO4J_PASSWORD` | No | Neo4j password (default: aitriad2026) |
+| Variable             | Required      | Description                           |
+| -------------------- | ------------- | ------------------------------------- |
+| `GEMINI_API_KEY`     | Yes (primary) | Google Gemini API key                 |
+| `ANTHROPIC_API_KEY`  | No            | Anthropic Claude API key              |
+| `GROQ_API_KEY`       | No            | Groq API key                          |
+| `AI_API_KEY`         | No            | Universal fallback key                |
+| `AI_MODEL`           | No            | Default model override                |
+| `AI_TRIAD_DATA_ROOT` | No            | Override data directory path          |
+| `NEO4J_PASSWORD`     | No            | Neo4j password (default: aitriad2026) |
 
 Use `Register-AIBackend` to configure keys via a GUI, or set them manually.
-Settings are persisted to `~/.aitriad-env` — add `. ~/.aitriad-env` to your shell profile.
+Settings are persisted to `~/.aitriad-env` — add `. ~/.aitriad-env` to your
+shell profile.
 
 ## AI Model Configuration
 
-Models are configured in `ai-models.json` (single source of truth for both PowerShell and Electron). The Taxonomy Editor Settings dialog includes a **Refresh Models** button that queries provider APIs (Gemini, Groq) and probes Claude model candidates to discover available models.
+Models are configured in `ai-models.json` (single source of truth for both
+PowerShell and Electron). The Taxonomy Editor Settings dialog includes a
+**Refresh Models** button that queries provider APIs (Gemini, Groq) and probes
+Claude model candidates to discover available models.
 
-Supported backends: **Google Gemini** (free tier available), **Anthropic Claude**, **Groq** (free tier available).
+Supported backends: **Google Gemini** (free tier available), **Anthropic
+Claude**, **Groq** (free tier available).
 
 ## Taxonomy Version
 
-Current version is tracked in `TAXONOMY_VERSION` (in the data repo). Bumping it triggers CI batch re-summarization.
+Current version is tracked in `TAXONOMY_VERSION` (in the data repo). Bumping it
+triggers CI batch re-summarization.
