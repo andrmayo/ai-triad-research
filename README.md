@@ -91,17 +91,44 @@ The containerized version of the platform is a multi-container application
 (since Neo4j runs in its own container). The project source code is accessed via
 a volume rather than being copied into a container, which allows for live edits.
 
+Before starting the container, set at least one AI API key in a `.env` file
+next to `compose.yaml` (docker compose loads it automatically):
+
+```bash
+# .env
+GEMINI_API_KEY=your-key-here
+```
+
+`Register-AIBackend`'s browser-based setup UI doesn't work from inside the
+container — it binds to `127.0.0.1`, which inside a container is only
+reachable from that container itself, not from the host, even with the port
+published. So for the dev container, API keys are set directly as
+environment variables instead; `Register-AIBackend` remains the way to
+configure keys when running directly on your host machine (see above).
+
 To build the app image and run with neo4j:
 
 ```bash
-docker compose --profile graph up -d --build
+docker compose --profile graph up --build
 ```
 
 To build the app image and run without neo4j (default):
 
 ```bash
-docker compose up -d --build
+docker compose up --build
 ```
+
+Or build then run:
+
+```bash
+docker compose build
+docker compose up
+```
+
+The above commands for the PowerShell dev setup (`Import-Module`,
+`Install-AIDependencies -Fix`, `Get-Tax`) get run in the container via
+`scripts/dev-bootstrap.sh`. If no AI API key is set, bootstrap prints a
+reminder to add one to `.env` and restart.
 
 Useful for Development:
 
