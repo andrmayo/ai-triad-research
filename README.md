@@ -157,11 +157,16 @@ Tear down:
 Running taxonomy-editor dev application using `npm`:
 
 ```bash
+  export AUTH_DISABLED=1
   cd taxonomy-editor
   npm run dev:container
   # health check when taxonomy-editor is running
   curl -sf http://localhost:7862/health && echo
 ```
+
+The `AUTH_DISABLED` env variable here is necessary here for full functionality,
+since you can't log in with a local deployment. Note that if `NODE_ENV` gets set
+to `production`, `AUTH_DISABLED` won't actually disable authorization.
 
 Then verify that this is working by visiting `http://localhost:5173/`. This is
 probably best for simple development (allows for Vite's hot reloading), but to
