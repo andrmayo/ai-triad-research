@@ -14,6 +14,14 @@ fi
 # `Get-Tax | Measure-Object` should show several hundred nodes (785 POV nodes as of 2026-07)
 pwsh -c 'Import-Module ./scripts/AITriad/AITriad.psm1; Install-AIDependencies -Fix; Get-Tax | Measure-Object'
 
+# Setting up pwsh profile to auto-import AITriad module
+PROFILE_PATH="$(pwsh -NoLogo -NoProfile -c '$PROFILE')"
+mkdir -p "$(dirname "$PROFILE_PATH")"
+IMPORT_LINE="Import-Module './scripts/AITriad/AITriad.psm1'"
+if ! grep -qF "$IMPORT_LINE" "$PROFILE_PATH" 2>/dev/null; then
+  echo "$IMPORT_LINE" >>"$PROFILE_PATH"
+fi
+
 echo "==> pnpm install (offline, from warm store)"
 pnpm install --frozen-lockfile --offline --store-dir /pnpm/store
 

@@ -154,8 +154,6 @@ Tear down:
   docker compose --profile graph down -v
 ```
 
-#### Run in
-
 ### Data Path Configuration
 
 The file `.aitriad.json` tells the code where to find data:
