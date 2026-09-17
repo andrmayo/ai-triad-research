@@ -34,7 +34,7 @@ services:
 
   neo4j:
     image: neo4j:community
-    profiles: ["graph"]
+    profiles: ["graph", "all"]
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-aitriad2026}
       NEO4J_PLUGINS: '["apoc"]'
@@ -49,6 +49,35 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  # This is useful for development to more closely mirror deployment,
+  # but misses out on hot-reloading with Vite,
+  # so the npm dev:container option will often be preferable for that reason
+  taxonomy-editor:
+    build:
+      context: .
+      dockerfile: taxonomy-editor/Dockerfile
+    profiles: ["taxonomy-editor", "all"]
+    ports:
+      - "7862:7862"
+    environment:
+      # AUTH_DISABLED="1" is a no-op if NODE_ENV == "production"
+      # One would need to change this (perhaps create another service
+      # here specifically geared for production) if using docker compose
+      # for deployment
+      NODE_ENV: development
+      HOST: "0.0.0.0"
+      AUTH_DISABLED: "1"
+      STORAGE_MODE: filesystem
+      AI_TRIAD_DATA_ROOT: /workspaces/ai-triad-data
+    volumes:
+      - ../ai-triad-data/:/workspaces/ai-triad-data:cached
+    healthcheck:
+      test: curl -f http://localhost:7862/health || exit 1
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 30
 
 volumes:
   pnpm-store:

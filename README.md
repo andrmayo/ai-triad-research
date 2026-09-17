@@ -154,7 +154,7 @@ Tear down:
   docker compose --profile graph down -v
 ```
 
-Running taxonomy-editor dev application:
+Running taxonomy-editor dev application using `npm`:
 
 ```bash
   cd taxonomy-editor
@@ -163,7 +163,20 @@ Running taxonomy-editor dev application:
   curl -sf http://localhost:7862/health && echo
 ```
 
-Then verify that this is working by visiting `http://localhost:5173/`.
+Then verify that this is working by visiting `http://localhost:5173/`. This is
+probably best for simple development (allows for Vite's hot reloading), but to
+better match deployment conditions, use a container service by starting up
+Docker with
+
+```bash
+  docker compose --profile all
+```
+
+or
+
+```bash
+  docker compose --profile taxonomy-editor
+```
 
 ### Data Path Configuration
 
