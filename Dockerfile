@@ -1,5 +1,11 @@
 FROM mcr.microsoft.com/devcontainers/javascript-node:22
 
+# Pin Python to 3.12 — Debian trixie's own apt repo only ships 3.13. Copy the
+# official python:3.12-slim-trixie image's self-contained /usr/local instead
+# (same Debian trixie base, so glibc-compatible); it already bundles pip and
+# the venv module, so apt's python3-pip/python3-venv are no longer needed.
+COPY --from=python:3.12-slim-trixie /usr/local/ /usr/local/
+
 RUN . /etc/os-release \
   && wget -q "https://packages.microsoft.com/config/debian/${VERSION_ID}/packages-microsoft-prod.deb" \
   && dpkg -i packages-microsoft-prod.deb && rm packages-microsoft-prod.deb \
@@ -7,7 +13,7 @@ RUN . /etc/os-release \
   && rm -rf /var/lib/apt/lists/*
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-  python3 python3-pip python3-venv pandoc ghostscript \
+  pandoc ghostscript \
   && rm -rf /var/lib/apt/lists/*
 
 ENV VIRTUAL_ENV=/opt/venv
