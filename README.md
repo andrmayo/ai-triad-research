@@ -154,6 +154,17 @@ Tear down:
   docker compose --profile graph down -v
 ```
 
+Running taxonomy-editor dev application:
+
+```bash
+  cd taxonomy-editor
+  npm run dev:container
+  # health check when taxonomy-editor is running
+  curl -sf http://localhost:7862/health && echo
+```
+
+Then verify that this is working by visiting `http://localhost:5173/`.
+
 ### Data Path Configuration
 
 The file `.aitriad.json` tells the code where to find data:
