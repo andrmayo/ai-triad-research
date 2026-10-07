@@ -23,7 +23,10 @@ if ! grep -qF "$IMPORT_LINE" "$PROFILE_PATH" 2>/dev/null; then
 fi
 
 echo "==> pnpm install (offline, from warm store)"
-pnpm install --frozen-lockfile --offline --store-dir /pnpm/store
+if ! pnpm install --frozen-lockfile --offline --store-dir /pnpm/store; then
+  echo "==> WARN: offline install failed (pnpm-store volume missing a package the lockfile needs), falling back to a networked install to refresh the store" >&2
+  pnpm install --frozen-lockfile --store-dir /pnpm/store
+fi
 
 if [ -z "${GEMINI_API_KEY:-}${ANTHROPIC_API_KEY:-}${GROQ_API_KEY:-}${AI_API_KEY:-}" ]; then
   echo "==> No AI API key set. Set GEMINI_API_KEY (or ANTHROPIC_API_KEY/GROQ_API_KEY/AI_API_KEY)"
