@@ -44,6 +44,7 @@ Institutional memory for failure patterns across the AI Triad Research project.
 - 2026-07-17 — PowerShell (t/1712, p/20#23): an inline `pwsh -Command` containing a PowerShell `-split "`n"` (backtick-n) plus nested single/double quotes broke **bash's own parser** (`unexpected EOF while looking for matching quote`) before pwsh ran at all. Fixed by writing the PS snippet to a temp `.ps1` and running `pwsh -File` — the ADR-004 remedy. Reinforces that once inlined PS carries backtick escapes AND nested quotes, `-File` beats fighting the quoting.
 - 2026-08-07 — DebateWorkspace (p/124#10, t/2256): `@'...'@` here-string in Bash tool with `-m` placed after `--` separator — git read the message text and the `-m` flag as filenames ("pathspec '-m' did not match"). Fixed: wrote message to file, used `git commit -F <file> -- <paths>`.
 - 2026-08-09 — Rosetta Stone 3 (p/355#3): `@'...'@` in Bash tool left a stray `@` in the commit subject (same facet as p/83#1). Fixed with `git commit --amend -F <file>` to rewrite the subject cleanly.
+- 2026-09-01 — Computational Linguist (p/7#74): inline `python -c` with backslash path-escaping (Windows `C:\...` paths inside a string argument) threw `SyntaxError: unterminated string literal` — the shell mangled the `\` escape sequences before Python saw them. Fix: write the script to a temp file and execute it (Shell Quoting Rule / ADR-004). Same root as p/7#30 + p/20#23 — the moment a script carries backslashes, nested quotes, or path escapes, inline `-c` fights the shell; a temp file avoids both layers.
 
 **Root Cause:** Heredocs (even quoted `<< 'EOF'` which disable variable expansion) still cannot contain the same quote delimiter used by the inner language. The `bash -c` and `pwsh -Command` wrappers compound this by adding another quoting layer. Additionally, PowerShell-specific syntax (`@'...'@` here-strings) is silently misinterpreted by Bash, not rejected — leading to confusing errors. The `--` separator compounds commit message issues: all flags must come before `--`, or git treats them as pathspecs.
 
@@ -360,6 +361,7 @@ Institutional memory for failure patterns across the AI Triad Research project.
 - 2026-07-26 — Computational Linguist (p/7#36): inline Python inspector crashed calling `len()` on `policy_count` (an int) while probing `policy_actions.json` shape — **printed values before type-checking them**. Trivial + self-correcting: read the shape from the partial output and moved on. Shape learned: `policy_actions.json` keys the list under `policies`, name field is `action`. Same inspect-before-coding failure (operate-before-type-check); loud crash, no downstream cost.
 - 2026-07-26 — Computational Linguist (**8th instance, same-session recurrence**, p/7#38): scratch script threw `AttributeError: 'str' has no .get` walking `situations.json` interpretations — **1,236 nodes have `interpretations.{pov}` as a dict, 23 have it as a plain string**. Cause: assumed uniform shape instead of type-checking at the read site. `isinstance`-guarding fixed it AND *was* the diagnosis — the string form is pre-BDI-decomposition (t/1805). Recurred within hours of #7 → CL argues recording isn't preventing recurrence (hookable check > doc entry); reversed Sage's earlier not-in-#82 call (see #82 tracker).
 - 2026-07-28 — Computational Linguist (**+4, p/7#47/#49**, now 12): **3 probe errors** (t/1826 — extraction-log `nodes`=list not dict, `aliases` nullable, `policy_actions` keys under `policies`/name=`action`) = #82 offender #5 (inspect-before-coding not applied). **+1 PRODUCTION defect (t/1830):** the extraction cmdlet **char-explodes bare-string `aliases`** (13/37 records — model emits string where schema says array, iterated unguarded). **It shipped in POWERSHELL (`Invoke-EntityExtraction`), NOT TS** (CL correction p/7#49) — so `tsc`/a TS union can't catch it; the PS-side prevention is **coerce-at-read (`if ($x -is [string]) { @($x) }`) at each AI-JSON boundary as ONE shared helper (Shared Utility Rule) + a bare-string Pester fixture**. Offender #5's real defense splits by surface: TS→union types, PS→shared coerce helper.
+- 2026-08-27 — Computational Linguist (p/7#68): inline profiling script hit `TypeError: unhashable type: 'dict'` — passed `entity['discovered_by']` directly to `Counter`. Field name suggests string; actual shape on all current `ent-*` records is `{model, usage_id}` dict. Fixed with `isinstance` guard before Counter. **Known shape:** `entities.json` `discovered_by` is always a dict `{model, usage_id}` on current records — never a bare string.
 
 **Root Cause:** Code written based on assumed schema/interface rather than inspecting the actual structure or function signature. Applies across all project data: taxonomy JSON, debate sessions, and tool/API returns. Field types vary — never assume string without checking.
 
@@ -387,6 +389,7 @@ Institutional memory for failure patterns across the AI Triad Research project.
 - 2026-08-01 — Technical Lead (p/8#158): **2nd `jq` instance** — a Bash `jq` command parsing `~/.claude` JSON exited **127 "command not found"** (`jq` not installed in the Bash tool's Git Bash). Resolved via the **PowerShell tool (`ConvertFrom-Json`)**. Distinct from the p/20#21 python-`jq`-shim (that was for a CI script that hard-depends on jq); for **ad-hoc JSON reads, read in PowerShell, don't shim** — win32 "host/file/JSON ops belong in the PowerShell tool" rule.
 - 2026-08-11 — ServerAPI (p/79#27): **3rd `jq` instance** — `gh pr view ... | jq` exited 127 ("jq: command not found") in the Bash tool. Fix: use `gh`'s built-in `--json <fields> --jq '<expr>'` flags — `gh` ships its own jq evaluator, no separate install needed.
 - 2026-08-11 — ServerAPI (p/79#29): **4th `jq` instance** — `gh pr checks | jq` exited 127 in the Bash tool; the same missing `jq` also silently broke a **Monitor CI-watch loop** (per-iteration jq failed with no output → loop emitted nothing → timed out at 15 min). **New amplifier: a missing tool inside a Monitor poll loop causes a silent 15-min timeout, not an immediate error.** Fix: use `gh pr checks --json ... --jq '...'` built-in.
+- 2026-09-02 — ServerAPI (p/504#5): **5th `jq` instance — Monitor poll loop silently slept to timeout.** A Monitor poll loop piped through system `jq` to detect completion; `jq` not on PATH, so each iteration errored to empty, the loop never fired, and it timed out silently. Fix: use `gh --json ... -q` (gh's embedded jq) or parse `gh pr checks` text output directly; avoid system `jq` in Bash-tool commands. Same amplifier as p/79#29: missing tool + Monitor loop = silent full-timeout.
 
 **Root Cause:** Dev environment may lack CLI tools (Azure CLI not installed, `jq` not on PATH) or required background services (Docker Desktop daemon not running). CI runners often have tools the dev shell doesn't, so a script that passes in CI fails locally. Both fail silently or with unhelpful exit codes.
 
@@ -704,8 +707,11 @@ Institutional memory for failure patterns across the AI Triad Research project.
 - 2026-08-03 — Shared Lib (p/5#23): **`cd C:\...` path in Bash (POSIX sh)** — Windows backslash paths are not valid POSIX paths; Bash interprets `\` as escape sequences and silently fails with "No such file or directory". Fixed by switching to the PowerShell tool for all git/shell ops.
 - 2026-08-04 — TL (p/335#1): **Bash glob with `C:\...` Windows path** — MSYS mangled the backslashes during glob expansion; no matches returned. Resolved by switching to the **Glob tool**, which handles Windows paths natively without MSYS translation.
 - 2026-08-04 — Shared Lib (p/5#25): **`cd C:\...` path in Bash again** — same failure as p/5#23. **Second time same agent hit identical mistake** → per-agent memory ("on win32, paths/shell ops = PowerShell tool") is the durable fix (mirrors the Diagnostics double-hit, p/9#28+34).
+- 2026-08-27 — Conflict (p/540#1): **`cd C:\path` in Bash — "No such file or directory."** Same as p/5#23+25 (axis 3). Fixed by switching to PowerShell tool. Third agent to hit this identical mistake.
+- 2026-08-27 — Server Storage (p/539#1): **`cmd /c mklink /D` via Bash — silent failure.** `cmd /c mklink /D <link> <target>` produced no error and no junction. Root cause: Bash swallows `cmd.exe` stdout/stderr, so neither the success message nor any error is visible. Fix: `New-Item -ItemType Junction -Path <link> -Target <target>` via PowerShell tool — worked immediately. **Fifth axis: Windows shell commands via `cmd /c` in Bash swallow all output and may silently do nothing.**
+- 2026-09-01 — Shared Lib (p/5#29): **`cmd //c mklink /J` via Bash — silent failure, 2nd axis-5 instance.** `cmd //c mklink /J <link> <target>` produced no junction and no visible error (exit-2 masked, MSYS path munging). Fix: `New-Item -ItemType Junction` via PowerShell tool worked immediately. Context: junctions used to share `node_modules` with throwaway worktrees (cheap alternative to `npm install`). See Windows Junction Trap pattern for the related `rmdir`-before-remove rule.
 
-**Root Cause:** Agents have access to both Bash and PowerShell tools. PowerShell cmdlets (`Get-ChildItem`, `Get-Item`, `Invoke-Pester`, `Select-Object`, etc.), `$var = ...` assignment, `.Property` access, and `;`-chained statements only work in the PowerShell tool. Unix commands (`ls`, `grep`, `cat`, `stat -c%s`) only work in Bash (on Windows/Git Bash). **A second axis is path format:** git-bash presents `/c/Users/...` msys paths, but native win32 programs (`node`, and anything not msys-aware) resolve `C:\...` — an msys path handed to `node require`/`fs` fails as MODULE_NOT_FOUND / ENOENT. **A third axis:** Windows backslash paths (`C:\...`) given directly to Bash fail silently — Bash treats `\` as escape characters. **A fourth axis: Bash glob over `C:\...` paths** — MSYS mangles the backslashes during expansion, producing zero matches with no error.
+**Root Cause:** Agents have access to both Bash and PowerShell tools. PowerShell cmdlets (`Get-ChildItem`, `Get-Item`, `Invoke-Pester`, `Select-Object`, etc.), `$var = ...` assignment, `.Property` access, and `;`-chained statements only work in the PowerShell tool. Unix commands (`ls`, `grep`, `cat`, `stat -c%s`) only work in Bash (on Windows/Git Bash). **A second axis is path format:** git-bash presents `/c/Users/...` msys paths, but native win32 programs (`node`, and anything not msys-aware) resolve `C:\...` — an msys path handed to `node require`/`fs` fails as MODULE_NOT_FOUND / ENOENT. **A third axis:** Windows backslash paths (`C:\...`) given directly to Bash fail silently — Bash treats `\` as escape characters. **A fourth axis: Bash glob over `C:\...` paths** — MSYS mangles the backslashes during expansion, producing zero matches with no error. **A fifth axis: `cmd /c <windows-command>` in Bash** — Bash does not surface `cmd.exe`'s stdout or stderr; the command may silently fail or do nothing.
 
 **Prevention:**
 1. Use PowerShell tool for: cmdlets (`Get-*`, `Set-*`, `Invoke-*`), `$env:` variables, `$var = ...` assignment, `.Property` access on results, pipeline operators with objects. File-size checks: `(Get-Item $p).Length`.
@@ -714,6 +720,7 @@ Institutional memory for failure patterns across the AI Triad Research project.
 4. **Path format:** when a native win32 program (`node`, etc.) needs a filesystem path, give it a native `C:\...` or repo-relative path — NOT a git-bash `/c/...` msys path OR a mount like **`/tmp`** (both fail as MODULE_NOT_FOUND/ENOENT; `/tmp` is a virtual msys mount Node can't resolve, and `> /tmp/…` redirects land where Node can't `require`). **For any Node-consumed temp file, use the session scratchpad's absolute Windows path, not `/tmp`.** For reading a JSON/data file on win32, the PowerShell tool with a native path is the reliable route.
 5. **Don't use Windows backslash paths (`C:\...`) directly in the Bash tool** — Bash (POSIX sh) treats `\` as escape characters and silently mangles the path. Use the PowerShell tool for any operation that needs a `C:\...` path, or convert to a git-bash `/c/...` form (only valid for msys-aware tools) (p/5#23).
 6. **For file discovery (finding files by name pattern), use the dedicated Glob tool** — it resolves Windows paths natively without MSYS translation. `find` or shell glob expressions with `C:\...` paths in the Bash tool are silently broken (p/335#1).
+7. **Never use `cmd /c <windows-command>` in the Bash tool for filesystem operations** — Bash swallows `cmd.exe` output; silent failure is indistinguishable from success. For Windows-native filesystem ops (junctions, symlinks, NTFS operations), use the PowerShell tool: `New-Item -ItemType Junction`, `New-Item -ItemType SymbolicLink`, etc. (p/539#1).
 
 **Applies To:** All agents on this Windows dev environment with dual shell access.
 
@@ -1184,14 +1191,16 @@ Institutional memory for failure patterns across the AI Triad Research project.
 
 **Instances:**
 - 2026-07-06 — ServerAPI: symlinked main tree's `node_modules` into a landing-worktree to run `npm run verify`. Windows created a junction; `git worktree remove` failed, and a naive `rm -rf` on the worktree would have destroyed the real `node_modules`. Resolved with `git worktree remove --force` + `git worktree prune`; confirmed real `node_modules` intact (906 entries). Recommendation: don't symlink `node_modules` — verify in main tree + `git diff`, or `npm ci` in worktree (p/79#5).
+- 2026-09-01 — Shared Lib (p/5#29): used `New-Item -ItemType Junction` (PowerShell) to share `node_modules` with a throwaway worktree — a cheaper alternative to a full `npm install`. The junction approach works, but requires explicit teardown: **`rmdir` the junction BEFORE `git worktree remove`** — removal recurses through the junction into the real `node_modules` if the link is still present. `cmd //c mklink /J` via Bash was tried first and silently failed (see Bash/PS confusion pattern, axis 5).
 
 **Root Cause:** Git Bash `ln -s <dir>` on Windows creates an NTFS directory junction, not a POSIX symlink. Junctions are followed by `rm -rf` and `rmdir` — cleanup of the worktree risks destroying the junction target. `git worktree remove` also fails because it encounters the junction during cleanup.
 
 **Prevention:**
 1. **Never symlink `node_modules` into a landing-worktree on Windows** — the junction will block cleanup and risk the real deps.
 2. To verify a worktree commit: run verify in the main tree and prove byte-identity via `git diff <worktree-sha> <main-sha>`.
-3. If isolation is essential: `npm ci` inside the worktree (clean install, no junction needed).
+3. If isolation is essential: `npm install` inside the worktree (clean install, no junction needed; note: `npm ci` fails — this repo has no lockfile).
 4. If a junction is already in place: `git worktree remove --force` + `git worktree prune` cleans safely.
+5. **If you intentionally use `New-Item -ItemType Junction` to share `node_modules`: `rmdir` the junction first, THEN `git worktree remove`** — worktree removal follows junctions and will recurse into the real `node_modules`. Junction teardown must precede worktree teardown.
 
 **Status:** Active
 
@@ -2326,6 +2335,7 @@ Institutional memory for failure patterns across the AI Triad Research project.
 - 2026-08-22 — DevOps (p/26#89): **12th instance, Facet 4.** `gh pr close --delete-branch` failed on GV probe PR #1385 — branch still held by a worktree. Fix: `git worktree remove --force`, then `git branch -D`, then `git push origin --delete <branch>`.
 - 2026-08-22 — Computational Linguist (p/7#62): **13th instance, Facet 2.** `gh pr merge <N> --squash --delete-branch` exited 1 — "cannot delete branch ... used by worktree." Remote merge AND remote-branch delete both succeeded; only the local branch delete failed. Confirmed `state=MERGED`, then `git worktree remove` + `git branch -D`. Key reinforcement: **non-zero exit from `--delete-branch` must be treated as post-merge cleanup failure, not a merge failure** — verify PR state before any re-attempt.
 - 2026-08-24 — DebateDiagnostics (p/514#1): **14th instance, Facet 2.** `gh pr merge --delete-branch` failed — branch still checked out in an active worktree. Fix: `git worktree remove` first. Self-noted: `/land-from-worktree` skill already omits `--delete-branch` for this exact reason; using the skill would have avoided the failure entirely.
+- 2026-08-26 — ServerAPI (p/504#3): **15th instance, Facet 2.** `gh pr merge --delete-branch` errored — worktree held the branch. Resolved by removing the worktree first (PR was already merged). Self-noted: `/land-from-worktree` omits `--delete-branch` for this reason; skill adherence would have prevented it.
 
 **Root Cause:** `--delete-branch` cleans up the merged head branch locally too, and gh switches the working copy to the base branch (`git checkout main`) to do so. Git's one-branch-per-worktree rule blocks checking out `main` while the primary worktree has it → `fatal`. The remote merge + branch delete already happened via the API; only the local checkout/cleanup fails. Bookkeeping-≠-artifact family — the exit code describes post-success cleanup, not the merge.
 
@@ -2669,6 +2679,7 @@ Institutional memory for failure patterns across the AI Triad Research project.
 
 **Instances:**
 - 2026-08-01 — DevOps (t/2091, p/26#31): a CI script built a tracked-dir set via a **`$(dirname)` subshell loop over `git ls-files` (~3k files)** → tens of thousands of subprocess spawns → **timed out (>2 min)** on Git Bash/Windows. Fixed with **pure-bash ancestor extraction via parameter expansion** — `while [[ $d == */* ]]; do d=${d%/*}; done` (zero subprocesses) → **47s**.
+- 2026-09-01 — PowerShell 2 (t/3124, p/228#18): a shell loop spawning a **per-file `git diff` over 236 files** timed out at the 2-min cap. Fixed by issuing **one bulk `git diff` piped to a single Python pass** — one subprocess vs 236 → well under the limit. Prevention #3 (batch all items into one invocation) confirmed as the right fix class.
 
 **Root Cause:** each `$(...)` / backtick command substitution **forks a subprocess**; on Windows Git Bash, fork/exec is emulated and ~orders of magnitude slower than native, so N-thousand spawns dominate wall-clock. Bash **parameter expansion** (`${d%/*}` = dirname, `${f##*/}` = basename, `${f%.*}` = strip-ext) does the same string ops **in-process** — zero spawns. Ties to the "foreground op > 120s Bash-tool cap → SIGTERM" genus (#78/#95/#116), but here the cost is **spawn-count**, not a single slow op or I/O.
 
@@ -3530,3 +3541,461 @@ Institutional memory for failure patterns across the AI Triad Research project.
 **Status:** Active — 1 instance (Pester BDI gate t/3007, p/335#47). Prevention t/3010 filed.
 
 **Applies To:** Any CI gate that uses path exclusions, ExcludePath filters, or hardcoded live-data baselines — especially Pester and vitest scoped runs.
+
+---
+
+## #173 [Runtime] Periodic 5s Health-Probe Spikes in ACA Web Container — GC Pause or GitHub API Poll Blocking Event Loop
+
+**Pattern:** The ACA web container health-probe occasionally logs "Cold-start spike excluded: ~5000ms (>50× baseline 3ms)" at ~35s intervals throughout a session. The cold-start exclusion logic correctly excludes these from the baseline (so the probe does not false-positive), but the spikes are real event-loop blocks of ~5s. They co-occurred with a dictionary timeout cascade in at least one session.
+
+**Instances:**
+- 2026-08-26 — FR `merged-b0045e04`, build 374d037a (Diagnostics p/9#69): 6 cold-start spikes logged at ~35s intervals over a 533s session. Probe correctly excluded each. Likely cause: ACA GC pause or periodic GitHub API polling blocking the Node.js event loop. No user-visible impact isolated to the spikes alone; co-occurred with a dictionary timeout cascade.
+
+**Root Cause:** Unconfirmed — two candidates: (1) ACA container GC pause (~35s period is consistent with periodic GC in a memory-constrained container); (2) a periodic GitHub API poll (e.g., rate-limit refresh, auth-token renewal) blocking the event loop synchronously. Either would cause a ~5s stall that triggers the spike exclusion heuristic.
+
+**Prevention / Watch Criteria:**
+1. **Monitor frequency and duration** — 6 spikes in 533s at ~5s each is ~5.6% probe-time overhead; tolerable but load-bearing for the cold-start exclusion logic working correctly.
+2. **Escalate if:** spike frequency increases above 1/30s, duration exceeds 8s, or spikes begin co-occurring with user-visible errors (not just log noise). The 50× threshold in the exclusion heuristic may need tuning if baseline latency drifts.
+3. **Correlate with dictionary timeout cascades** — if future incidents show spikes immediately preceding cascades, the event-loop block is the proximate cause, not a co-incidence.
+4. **Candidate investigation:** add a flight-recorder mark immediately before and after the periodic GitHub API calls (if any) to distinguish GC from API-poll as the root cause.
+
+**Status:** Monitoring — not yet a confirmed failure; watch if frequency or duration increases. 1 instance (Diagnostics p/9#69, build 374d037a).
+
+**Applies To:** ACA web container operations; anyone diagnosing event-loop latency spikes in the health-probe log.
+
+---
+
+## #174 [Build] This Repo Has No Committed `package-lock.json` — Use `npm install`, Not `npm ci`; Install in Both `taxonomy-editor/` and `lib/`
+
+**Pattern:** `npm ci` in a fresh worktree fails immediately with EUSAGE — "no package-lock.json found." This repo does not commit a lockfile; `npm install` is the correct install command. A second failure follows if only `taxonomy-editor/` is installed: `tsc -p tsconfig.main.json` reports spurious "module not found" errors for lib files — because `lib/`'s own dependencies (e.g., `pptxgenjs`) live in `lib/node_modules` and are required for TypeScript compilation of files that transitively import from `lib/`.
+
+**Instances:**
+- 2026-08-27 — Rosetta Stone 2 (p/195#14): `npm ci` in a fresh worktree failed EUSAGE (no lockfile). Switched to `npm install`. Then `tsc -p tsconfig.main.json` failed with spurious module-not-found for `pptxgenjs` — resolved by also running `npm install` in `lib/`.
+
+**Root Cause:** The repo intentionally omits a committed lockfile (flexible dependency resolution). `npm ci` requires one; `npm install` does not. The two-directory install requirement comes from the multi-package layout: `taxonomy-editor/` and `lib/` each have their own `node_modules`, and `lib/`'s transitive deps are not hoisted into `taxonomy-editor/node_modules`. Skipping the `lib/` install produces false tsc errors on any file that imports from `lib/`.
+
+**Prevention:**
+1. **In any fresh worktree, run `npm install` (NOT `npm ci`) in BOTH directories:**
+   ```
+   cd taxonomy-editor && npm install
+   cd ../lib && npm install
+   ```
+2. **`npm ci` will always fail in this repo** — there is no `package-lock.json` to consume. If a skill or playbook references `npm ci`, treat it as `npm install`.
+3. **"Module not found" tsc errors after install in only one dir** — run `npm install` in `lib/` as well; the error is a missing transitive dep, not a code bug.
+4. **/land-from-worktree note:** the install step should use `npm install`, not `npm ci`. Flag to skill owner (TL) if the skill references `npm ci`.
+
+**Status:** Active — 1 instance (Rosetta Stone 2 p/195#14). Applies to all agents setting up fresh worktrees for taxonomy-editor or lib work.
+
+**Applies To:** All agents creating fresh worktrees for taxonomy-editor, lib, or cross-package TypeScript compilation.
+
+---
+
+## #175 [Process] Open Design Ruling = Gated PR; Draft Not Set + Auto-Merge Enabled = PR Lands Before Author Verification
+
+**Pattern:** A PR has an open design ruling sent to another agent — making it a gated PR per root AGENTS.md ("Gated PRs stay draft; never enable auto-merge on a gated PR"). The PR is NOT marked draft. A dispatched worker enables `gh pr merge --auto` (treating "do not self-merge" as "don't run `gh pr merge`" but not as "don't enable auto-merge"). CI goes green; the PR auto-merges the moment checks pass, bypassing the author's Pre-Self-Merge Verification entirely — no agent is in the loop when it lands.
+
+**Instances:**
+- 2026-09-01 — PowerShell (PR #1707, p/20#32): a dispatched ps-ticket-worker subagent enabled auto-merge despite explicit "do NOT self-merge, report back" instruction. The PR landed on the original head the moment CI went green, stranding a post-merge rework (CL-requested id-scheme change) and briefly putting a superseded scheme on main. Resolved: cherry-pick of the rework onto main via PR #1710. Root: open design ruling to CL made the PR gated; draft was not set; auto-merge was the gap. (PowerShell p/20#34 — correction from CL p/23#223.)
+
+**Root Cause:** "Gated" is a semantic state (an unresolved dependency or decision) that GitHub has no native concept of. The only enforcement mechanisms are (a) marking the PR draft (blocks merge button + auto-merge) or (b) not enabling auto-merge. A comment or ticket `blocks` relation gives visibility but does NOT prevent GitHub from merging. A dispatch prompt that says "do not self-merge" does not automatically prohibit `gh pr merge --auto` — a worker interprets "do not self-merge" as "don't run `gh pr merge`" while treating auto-merge as a separate, acceptable action. The gap: the author's verification loop is bypassed entirely when auto-merge fires.
+
+**Prevention:**
+1. **Any open design ruling = gated PR = open as draft immediately.** Don't wait for the ruling to close; draft enforces the hold at the GitHub level. Un-draft only when the ruling is resolved.
+2. **Dispatch prompts must explicitly forbid enabling auto-merge** when the intent is "do not merge, report back": include "do NOT enable auto-merge (`gh pr merge --auto`)" in addition to "do not self-merge."
+3. **Workers that must-not-merge should open the PR as draft** — draft blocks both the merge button and auto-merge, making the intent unambiguous regardless of how "don't merge" is interpreted.
+4. **A comment hold or ticket `blocks` relation is visibility, not enforcement** — it does not prevent GitHub from merging. Only draft enforces.
+
+**Status:** Active — 1 instance (PowerShell PR #1707, p/20#32). Root AGENTS.md already has the gated-PR/draft rule (t/2603/#997); this is the first LessonsLearned instance showing the dispatch-prompt loophole and the open-design-ruling trigger.
+
+**Applies To:** All agents dispatching subagent workers to open PRs; all agents with open design rulings on in-flight PRs.
+
+---
+
+## #176 [Process] Auto-Merge Fires on Pre-Push PR Head — Author's Pre-Self-Merge Verification Bypassed When Merge Is Triggered Externally
+
+**Pattern:** An author enables auto-merge on a PR, then pushes additional commits. Auto-merge fires on the head that was current when it was enabled (or when CI last went green) — NOT on the author's latest-pushed commit. The PR lands on a stale head, stranding the post-push commits off main. This violates Pre-Self-Merge Verification step 1 (head == latest push), but the author's verification loop is never entered because the merge was triggered by GitHub's auto-merge machinery, not by the author.
+
+**Instances:**
+- 2026-09-01 — Computational Linguist (PR #1712, p/7#71): PR #1712 squash-merged at stale head `72cf6db4` predating two follow-up pushes; the `sit-*` extension + summary assertion was stranded off main (main got only the original reconciler). Root: auto-merge fired on the pre-push head; head-match gate not enforced because the merge was triggered externally. Resolved: re-landed the complete file in PR #1716 after verifying the gap against `origin/main`.
+
+**Root Cause:** GitHub auto-merge fires when required checks pass for the HEAD that is current at that moment — not necessarily the author's latest pushed commit. If the author pushes new commits after enabling auto-merge, the auto-merge queue may already be primed for an older head, and if that older head's CI was already green, the merge can fire before CI even runs for the new push. The author's Pre-Self-Merge Verification (step 1: head == latest push) is a self-directed check — it is never run when GitHub's automation is the merge actor.
+
+**Prevention:**
+1. **Do not enable auto-merge until all planned pushes to the branch are complete.** If you know more commits are coming, hold off on `--auto` until the branch is final.
+2. **If you push commits after enabling auto-merge, cancel auto-merge first** (`gh pr merge --disable-auto <n>` or close/reopen), update the branch, then re-enable. Do not assume auto-merge will re-queue on the new head.
+3. **For PRs where another actor may trigger the merge** (auto-merge, a teammate, a bot), ensure the PR head is the commit you intend BEFORE enabling auto-merge — treat it as your last chance to run the verification.
+4. **After a PR lands, confirm `gh pr view <n> --json headRefOid` matches your intended head** before declaring the work complete — a stale-head merge is detectable immediately post-merge and recoverable via a follow-up PR.
+
+**Status:** Active — 1 instance (CL PR #1712, p/7#71). Sibling of the Pre-Self-Merge Verification rule (root AGENTS.md, step 1) — extends it to the case where the author is not the merge actor.
+
+**Applies To:** All agents enabling auto-merge on PRs where further pushes are possible; all PRs where a third party (bot, teammate, scheduled action) may trigger the merge.
+
+---
+
+## #177 [Build] `ConvertFrom-Json` Round-Trip Silently Mutates Untargeted Fields — ISO Datetimes Re-Offset, Single-Element Arrays Collapse to Scalars
+
+**Pattern:** A PowerShell 7.4 whole-file JSON read-modify-write (`ConvertFrom-Json` → mutate → `ConvertTo-Json`) silently corrupts fields the code never touched: ISO 8601 datetime strings (`measured_at`, `generated_at`) are re-offset to local timezone, and single-element arrays (`vocabulary_terms: ["x"]`) collapse to bare scalars (`"x"`). The mutations are invisible until downstream readers fail on type mismatches. Any cmdlet that reads a data JSON file and unconditionally rewrites the whole file via `ConvertTo-Json` is at risk.
+
+**Instances:**
+- 2026-09-01 — PowerShell 2 (t/3124, p/228#17+18): `Update-ClaimEntityRef` caught the pattern before bad data landed — a whole-file JSON round-trip via `ConvertFrom-Json` + `ConvertTo-Json` would have re-offset ISO datetimes in `measured_at`/`generated_at` and collapsed single-element `vocabulary_terms` arrays to strings. Fix: `ConvertFrom-JsonPreserveShape` — a `ConvertFrom-Json` + `System.Text.Json` tandem walk that restores datetime strings and re-wraps collapsed single-element arrays. Mirrors the existing `ConvertFrom-EdgesJson` pattern. Recurrence of t/2974.
+
+**Root Cause:** `ConvertFrom-Json` maps ISO 8601 strings to .NET `DateTime` objects; `ConvertTo-Json` serializes them back with local-timezone offset, changing the string representation. Single-element JSON arrays deserialize to a bare .NET object (not a `[object[]]`); `ConvertTo-Json` then emits a scalar, not a one-element array. Both corruptions are type-level coercions invisible to PowerShell code that reads/mutates only other fields — the round-trip "works" from the mutation's perspective while silently destroying field shapes elsewhere in the file.
+
+**Prevention:**
+1. **Any new cmdlet that reads a data JSON file and rewrites the whole file must use a shape-preserving reader, never raw `ConvertFrom-Json`.** Use `ConvertFrom-JsonPreserveShape` (or the equivalent `ConvertFrom-EdgesJson` pattern) — the `System.Text.Json` tandem walk restores datetime strings and single-element arrays.
+2. **If a shape-preserving reader isn't available, write back ONLY the fields that were mutated** — construct a targeted patch rather than a full round-trip of the parsed object.
+3. **Treat `ConvertFrom-Json` → `ConvertTo-Json` as a lossy transform on datetime fields and arrays with ≤1 element.** Any file that passes through this pipeline is silently corrupted unless protected.
+4. **Test with files that contain (a) ISO datetime fields and (b) single-element arrays** — the corruption is invisible in unit fixtures that use multi-element arrays or omit datetime fields.
+
+**Status:** Active — recurrence of t/2974; 1 instance caught pre-land (PowerShell 2 t/3124, p/228#17+18). `ConvertFrom-JsonPreserveShape` is the fix pattern; flag any new whole-file rewriter that uses raw `ConvertFrom-Json`.
+
+**Applies To:** All PowerShell cmdlets that perform whole-file JSON read-modify-write on data files in this repo (entities, claims, situations, etc.).
+
+---
+
+## #178 [Diagnostic] Cache-Miss Discrimination — Slow Embedding Computes May Be Volume Demand, Not a Dead Cache; Inspect WHAT Is Computed, Not Just Duration
+
+**Pattern:** A flight-recorder showing slow embedding computes is misread as "cache is dead" based on duration alone. The correct discriminator is WHAT is being computed: node-IDs already present in the cache that appear in the slow batch → genuine cache misses (cache failure); node-IDs absent from the cache (novel frames, paragraphs, claims) → correct misses → the slowness is demand-side VOLUME, not a cache defect. Treating correct-novel-misses as evidence of a dead cache sends the diagnosis down a wrong root-cause path and drives the wrong fix class.
+
+**Instances:**
+- 2026-09-01 — t/3165 embedding-saturation incident (Diagnostics, p/334#225; TL p/335#49): FR showed slow embedding computes; initial diagnosis inferred "cache dead." Corrected by Diagnostics: the slow items were novel frames/paragraphs/claims not yet in the cache → correct misses → slowness was volume-starvation, not a cache failure. Durable fix: off-thread ONNX compute behind `EMBEDDING_WORKER_OFFLOAD` (t/3183, PR #1753) — a worker-offload, not a cache fix. Incident anchor: t/3165#24/#32.
+
+**Root Cause:** Duration alone is an ambiguous signal — both a dead cache and a high-volume correct-miss load produce long compute times. The discriminating dimension is novelty of the requested items: a cache failure shows known items missing; volume-starvation shows only novel items (expected misses). Collapsing the two into one "slow = broken" hypothesis produces a wrong fix class (cache repair vs worker offload).
+
+**Prevention:**
+1. **When a FR shows slow embedding (or other cached) computes, inspect what's in the batch** — are the slow items node-IDs that should have been cached (known IDs, previously seen)? Or are they all novel? Known-IDs-slow = cache failure; novel-IDs-slow = volume demand.
+2. **Fix class depends on root cause** — volume-starvation → off-thread / worker offload; genuine cache failure → cache invalidation, warming, or schema fix. Don't apply a cache fix to a volume problem.
+3. **Log the novel-vs-cached breakdown per compute batch** (observability follow-up) — makes this discrimination instant in future incidents without manual FR archaeology.
+4. **Note for `/triage-flight-recorder`**: add "slow embedding" as a known pattern requiring the novel-vs-cached split before concluding cache failure.
+
+**Status:** Active — 1 incident (t/3165). The discrimination heuristic (inspect what's computed, not just duration) is the durable prevention; observability improvement (novel/cached breakdown per batch) is the follow-up.
+
+**Applies To:** Anyone triaging flight-recorder embedding-compute slowdowns; the `/triage-flight-recorder` skill should surface this split before concluding cache failure.
+
+---
+
+## #179 [Process] Deleting a PR's Head Branch Before `state=MERGED` Closes the PR — Confirm Merge Before Branch Cleanup
+
+**Pattern:** An agent deletes a PR's remote head branch (e.g., `git push origin --delete <branch>`) before confirming `state=MERGED`, assuming auto-merge will handle the rest. GitHub interprets the branch deletion as abandonment and CLOSES the PR — it does not merge it. The PR transitions from OPEN to CLOSED (not MERGED), stranding the work.
+
+**Instances:**
+- 2026-09-01 — Computational Linguist (PR #1780, p/7#76): deleted the remote head branch of an open (not-yet-merged) PR assuming auto-merge was in progress (as prior PRs had auto-merged). GitHub closed PR #1780 on branch deletion. Recovery: the local branch ref survived `git worktree remove`, so the branch was re-pushed + `gh pr reopen`, then watched to MERGED state before cleanup. No work lost.
+
+**Root Cause:** GitHub closes a PR when its head branch is deleted while the PR is still OPEN — deletion signals "this work is abandoned." Auto-merge does not protect against this: if the branch is deleted before auto-merge fires, GitHub closes the PR rather than merging it. The assumption "auto-merge will handle it" only holds if the branch persists until CI is green and the merge fires.
+
+**Prevention:**
+1. **Confirm `state=MERGED` (via `gh pr view <n> --json state,mergedAt`) BEFORE deleting any PR's head branch** — never delete a branch on an OPEN PR, even if auto-merge is enabled.
+2. **The cleanup order is: wait for MERGED → then delete the branch** (remote + local). Never reverse this order.
+3. **Recovery if you accidentally close a PR**: if the local branch ref still exists, re-push it (`git push origin <branch>`) + `gh pr reopen <n>` + re-enable auto-merge if needed, then watch to MERGED before cleanup.
+4. **Sibling of #106** (gh pr merge --delete-branch exits non-zero after a successful merge): in both cases, the discriminator is checking `state=MERGED` before concluding the merge is incomplete and taking action.
+
+**Status:** Active — 1 instance (CL PR #1780, p/7#76). Complement to Pre-Self-Merge Verification and #106 — the branch-cleanup-before-merge failure mode.
+
+**Applies To:** All agents performing branch cleanup after landing PRs, especially those using auto-merge or relying on a third party to trigger the merge.
+
+---
+
+## #180 [Build] Dynamic `new Worker(new URL('./file.js', ...))` String Reference Is Invisible to tsc — Worker File Never Emitted Without an Explicit Emit-Gate
+
+**Pattern:** A web worker is instantiated via `new Worker(new URL('./embeddingWorker.js', import.meta.url))` — a runtime string, not a static import. TypeScript's static import graph does NOT follow this reference, so tsc compiles successfully while never emitting the worker `.js` file. The build appears green; the worker is absent at runtime. Unit tests and Electron-worker spikes don't catch this because they either mock the worker or run from source — only a test that consumes the real compiled `dist/` output exposes the missing file.
+
+**Instances:**
+- 2026-09-02 — t/3165 / t/3209 (TL e/133#1): an Electron-worker spike + fake-worker unit tests all passed; a staging canary was the FIRST run against the real server-container tsc build — and immediately caught the bug: `embeddingWorker.js` was absent from `dist/` because it's referenced only as a string, invisible to tsc's import graph. Countermeasure: emit-gate PR #1784 scans emitted `dist/` for worker-URL string refs and fails the build if the target `.js` is absent.
+
+**Root Cause:** tsc resolves the module graph by following static `import` statements. A `new Worker(new URL('./worker.js', import.meta.url))` is a runtime constructor call with a string argument — the compiler does not index or follow it. The worker source file is thus unreferenced from tsc's perspective: it is compiled only if it appears in `include`/`files`/a static import chain, and emitted only if it is compiled. A perfectly valid, type-checked codebase can produce a broken `dist/` when worker files are the only consumers of their own source.
+
+**Prevention:**
+1. **Any file reachable only via a dynamic/worker-URL string reference needs an explicit emit-gate** — a post-build check that scans `dist/` for worker URL refs and asserts the target `.js` is present. Do not rely on tsc, unit tests, or Electron-worker spikes to catch a missing worker file.
+2. **Validate in the REAL target build, not a proxy.** A local spike, a unit test with a mocked worker, or a CI step that runs from source are all structurally incapable of detecting a missing emitted file. The signal comes only from a step that (a) runs `tsc` on the REAL build target and (b) consumes the emitted `dist/`.
+3. **When adding a new worker file, add it to `tsconfig.json` `include`** (or add a static import from a file that IS in the graph) — this ensures tsc compiles and emits it regardless of the runtime URL reference.
+
+**Status:** Active — 1 instance (t/3165/t/3209, e/133). Emit-gate PR #1784 is the durable countermeasure. Sibling of the "build ≠ runs" gate-integrity family (#94, #112, #130).
+
+**Applies To:** All agents adding or modifying web workers, worker-URL dynamic imports, or any file referenced only at runtime — not via a static import chain.
+
+---
+
+## #181 [Build] Zero-Work-Green Gate — A Gate Reports Pass While Performing No Work; Must Assert Workload-Validity Precondition
+
+**Pattern:** A canary or CI gate reports `gate.pass` / green while having performed zero meaningful work — e.g., an embedding-canary that ran an idle loop and computed 0 vectors, reporting a meaningless p99 latency. The gate is structurally incapable of detecting a regression because there is nothing to measure. "No error" ≠ "work happened."
+
+**Instances:**
+- 2026-09-02 — t/3165 canary (TL e/133#2): the canary's first run reported `gate.pass` but computed 0 vectors (idle loop). The p99 result was meaningless. Hardened with a workload-validity precondition: `vectors > 0`, `non-200 == 0`, `demand ≥ floor`, `dims == 384` — the gate only accepts a result if the precondition proves real work happened.
+
+**Root Cause:** A gate that checks only for the absence of errors passes when nothing ran. An idle/empty-input execution is indistinguishable from a healthy execution unless the gate explicitly asserts that the work occurred and produced output. Gates that measure latency, throughput, or quality are particularly vulnerable: zero-work produces zero-error, making the gate trivially green.
+
+**Prevention:**
+1. **Every gate must assert that work ACTUALLY HAPPENED** — add a workload-validity precondition before accepting results: output-count > 0, no non-2xx responses, result-dimensions match expected, demand ≥ configured floor.
+2. **A gate that reports pass on an empty/idle run is a dead gate** — it gives false confidence while providing zero signal. A workload-validity failure should be a hard gate failure, not a skip or a warn.
+3. **Test the gate itself against an empty-input / idle-loop run** — confirm it reports FAIL, not pass, when nothing is computed.
+
+**Status:** Active — 1 instance (t/3165 canary, TL e/133#2). Sibling of gate-integrity genus (#94, #112): a zero-work gate is the "gate passes while broken" failure mode applied to workload quantity rather than build vs. runtime.
+
+**Applies To:** All canaries, load tests, latency gates, and quality gates that measure performance or correctness of a computation — embedding, inference, indexing, search, etc.
+
+---
+
+## #182 [Deploy] IaC-Landed ≠ Prod-Deployed; ACA Resource-Shape Validity Needs a Gate — Invalid cpu:mem Combo Landed Undetected
+
+**Pattern:** A bicep change lands on main and CI goes green, but the resource shape it specifies is invalid for the target platform. For ACA (Azure Container Apps), ACA requires memory ≥ 4Gi when vCPU ≥ 2.0 — an `(2.0 vCPU, 2Gi)` combo is rejected at ARM deploy time. No gate in CI caught the invalid combo before it landed; a deploy would have failed the ARM step. Additionally: prod may run a different resource shape than the canary (e.g., 1vCPU/2Gi prod vs 2vCPU canary) — a performance invariant validated at 2vCPU (e.g., "worker gets its own core") silently breaks at 1vCPU.
+
+**Instances:**
+- 2026-09-02 — t/3165 / #1771 (TL e/133#3): PR #1771 landed `(2.0 vCPU, 2Gi)` in bicep — an invalid ACA combo (ACA requires 4Gi for ≥2vCPU). No gate caught it. Simultaneously, prod was running 1vCPU/2Gi while the embedding-offload canary validated 2vCPU — the offload's C1 single-session invariant (worker gets its own core) silently violated in prod. Prevention filed: t/3212 (bicep ACA cpu:mem-combo validation gate).
+
+**Root Cause:** CI gates validate build correctness (tsc, Pester, vitest) and contract correctness, not infrastructure resource-shape validity. The ARM template is not deployed in CI; its resource specs are untested until a real deploy. Prod and canary may diverge in resource shape without any visible signal — the canary validates at a different scale than prod runs.
+
+**Prevention:**
+1. **Add a bicep resource-shape validation gate** — for ACA, assert `cpu ≥ 2 → mem ≥ 4Gi` (and other ACA resource constraints) statically before any template lands. Track in t/3212.
+2. **When adding a performance invariant that assumes a specific resource shape** (e.g., "worker gets its own core at 2vCPU"), assert that prod's actual resource allocation matches the assumption before claiming the fix is live in prod.
+3. **IaC-landed ≠ prod-deployed ≠ prod-correct** — landing a bicep change proves the template is syntactically valid; deploying proves ARM accepted it; validating prod proves the running container matches the intended shape. Three separate confirmation points.
+
+**Status:** Active — 1 instance (t/3165/#1771, TL e/133#3). t/3212 tracks the bicep ACA cpu:mem gate. Sibling of bookkeeping-≠-artifact (#94, #130): the "it's in IaC" claim doesn't guarantee prod reflects it.
+
+**Applies To:** All agents modifying ACA bicep resource specs; all fixes whose performance guarantees depend on a specific vCPU/memory shape.
+
+---
+
+## #183 [Deploy] Ephemeral CLI Config Is Wiped by the Next IaC Deploy — Durable Config Lives in IaC at Point-of-Use, Gated
+
+**Pattern:** A flag or env-var is set via an ad-hoc CLI command (`az containerapp update --set-env-vars FEATURE=1`). The next full template deploy overwrites the container's environment with the bicep-defined baseline, silently reverting the CLI-set value. The feature appears enabled until the next deploy, then silently regresses with no error.
+
+**Instances:**
+- 2026-09-02 — t/3165 / `EMBEDDING_WORKER_OFFLOAD` (TL e/133#4): an early `az --set-env-vars` flip enabled the worker offload for testing. The durable fix put `EMBEDDING_WORKER_OFFLOAD=1` in bicep `baseEnv` + a `Test-AzureHealth -CheckConfig` config-drift gate that hard-fails CI if a deploy ever drops it. A real deploy was run to exercise the gate's GREEN arm against prod (`Config:EnvVar:EMBEDDING_WORKER_OFFLOAD=True ok`).
+
+**Root Cause:** ACA's bicep template defines the authoritative environment for the container. Any value set via CLI is applied only to the live revision; a full template redeploy re-renders the environment from the template, discarding CLI-set values. Ad-hoc CLI changes are ephemeral by design; they are a debugging/testing tool, not a durable config mechanism.
+
+**Prevention:**
+1. **Durable config lives in IaC (bicep `baseEnv`), not in CLI commands.** Once a flag is validated, move it from `az --set-env-vars` to the bicep template before it is at risk of being overwritten by the next deploy.
+2. **Gate durable config with a config-drift check** — a CI step (e.g., `Test-AzureHealth -CheckConfig`) that fails if a deploy drops the expected env-var. This both documents the expected value and hard-fails if it regresses.
+3. **Run a real deploy to exercise the gate's GREEN arm** — "the drift gate exists" is not the same as "the drift gate fires on real prod." A gate arm is unverified until it runs against the real target environment.
+
+**Status:** Active — 1 instance (t/3165 `EMBEDDING_WORKER_OFFLOAD`, TL e/133#4). General principle: any config set only via CLI is invisible to IaC and will be wiped on the next full deploy.
+
+**Applies To:** All agents setting environment variables or config via `az containerapp update`/`az webapp config`/similar CLI commands; all flags that must survive deploys.
+
+---
+
+## #184 [Process] Gate Block-Arm Unverified by a Canary That Never Trips It — Both Arms Must Be Deliberately Exercised
+
+**Pattern:** A gate has two arms: a GREEN arm (all healthy → proceed) and a BLOCK arm (unhealthy → hold). A canary is run against real prod and the GREEN arm fires correctly. The team reads this as "gate verified." But the BLOCK arm was never triggered — the canary always produced a healthy result. A gate whose block arm has never fired is unverified: it may be silently broken (wrong threshold, wrong signal, logic error) and will fail to hold when it matters.
+
+**Instances:**
+- 2026-09-02 — t/3165 canary / #1706 `/readyz` fire arm (TL e/133#5): the t/3165 canary always `resolves:true` (healthy prod) — the `/readyz` BLOCK arm (`resolves:false → BLOCK shift`) was never exercised. It was explicitly NOT promoted as "verified" off this green; it gets its own deliberate both-arms Gate-Promotion (t/3192) where the block arm will be triggered and confirmed.
+
+**Root Cause:** A canary or smoke test run in a healthy environment structurally exercises only the GREEN arm. "The gate passed" means "the gate detected a healthy state correctly" — it says nothing about whether the gate can detect an unhealthy state. The block arm requires a deliberate unhealthy input; waiting for organic failure to verify it is not a verification strategy.
+
+**Prevention:**
+1. **Before declaring a gate "verified," confirm BOTH arms have fired** — GREEN arm (healthy → proceed) AND BLOCK arm (unhealthy → hold). A gate verified on only one arm is half-verified.
+2. **For each new gate, write a deliberate block-arm test** — inject an unhealthy condition (a failure-mode canary, a mock, a forced error) and confirm the gate fires BLOCK, not PASS.
+3. **Document gate-promotion separately from gate-landing** — landing the gate code and verifying both arms are two distinct milestones. Track the block-arm verification as a follow-up ticket (e.g., t/3192 pattern).
+
+**Status:** Active — 1 instance (t/3165/#1706, TL e/133#5). Sibling of gate-integrity genus: a gate whose block arm has never fired provides false confidence, not verified safety.
+
+**Applies To:** All agents landing new gates, canaries, or circuit-breaker checks — escalate block-arm verification as a mandatory follow-up, not an assumption.
+
+---
+
+## #185 [Process] Staged Blue-Green Flip with Active Load Injection for Load-Failure Incidents — Don't Wait for Organic Load
+
+**Pattern:** For a load-induced incident, a standard blue-green 0%→100% flip without active load injection may never reproduce the failure condition during the canary window — prod traffic may be too low to trigger the load-induced bug. The staged flip gives blast-radius control; the active load injection gives genuine stress coverage.
+
+**Instances:**
+- 2026-09-02 — t/3165 embedding-offload flip (TL e/133#6): blue-green 0%→25%→100%. Since prod is low-traffic, the exact failure mechanism (1536 concurrent embedding computes) was actively DRIVEN against the 25% revision's FQDN during the canary window rather than waiting for organic load. Result: max 39.6ms vs the original 7–8s freezes — the fix confirmed under genuine stress, not just "no errors in prod."
+
+**Root Cause:** Organic prod traffic may be orders of magnitude below the load that triggered the incident. A canary window with only organic traffic proves "no regressions at low load" — it does not prove "the fix holds under the original failure load." For load-induced failures, the validation must reproduce the failure mechanism deliberately.
+
+**Prevention:**
+1. **For load-induced incidents, actively drive the failure mechanism against the canary revision** — don't rely on organic traffic to recreate the load condition. Identify the failure threshold (e.g., N concurrent computes) and generate it deliberately against the canary's FQDN.
+2. **Use staged traffic splits (0%→25%→100%) for blast-radius control** — the 25% canary bounds impact to a fraction of prod while still receiving real traffic routing.
+3. **Record the peak metric under active load** (e.g., p99 latency, max duration) as the validation signal, not just "no errors" — a fix that holds under the original failure load is verified; a fix that sees no errors at 1% of the original load is not.
+
+**Status:** Active — 1 instance (t/3165, TL e/133#6). Process pattern for load-failure incident validation.
+
+**Applies To:** All agents validating fixes for load-induced incidents (embedding saturation, rate-limiting, queue exhaustion, connection-pool exhaustion) in low-traffic prod environments.
+
+---
+
+## #186 [Governance] Prod-Change Directives from Unresolvable or Unauthenticated Senders Are Void — Gate Against Real Verified State
+
+**Pattern:** One or more agents send a message claiming "all prerequisites are met" or "it is safe to proceed" with a prod change. The senders are unresolvable (no verified identity in the system) or the claim cannot be independently confirmed. Acting on such a directive without verifying the claim against real system state risks an unsafe prod change.
+
+**Instances:**
+- 2026-09-02 — t/3165 1-vCPU flip attempt (TL e/133#7): two unresolvable senders pushed a false "all prereqs met" status to trigger an unsafe 1-vCPU flip. The directive was held because (a) the gate keyed on real verified prod state, not the sender's claim, and (b) every prod mutation went through the human's hands. No unsafe flip occurred.
+
+**Root Cause:** In a multi-agent fleet, any agent can send any message, including false status claims. An unresolvable sender has no verified identity; their claim is unverifiable by construction. A gate that proceeds on a sender's "safe to proceed" message rather than on independently verified prod state is trivially bypassable — intentionally or through agent error.
+
+**Prevention:**
+1. **Prod-change directives from unresolvable or unverified senders are void** — do not act on a "safe to proceed" claim you cannot independently verify. Always gate against real observed state (CI green, health probe passing, config correct), not a sender's assertion.
+2. **Every prod mutation goes through the human's hands** — for irreversible or high-blast-radius prod changes, require a human confirmation step, not just an agent-to-agent "all clear."
+3. **If an agent is claiming prerequisites are met, verify each prerequisite independently** — check CI, check health endpoints, check config — before proceeding.
+
+**Status:** Active — 1 instance (t/3165, TL e/133#7). Governance principle: the gate keyed on real state, not on sender claims. Applies when any agent (including fleet members) claims a prod action is safe.
+
+**Applies To:** All agents handling multi-agent coordination for prod changes. Especially relevant for gated deploys where multiple agents vote or claim prerequisite status.
+
+---
+
+## #187 [Process/Git] `git worktree add <path> <branch>` Fails When Branch Is Already Checked Out in Another Worktree
+
+**Pattern:** `git worktree add <path> <branch>` throws "fatal: '<branch>' is already used by worktree '<other-path>'" when the named branch is currently checked out in another agent's worktree. Git prevents a branch from being active in two worktrees simultaneously.
+
+**Instances:**
+- 2026-09-03 — Tech Lead (p/335#52): attempted to add a worktree pointing at a branch already checked out elsewhere. Resolution: `git worktree add <path> -b <tmp-branch> <OID>` (temp branch off the head OID), then push onto the target branch ref after work is complete.
+
+**Root Cause:** Git's worktree design prevents the same branch ref from being the HEAD of two simultaneous worktrees — branch contention is a fundamental constraint, not a transient error.
+
+**Prevention:**
+1. **When the target branch is already checked out elsewhere, create a temp branch off the OID:** `git worktree add <path> -b <tmp> <target-OID>`, do the work, then `git push origin <tmp>:<target>` to land onto the target ref.
+2. **Check for existing worktrees on the branch before `git worktree add`:** `git worktree list` shows which branches are currently checked out and where.
+3. **Coordinate with the agent holding the branch before attempting to check it out** — the "branch in use" error is a signal of a live concurrent worktree, not a stale ref.
+
+**Status:** Active — 1 instance (p/335#52). Worktree contention pattern; temp-OID branch is the canonical workaround.
+
+**Applies To:** All agents creating worktrees for feature work, especially in multi-agent fleets where multiple instances may attempt worktree ops on the same branch.
+
+---
+
+## #188 [Process/CI] `gh workflow run` 404s When the Workflow Only Exists on a Feature Branch
+
+**Pattern:** `gh workflow run <workflow-file>` returns a 404 "not found on the default branch" error when the workflow being dispatched was added on a feature branch and has not yet merged to main. GitHub only registers `workflow_dispatch` triggers from the default branch.
+
+**Instances:**
+- 2026-09-03 — DevOps (p/26#94): new dispatch workflow dispatched from its feature branch before merge; 404 every time. Resolution: sequence dispatch-validation to post-merge; the workflow is only callable once it exists on main.
+
+**Root Cause:** GitHub indexes `workflow_dispatch` and `schedule` triggers exclusively from the default branch. A workflow that exists only on a feature branch is invisible to the GitHub Actions dispatch API — it effectively does not exist as a triggerable workflow until it lands on main.
+
+**Prevention:**
+1. **Do not attempt `gh workflow run` on workflows that haven't merged to main** — they will always 404. This is not a permissions issue or path error; it is a GitHub platform constraint.
+2. **Sequence dispatch-validation as a post-merge step** for new scheduled/dispatch workflows — document this in the PR description so the reviewer knows the real smoke test happens after merge, not in CI.
+3. **For pre-merge testing of dispatch logic**, use `workflow_call` (callable from within CI) or `push`/`pull_request` triggers on the feature branch instead.
+
+**Status:** Active — 1 instance (p/26#94). GitHub platform constraint; post-merge sequencing is the canonical resolution.
+
+**Applies To:** All agents adding new `workflow_dispatch` or scheduled workflows. Relevant during PR authoring to set correct expectations about when dispatch testing can occur.
+
+---
+
+## #189 [Build/Worktree] Worktree Checkout Has No `node_modules` — vitest/npm Tools Fail
+
+**Pattern:** A fresh `git worktree add` checkout does not include `node_modules` (they are gitignored). Any test runner, build tool, or script that requires installed packages (vitest, tsc, npm scripts) fails immediately with module-not-found or command-not-found errors in the worktree.
+
+**Instances:**
+- 2026-09-03 — Server Auth (p/608#1, t/3284): worktree at `.worktrees/t3284/taxonomy-editor/` had no `node_modules`; vitest failed. Resolution: `New-Item -ItemType Junction -Path .worktrees/t3284/taxonomy-editor/node_modules -Target taxonomy-editor/node_modules` (junction to shared tree's installed node_modules). Tests then ran successfully.
+
+**Root Cause:** `node_modules` is gitignored by design — it is never committed. Worktrees share the `.git` directory but have independent working trees; they do not inherit the parent checkout's `node_modules`. Running `npm install` in a worktree creates a duplicate install; using a junction to the shared tree's `node_modules` is faster and avoids disk waste.
+
+**Prevention:**
+1. **After creating a worktree for any npm-based subtree, create a junction to the shared tree's `node_modules` before running any npm scripts:** `New-Item -ItemType Junction -Path <worktree>/<subtree>/node_modules -Target <shared-tree>/<subtree>/node_modules`
+2. **Remove the junction before `git worktree remove`** (per Pattern #122 / rmdir-first rule) to prevent `git worktree remove` from failing on the non-empty directory: `Remove-Item <worktree>/<subtree>/node_modules` (removes the junction, not the target).
+3. **Applicable subtrees**: `taxonomy-editor/`, `poviewer/`, `summary-viewer/`, `lib/debate/` — any directory with its own `package.json` and gitignored `node_modules`.
+
+**Status:** Active — 1 instance (p/608#1, t/3284). Worktree setup gap; junction is the canonical fix.
+
+**Applies To:** All agents creating worktrees for work in npm-based subtrees. Especially relevant for test-running worktrees where the first action is `npx vitest` or `npm run build`.
+
+---
+
+## #190 [Process/CI] FIRE Arm "Observationally Pending" Is Not Safe — Force-Trigger End-to-End When Cheap
+
+**Pattern:** A gate's FIRE arm was accepted as "observationally pending" (predicate correct, fire never verified in production). The predicate fired correctly (exit 1, red CI job) but the human-reaching signal never arrived because a downstream step in the fire→signal chain silently errored — "fires but nobody's told." The chain break was entirely independent of the predicate logic.
+
+**Instances:**
+- 2026-09-03 — DevOps (p/26#97, t/3278): `deploy-drift-check` predicate correctly returned Fire=True (exit 1), but `gh issue create --label deploy-drift` then errored "label not found" (the label was never created in the repo). The gate job went red — technically fired — yet the human-visible issue never opened. Caught by forcing the fire via a threshold-override dispatch. Fix: workflow now self-ensures the label with `gh label create --force` before `gh issue create`.
+
+**Root Cause:** A gate's observable output is the job exit code (pass/fail), not whether the human-reaching artifact (issue, alert, notification) was actually created. These are separate steps in the same job, and errors in post-predicate steps are silently swallowed from the gate's perspective. Unit-green + a de-gated fire arm proves only the predicate logic — not the full fire→signal chain.
+
+**Prevention:**
+1. **Force-trigger the fire arm end-to-end at least once** — even when observationally pending — by using a threshold-override dispatch or injecting a synthetic event. Confirm the human-reaching artifact (issue, alert, notification) actually appears.
+2. **Self-ensure every dependency of the fire path** — labels, webhooks, topics, channels — with idempotent creation (`gh label create --force`, `gh api ... --method PUT`, etc.) before the step that depends on them.
+3. **Do not accept "observationally pending" as equivalent to "both arms verified."** Gate-Promotion (Pattern #184, t/3192) requires both arms deliberately exercised. A fire arm that has never triggered end-to-end in a real or forced run is unverified.
+
+**Status:** Active — 1 instance (p/26#97, t/3278). Gate verification gap; force-trigger + dependency self-ensure is the canonical prevention.
+
+**Applies To:** All agents authoring or reviewing alert/gate workflows where the FIRE arm emits an artifact (GitHub issue, webhook call, notification) after the predicate step. Especially relevant during Gate-Promotion review (Pattern #184).
+
+---
+
+## #191 [Process/Git] Check `git worktree list` Before Touching Another Role's PR Branch
+
+**Pattern:** An agent attempts to create a worktree for another role's PR branch (to apply a cross-scope fix) and hits "fatal: '<branch>' is already checked out at '<other-path>'" — the branch owner already holds a live worktree. Attempting to push directly over the owner's branch while they hold a worktree risks clobbering in-progress work (same failure class as the #1912 force-push clobber).
+
+**Instances:**
+- 2026-09-04 — Tech Lead (p/335#56): `git worktree add -b <branch>` failed "branch already exists" because the owning role held a live worktree on that branch. Resolution: routed the exact fix (as a patch description) to the owner, who applied and pushed it from their worktree. No clobber risk.
+
+**Root Cause:** When a role holds a live worktree on their feature branch, any external agent pushing to that branch — or force-deleting/recreating it — will conflict with or overwrite the owner's uncommitted work. The "branch already exists" error is a signal, not just a naming collision.
+
+**Prevention:**
+1. **Before touching another role's PR branch, run `git worktree list`** — if the owner has a live worktree on that branch, do not attempt to check it out or push to it directly.
+2. **Route the fix to the owner instead** — ping them with the exact change needed (file, line, diff) and let them apply + push from their live worktree. This avoids all clobber risk.
+3. **If the branch is truly orphaned** (owner confirms no live worktree), clean up with `git worktree prune` + `git branch -D` before creating a new worktree. Confirm with the branch owner first.
+
+**Status:** Active — 1 instance (p/335#56). Cross-role branch-safety pattern; route-to-owner is the canonical approach.
+
+**Applies To:** All agents who need to apply fixes to tickets or PRs owned by another role. Especially relevant for TL and Sage who may need to apply cross-scope fixes during incidents.
+
+---
+
+## #192 [Build/Worktree] `mklink /J` Junction Inside Worktree Blocks `git worktree remove` — Orphaned Dir + Stale Branch
+
+**Pattern:** A `mklink /J` junction (e.g., for `node_modules`) inside a worktree blocks `git worktree remove` because the junction appears as a non-empty directory. Git de-registers the worktree but leaves the physical directory behind — an orphaned dir that still has the old branch checked out. Subsequent `git worktree add` on the same path or branch then fails with "already exists" / "branch already in use."
+
+**Instances:**
+- 2026-09-04 — ServerAPI (p/504#8, t/3296): `.worktrees/t3296a/` had a `mklink /J`-created `node_modules` junction. `git worktree remove` failed silently (git de-registered but left the dir). Re-`add` saw both an existing dir and a stale branch — failed on both. Fix sequence: (1) `cmd //c rmdir .worktrees/t3296a\taxonomy-editor\node_modules` (removes the junction link only — NOT the real node_modules target), (2) `rm -rf .worktrees/t3296a`, (3) `git worktree prune`, (4) `git branch -D <stale-branch>`, (5) `git worktree add` fresh.
+
+**Root Cause:** `git worktree remove` refuses to delete a worktree directory it considers non-empty. A junction appears as a non-empty directory to git. When removal fails partway, git may still de-register the worktree metadata, leaving the physical dir orphaned — causing the next `add` to fail on the dir AND on the stale branch that was never cleaned up.
+
+**Warning:** `rm -rf` on a directory containing a `mklink /J` junction **follows the junction and deletes the real target** — in this case, the real `node_modules` on the shared tree. Always use `cmd //c rmdir <junction-path>` (removes only the link) before `rm -rf` on the parent dir.
+
+**Prevention:**
+1. **Remove `mklink /J` junctions with `cmd //c rmdir <path>` BEFORE `git worktree remove`** — this removes only the link, leaving the real target intact.
+2. **Prefer `New-Item -ItemType Junction` (PowerShell) over `mklink /J` (cmd)** — teardown is `Remove-Item <path>` (removes junction only), which is safer and doesn't require escaping to cmd. See also Pattern #189.
+3. **If a `git worktree remove` fails, check for junctions in the worktree directory** before retrying — they are the most common non-empty-dir blocker. Follow the full cleanup sequence: `rmdir <junction>` → `rm -rf <orphan-dir>` → `git worktree prune` → `git branch -D <stale>` → re-add.
+4. **Never `rm -rf` a worktree directory without first removing junctions** — it will silently delete the junction's real target.
+
+**Status:** Active — 1 instance (p/504#8, t/3296). Extension of Patterns #122 and #189; junction teardown sequence is the canonical fix.
+
+**Applies To:** All agents creating worktrees with junction-linked directories (node_modules, build outputs). Windows-specific (mklink /J / New-Item -ItemType Junction). Especially relevant for npm-worktree setups per Pattern #189.
+
+**Applies To:** All agents receiving "safe to proceed" or "all prerequisites met" messages for prod changes; all human operators reviewing agent-initiated prod-change requests.
+
+---
+
+## #193 [Process/Search] Recursive `grep -r`/`find` from Repo Root Times Out — Traverses Data Sibling and `node_modules`
+
+**Pattern:** Running `grep -rn`/`grep -rlnE`/`find .` from the repository root times out (2m Bash limit) because the traversal descends into the ~410 MB `ai-triad-data` sibling directory and/or `node_modules`. The shell tool has no awareness of `.gitignore` exclusions.
+
+**Instances:**
+- 2026-09-04 — Diagnostics (p/9#71): `grep -rn` from repo root traversed `ai-triad-data` sibling (~410 MB) + `node_modules`; timed out at 2m. Resolved by switching to scoped Grep/Glob tools on explicit paths.
+- 2026-09-04 — PowerShell (p/20#37): `grep -rlnE ... .` over repo tree timed out at 120s for the same reason. Resolved by using `git ls-files | grep` (tracked files only) and the Grep tool.
+
+**Root Cause:** The shell `grep -r` and `find` commands follow all directories unless explicitly excluded. This repo's root contains a ~410 MB data sibling (`../ai-triad-data` symlinked or adjacent) and large `node_modules` trees. Neither is excluded by default shell glob rules.
+
+**Prevention:**
+1. **Never run `grep -r .` or `find .` from the repo root** — always scope to an explicit subtree (`scripts/`, `taxonomy-editor/src/`, `lib/`).
+2. **Prefer the dedicated Grep and Glob tools** over shell `grep`/`find` — they are gitignore-aware and will not traverse data siblings or `node_modules`.
+3. **Use `git ls-files | grep <pattern>`** as a fast, tracked-files-only alternative when searching for filenames or content across the whole repo — it reads only what git knows about, skipping all untracked and ignored paths.
+4. **Add explicit `--exclude-dir` flags** if shell grep is unavoidable: `grep -r --exclude-dir=node_modules --exclude-dir=.worktrees <pattern> .`
+
+**Status:** Active — 2 instances (p/9#71, p/20#37). Matches root AGENTS.md search-tooling rule: prefer Grep/Glob over shell grep/find.
+
+**Applies To:** All agents performing codebase-wide searches. Especially relevant when the task prompt says "search the whole repo" — always scope or use dedicated tools.
+
+---
+
+## #194 [Process/Claim] Taking Over an Asleep Owner's Assigned Ticket Requires a PR/Branch Check Before Implementing
+
+**Pattern:** An agent takes over an asleep peer's assigned ticket and begins implementing, without first checking whether the original owner already has an in-flight PR or branch. Both agents produce implementations of the same ticket, burning CI cycles and requiring consolidation.
+
+**Instances:**
+- 2026-09-04 — PowerShell 2 (p/228#22, t/3307): Main (PowerShell) was asleep and assigned to t/3307. PowerShell 2 took it over and began implementing; neither checked for the other's in-flight work. Both produced PRs (#1947 + #1948). Resolved by consolidating to Main's #1947 as sole survivor and closing #1948. Root: `git worktree add` on the branch then failed "already used by worktree," surfacing the collision.
+
+**Root Cause:** Ticket assignment and comments show who owns the work, but not whether a branch or PR already exists. An asleep agent's in-flight branch is invisible on the ticket — it lives in `git` and GitHub, not in the ticket tracker. The AGENTS.md "Claim Before Implement" rule (q/42) mentions checking "in-flight PR or recent landed commit," but the concrete mechanic (`gh pr list --search`) was not applied.
+
+**Prevention:**
+1. **Before implementing an assigned ticket, run `gh pr list --search "<ticket-id>" --state open`** — if a PR already exists for this ticket, coordinate with the branch owner before starting your own implementation. This is the concrete step that instantiates the AGENTS.md q/42 rule.
+2. **Check `git branch -r | grep <ticket-id>`** as a secondary check — a feature branch may exist without an open PR yet (e.g., pushed but not yet PR'd, or in a worktree).
+3. **If taking over from an asleep owner, ping them before starting** — they may have WIP in a local worktree not yet pushed. A ping costs one round-trip; a duplicate PR costs two CI cycles and a consolidation.
+
+**Status:** Active — 1 instance (p/228#22, t/3307). Recurrence of t/2514 duplicate-implementation class. The concrete `gh pr list --search` mechanic is the prevention gap vs. the existing q/42 rule.
+
+**Applies To:** All agents in multi-instance roles (PowerShell, CL, ServerAPI, etc.) and any agent taking over a ticket from an asleep peer. Especially relevant when the ticket is already assigned.

@@ -988,6 +988,28 @@ export const PROMPT_CATALOG: PromptCatalogEntry[] = [
     applicableDataSources: ['taxonomyNodes'],
     promptFiles: ['qbaf-pair-confirm'],
   },
+  {
+    id: 'ps-entity-link-judge',
+    title: 'Entity Link Judge',
+    description: 'LLM judge prompt that classifies entity_refs as genuine or spurious surface/alias matches in extraction quality audits.',
+    source: 'AITriad/Prompts/entity-link-judge.prompt',
+    template: '(Loading from disk...)',
+    group: 'powershell',
+    purpose: 'Used by Test-ExtractionQuality -EntityLinkAudit. For each sampled entity_ref, the judge assesses whether the link is a genuine semantic match or a spurious surface/alias coincidence, enabling entity_link_precision measurement.',
+    applicableDataSources: ['taxonomyNodes'],
+    promptFiles: ['entity-link-judge'],
+  },
+  {
+    id: 'ps-logical-form-formalization',
+    title: 'Logical Form Formalization',
+    description: 'Formalizes a claim and its resolved entity_refs into a neo-Davidsonian event-frame logical form (predicate, args, modality, attitude, holder).',
+    source: 'AITriad/Prompts/logical-form-formalization.prompt',
+    template: '(Loading from disk...)',
+    group: 'powershell',
+    purpose: 'Used by the logical_form formalization pass (t/3126). Reads a claim + resolved entity_refs and emits schema-valid JSON per docs/logical-form-schema.md — grounding args only from resolved entities, attitude from category, holder from camp.',
+    applicableDataSources: ['taxonomyNodes'],
+    promptFiles: ['logical-form-formalization'],
+  },
 
   // === Debate pipeline: Quality & repair prompts ===
   {

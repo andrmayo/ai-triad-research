@@ -2,8 +2,10 @@
 # Licensed under the MIT License. See LICENSE file in the project root.
 
 # t/1894 Phase 2-B — batch entity mention indexer. Uses the no-mock fixture pattern:
-# every call passes explicit -EntitiesPath / -SourceEvidenceIndexPath / -PovPath /
+# every call passes explicit -EntitiesPath / -SourceEvidenceIndexPath / -SummariesPath /
 # -OutputPath under $TestDrive, so no Private path-helper mocking is required.
+# t/3160 G7: node:* (POV/situation grounding) moved to CL's Python reconciler; this cmdlet
+# now owns {sei:*, summary:*} only (the -PovPath parameter was removed).
 
 Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
     BeforeAll {
@@ -12,6 +14,11 @@ Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
         function New-Sei {
             param([hashtable]$Map, [string]$Path)
             ($Map | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $Path -Encoding utf8NoBOM
+        }
+
+        function New-Summary {
+            param([hashtable]$Doc, [string]$Path)
+            ($Doc | ConvertTo-Json -Depth 10) | Set-Content -LiteralPath $Path -Encoding utf8NoBOM
         }
     }
 
@@ -43,7 +50,7 @@ Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
                 'acc-desires-001' = @{ facts = @(@{ claim = 'The Apollo Project reshaped ambition.'; doc_id = 'd1' }) }
             }
 
-            $r = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -PovPath @() -OutputPath $script:outPath
+            $r = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath
             $r.Written | Should -BeTrue
 
             $file = Get-Content -Raw -LiteralPath $script:outPath -Encoding utf8 | ConvertFrom-Json
@@ -67,7 +74,7 @@ Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
             New-Sei -Path $script:seiPath -Map @{
                 'n1' = @{ facts = @(@{ claim = 'Apollo Program milestone'; doc_id = 'd1' }) }
             }
-            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -PovPath @() -OutputPath $script:outPath | Out-Null
+            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath | Out-Null
 
             $file = Get-Content -Raw -LiteralPath $script:outPath -Encoding utf8 | ConvertFrom-Json
             $m = @($file.containers.'sei:n1'.mentions)
@@ -83,7 +90,7 @@ Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
             New-Sei -Path $script:seiPath -Map @{
                 'n1' = @{ facts = @(@{ claim = "Apollo${nbsp}Program advanced"; doc_id = 'd1' }) }
             }
-            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -PovPath @() -OutputPath $script:outPath | Out-Null
+            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath | Out-Null
 
             $file = Get-Content -Raw -LiteralPath $script:outPath -Encoding utf8 | ConvertFrom-Json
             $m = @($file.containers.'sei:n1'.mentions)
@@ -107,7 +114,7 @@ Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
             New-Sei -Path $script:seiPath -Map @{
                 'n1' = @{ facts = @(@{ claim = 'GPT-4o beats o4-mini but GPT-4omini is fake.'; doc_id = 'd1' }) }
             }
-            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -PovPath @() -OutputPath $script:outPath | Out-Null
+            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath | Out-Null
 
             $m = @((Get-Content -Raw -LiteralPath $script:outPath -Encoding utf8 | ConvertFrom-Json).containers.'sei:n1'.mentions)
             $m.Count | Should -Be 2   # standalone GPT-4o + o4-mini; the 'GPT-4omini' occurrence must NOT match
@@ -120,7 +127,7 @@ Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
             New-Sei -Path $script:seiPath -Map @{
                 'n1' = @{ facts = @(@{ claim = 'the APOLLO team; also apollonian ideals'; doc_id = 'd1' }) }
             }
-            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -PovPath @() -OutputPath $script:outPath | Out-Null
+            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath | Out-Null
 
             $file = Get-Content -Raw -LiteralPath $script:outPath -Encoding utf8 | ConvertFrom-Json
             $m = @($file.containers.'sei:n1'.mentions)
@@ -137,11 +144,11 @@ Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
             New-Sei -Path $script:seiPath -Map @{
                 'n1' = @{ facts = @(@{ claim = 'The Apollo Project reshaped ambition.'; doc_id = 'd1' }) }
             }
-            $r1 = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -PovPath @() -OutputPath $script:outPath
+            $r1 = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath
             $r1.Written | Should -BeTrue
             $hash1 = (Get-FileHash -LiteralPath $script:outPath -Algorithm SHA256).Hash
 
-            $r2 = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -PovPath @() -OutputPath $script:outPath
+            $r2 = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath
             $r2.Unchanged | Should -BeTrue
             $r2.Written | Should -BeFalse
             (Get-FileHash -LiteralPath $script:outPath -Algorithm SHA256).Hash | Should -Be $hash1
@@ -149,8 +156,8 @@ Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
 
         It '-Force rewrites even when unchanged' {
             New-Sei -Path $script:seiPath -Map @{ 'n1' = @{ facts = @(@{ claim = 'Apollo Project.'; doc_id = 'd1' }) } }
-            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -PovPath @() -OutputPath $script:outPath | Out-Null
-            $r = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -PovPath @() -OutputPath $script:outPath -Force
+            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath | Out-Null
+            $r = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath -Force
             $r.Written | Should -BeTrue
         }
     }
@@ -161,7 +168,7 @@ Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
             New-Sei -Path $script:seiPath -Map @{
                 'n1' = @{ facts = @(@{ claim = 'The Apollo Project reshaped ambition.'; doc_id = 'd1' }) }
             }
-            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -PovPath @() -OutputPath $script:outPath | Out-Null
+            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath | Out-Null
 
             # Inject a human mention at the SAME offset/span as the alias hit, different ref.
             $file = Get-Content -Raw -LiteralPath $script:outPath -Encoding utf8 | ConvertFrom-Json
@@ -169,7 +176,7 @@ Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
             $c.mentions = @([ordered]@{ entity_ref = 'ent-999'; quote = 'Apollo Project'; offset = 4; discovered_by = 'human' })
             ($file | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $script:outPath -Encoding utf8NoBOM
 
-            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -PovPath @() -OutputPath $script:outPath -Force | Out-Null
+            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath -Force | Out-Null
 
             $after = Get-Content -Raw -LiteralPath $script:outPath -Encoding utf8 | ConvertFrom-Json
             $m = @($after.containers.'sei:n1'.mentions)
@@ -181,27 +188,176 @@ Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
 
     Context 'Container sources' {
 
-        It 'Indexes POV node label/description as node:<id> containers' {
-            $povPath = Join-Path $script:root 'accelerationist.json'
-            $pov = [ordered]@{
-                _schema_version = '1.0.0'; pov = 'accelerationist'; last_modified = '2026-07-28'
-                nodes           = @(
-                    [ordered]@{ id = 'acc-beliefs-001'; category = 'Beliefs'; label = 'Apollo Project analogy'; description = 'Framed after the Apollo Program push.' }
-                )
+        It 'NEVER emits a node:* container key — node grounding is owned by the CL reconciler (t/3160 G7 disjoint scope)' {
+            # sei + summary inputs both present; the output must contain ONLY sei:* / summary:*
+            # keys, never node:*. node:* moved to reconcile_grounding.py under the G7 disjoint-
+            # scope contract (t/3160#2-#3) — this cmdlet must not double-write it.
+            New-Sei -Path $script:seiPath -Map @{
+                'acc-desires-001' = @{ facts = @(@{ claim = 'The Apollo Project reshaped ambition.'; doc_id = 'd1' }) }
             }
-            ($pov | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $povPath -Encoding utf8NoBOM
+            $summPath = Join-Path $script:root 'doc-disjoint.json'
+            New-Summary -Path $summPath -Doc @{ doc_id = 'docD'; factual_claims = @(@{ claim = 'Apollo Project.' }) }
 
-            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath (Join-Path $script:root 'missing-sei.json') -PovPath @($povPath) -OutputPath $script:outPath | Out-Null
+            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @($summPath) -OutputPath $script:outPath | Out-Null
 
             $file = Get-Content -Raw -LiteralPath $script:outPath -Encoding utf8 | ConvertFrom-Json
-            $c = $file.containers.'node:acc-beliefs-001'
-            $c | Should -Not -BeNullOrEmpty
-            @($c.mentions).Count | Should -BeGreaterOrEqual 1
-            @($c.mentions).entity_ref | Should -Contain 'ent-001'
+            $keys = @($file.containers.PSObject.Properties.Name)
+            # The load-bearing disjoint-scope assertion: no node:* key, ever.
+            @($keys | Where-Object { $_ -like 'node:*' }) | Should -BeNullOrEmpty
+            # Sanity: the cmdlet still produces its own {sei:*, summary:*} scope.
+            $keys | Should -Contain 'sei:acc-desires-001'
+            @($keys | Where-Object { $_ -like 'summary:*' }) | Should -Not -BeNullOrEmpty
         }
 
-        It 'Absent SEI and POV files are non-fatal (empty index, no throw)' {
-            $r = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath (Join-Path $script:root 'nope.json') -PovPath @() -OutputPath $script:outPath
+        It 'PRESERVES a reconciler-owned node:* container verbatim across a rebuild (no clobber — t/3160 G7 no-orphan)' {
+            # Pre-seed entity_mentions.json with a node:* container the CL reconciler owns. The
+            # cmdlet writes the whole file, so without preservation this rebuild would DELETE node:*.
+            $preexisting = [ordered]@{
+                _schema_version = '1.0.0'; _doc = 'test'; indexed_status = @('approved')
+                last_modified   = '2026-07-28T00:00:00Z'
+                containers      = [ordered]@{
+                    'node:acc-beliefs-001' = [ordered]@{
+                        text_sha256  = 'deadbeef'
+                        extracted_at = '2026-07-28T00:00:00Z'
+                        mentions     = @([ordered]@{ entity_ref = 'ent-001'; quote = 'Apollo Project'; offset = 0; discovered_by = 'alias' })
+                    }
+                }
+            }
+            ($preexisting | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $script:outPath -Encoding utf8NoBOM
+
+            New-Sei -Path $script:seiPath -Map @{
+                'acc-desires-001' = @{ facts = @(@{ claim = 'The Apollo Project reshaped ambition.'; doc_id = 'd1' }) }
+            }
+            $r = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath
+            $r.PreservedForeignCount | Should -Be 1
+
+            $file = Get-Content -Raw -LiteralPath $script:outPath -Encoding utf8 | ConvertFrom-Json
+            # node:* preserved VERBATIM (owned by the reconciler; this cmdlet must not touch it)
+            $nodeC = $file.containers.'node:acc-beliefs-001'
+            $nodeC | Should -Not -BeNullOrEmpty
+            $nodeC.text_sha256 | Should -Be 'deadbeef'
+            @($nodeC.mentions)[0].entity_ref | Should -Be 'ent-001'
+            # own sei:* container added alongside it
+            $file.containers.'sei:acc-desires-001' | Should -Not -BeNullOrEmpty
+
+            # Second run on unchanged inputs is a byte-stable no-op — node:* still preserved.
+            $hash1 = (Get-FileHash -LiteralPath $script:outPath -Algorithm SHA256).Hash
+            $r2 = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath
+            $r2.Unchanged | Should -BeTrue
+            (Get-FileHash -LiteralPath $script:outPath -Algorithm SHA256).Hash | Should -Be $hash1
+        }
+
+        It 'Absent SEI file is non-fatal (empty index, no throw)' {
+            $r = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath (Join-Path $script:root 'nope.json') -SummariesPath @() -OutputPath $script:outPath
+            $r.ContainerCount | Should -Be 0
+        }
+    }
+
+    Context 'Summary containers (t/3122, §4/R2.2 T2)' {
+
+        It 'Indexes key_points as summary:<doc_id>#<pov>-kp-<n> with <n> reset PER POV (CL ruling p/23#220-221)' {
+            $summPath = Join-Path $script:root 'doc1.json'
+            # safetyist has TWO key_points so its index runs 0,1; skeptic then RESETS to 0.
+            # Under the old running-counter scheme skeptic's point would have been kp-3 — this
+            # asserts the per-POV reset, i.e. an insert/remove in one POV can't renumber another.
+            New-Summary -Path $summPath -Doc @{
+                doc_id        = 'doc1'
+                pov_summaries = [ordered]@{
+                    accelerationist = @{ key_points = @(@{ point = 'No entity here.' }) }
+                    safetyist       = @{ key_points = @(
+                            @{ point = 'The Apollo Project reshaped ambition.' },
+                            @{ point = 'Apollo again, a second safetyist point.' }
+                        ) }
+                    skeptic         = @{ key_points = @(@{ point = 'Also mentions Apollo alone.' }) }
+                }
+            }
+
+            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath (Join-Path $script:root 'no-sei.json') -SummariesPath @($summPath) -OutputPath $script:outPath | Out-Null
+
+            $file = Get-Content -Raw -LiteralPath $script:outPath -Encoding utf8 | ConvertFrom-Json
+            # accelerationist #acc-kp-0 has no entity → omitted (absence == "no links yet")
+            $file.containers.PSObject.Properties['summary:doc1#acc-kp-0'] | Should -BeNullOrEmpty
+            # safetyist indexes reset to 0 within its own array: saf-kp-0 (Apollo Project) + saf-kp-1 (Apollo)
+            $sk0 = $file.containers.'summary:doc1#saf-kp-0'
+            $sk0 | Should -Not -BeNullOrEmpty
+            @($sk0.mentions).entity_ref | Should -Contain 'ent-001'
+            $sk1 = $file.containers.'summary:doc1#saf-kp-1'
+            $sk1 | Should -Not -BeNullOrEmpty
+            @($sk1.mentions).entity_ref | Should -Contain 'ent-002'
+            # skeptic RESETS to 0 (skp-kp-0), proving it is not a document-wide running counter
+            $sp0 = $file.containers.'summary:doc1#skp-kp-0'
+            $sp0 | Should -Not -BeNullOrEmpty
+            @($sp0.mentions).entity_ref | Should -Contain 'ent-002'
+            # the retired running-counter ids must NOT exist
+            $file.containers.PSObject.Properties['summary:doc1#kp-1'] | Should -BeNullOrEmpty
+            $file.containers.PSObject.Properties['summary:doc1#kp-2'] | Should -BeNullOrEmpty
+        }
+
+        It 'Indexes factual_claims as summary:<doc_id>#fc-<n> by array position' {
+            $summPath = Join-Path $script:root 'doc2.json'
+            New-Summary -Path $summPath -Doc @{
+                doc_id         = 'doc2'
+                factual_claims = @(
+                    @{ claim = 'Unrelated claim.' },
+                    @{ claim = 'The Apollo Project launched in 1961.' }
+                )
+            }
+
+            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath (Join-Path $script:root 'no-sei.json') -SummariesPath @($summPath) -OutputPath $script:outPath | Out-Null
+
+            $file = Get-Content -Raw -LiteralPath $script:outPath -Encoding utf8 | ConvertFrom-Json
+            $file.containers.PSObject.Properties['summary:doc2#fc-0'] | Should -BeNullOrEmpty
+            $fc1 = $file.containers.'summary:doc2#fc-1'
+            $fc1 | Should -Not -BeNullOrEmpty
+            $m = @($fc1.mentions)
+            $m.Count | Should -Be 1
+            $m[0].entity_ref | Should -Be 'ent-001'
+            $m[0].quote | Should -Be 'Apollo Project'
+            $m[0].discovered_by | Should -Be 'alias'
+        }
+
+        It 'Reused mention record shape: entity_ref/quote/offset/discovered_by only' {
+            $summPath = Join-Path $script:root 'doc3.json'
+            New-Summary -Path $summPath -Doc @{
+                doc_id         = 'doc3'
+                factual_claims = @(@{ claim = 'Apollo Project.' })
+            }
+            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath (Join-Path $script:root 'no-sei.json') -SummariesPath @($summPath) -OutputPath $script:outPath | Out-Null
+
+            $file = Get-Content -Raw -LiteralPath $script:outPath -Encoding utf8 | ConvertFrom-Json
+            $m = $file.containers.'summary:doc3#fc-0'.mentions[0]
+            ($m.PSObject.Properties.Name | Sort-Object) | Should -Be @('discovered_by', 'entity_ref', 'offset', 'quote')
+        }
+
+        It 'Second run on unchanged summary input is a byte-stable no-op (idempotent)' {
+            $summPath = Join-Path $script:root 'doc4.json'
+            New-Summary -Path $summPath -Doc @{
+                doc_id         = 'doc4'
+                factual_claims = @(@{ claim = 'Apollo Project.' })
+            }
+            $r1 = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath (Join-Path $script:root 'no-sei.json') -SummariesPath @($summPath) -OutputPath $script:outPath
+            $r1.Written | Should -BeTrue
+            $hash1 = (Get-FileHash -LiteralPath $script:outPath -Algorithm SHA256).Hash
+
+            $r2 = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath (Join-Path $script:root 'no-sei.json') -SummariesPath @($summPath) -OutputPath $script:outPath
+            $r2.Unchanged | Should -BeTrue
+            $r2.Written | Should -BeFalse
+            (Get-FileHash -LiteralPath $script:outPath -Algorithm SHA256).Hash | Should -Be $hash1
+        }
+
+        It 'A summary file missing doc_id is skipped (non-fatal)' {
+            $summPath = Join-Path $script:root 'nodocid.json'
+            New-Summary -Path $summPath -Doc @{ factual_claims = @(@{ claim = 'Apollo Project.' }) }
+            $r = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath (Join-Path $script:root 'no-sei.json') -SummariesPath @($summPath) -OutputPath $script:outPath
+            $r.ContainerCount | Should -Be 0
+        }
+
+        It '-SummariesPath @() skips summary containers entirely' {
+            $summPath = Join-Path $script:root 'doc6.json'
+            New-Summary -Path $summPath -Doc @{ doc_id = 'doc6'; factual_claims = @(@{ claim = 'Apollo Project.' }) }
+            # Explicit -SummariesPath overrides default discovery; passing a non-empty array but then
+            # verifying an empty array truly yields zero summary containers.
+            $r = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath (Join-Path $script:root 'no-sei.json') -SummariesPath @() -OutputPath $script:outPath
             $r.ContainerCount | Should -Be 0
         }
     }
@@ -210,23 +366,9 @@ Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
         # These offsets prove the recipe's byte layout: absent fields omit entirely (no empty
         # segment / hanging delimiter), fixed field order, join-not-terminate (no trailing
         # delimiter). C/E must reproduce this exactly or text_sha256 mismatches and offsets shift.
-
-        It 'node: omits an absent field with no empty segment (label + plain_description, description absent)' {
-            $povPath = Join-Path $script:root 'accelerationist.json'
-            # description is ABSENT; text must be "Alpha\n\nBeta Apollo Project gamma" (NOT "Alpha\n\n\n\nBeta...").
-            $pov = [ordered]@{
-                _schema_version = '1.0.0'; pov = 'accelerationist'; last_modified = '2026-07-28'
-                nodes           = @([ordered]@{ id = 'acc-b-1'; category = 'Beliefs'; label = 'Alpha'; plain_description = 'Beta Apollo Project gamma' })
-            }
-            ($pov | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $povPath -Encoding utf8NoBOM
-            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath (Join-Path $script:root 'no-sei.json') -PovPath @($povPath) -OutputPath $script:outPath | Out-Null
-
-            $m = @((Get-Content -Raw -LiteralPath $script:outPath -Encoding utf8 | ConvertFrom-Json).containers.'node:acc-b-1'.mentions)
-            $m.Count | Should -Be 1
-            # "Alpha"(5) + "\n\n"(2) + "Beta "(5) = 12. An empty description segment would push this to 14.
-            $m[0].offset | Should -Be 12
-            $m[0].quote | Should -Be 'Apollo Project'
-        }
+        # (The node: recipe's byte layout is covered directly by the golden-fixture parity
+        # context below — it is no longer reachable through this cmdlet after the t/3160 G7
+        # node:* boundary move.)
 
         It 'sei: omits an empty claim with a single \n join, no trailing delimiter' {
             New-Sei -Path $script:seiPath -Map @{
@@ -236,7 +378,7 @@ Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
                         @{ claim = 'Apollo Project here.'; doc_id = 'd3' }
                     ) }
             }
-            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -PovPath @() -OutputPath $script:outPath | Out-Null
+            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath | Out-Null
 
             $m = @((Get-Content -Raw -LiteralPath $script:outPath -Encoding utf8 | ConvertFrom-Json).containers.'sei:n1'.mentions)
             $m.Count | Should -Be 1
@@ -249,7 +391,7 @@ Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
 
         It '-WhatIf does not write the file' {
             New-Sei -Path $script:seiPath -Map @{ 'n1' = @{ facts = @(@{ claim = 'Apollo Project.'; doc_id = 'd1' }) } }
-            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -PovPath @() -OutputPath $script:outPath -WhatIf | Out-Null
+            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath -WhatIf | Out-Null
             Test-Path -LiteralPath $script:outPath | Should -BeFalse
         }
     }
@@ -273,7 +415,7 @@ Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
         }
 
         It 'Default indexes ONLY approved entities (proposed + status-less skipped)' {
-            $r = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -PovPath @() -OutputPath $script:outPath
+            $r = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath
             $r.IndexedStatus | Should -Be @('approved')
 
             $file = Get-Content -Raw -LiteralPath $script:outPath -Encoding utf8 | ConvertFrom-Json
@@ -284,7 +426,7 @@ Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
         }
 
         It '-Status proposed indexes ONLY the proposed entity' {
-            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -PovPath @() -OutputPath $script:outPath -Status proposed | Out-Null
+            Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath -Status proposed | Out-Null
             $file = Get-Content -Raw -LiteralPath $script:outPath -Encoding utf8 | ConvertFrom-Json
             $file.indexed_status | Should -Be @('proposed')
             $m = @($file.containers.'sei:n1'.mentions)
@@ -293,7 +435,7 @@ Describe 'Update-EntityMentionIndex (t/1894 Phase 2-B)' -Tag 'unit' {
         }
 
         It '-Status approved,proposed (the explicit preview) indexes both, and records both in the envelope' {
-            $r = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -PovPath @() -OutputPath $script:outPath -Status approved, proposed
+            $r = Update-EntityMentionIndex -EntitiesPath $script:entPath -SourceEvidenceIndexPath $script:seiPath -SummariesPath @() -OutputPath $script:outPath -Status approved, proposed
             ($r.IndexedStatus | Sort-Object) | Should -Be @('approved', 'proposed')
 
             $file = Get-Content -Raw -LiteralPath $script:outPath -Encoding utf8 | ConvertFrom-Json

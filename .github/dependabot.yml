@@ -11,15 +11,32 @@ version: 2
 #   - Expected steady state with weekly triage: ~5-8 open dependabot PRs.
 # Change the limits here (not by manually closing PRs) if the pile reappears.
 updates:
-  # ── npm — grouped minor/patch, majors individual ──
+  # ── npm workspace ROOT — a single entry owns the ENTIRE pnpm workspace ──
+  # All workspace members (pnpm-workspace.yaml: taxonomy-editor, lib, poviewer,
+  # summary-viewer, workflow-app) share the ONE root pnpm-lock.yaml. A per-app
+  # `directory:` entry bumps only that member's package.json and can't reach the
+  # root lockfile → ERR_PNPM_OUTDATED_LOCKFILE on frozen install (t/3116;
+  # electron 43→44 #1645/#1648/#1649). This single ROOT entry updates member
+  # manifests + the shared root lockfile in the SAME PR. Do NOT re-add per-app
+  # entries for workspace members.
+  #
+  # taxonomy-editor additionally carries an in-dir STANDALONE lockfile (Docker
+  # prod-deps) + generated license notices; a root-entry bump leaves those stale
+  # (test-container / test-electron(taxonomy-editor) red). The companion
+  # dependabot-lockfile-heal.yml workflow re-syncs both in-PR (t/3116; SO e/127).
+  #
+  # lib/debate keeps its OWN entry (below): its root-workspace importer is empty
+  # — the root entry never bumps it — so its standalone lockfile is managed only
+  # per-directory, no heal needed. (If a future lib/debate bump ever drifts its
+  # standalone lockfile, extend sync-standalone-lockfile.mjs to cover it.)
   - package-ecosystem: npm
-    directory: /taxonomy-editor  # largest app (most deps) — a little more headroom
+    directory: /
     schedule:
       interval: weekly
     groups:
       minor-and-patch:
         update-types: [minor, patch]
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 6  # covers taxonomy-editor majors (was on its own entry) too
     ignore:
       # undici MAJOR is HELD (t/2053/t/2113/t/2281; #1091). The GitHub REST client passes an
       # undici.Agent as `dispatcher:` to Node's built-in fetch; per assertUndiciMajorInvariant,
@@ -30,51 +47,6 @@ updates:
       # REVISIT when the pinned Node runtime bundles a newer undici major, then bump both together.
       - dependency-name: undici
         update-types: [version-update:semver-major]
-
-  - package-ecosystem: npm
-    directory: /workflow-app
-    schedule:
-      interval: weekly
-    groups:
-      minor-and-patch:
-        update-types: [minor, patch]
-    open-pull-requests-limit: 2
-
-  - package-ecosystem: npm
-    directory: /poviewer
-    schedule:
-      interval: weekly
-    groups:
-      minor-and-patch:
-        update-types: [minor, patch]
-    open-pull-requests-limit: 2
-
-  - package-ecosystem: npm
-    directory: /summary-viewer
-    schedule:
-      interval: weekly
-    groups:
-      minor-and-patch:
-        update-types: [minor, patch]
-    open-pull-requests-limit: 2
-
-  - package-ecosystem: npm
-    directory: /
-    schedule:
-      interval: weekly
-    groups:
-      minor-and-patch:
-        update-types: [minor, patch]
-    open-pull-requests-limit: 2
-
-  - package-ecosystem: npm
-    directory: /lib
-    schedule:
-      interval: weekly
-    groups:
-      minor-and-patch:
-        update-types: [minor, patch]
-    open-pull-requests-limit: 2
 
   - package-ecosystem: npm
     directory: /lib/debate

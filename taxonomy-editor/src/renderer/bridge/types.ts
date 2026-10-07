@@ -82,6 +82,63 @@ export type DebateTestedEntry = _DebateTestedEntry;
 import type { DebateDelta as _DebateDelta } from '@lib/debate/types';
 export type DebateDelta = _DebateDelta;
 
+// t/3258 (T3): the relevance-selection result + AN-claim input the fetchRelevantNodes bridge method
+// carries. Both transports call the SAME shared lib (selectRelevantTaxonomy) so the result is
+// parity-identical by construction — this is the exact contract the server route already types against.
+import type { ANClaimInput as _ANClaimInput, RelevantTaxonomyResult as _RelevantTaxonomyResult } from '@lib/debate/relevanceSelection';
+export type ANClaimInput = _ANClaimInput;
+export type RelevantTaxonomyResult = _RelevantTaxonomyResult;
+
+/**
+ * Payload for `fetchRelevantNodes` (t/3258 T3). Mirrors `SelectRelevantTaxonomyInput['session']` +
+ * `params` — ONLY the per-session state the server/main cannot reconstruct crosses the wire; the
+ * static corpus (nodeEmbeddings), taxonomy nodes, policyRegistry, lineage map and doctrinal
+ * boundaries are derived on the server/main side. Field-for-field identical to the server route's
+ * `RelevantNodesBody` (routes/relevantNodes.ts) so the two callers stay in lockstep.
+ */
+export interface FetchRelevantNodesPayload {
+  /** POV file key: accelerationist | safetyist | skeptic. */
+  pov: string;
+  topic: string;
+  recentTranscript: string;
+  /** Default 0.45 (applied by the lib fn when omitted). */
+  threshold?: number;
+  session: {
+    /** `argument_network.nodes[]` with embeddings — the PRIMARY scoring signal; `text` for provenance. */
+    anClaimEmbeddings: ANClaimInput[];
+    lineageFrame?: { cluster_id: string; label?: string }[];
+    /** `debate.source_type`; lineage frame is only "expected" for `'topic'` debates. */
+    sourceType?: string;
+    excludeGreatestHits?: boolean;
+    /** Fetched caller-side (renderer: bridge `getGreatestHits`) and passed as an array. */
+    greatestHitsList?: string[];
+  };
+}
+
+// t/3316 (t/3297 client half): per-claim taxonomy attribution moved server/main-side — the debate
+// client stops assembling the corpus for attribution (the last synthetic-corpus fetch). Both
+// transports call the SAME pure fn (computeClaimTaxonomyAttribution) — web server-side, electron
+// main-side — so the result is parity-identical by construction.
+import type { ClaimAttributionResult as _ClaimAttributionResult } from '@lib/debate/argumentNetwork/attribution';
+import type { ClaimTaxonomyAttribution as _ClaimTaxonomyAttribution } from '@lib/debate/types';
+
+/** Payload for `fetchClaimAttribution` (t/3316). The client sends the newly-extracted AN claims (id +
+ *  embeddings); the server/main derives the same-POV candidate corpus itself. Field-for-field identical
+ *  to the attribution route's body (routes/attribution.ts). */
+export interface FetchClaimAttributionPayload {
+  /** Speaker POV file key: accelerationist | safetyist | skeptic. */
+  pov: string;
+  claims: { id: string; embedding?: number[]; attribution_embedding?: number[] }[];
+  topN?: number;
+}
+
+/** Response: per-claim attribution (applied verbatim to each AN node's `claim_taxonomy_attribution`) +
+ *  the diagnostics summary — the 4 counts AND `decisions[]` (drives ExtractionTimelinePanel, t/3316#2). */
+export interface ClaimAttributionResponse {
+  attributions: Record<string, _ClaimTaxonomyAttribution>;
+  summary: _ClaimAttributionResult;
+}
+
 import type { OpEdSet, OpEdSetSummary, PovKey } from '../../../../lib/oped/types';
 import type { BriefPreset, ExportJobState, ExportErrorCode, BriefArtifactName } from '../../../../lib/brief/types';
 
@@ -300,6 +357,17 @@ export interface AppAPI {
   // (t/2060). Electron computes it; the web transport returns [] (server backend doesn't DML-OOM).
   updateNodeEmbeddings: (nodes: { id: string; text: string; pov: string; exclusionText?: string }[]) => Promise<{ staleNodeIds: string[] }>;
   computeQueryEmbedding: (text: string) => Promise<{ vector: number[] }>;
+  // t/3258 (T3): server/main-side taxonomy relevance selection — the debate client stops fetching
+  // the corpus to score locally. Both transports run the SAME shared lib (selectRelevantTaxonomy),
+  // so the result is parity-identical by construction. Web → REST POST /api/taxonomy/relevant-nodes;
+  // Electron → IPC → a main handler mirroring routes/relevantNodes.ts (packaged Electron has no
+  // embedded server). Only per-session state crosses the wire; the corpus is assembled server/main-side.
+  fetchRelevantNodes: (payload: FetchRelevantNodesPayload) => Promise<RelevantTaxonomyResult>;
+  // t/3316 (t/3297 client half): server/main-side per-claim taxonomy attribution — the debate client
+  // stops assembling the corpus for attribution. Both transports run the SAME pure fn
+  // (computeClaimTaxonomyAttribution). Web → REST POST /api/argument-network/attribution; Electron →
+  // IPC → a main handler (window.electronAPI.computeAttribution, t/3322) computing from the LOCAL corpus.
+  fetchClaimAttribution: (payload: FetchClaimAttributionPayload) => Promise<ClaimAttributionResponse>;
   nliClassify: (pairs: Array<{ text_a: string; text_b: string }>) => Promise<{
     results: Array<{
       nli_label: string;
@@ -370,6 +438,9 @@ export interface AppAPI {
   shareOpEdSet: (setId: string) => Promise<{ shareId: string; url: string }>;
   /** t/2728: revoke a public share (owner-only). */
   unshareOpEdSet: (setId: string) => Promise<{ ok: boolean }>;
+  /** t/3315: publish a public share link for a COMMUNITY op-ed (any submitter — community is public).
+   *  Same public /share/oped view as own-op-ed share. Web-only; Electron rejects. */
+  shareCommunityOpEd: (id: string) => Promise<{ shareId: string; url: string }>;
 
   // --- News Report ---
   generateNewsReport: (debateId: string) => Promise<{ article: string }>;

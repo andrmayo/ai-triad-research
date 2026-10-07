@@ -274,6 +274,12 @@ export const api: AppAPI = {
     return window.electronAPI.computeQueryEmbedding(text);
   },
   nliClassify: (pairs) => window.electronAPI.nliClassify(pairs),
+  // t/3258 (T3): packaged Electron has no embedded server, so this delegates to a main-process
+  // handler that mirrors routes/relevantNodes.ts via the SAME shared lib (parity by construction).
+  fetchRelevantNodes: (payload) => window.electronAPI.fetchRelevantNodes(payload),
+  // t/3316: packaged Electron has no server → delegates to a main handler (t/3322) computing
+  // attribution from the LOCAL corpus via the SAME pure fn (parity by construction, per-build).
+  fetchClaimAttribution: (payload) => window.electronAPI.computeAttribution(payload),
 
   // Debate sessions
   getDebateQuotaStatus: () => Promise.resolve({ allowed: true, resource: 'debates', current: 0, limit: Infinity }),
@@ -332,6 +338,7 @@ export const api: AppAPI = {
   // desktop has no public URL, so reject with the standard web-only actionable error.
   shareOpEdSet: () => rejectOpEdIpc('share an op-ed', 'shareOpEdSet'),
   unshareOpEdSet: () => rejectOpEdIpc('un-share an op-ed', 'unshareOpEdSet'),
+  shareCommunityOpEd: () => rejectOpEdIpc('share a community op-ed', 'shareCommunityOpEd'), // t/3315: web-only
 
   // News Report
   generateNewsReport: (debateId) => window.electronAPI.generateNewsReport(debateId),

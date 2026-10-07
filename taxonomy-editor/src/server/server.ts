@@ -20,6 +20,9 @@ import { createRequire } from 'module';
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { getGlobalRecorder, setGlobalRecorder } from '../../../lib/flight-recorder/index.js';
 import { warmup as warmupEmbeddings } from '../../../lib/embeddings/onnxEmbedding.js';
+import { prewarmEmbeddingsCache, getEmbeddingsCacheStatus } from './ai/aiBackends.js';
+import { startEventLoopMonitor } from './eventLoopMonitor.js';
+import { startGroundingSweep } from './groundingSweepScheduler.js';
 
 const require = createRequire(import.meta.url);
 
@@ -31,11 +34,12 @@ import {
   getStoredApiKeys, addApiKey, removeApiKey, resolveDataPath,
   getPaidGeminiFallbackKey, setPaidGeminiFallbackKey, deletePaidGeminiFallbackKey,
   BROKER_SCRIPT, SCRIPTS_DIR, getProjectRoot, type AIBackend,
-  STORAGE_MODE, CACHE_DIR,
+  STORAGE_MODE, CACHE_DIR, isEmbeddingWorkerOffloadEnabled, getEmbeddingWorkerPoolSize,
 } from './config.js';
+import { configureEmbeddingWorkerPool } from '../../../lib/embeddings/offThreadEmbedding.js';
 import { GitHubAPIBackend } from './storage/githubAPIBackend.js';
 import { SessionBranchManager } from './storage/sessionBranchManager.js';
-import { runWithUser, getCurrentUserId, setSessionBranchName, deriveStorageUserId, type UserContext } from './security/userContext.js';
+import { runWithUser, getCurrentUserId, getSessionBranchName, setSessionBranchName, deriveStorageUserId, type UserContext } from './security/userContext.js';
 import { isAuthDisabledAllowed, isPathWithinDir, isTerminalAccessAllowed, isAnonAllowedRoute, invalidRouteParam, missingApiKeyError, resolveTestPersonaOverride } from './security/accessControl.js';
 import { sanitizeUserText } from './security/contentSanitizer.js';
 import { isFreeTierAiPath } from './anonAiRoutes.js';
@@ -79,6 +83,7 @@ import {
 import type { ReviewAction } from './community/admin/types.js';
 import { calibrationReviewHandler } from './community/admin/calibrationHandler.js';
 import { communityReviewHandler } from './community/admin/communityReviewHandler.js';
+import { serveStatic } from './staticServe.js';
 
 // Register review domain handlers at startup so the unified admin endpoints
 // (queue/stats/action/detail) can delegate to them (t/646, t/647, t/650).
@@ -92,7 +97,13 @@ const serverRecorder = new FlightRecorder({ capacity: 2000, dumpOnError: false }
 // correlate to the originating HTTP request. An explicit request_id passed to
 // record() still wins; outside a request the field is omitted.
 const _baseServerRecord = serverRecorder.record.bind(serverRecorder);
-serverRecorder.record = (input) => _baseServerRecord({ request_id: getRequestId(), ...input });
+// t/3067: stamp _sessionBranch on every event so session-scoped dump filtering
+// can isolate this user's events from the global ring buffer at write time.
+// Object.assign avoids the object-literal excess-property check (RecordInput
+// doesn't declare _sessionBranch; Shared Lib owns that type).
+serverRecorder.record = (input) => _baseServerRecord(
+  Object.assign({}, input, { request_id: getRequestId(), _sessionBranch: getSessionBranchName() ?? null }),
+);
 serverRecorder.intern('component', 'server');
 serverRecorder.intern('component', 'git');
 serverRecorder.intern('component', 'data-pull');
@@ -338,54 +349,6 @@ registerAllRoutes(router, serverCtx);
 // ── Static file serving ──
 
 const STATIC_DIR = path.resolve(__dirname, '../renderer');
-const MIME_TYPES: Record<string, string> = {
-  '.html': 'text/html',
-  '.js': 'text/javascript',
-  '.css': 'text/css',
-  '.json': 'application/json',
-  '.png': 'image/png',
-  '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon',
-  '.woff': 'font/woff',
-  '.woff2': 'font/woff2',
-};
-
-function serveStatic(req: http.IncomingMessage, res: http.ServerResponse): boolean {
-  const url = new URL(req.url!, 'http://localhost');
-
-  // t/854: never serve source maps in production — *.js.map lets anyone recover
-  // the full client source (API shapes, auth flows, internal logic). 404 them.
-  if (process.env.NODE_ENV === 'production' && url.pathname.endsWith('.map')) {
-    res.writeHead(404, { 'Content-Type': 'text/plain' });
-    res.end('Not found');
-    return true;
-  }
-
-  let filePath = path.join(STATIC_DIR, url.pathname === '/' ? 'index.html' : url.pathname);
-
-  // Security: prevent directory traversal
-  if (!filePath.startsWith(STATIC_DIR)) {
-    res.writeHead(403);
-    res.end('Forbidden');
-    return true;
-  }
-
-  if (!fs.existsSync(filePath)) {
-    // SPA fallback: serve index.html for non-API routes
-    if (!url.pathname.startsWith('/api/') && !url.pathname.startsWith('/ws/') && !url.pathname.startsWith('/health')) {
-      filePath = path.join(STATIC_DIR, 'index.html');
-    } else {
-      return false;
-    }
-  }
-
-  const ext = path.extname(filePath);
-  const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-  const content = fs.readFileSync(filePath);
-  res.writeHead(200, { 'Content-Type': contentType });
-  res.end(content);
-  return true;
-}
 
 // ── Request router ──
 
@@ -480,6 +443,7 @@ function loadAuthorizedUsers(): AuthorizedUsersFile | null {
   for (const p of candidates) {
     try {
       if (fs.existsSync(p)) {
+        // eslint-disable-next-line local/no-raw-data-root-read -- auth allowlist is mount-sourced (/data volume) with an existsSync fallback loop BY DESIGN; routing through readDataFile would flip the trust source from the mount to the data-repo-via-API (auth surface — t/3093#3, ServerAPI route-b)
         const data = JSON.parse(fs.readFileSync(p, 'utf-8')) as AuthorizedUsersFile;
         log.auth.info({ count: data.users.length, path: p }, 'Loaded authorized users');
         return data;
@@ -644,9 +608,9 @@ async function handleRequestInner(
       return;
     }
 
-    // Static file serving (SPA)
-    if (req.method === 'GET') {
-      if (serveStatic(req, res)) return;
+    // Static file serving (SPA) — t/3084: HEAD must also hit serveStatic, not the catch-all 404
+    if (req.method === 'GET' || req.method === 'HEAD') {
+      if (serveStatic(req, res, STATIC_DIR)) return;
     }
 
     res.writeHead(404);
@@ -1329,6 +1293,29 @@ initAnonymousSessionStore({
 
 // ── Start ──
 assertStateRootIsolation(); // t/2643: refuse start if staging's state root wasn't isolated (env drift) — no-op prod/local
+// t/3296 (t/3290 prevention): fail LOUD on an unresolved/misprovisioned data root. Backends are set
+// above; assert taxonomy/ + dictionary/ are present AND non-empty via the ACTIVE backend (validateDataRoot
+// uses listDirectoryStrict — profile-agnostic: fs for local, GitHub Contents for hosted; a transient
+// GitHub blip throws rather than false-empties). On failure: no showErrorBox (server-side) — log the
+// ActionableError to stdout (→ Log Analytics) + exit non-zero so the container crash-loops VISIBLY
+// instead of silently serving empty panels. Before listen, so an un-provisioned revision never serves.
+try {
+  await fileIO.validateDataRoot();
+} catch (err) {
+  // t/3296/t/3305: the hard exit(1) is ENFORCE-gated (default WARN-only). A credential-less boot —
+  // the container liveness smoke test (github-api mode, NO GitHub App creds) — MUST still start, so
+  // exit(1) fires ONLY when DATA_ROOT_VALIDATION_ENFORCE is set. DevOps sets it in staging→prod (real
+  // creds + data present) as the gated promotion to prod-blocking (t/2683 real-env-first): staging
+  // proves the exit path against the real backend before prod. Default warn-only is OBSERVABLE (WARN
+  // to stdout→Log_s), never a silent-empty; only the credential-less smoke boot relies on it.
+  const enforce = /^(1|true|yes|on)$/i.test(process.env.DATA_ROOT_VALIDATION_ENFORCE ?? '');
+  const errObj = err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : String(err);
+  if (enforce) {
+    log.server.error({ err: errObj, enforce }, 'Data root validation failed at boot — refusing to start (DATA_ROOT_VALIDATION_ENFORCE)');
+    process.exit(1);
+  }
+  log.server.warn({ err: errObj, enforce }, 'Data root validation failed at boot — WARN-only (DATA_ROOT_VALIDATION_ENFORCE unset); continuing');
+}
 // t/2532 (M12): loopback (127.0.0.1) in dev / 0.0.0.0 in prod; HOST opts into LAN exposure (logged loudly below).
 const BIND_HOST = resolveBindHost(process.env);
 server.listen(PORT, BIND_HOST, () => {
@@ -1338,9 +1325,56 @@ server.listen(PORT, BIND_HOST, () => {
   serverRecorder.record({ type: 'lifecycle', component: 'server', level: 'info', message: 'Server started', data: { port: PORT, host: BIND_HOST, version: SERVER_VERSION, dataRoot: getDataRoot(), platform: process.platform, arch: process.arch, storageMode: STORAGE_MODE } });
   log.server.info({ port: PORT, host: BIND_HOST }, 'Taxonomy Editor running');
   log.server.info({ dataRoot: getDataRoot() }, 'Data root');
+  // t/3166: periodic event-loop lag gauge (Pino) + threshold-crossing FR warn at >1s block,
+  // so a starvation event (t/3165: 7–8s in-process ONNX froze the loop → ingress-fabricated
+  // 500) is directly greppable instead of inferred. Unref'd interval — never holds the process.
+  startEventLoopMonitor();
+  // t/3172 (G8b): scheduled full-taxonomy grounding sweep — path-agnostic correctness backstop for
+  // batch/PS/Python writes that bypass the inline G8a hook. Gated on GROUNDING_SWEEP_ENABLED
+  // (default OFF): inert until the sequenced enable (t/3203 + TL lock-symmetry sign-off). Unref'd.
+  startGroundingSweep();
+  // t/3165 observability: one-line boot record of the offload flag's RUNTIME value, so a deploy's
+  // effective EMBEDDING_WORKER_OFFLOAD is greppable in Log Analytics at startup — the "looked set
+  // in ACA config but process.env evaluated false" regression (bicep value-form) is then visible
+  // immediately, not inferred from a debate's compute path.
+  log.server.info({ embeddingWorkerOffload: isEmbeddingWorkerOffloadEnabled() }, 'embedding offload flag at boot');
+  // t/3278 Arm-1: log the baked BUILD_SHA at boot so "what SHA is running?" is answerable from LA on
+  // every deploy (the durable primitive vs the incidental t/3211 marker). 'unknown' if the build didn't
+  // pass --build-arg BUILD_SHA → a visible gap, not a silent one (drift-check reads /health.buildSha).
+  log.server.info({ buildSha: process.env.BUILD_SHA ?? 'unknown' }, 'build sha at boot');
+  // t/3211: log the live cgroup-effective core count at boot so the embedding-worker-pool SKU sizing
+  // (K = min(EMBEDDING_WORKER_POOL_SIZE, availableParallelism()-1)) is confirmed EMPIRICALLY from LA on
+  // the next deploy, not asserted blind from the ACA vCPU config (cgroup quota can differ). DevOps reads
+  // this before any 4-vCPU bump + POOL_SIZE flip (p/526#75).
+  log.server.info({ availableParallelism: os.availableParallelism(), cpus: os.cpus().length }, 'host core count at boot');
+  // t/3211: configure the embedding-worker POOL once at startup with the RAW EMBEDDING_WORKER_POOL_SIZE
+  // (default 1 → single worker, today's exact behavior). Shared Lib's configureEmbeddingWorkerPool
+  // SELF-CLAMPS to min(size, availableParallelism()-1) + WARNs, so a mis-set value can't oversubscribe
+  // the main loop. Inert until POOL_SIZE>1 on a container with spare cores (needs the 4-vCPU SKU + flip).
+  const poolSize = getEmbeddingWorkerPoolSize();
+  configureEmbeddingWorkerPool(poolSize);
+  log.server.info({ requestedPoolSize: poolSize }, 'embedding worker pool configured at boot');
   void warmupEmbeddings().catch((err: unknown) => {
     log.server.error({ err: String(err) }, 'ONNX embedding warmup failed at boot');
     getGlobalRecorder()?.record({ type: 'system.error', component: 'server', level: 'error', message: 'ONNX embedding warmup failed at boot', error: { name: (err as Error)?.name ?? 'Error', message: String(err), stack: (err as Error)?.stack } });
+  });
+  // t/3085: pre-warm the embeddings.json cache at startup so the first debate request
+  // gets the precomputed vectors. Emits an FR signal "embeddings.json loaded: N nodes".
+  // t/3086: after prewarm resolves, emit a Pino startup probe (both arms) so the cache
+  // state is visible in server logs and in /health without reading the FR dump.
+  void prewarmEmbeddingsCache().then(() => {
+    const { present, nodeCount } = getEmbeddingsCacheStatus();
+    if (present) {
+      log.server.info({ embeddings_node_count: nodeCount }, 'startup probe: embeddings.json cache ready');
+    } else {
+      log.server.warn({}, 'startup probe: embeddings.json ABSENT — debates will re-embed ~3600 texts per session (check t/3085 DevOps half)');
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'server', level: 'warn',
+        message: 'startup probe: embeddings.json cache absent',
+      });
+    }
+  }).catch((err: unknown) => {
+    getGlobalRecorder()?.record({ type: 'system.error', component: 'server', level: 'warn', message: 'embeddings.json pre-warm failed at boot', error: { name: (err as Error)?.name ?? 'Error', message: String(err), stack: (err as Error)?.stack } });
   });
 
   // t/924: surface the free-tier key pool + effective RPM so rate-limit

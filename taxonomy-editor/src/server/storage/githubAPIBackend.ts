@@ -28,7 +28,7 @@ import type { FlightRecorder, RecordInput } from '../../../../lib/flight-recorde
 import { getCurrentUserId, getSessionBranchName } from '../security/userContext.js';
 import { GitHubRestClient, normalizeErrorForEvent, type CircuitState } from './githubRestClient.js';
 import { getDataRoot } from '../config.js';
-import { writeFramedNdjson } from '../logger.js';
+import { writeFramedNdjson, log } from '../logger.js';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -397,6 +397,8 @@ export class GitHubAPIBackend implements StorageBackend {
     // When on a session branch (and no ref is forced), write to overlay only —
     // no API call. The overlay is flushed via commitOverlay() (Trees API batch).
     if (!forceRef && ref !== this.baseBranch && this.hasSessionContext()) {
+      this.recordEvent({ type: 'cache.hit', component: 'cache', level: 'debug',
+        message: `writeFile: overlay fast-path taken: ${repoPath}`, data: { path: repoPath, ref } });
       this.writeToOverlay(filePath, content);
       return;
     }
@@ -570,6 +572,8 @@ export class GitHubAPIBackend implements StorageBackend {
       }
     } else if (!(this.rest.isTripped())) {
       await this.fetchDirectoryFromAPI(repoPath, opts, seen);
+    } else {
+      log.server.warn({ dir: repoPath, cause: 'circuit-breaker-open' }, 'listDirectory returning [] — circuit breaker open, may be false-empty (t/3300)');
     }
 
     // Merge the session overlay so files written this session are visible and
@@ -579,6 +583,46 @@ export class GitHubAPIBackend implements StorageBackend {
     this.mergeOverlayIntoListing(prefix, seen);
 
     return [...seen];
+  }
+
+  /**
+   * Validation-scoped probe (t/3296 A arm): like listDirectory but throws on
+   * unreachable instead of silently returning []. 3-way outcome taxonomy:
+   *   (1) Genuine 200 + empty → returns []          (caller exits, no retry)
+   *   (2) Transient (breaker/503/timeout) → throws Error with { kind: 'transient' }
+   *   (3) Config / no-creds → throws ActionableError (caller exits, no retry)
+   * The regular listDirectory() contract is unchanged — zero cross-caller regression.
+   */
+  async listDirectoryStrict(dirPath: string, opts?: { ref?: string }): Promise<string[]> {
+    if (this.rest.isTripped()) {
+      throw Object.assign(new Error('GitHub API circuit breaker open — transient'), { kind: 'transient' as const });
+    }
+    const creds = await this.getCredsCached();
+    if (!creds) {
+      throw new ActionableError({
+        goal: 'Validate data root via GitHub API',
+        problem: 'GitHub App credentials are missing or not configured. The server cannot reach the GitHub repository.',
+        location: 'GitHubAPIBackend.listDirectoryStrict',
+        nextSteps: [
+          'Set GITHUB_APP_ID, GITHUB_PRIVATE_KEY, and GITHUB_REPO environment variables',
+          'Verify the GitHub App is installed on the target repository',
+        ],
+      });
+    }
+    const ref = opts?.ref ?? this.getEffectiveRef();
+    const qRef = ref === 'main' ? '' : `?ref=${encodeURIComponent(ref)}`;
+    const resp = await this.rest.request(creds, 'GET',
+      `/repos/${creds.repo}/contents/${this.toRepoPath(dirPath)}${qRef}`);
+    if (!resp.ok) {
+      throw Object.assign(
+        new Error(`GitHub API returned ${(resp as { status?: number }).status ?? 'unknown'}: ${(resp as { error?: string }).error ?? ''}`),
+        { kind: 'transient' as const, status: (resp as { status?: number }).status },
+      );
+    }
+    if (Array.isArray(resp.data)) {
+      return (resp.data as Array<{ name: string }>).map(e => e.name);
+    }
+    return [];
   }
 
   private async fetchDirectoryFromAPI(
@@ -592,7 +636,11 @@ export class GitHubAPIBackend implements StorageBackend {
         `/repos/${creds.repo}/contents/${repoPath}${qRef}`);
       if (resp.ok && Array.isArray(resp.data)) {
         for (const e of resp.data as Array<{ name: string }>) seen.add(e.name);
+      } else if (!resp.ok) {
+        log.server.warn({ dir: repoPath, status: (resp as { status?: number }).status, cause: 'api-non-ok' }, 'listDirectory returning [] — GitHub API non-ok response, may be false-empty (t/3300)');
       }
+    } else {
+      log.server.warn({ dir: repoPath, cause: 'no-credentials' }, 'listDirectory returning [] — no GitHub credentials available, may be false-empty (t/3300)');
     }
   }
 
@@ -1302,8 +1350,12 @@ export class GitHubAPIBackend implements StorageBackend {
     const diskPath = path.join(this.cacheDir, repoPath);
     try {
       return await fs.readFile(diskPath, 'utf-8');
-    } catch {
-      /* telemetry — silent by design */
+    } catch (err: unknown) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'github-api-backend', level: 'warn',
+        message: 'readFromDiskCache: cache file unreadable, returning null (cache miss)',
+        data: { repoPath, diskPath, error: String(err) },
+      });
       return null;
     }
   }

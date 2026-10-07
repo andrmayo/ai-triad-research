@@ -16,11 +16,13 @@ import { createRequire } from 'module';
 import { getGlobalRecorder } from '../../../../lib/flight-recorder/index.js';
 
 const require = createRequire(import.meta.url);
-import { getApiKey, getApiKeys, getProjectRoot, EMBED_SCRIPT, resolveDataPath, type AIBackend } from '../config.js';
+import { getApiKey, getApiKeys, getProjectRoot, EMBED_SCRIPT, resolveDataPath, isEmbeddingWorkerOffloadEnabled, type AIBackend } from '../config.js';
+import { writeAICallLogEntry, isAICallLogEnabled } from './aiCallLog.js';
 import { ActionableError } from '../../../../lib/debate/errors.js';
 import { parseJsonRobust } from '../../../../lib/debate/helpers.js';
 import { extractProviderReason, deriveKeyErrorMessage } from './providerErrors.js';
 import { readFileWithMtime } from './fsCache.js';
+import { readDataFile } from '../storage/readDataFile.js';
 import { tavilySearch, buildSearchAugmentedPrompt } from '../../../../lib/search/tavily.js';
 import { resolveEmbeddings, type EmbeddingFallback } from '../../../../lib/embeddings/embeddingResolver.js';
 import type { EmbeddingsFile } from '../../../../lib/electron-shared/embeddingIO.js';
@@ -32,6 +34,9 @@ import {
   computeEmbeddings as onnxComputeEmbeddings,
   tryWarmup as onnxTryWarmup,
 } from '../../../../lib/embeddings/onnxEmbedding.js';
+// t/3183 (t/2977 Item B): off-main-thread ONNX compute via the shared worker (t/3181). Consumed
+// only when EMBEDDING_WORKER_OFFLOAD is on; flag-off never touches this path (byte-identical).
+import { computeEmbeddingsOffThread } from '../../../../lib/embeddings/offThreadEmbedding.js';
 import {
   resolveBackend,
   callProvider,
@@ -363,6 +368,9 @@ export async function generateText(
           message: `Skipping ${currentModel}: no ${backend} API key — trying next fallback`,
           data: { model: currentModel, backend, fallbackIndex: mi, chain: modelsToTry },
         });
+        // t/3176 (Fallback-Path Logging): the FR record above is info-only → invisible in prod log
+        // dashboards. WARN so a silent key-gap that degrades the model chain is greppable.
+        log.api.warn({ model: currentModel, backend, fallbackIndex: mi }, 'generateText: no API key for backend — skipping to next fallback chain entry');
         continue;
       }
       throwNoApiKeyError(backend, modelsToTry);
@@ -449,13 +457,27 @@ export async function generateTextWithSearch(
         citations: citations.length ? citations : undefined,
       };
     }
+    // t/3176 (Fallback-Path Logging): no Tavily key → search is silently omitted and we degrade to
+    // plain generation. WARN so a missing-key regression (answers ungrounded) is visible, not silent.
+    log.api.warn({ model: resolved, backend }, 'generateTextWithSearch: no Tavily key — falling back to plain generation (search omitted)');
     const result = await generateText(prompt, resolved, undefined, undefined, explicitApiKey);
     return { text: result.text };
   }
 
-  const apiKey = (typeof explicitApiKey === 'string' ? explicitApiKey : explicitApiKey?.[0])
-    ?? await getApiKey('gemini');
-  if (!apiKey) {
+  // t/3175: parity with generateText's resilience stack. Previously this used only
+  // explicitApiKey[0] and called geminiGroundedSearch directly — so a debate round's
+  // search-verify bursts hammered ONE free-tier key (the other pool keys idle) → 429
+  // api_key_exhausted with no retry. Route the grounded-search provider call through
+  // callWithKeyRotation (round-robin + 429 cooldown across the whole pool) wrapped in
+  // withRetry (backoff), exactly like generateText (aiBackends.ts:383). Paid-overflow
+  // is layered at the route caller (routes/ai.ts), mirroring generateWithPaidFallback.
+  const fallbackKey = (Array.isArray(explicitApiKey) || explicitApiKey) ? undefined : await getApiKey('gemini');
+  const keys: string[] = Array.isArray(explicitApiKey)
+    ? explicitApiKey.filter(Boolean)
+    : explicitApiKey
+      ? [explicitApiKey]
+      : (fallbackKey ? [fallbackKey] : []);
+  if (keys.length === 0) {
     throw new ActionableError({
       goal: 'Perform grounded search via Gemini',
       problem: 'No Gemini API key configured',
@@ -465,10 +487,27 @@ export async function generateTextWithSearch(
   }
 
   const apiModel = getApiModelId(resolved);
-  return geminiGroundedSearch(fetch, prompt, apiModel, apiKey);
+  return withRetry(
+    () => callWithKeyRotation('gemini', keys,
+      (apiKey) => geminiGroundedSearch(fetch, prompt, apiModel, apiKey)),
+    SERVER_RETRY_CONFIG,
+    `gemini-search/${apiModel}`,
+  );
 }
 
 // ── UsageID wrappers (t/1262) ──
+
+/** t/3245: classify a generateText failure into an AI-call-log Status string — the HTTP/API status when
+ *  the error carries one, else a coarse aborted/timeout/error class. Never throws (used on a catch path). */
+function deriveCallLogStatus(err: unknown): string {
+  const e = err as { statusCode?: number; status?: number; name?: string; message?: string };
+  const code = e?.statusCode ?? e?.status;
+  if (typeof code === 'number' && Number.isFinite(code)) return String(code);
+  const msg = (e?.message ?? '').toLowerCase();
+  if (e?.name === 'AbortError' || msg.includes('abort')) return 'aborted';
+  if (msg.includes('timeout') || msg.includes('timed out')) return 'timeout';
+  return 'error';
+}
 
 /**
  * Resolve AI call parameters from the UsageID registry, then delegate to
@@ -497,7 +536,22 @@ export async function generateTextByUsage(
     data: { usageId, model: merged.model, hasOverrides: !!overrides, valueKeys: Object.keys(values) },
   });
 
-  return generateText(prompt, merged.model, onRetry, merged.timeoutMs, explicitApiKey, { temperature: merged.temperature, signal });
+  // t/3245: AI Call Log capture (TS side of t/3242's PS hook). Logs ONE record per call with the final
+  // status + total retry count — PS logs per-attempt, a documented granularity divergence (t/3245 PR).
+  // Flag off → the onRetry wrap and the write are both skipped (zero overhead). Scenario defaults to
+  // usageId, mirroring the PS -Scenario default.
+  if (!isAICallLogEnabled()) {
+    return generateText(prompt, merged.model, onRetry, merged.timeoutMs, explicitApiKey, { temperature: merged.temperature, signal });
+  }
+  let retryCount = 0;
+  const countingOnRetry = (p: GenerateTextProgress): void => { retryCount++; onRetry?.(p); };
+  // .then(onFulfilled, onRejected), not try/catch: the audit write is a settle-time side effect and the
+  // error is re-thrown UNCHANGED. generateText already records its own failures, so this wrapper must not
+  // double-record — the error propagates to the existing recorder (ADR-003: no swallow).
+  return await generateText(prompt, merged.model, countingOnRetry, merged.timeoutMs, explicitApiKey, { temperature: merged.temperature, signal }).then(
+    (result) => { writeAICallLogEntry({ scenario: usageId, promptId: usageId, promptStart: prompt, retryCount, status: '200' }); return result; },
+    (err: unknown) => { writeAICallLogEntry({ scenario: usageId, promptId: usageId, promptStart: prompt, retryCount, status: deriveCallLogStatus(err) }); throw err; },
+  );
 }
 
 /**
@@ -526,38 +580,128 @@ export async function generateTextWithSearchByUsage(
     data: { usageId, model: merged.model, hasOverrides: !!overrides, valueKeys: Object.keys(values) },
   });
 
-  return generateTextWithSearch(prompt, merged.model, explicitApiKey);
+  // t/3245: AI Call Log capture. generateTextWithSearch exposes no retry callback → RetryCount 0. Same
+  // .then(onFulfilled, onRejected) settle-side-effect pattern as generateTextByUsage (no double-record).
+  if (!isAICallLogEnabled()) {
+    return generateTextWithSearch(prompt, merged.model, explicitApiKey);
+  }
+  return await generateTextWithSearch(prompt, merged.model, explicitApiKey).then(
+    (result) => { writeAICallLogEntry({ scenario: usageId, promptId: usageId, promptStart: prompt, retryCount: 0, status: '200' }); return result; },
+    (err: unknown) => { writeAICallLogEntry({ scenario: usageId, promptId: usageId, promptStart: prompt, retryCount: 0, status: deriveCallLogStatus(err) }); throw err; },
+  );
 }
 
 // ── Embeddings ──
 
 let embeddingsCache: EmbeddingsFile | null = null;
+// Hydrate-once dedup: coalesce concurrent callers onto one fs.readFile (t/3085).
+let embeddingsLoadInFlight: Promise<EmbeddingsFile | null> | null = null;
+// t/3086: Python availability probe result. Declared here so _setPythonAvailableForTest (below)
+// satisfies no-use-before-define. Populated lazily by isPythonEmbeddingAvailable().
+let _pythonAvailable: boolean | null = null;
 
 function getEmbeddingsPath(): string {
   return path.join(resolveDataPath('taxonomy/Origin'), 'embeddings.json');
 }
+const EMBEDDINGS_REL_PATH = path.join('taxonomy', 'Origin', 'embeddings.json');
 
-function loadEmbeddingsFile(): EmbeddingsFile | null {
-  try {
-    const p = getEmbeddingsPath();
-    if (embeddingsCache) return embeddingsCache;
-    embeddingsCache = JSON.parse(fs.readFileSync(p, 'utf-8'));
-    return embeddingsCache;
-  } catch (err) {
-    // ENOENT is expected (no precomputed cache) → fall through to fresh
-    // embedding. Anything else (corrupt JSON, permissions) silently re-embeds
-    // against the API quota, so surface it at warn.
-    const code = (err as NodeJS.ErrnoException).code;
-    getGlobalRecorder()?.record({
-      type: 'system.error', component: 'ai-backends',
-      level: code === 'ENOENT' ? 'info' : 'warn',
-      message: code === 'ENOENT'
-        ? 'No embeddings cache file — computing fresh'
-        : 'Embeddings cache unreadable — falling back to full re-embed (API quota)',
-      error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
-    });
-    return null;
-  }
+/**
+ * Load the precomputed embeddings.json once, asynchronously, with promise coalescing so
+ * concurrent callers all await the same read rather than each issuing a separate disk I/O.
+ * t/3085: replaces sync fs.readFileSync; ENOENT promoted to warn because in prod ACA
+ * (github-api mode) the file never reaches /tmp — every absence fires this path.
+ */
+async function loadEmbeddingsFileAsync(): Promise<EmbeddingsFile | null> {
+  if (embeddingsCache) return embeddingsCache;
+  if (embeddingsLoadInFlight) return embeddingsLoadInFlight;
+  embeddingsLoadInFlight = (async () => {
+    try {
+      const buf = await readDataFile(EMBEDDINGS_REL_PATH, { largeFile: true });
+      const raw = buf.toString('utf-8');
+      const parsed = JSON.parse(raw) as EmbeddingsFile;
+      embeddingsCache = parsed;
+      const nodeCount = Object.keys(parsed.nodes ?? {}).length;
+      getGlobalRecorder()?.record({
+        type: 'system.info', component: 'ai-backends', level: 'info',
+        message: `embeddings.json loaded: ${nodeCount} nodes`,
+        data: { embeddings_node_count: nodeCount, embeddings_model: parsed.model },
+      });
+      return embeddingsCache;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      // t/3085: ENOENT promoted to warn — in prod ACA (github-api mode) the file never
+      // reaches /tmp, so every request hits this path. It is not a normal miss; it is the
+      // root-cause symptom that triggers ~3,600 ONNX re-embeds per debate.
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'ai-backends', level: 'warn',
+        message: code === 'ENOENT'
+          ? 'embeddings.json not found — re-embedding all taxonomy texts (quota impact in prod)'
+          : 'embeddings.json unreadable — falling back to full re-embed (API quota)',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+      return null;
+    } finally {
+      embeddingsLoadInFlight = null;
+    }
+  })();
+  return embeddingsLoadInFlight;
+}
+
+/** Pre-warm the embeddings cache at server startup (t/3085). Fire-and-forget; errors are FR-recorded. */
+export async function prewarmEmbeddingsCache(): Promise<void> {
+  await loadEmbeddingsFileAsync();
+}
+
+/** t/3086: probe result after prewarmEmbeddingsCache() resolves. */
+export function getEmbeddingsCacheStatus(): { present: boolean; nodeCount: number | null } {
+  if (!embeddingsCache) return { present: false, nodeCount: null };
+  return { present: true, nodeCount: Object.keys(embeddingsCache.nodes ?? {}).length };
+}
+
+/** t/3165: a stable core POV belief node used as the /readyz + deploy-gate RESOLUTION canary.
+ *  If the taxonomy ever legitimately drops it, update this one constant (the resolution check
+ *  will otherwise false-fail; corpusNodeCount>0 distinguishes that config case from a dead cache). */
+export const EMBEDDINGS_RESOLUTION_CANARY = 'acc-beliefs-003';
+const EMBEDDING_DIM = 384; // all-MiniLM-L6-v2
+
+/**
+ * t/3165: RESOLUTION probe (presence != resolution). The t/3165 class is a cache that is
+ * present (nodeCount>0) but doesn't actually resolve a keyed lookup at runtime (stale/wrong
+ * corpus, or empty/corrupt vectors). Asserts the canary id resolves to a real EMBEDDING_DIM
+ * vector — the SAME `nodes[id].vector` lookup the compute path uses (embeddingResolver.ts),
+ * so /readyz gates on the real resolve path, not mere file presence. `/readyz` and DevOps2's
+ * deploy gate (t/3091) share this single predicate.
+ */
+export function getEmbeddingsResolution(): {
+  present: boolean; nodeCount: number | null; resolves: boolean; canaryId: string;
+} {
+  const cache = embeddingsCache;
+  const present = !!(cache && cache.nodes && Object.keys(cache.nodes).length > 0);
+  const nodeCount = cache ? Object.keys(cache.nodes ?? {}).length : null;
+  const vec = cache?.nodes?.[EMBEDDINGS_RESOLUTION_CANARY]?.vector;
+  // t/3192: non-prod-only test knob — force resolves:false so /readyz returns 503 warming, letting
+  // DevOps exercise the deploy warm-gate's FIRE arm (resolves:false → block the traffic-shift)
+  // against a REAL staging/throwaway revision without an actually-broken cache. Gated to
+  // NODE_ENV!=='production' so it can NEVER force a false-negative /readyz in prod.
+  const forceResolvesFalse = process.env.NODE_ENV !== 'production' && process.env.READYZ_FORCE_RESOLVES_FALSE === '1';
+  const resolves = !forceResolvesFalse && present && Array.isArray(vec) && vec.length === EMBEDDING_DIM && vec.some((v) => v !== 0);
+  return { present, nodeCount, resolves, canaryId: EMBEDDINGS_RESOLUTION_CANARY };
+}
+
+/** Reset the embeddings cache — test isolation only. */
+export function _resetEmbeddingsCacheForTest(): void {
+  embeddingsCache = null;
+  embeddingsLoadInFlight = null;
+}
+
+/** Pre-set Python availability without spawning the probe — test isolation only. */
+export function _setPythonAvailableForTest(v: boolean): void {
+  _pythonAvailable = v;
+}
+
+/** Clear the cached Python-availability probe result so the next call re-runs it — test isolation only. */
+export function _resetPythonAvailableForTest(): void {
+  _pythonAvailable = null;
 }
 
 const EMBEDDINGS_REQUEST_TIMEOUT_MS = 45_000;
@@ -567,9 +711,37 @@ const EMBEDDINGS_REQUEST_TIMEOUT_MS = 45_000;
 // batch froze it ~46.8s → 500, past ACA's liveness deadline, and the t/2905 concurrency cap
 // can't catch a *single* request. Splitting the batch and yielding (setImmediate) between
 // chunks keeps the loop responsive to health checks + other work during a big compute.
-// TUNE from the first post-deploy large-compute trace (t/2904 loop-delay/heap observability);
-// 256 is the pre-calibration default.
-const EMBEDDING_COMPUTE_CHUNK = 256;
+// TUNE from the first post-deploy large-compute trace (t/2904 loop-delay/heap observability).
+// t/3180 (t/2977 Item A, interim relief): 256→128 — the t/3165 incident's novel-text batches
+// (~200/792) still blocked the loop enough to trip ACA liveness 503s at chunk=256; halving the
+// chunk yields the loop 2× as often between ONNX passes → fewer liveness 503s. Interim only
+// (reduces, doesn't eliminate — the durable fix is worker-offload, t/2977 Item B / t/3183).
+const EMBEDDING_COMPUTE_CHUNK = 128;
+
+// t/3183 C6 (t/2977#6) — PROVISIONAL demand baseline for the novel-text class's 3rd recurrence.
+// The worker (Item B) raises the compute CEILING (a big batch no longer blocks the loop) but does
+// NOT bound DEMAND. When a single request's NOVEL (cacheHits=0) count exceeds this, we emit ONE
+// WARN naming the requester — never a hard reject — so an unbounded-demand caller is visible BEFORE
+// it saturates the worker queue (offload on) or the loop (offload off).
+//
+// TIERING vs LARGE_RECOMPUTE_WARN_ITEMS=64 (routes/ai.ts, #1720) — intentionally NOT redundant
+// (TL p/522#134):
+//   • 64  = "notable volume" — a large recompute happened (INFO/WARN, expected under cold cache).
+//   • 256 = "demand baseline exceeded — the DEMAND itself may be the bug" (the class's failure mode).
+//
+// 256 is CALIBRATED (t/3199, TL sign-off t/3199#3) on two independent axes — it must sit ABOVE the
+// legit residual-novel-per-turn max or it fires every normal debate (noise = dead gate):
+//  • Organic demand: a normal turn's residual-novel count is ~200 (trace-derived from t/3165 — the
+//    792/1347 batches were largely STATIC corpus, now cached, so they over-state a normal turn).
+//    256 > ~200 → normal turns never false-fire.
+//  • Physical ceiling: the offload worker computes ~10 texts/s (measured at the re-canary) and the
+//    route timeout is ~50s → a single all-novel request hits a ~500-text wall. 256 ≈ HALF that wall,
+//    so the WARN fires with ~2× margin BEFORE requests start timing out.
+// Validated at the storm-replay canary (GREEN — staging rev 0000166, image b2b79c95; t/3209). t/3085
+// residual (kept visible): that storm was SYNTHETIC (uniform 128-novel/request), so the ORGANIC leg
+// stays trace-derived, not directly measured — the prod-turn re-confirm (t/3210) closes it after the
+// flag flips ON. WARN-only; never a hard cap.
+const NOVEL_TEXT_DEMAND_BASELINE = 256;
 
 // Resolve a (possibly large) batch in chunks, yielding the event loop between chunks. Safe
 // because resolveEmbeddings is order-preserving and per-text pure (local cache-hit or chain
@@ -586,8 +758,19 @@ export async function resolveEmbeddingsChunked(
 ): Promise<number[][]> {
   // t/2985: timeout is per-chunk, not aggregate — large healthy batches complete while a
   // stuck chunk still gets bounded. The outer withTimeout (aggregate) was removed.
-  const resolveChunk = (t: string[], i: string[] | undefined) =>
-    withTimeout(resolveEmbeddings(t, i, local, chain), chunkTimeoutMs, 'embeddings-chunk');
+  // t/3074 TL-GV: stamp .timeout at the rejection throw site (not via message-matching —
+  // that was fragile-prose per t/2952; a wording drift in withTimeout would silently revert
+  // timeouts to 500). Promise.race owns the rejection object so the marker is structural.
+  const resolveChunk = async (t: string[], i: string[] | undefined): Promise<number[][]> => {
+    const timeoutErr = Object.assign(
+      new Error(`embeddings-chunk timed out after ${chunkTimeoutMs / 1000}s`),
+      { timeout: true },
+    );
+    const timeoutRace = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(timeoutErr), chunkTimeoutMs),
+    );
+    return Promise.race([resolveEmbeddings(t, i, local, chain), timeoutRace]);
+  };
   if (texts.length <= chunkSize) return resolveChunk(texts, ids);
   const out: number[][] = [];
   for (let i = 0; i < texts.length; i += chunkSize) {
@@ -602,9 +785,32 @@ export async function resolveEmbeddingsChunked(
 // t/1641/t/1643: `_explicitApiKey` is retained for call-site arity (server.ts passes
 // the free-tier key) but is no longer consumed — embeddings are computed by the local
 // Python encoder or the in-process ONNX fallback, both 384-dim/all-MiniLM-L6-v2, no API.
-export async function computeEmbeddings(texts: string[], ids?: string[], _explicitApiKey?: string): Promise<number[][]> {
+export async function computeEmbeddings(
+  texts: string[], ids?: string[], _explicitApiKey?: string,
+  opts?: { requester?: string },
+): Promise<{ vectors: number[][]; cacheHits: number; cacheMisses: number }> {
   const startMs = Date.now();
-  const local = loadEmbeddingsFile();
+  // t/3183: label the caller so a worker-queue shed WARN (offload on) and the demand-baseline WARN
+  // both name WHO. Defaults to 'unknown' — callers pass the route/usage (see routes/ai.ts).
+  const requester = opts?.requester ?? 'unknown';
+  const local = await loadEmbeddingsFileAsync();
+  // t/3086: pre-pass hit count (cheap dict lookup, same data resolveEmbeddings uses).
+  const cacheHits = (ids && local)
+    ? ids.filter(id => id != null && local.nodes[id] != null).length
+    : 0;
+  const cacheMisses = texts.length - cacheHits;
+
+  // t/3183 C6: the worker raises the compute ceiling but does not bound demand (class's 3rd
+  // recurrence). One WARN per over-baseline request makes an unbounded-demand caller visible
+  // BEFORE it saturates the worker queue / starves the loop — offload on or off.
+  if (cacheMisses > NOVEL_TEXT_DEMAND_BASELINE) {
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'ai-backends', level: 'warn',
+      message: `Novel-text demand ${cacheMisses} exceeds by-design baseline ${NOVEL_TEXT_DEMAND_BASELINE} (calibrated: organic-normal ~200 + ~500-text throughput/timeout wall, t/3199) — the worker raises the compute ceiling but does not bound demand; check for an unbounded-demand caller`,
+      data: { requester, cacheMisses, cacheHits, baseline: NOVEL_TEXT_DEMAND_BASELINE, inputCount: texts.length },
+    });
+  }
+
   const chain: EmbeddingFallback[] = [];
 
   // Local Python encoder stays primary when present (TL ruling t/1641#10).
@@ -623,12 +829,43 @@ export async function computeEmbeddings(texts: string[], ids?: string[], _explic
   // t/1641/t/1643: in-process ONNX all-MiniLM-L6-v2 (shared lib t/1651) — hosted
   // fallback when the Python ML venv is absent (DevOps venv slim, t/1642). Same
   // 384-dim vector space as the stored corpus; no API key, no network.
-  if (await onnxTryWarmup()) {
+  if (isEmbeddingWorkerOffloadEnabled()) {
+    // t/3183 (t/2977 Item B): flag ON → run the ONNX pass in the shared worker thread so a large
+    // miss-text batch can't block the event loop past ACA's liveness deadline (t/3165). Widen the
+    // worker's Float32Array views → number[][] for the resolver. A shed/crash rejects (load-shed
+    // 503) and is NOT caught here — an in-thread recompute would reintroduce the exact starvation the
+    // offload removes.
+    // t/3209 (C1 — the SO single-session invariant): do NOT call onnxTryWarmup() under the flag. It
+    // warms/inits a MAIN-THREAD ONNX session, but the WORKER owns the only session (t/3181); warming
+    // here too was a 2× ~250MB model double-load that could OOM under storm load (the C1 defect the
+    // canary surfaced alongside the emit bug). The worker inits ONNX itself; if it's genuinely
+    // unavailable the worker fails LOUD → resolveEmbeddings "all fallbacks failed" (caught below),
+    // which the canary sees — no silent in-thread fallback.
     chain.push({
-      name: 'onnx-batch',
-      compute: (t) => onnxComputeEmbeddings(t),
+      name: 'onnx-batch-worker',
+      compute: (t) => computeEmbeddingsOffThread(t, { requester }).then(vecs => vecs.map(v => Array.from(v))),
     });
+  } else if (await onnxTryWarmup()) {
+    // Flag OFF → today's exact in-thread call (warms + uses the main-thread session) → byte-identical.
+    chain.push({ name: 'onnx-batch', compute: (t) => onnxComputeEmbeddings(t) });
   }
+
+  // t/3165 observability: emit the RESOLVED chain + the offload-flag value to Pino/stdout. The
+  // completion record at :821 lands in the FR ring ONLY (invisible to Log Analytics) — which is
+  // precisely why the "offload looked engaged at flip but silently wasn't" regression took inference
+  // to diagnose. A prod compute now self-reports on stdout: offloadFlag=false + chain=['onnx-batch']
+  // (in-process, main-thread — the t/3165 starvation shape) vs offloadFlag=true +
+  // chain=['onnx-batch-worker'] (engaged). Unconditional + pre-compute → can't be masked by a
+  // swallowed downstream error.
+  // t/3246: emit under the established component:'api' (proven to reach Log Analytics) with the
+  // subsystem identity in a `subsystem` field — the earlier novel component:'ai-backends' kept
+  // offloadFlag/chainMembers invisible in LA (same drop as the synth serialize_ms lines).
+  log.api.info({
+    component: 'api', subsystem: 'ai-backends', requester,
+    offloadFlag: isEmbeddingWorkerOffloadEnabled(),
+    chainMembers: chain.map(c => c.name),
+    inputCount: texts.length, cacheHits, cacheMisses,
+  }, 'computeEmbeddings chain resolved');
 
   try {
     // t/2985: timeout is now per-chunk inside resolveEmbeddingsChunked — no aggregate ceiling.
@@ -637,9 +874,9 @@ export async function computeEmbeddings(texts: string[], ids?: string[], _explic
     getGlobalRecorder()?.record({
       type: 'ai.response', component: 'ai-backends', level: 'info',
       message: `computeEmbeddings completed: ${texts.length} inputs in ${elapsedMs}ms`,
-      data: { inputCount: texts.length, dimensions: result[0]?.length ?? 0, elapsedMs, chainMembers: chain.map(c => c.name) },
+      data: { inputCount: texts.length, dimensions: result[0]?.length ?? 0, elapsedMs, chainMembers: chain.map(c => c.name), cacheHits, cacheMisses },
     });
-    return result;
+    return { vectors: result, cacheHits, cacheMisses };
   } catch (err) {
     const elapsedMs = Date.now() - startMs;
     getGlobalRecorder()?.record({
@@ -648,6 +885,12 @@ export async function computeEmbeddings(texts: string[], ids?: string[], _explic
       error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
       data: { inputCount: texts.length, elapsedMs, chainMembers: chain.map(c => c.name) },
     });
+    // t/3209: also surface the underlying error to Pino/stdout (→ Log Analytics). The FR record above
+    // lives in the ring buffer only, so a container-side compute failure was previously invisible in
+    // logs — the offload NO-GO was diagnosable ONLY by inference (zero worker/fallback lines reached
+    // stdout). The real cause (e.g. the worker's ERR_MODULE_NOT_FOUND surfaced through resolveEmbeddings)
+    // is now greppable instead of masked by the generic ActionableError below.
+    log.api.error({ component: 'api', subsystem: 'ai-backends', inputCount: texts.length, elapsedMs, chainMembers: chain.map(c => c.name), err: String(err) }, 'computeEmbeddings failed');
     // t/2985: distinguish a per-chunk timeout from an empty-chain init failure so triage
     // isn't misdirected to a packaging cause when the encoder worked but timed out.
     const msg = err instanceof Error ? err.message : String(err);
@@ -702,14 +945,14 @@ function computeBatchViaLocalPython(texts: string[], ids: string[]): Promise<num
 
 // ── Python embedding availability probe ──
 
-let _pythonAvailable: boolean | null = null;
-
 function isPythonEmbeddingAvailable(): Promise<boolean> {
   if (_pythonAvailable !== null) return Promise.resolve(_pythonAvailable);
   return new Promise(resolve => {
     execFile(PYTHON, ['-c', 'import sentence_transformers'], { timeout: 10_000 }, (err) => {
       _pythonAvailable = !err;
-      if (!_pythonAvailable) log.server.info('[embeddings] Python sentence-transformers unavailable — using API only');
+      // t/3176 (Fallback-Path Logging): unavailable Python → the compute path silently degrades to
+      // the ONNX/API fallback for the process lifetime. WARN (not info) so it surfaces in prod logs.
+      if (!_pythonAvailable) log.server.warn('[embeddings] Python sentence-transformers unavailable — using API only');
       resolve(_pythonAvailable);
     });
   });
@@ -886,8 +1129,20 @@ export async function updateNodeEmbeddings(nodes: { id: string; text: string; po
     : {};
 
   let data: EmbeddingsFile;
-  try { data = JSON.parse(fs.readFileSync(filePath, 'utf-8')); }
-  catch { /* telemetry — silent by design */ data = { model: 'all-MiniLM-L6-v2', dimension: 384, node_count: 0, nodes: {} }; }
+  try {
+    const buf = await readDataFile(EMBEDDINGS_REL_PATH, { largeFile: true });
+    data = JSON.parse(buf.toString('utf-8')) as EmbeddingsFile;
+  }
+  catch (err) {
+    // t/3176 (Fallback-Path Logging): a read failure here silently starts from an EMPTY baseline —
+    // this write only re-adds the current nodes, so any embeddings the file held for OTHER nodes are
+    // dropped until the next full re-embed. That data-losing degradation must not be silent. WARN.
+    log.api.warn(
+      { err: (err as Error).message, path: EMBEDDINGS_REL_PATH },
+      'updateNodeEmbeddings: embeddings file unreadable — continuing with an EMPTY baseline (other nodes’ stored embeddings are discarded this write; they re-populate on the next full embed)',
+    );
+    data = { model: 'all-MiniLM-L6-v2', dimension: 384, node_count: 0, nodes: {} };
+  }
 
   for (const node of nodes) {
     if (vectors[node.id]) {
@@ -901,6 +1156,7 @@ export async function updateNodeEmbeddings(nodes: { id: string; text: string; po
   data.node_count = Object.keys(data.nodes).length;
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
   embeddingsCache = null;
+  embeddingsLoadInFlight = null; // bust any in-flight read that would return the stale file
 }
 
 // ── NLI classification ──

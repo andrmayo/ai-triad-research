@@ -215,7 +215,7 @@ jobs:
           echo "Deploying image tag: $(cat $GITHUB_OUTPUT | grep tag= | cut -d= -f2)"
 
       - name: Log in to Azure
-        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca  # v3
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c  # v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -346,6 +346,18 @@ jobs:
         run: |
           ./operations/devops/Invoke-BlobContainerGateCheck.ps1 `
             -StorageAccount '${{ steps.deploy.outputs.storageAccountName }}'
+
+      # Warn-only: compares share data against the data-repo canonical blob sha via
+      # GitHub Git Trees API. Catches seed-lag (t/3090 pattern — share stale relative
+      # to data repo). Flip to blocking is a separate Gate-Promotion PR after ≥1 green
+      # cycle on the real share. (t/3091)
+      - name: Verify share data freshness (warn-only — t/3091)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          ./operations/devops/Invoke-ShareFreshnessGateCheck.ps1 `
+            -StorageAccount '${{ steps.deploy.outputs.storageAccountName }}' `
+            -GitHubToken    '${{ github.token }}'
 
       - name: Cleanup stale revisions
         shell: pwsh
@@ -484,8 +496,48 @@ jobs:
             Add-Content -Path $env:GITHUB_OUTPUT -Value 'accepted=true'
           }
 
+      - name: Warm-gate (/readyz) — PEER-BLOCKING (t/3148, promoted from observe-only)
+        id: warm_gate
+        if: steps.health_check.outputs.healthy == 'true'
+        shell: pwsh
+        run: |
+          # t/3148 BLOCKING flip (mechanism B, TL-decided p/542#108; real-env evidence run
+          # 33434586564: "Warm-gate PASSED after 1 poll … {status:ready,nodeCount:4144}"). Poll the
+          # new revision's /readyz until the embeddings.json cache is warm, then emit warm=true/false.
+          # This step is a PEER of the acceptance/persona gates: 'Shift traffic' requires
+          # warm=='true'; warm=='false' takes the SAME full rollback path as an acceptance failure.
+          # The runner is FAIL-CLOSED (warm defaults false; only a proven-warm 200 with body
+          # {status:ready,nodeCount>0} sets true) and always exits 0 — the gate is OUTPUT-driven,
+          # not exit-code-driven. A non-JSON SPA index.html 200 is NOT warm (body-shape check,
+          # ServerAPI p/542#74). warm is UNSET only when this step is SKIPPED (health!='true'),
+          # which every rollback condition already covers via its health!='true' clause (no limbo).
+          $BaseUrl = "${{ steps.health_check.outputs.base_url }}"
+          & ./operations/devops/Invoke-ReadyzWarmGateCheck.ps1 -BaseUrl $BaseUrl -TimeoutSec 300 -PollIntervalSec 10
+
+      - name: Verify embeddings cache resolution (warn-only — t/3091)
+        # Calls POST /api/embeddings/compute with canary acc-beliefs-003 (confirmed-real stored key,
+        # p/555#4). Asserts cacheHits>=1: the same nodes[id] lookup computeEmbeddings uses. Runs
+        # AFTER warm-gate (which proved corpusNodeCount>0), so cacheHits:0 here is a genuine
+        # resolution failure on the compute path, not a dead-cache (t/3165 pattern).
+        # Requires ServerAPI t/3165 PR #1704 merged (adds cacheHits/cacheMisses/corpusNodeCount
+        # to compute 200 response). Script degrades gracefully (warn) if fields are absent.
+        # WARN-ONLY BY DESIGN (t/3192; both GV arms now real-env-proven, t/3192#6): kept
+        # continue-on-error:true. The FIRE arm (resolves:false → block the shift) is the WARM-GATE's
+        # job (step above, peer-blocking t/3148) — this step is a logging confirmation. Flipping THIS
+        # step to blocking would only catch a script crash (resolves:false is a handled exit-0 the
+        # warm-gate already blocks) = a flaky surface with zero new coverage (TL, t/3192#5).
+        id: embeddings_resolution
+        if: steps.warm_gate.outputs.warm == 'true'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          & ./operations/devops/Invoke-EmbeddingsResolutionGateCheck.ps1 `
+            -BaseUrl '${{ steps.health_check.outputs.base_url }}'
+
       - name: Shift traffic to new revision
-        if: steps.health_check.outputs.healthy == 'true' && steps.acceptance.outputs.accepted == 'true' && steps.persona.outputs.accepted == 'true'
+        # t/3148: warm_gate is now a peer gate — traffic shifts only when the /readyz warm-gate
+        # reports warm=='true' (embeddings.json cache proven warm), alongside acceptance/persona.
+        if: steps.health_check.outputs.healthy == 'true' && steps.acceptance.outputs.accepted == 'true' && steps.persona.outputs.accepted == 'true' && steps.warm_gate.outputs.warm == 'true'
         shell: pwsh
         run: |
           Import-Module ./scripts/AITriad/AITriad.psm1 -Force
@@ -515,7 +567,7 @@ jobs:
             -ExpectedTrafficRevision '${{ steps.new_revision.outputs.revision }}' `
             -ExpectedTrafficWeight 100 `
             -ExpectedEnvVars @{
-              # MANDATORY: Keep in sync with baseEnv in deploy/azure/main.bicep (lines 383-417).
+              # MANDATORY: Keep in sync with the baseEnv block in deploy/azure/main.bicep.
               # Every PR that adds/changes a Bicep env var MUST update this table in the same PR.
               # Drift here = false-red OR silently missed config check (t/2631).
               NODE_ENV                           = 'production'
@@ -533,6 +585,9 @@ jobs:
               GITHUB_APP_PRIVATE_KEY_SECRET_NAME = '${{ vars.SYNC_GITHUB_APP_PRIVATE_KEY_SECRET_NAME }}'
               AZURE_KEYVAULT_URL                 = '${{ steps.deploy.outputs.keyVaultUri }}'
               AZURE_STORAGE_ACCOUNT_URL          = '${{ steps.deploy.outputs.storageAccountBlobUrl }}'
+              EMBEDDING_WORKER_OFFLOAD           = '1'  # t/3165 durable close — gate verifies the offload flag is deployed
+              GROUNDING_RECONCILE_INLINE         = '1'  # t/3163 G8a — gate verifies the staged inline-reconcile flag is deployed
+              GROUNDING_SWEEP_ENABLED            = '1'  # t/3163 G8b — gate verifies the staged sweep-enable flag is deployed
             } `
             -CheckFirewall `
             -StorageAccountName '${{ steps.deploy.outputs.storageAccountName }}' `
@@ -547,8 +602,60 @@ jobs:
           }
           Write-Host "Config verification passed ($($ConfigChecks.Count) checks)"
 
+      - name: Assert in-process offload flag (BLOCKING, t/3247)
+        # Prevention for t/3165. The Verify-Bicep-config step above proves EMBEDDING_WORKER_OFFLOAD
+        # is PRESENT in ACA config; this asserts the RUNNING process EVALUATED it truthy, via
+        # ServerAPI's #1828 boot log (server.ts:1316 -> "embedding offload flag at boot"
+        # {embeddingWorkerOffload:bool}). "Config present" != "flag effective" (t/3165).
+        #
+        # GATE PROMOTION (t/3247): BLOCKING (continue-on-error: false). Promoted from warn-only after
+        # calibration — 4/4 real deploys (runs 33748402995 / 33778872175 / 33785227781 / 33891736936)
+        # found the boot line on attempt 1 at ~0s ingest lag with the true-arm read cleanly. The 8x30s
+        # (210s) retry ceiling below is RETAINED as over-provisioned headroom against LA ingestion
+        # spikes (calibration showed ~0s, not a tight bound — shrinking it would remove anti-flake
+        # margin). Predicate is DOT-SOURCED from operations/devops/Test-BootFlagEffective.ps1 — the
+        # single source its Pester both-arms test also uses (t/3010 co-location). Cond 2: present+false
+        # = 'drift' (blocks); absent-after-retry is a DISTINCT 'boot line not found' diagnostic
+        # (ingestion/#1828), NOT drift — also fail-closed (never pass an unverifiable deploy).
+        if: steps.acceptance.outputs.accepted == 'true' && steps.persona.outputs.accepted == 'true'
+        continue-on-error: false
+        shell: pwsh
+        env:
+          NEW_REVISION: ${{ steps.new_revision.outputs.revision }}
+        run: |
+          . ./operations/devops/Test-BootFlagEffective.ps1
+          $ws = az monitor log-analytics workspace list -g '${{ env.RESOURCE_GROUP }}' --query '[0].customerId' -o tsv
+          if (-not $ws) {
+            Write-Host '::warning::t/3247: no Log Analytics workspace in ${{ env.RESOURCE_GROUP }} — cannot assert in-process flag'
+            exit 0
+          }
+          # Query the NEW revision's boot line only. Bounded retry absorbs LA ingestion lag
+          # (~1-3 min typical). Ceiling RETAINED at 8x30s=210s as headroom — warn-phase calibration
+          # observed attempt-1 / ~0s across 4 deploys (this step runs post-traffic-shift, so boot
+          # logs are already ingested); the margin guards LA ingestion spikes, not a tight bound.
+          $q = "ContainerAppConsoleLogs_CL | where RevisionName_s == '$env:NEW_REVISION' | where Log_s has 'embedding offload flag at boot' | project TimeGenerated, Log_s | order by TimeGenerated desc | take 5"
+          $lines = @(); $maxAttempts = 8
+          for ($i = 1; $i -le $maxAttempts; $i++) {
+            $lines = @(az monitor log-analytics query --workspace $ws --analytics-query $q --query '[].Log_s' -o tsv 2>$null | Where-Object { $_ })
+            if ($lines.Count -gt 0) { Write-Host "t/3247: boot line found on attempt $i (~$([int](($i-1)*30))s ingest lag)"; break }
+            if ($i -lt $maxAttempts) { Write-Host "t/3247: boot line not yet ingested (attempt $i/$maxAttempts) — wait 30s"; Start-Sleep -Seconds 30 }
+          }
+          $r = Test-BootFlagEffective -BootLogLines $lines
+          Write-Host "t/3247 in-process flag assert: Status=$($r.Status) Pass=$($r.Pass) — $($r.Detail)"
+          if (-not $r.Pass) {
+            if ($r.Status -eq 'Drift') {
+              Write-Host "::error::t/3247 CONFIG DRIFT (present in ACA config but process not effective) — $($r.Detail)"
+            } else {
+              Write-Host "::error::t/3247 BOOT LINE NOT FOUND (ingestion/calibration, NOT drift) — $($r.Detail)"
+            }
+            exit 1   # BLOCKING (continue-on-error:false): fail-closed on drift OR unverifiable boot line
+          }
+          Write-Host "::notice::t/3247 in-process offload flag EFFECTIVE — $($r.Detail)"
+
       - name: Collect failure diagnostics
-        if: steps.health_check.outputs.healthy != 'true' || steps.acceptance.outputs.accepted == 'false' || steps.persona.outputs.accepted == 'false'
+        # t/3148: warm_gate is a peer failure trigger — a warm-timeout (warm=='false') collects
+        # diagnostics on the same footing as an acceptance/persona failure.
+        if: steps.health_check.outputs.healthy != 'true' || steps.acceptance.outputs.accepted == 'false' || steps.persona.outputs.accepted == 'false' || steps.warm_gate.outputs.warm == 'false'
         continue-on-error: true
         shell: pwsh
         run: |
@@ -569,15 +676,15 @@ jobs:
           else { Write-Host '(no system logs available)' }
 
       - name: Re-authenticate before rollback
-        if: always() && (steps.health_check.outputs.healthy != 'true' || steps.acceptance.outputs.accepted == 'false' || steps.persona.outputs.accepted == 'false') && steps.current_revision.outputs.revision != ''
-        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca  # v3
+        if: always() && (steps.health_check.outputs.healthy != 'true' || steps.acceptance.outputs.accepted == 'false' || steps.persona.outputs.accepted == 'false' || steps.warm_gate.outputs.warm == 'false') && steps.current_revision.outputs.revision != ''
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c  # v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Rollback on failure
-        if: always() && (steps.health_check.outputs.healthy != 'true' || steps.acceptance.outputs.accepted == 'false' || steps.persona.outputs.accepted == 'false') && steps.current_revision.outputs.revision != ''
+        if: always() && (steps.health_check.outputs.healthy != 'true' || steps.acceptance.outputs.accepted == 'false' || steps.persona.outputs.accepted == 'false' || steps.warm_gate.outputs.warm == 'false') && steps.current_revision.outputs.revision != ''
         shell: pwsh
         run: |
           Import-Module ./scripts/AITriad/AITriad.psm1 -Force
@@ -602,7 +709,7 @@ jobs:
           exit 1
 
       - name: Fail if unhealthy (no previous revision to rollback to)
-        if: (steps.health_check.outputs.healthy != 'true' || steps.acceptance.outputs.accepted == 'false' || steps.persona.outputs.accepted == 'false') && steps.current_revision.outputs.revision == ''
+        if: (steps.health_check.outputs.healthy != 'true' || steps.acceptance.outputs.accepted == 'false' || steps.persona.outputs.accepted == 'false' || steps.warm_gate.outputs.warm == 'false') && steps.current_revision.outputs.revision == ''
         run: |
           echo "::error::Health check failed and no previous revision exists for rollback"
           exit 1

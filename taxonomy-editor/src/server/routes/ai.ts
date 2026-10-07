@@ -21,13 +21,13 @@ import { getGlobalRecorder } from '../../../../lib/flight-recorder/index.js';
 import { callerTierIdentity, missingApiKeyError, expiredAuthCookies } from '../security/accessControl.js';
 import { getCurrentUser, getCurrentUserId } from '../security/userContext.js';
 import type { GenerateTextProgress } from '../ai/aiBackends.js';
-import { log, getRequestContext } from '../logger.js';
+import { log, getRequestContext, getRequestId } from '../logger.js';
 import { DEFAULT_MODEL } from '../../../../lib/ai-client/index.js';
 import { hasApiKey, getPaidGeminiFallbackKey, type AIBackend } from '../config.js';
 import * as proxyTiers from '../ai/proxyTiers.js';
 import * as rateLimiter from '../security/rateLimiter.js';
 import * as ai from '../ai/aiBackends.js';
-import { resolveGenerationContext, enforceBackendAllowed } from './generationContext.js';
+import { resolveGenerationContext, enforceBackendAllowed, enforceAnonDebateGate } from './generationContext.js';
 
 import * as fileIO from '../storage/fileIO.js';
 import { beginEmbeddingCompute, endEmbeddingCompute, embeddingLoadSnapshot, evaluateEmbeddingLoadShed, isEmbeddingModelWarm, markEmbeddingModelWarm } from '../embeddingsLoad.js';
@@ -84,7 +84,7 @@ function enforceAiRateLimits(res: http.ServerResponse, isFree: boolean, limitKey
     getGlobalRecorder()?.record({
       type: 'ai.error', component: 'rate-limiter', level: 'warn',
       message: `RPM limit reached (${rpmCheck.current}/${rpmCheck.limit})`,
-      data: { type: 'requests_per_minute', limitKey, limit: rpmCheck.limit, current: rpmCheck.current, retryAfterMs: rpmCheck.retryAfterMs, backend, tier: tier.level },
+      data: { type: 'requests_per_minute', rate_limit_source: 'per_ip_rpm', limitKey, limit: rpmCheck.limit, current: rpmCheck.current, retryAfterMs: rpmCheck.retryAfterMs, backend, tier: tier.level },
     });
     res.writeHead(429); res.end(JSON.stringify({ error: 'Rate limit exceeded', limitType: 'requests_per_minute', rate_limit_source: 'per_ip_rpm', rate_limit_type: 'api_call', retryAfterMs: rpmCheck.retryAfterMs, limit: rpmCheck.limit, current: rpmCheck.current })); return true;
   }
@@ -94,7 +94,7 @@ function enforceAiRateLimits(res: http.ServerResponse, isFree: boolean, limitKey
     getGlobalRecorder()?.record({
       type: 'ai.error', component: 'rate-limiter', level: 'warn',
       message: `Daily token limit reached (${tokenCheck.current}/${tokenCheck.limit})`,
-      data: { type: 'tokens_per_day', limitKey, limit: tokenCheck.limit, current: tokenCheck.current, backend, tier: tier.level },
+      data: { type: 'tokens_per_day', rate_limit_source: 'daily_token', limitKey, limit: tokenCheck.limit, current: tokenCheck.current, backend, tier: tier.level },
     });
     res.writeHead(429); res.end(JSON.stringify({ error: 'Daily token limit exceeded', limitType: 'tokens_per_day', rate_limit_source: 'daily_token', rate_limit_type: 'api_call', limit: tokenCheck.limit, current: tokenCheck.current })); return true;
   }
@@ -158,7 +158,9 @@ export function shouldAbortOnClientClose(finished: boolean, responseEnded: boole
  *  free pool exhausted, retry ONCE with the admin-registered paid Gemini key after a
  *  deliberate 3s throttle (t/948). Re-throws the original error when there's no paid
  *  path or the paid retry also fails. The paid key never enters the round-robin pool. */
-async function generateWithPaidFallback(
+// Exported for the t/3111 fallback-ordering test (free pool tried first; paid reached
+// ONLY on a free-tier 429; paid never in the rotation). Otherwise an internal helper.
+export async function generateWithPaidFallback(
   prompt: string,
   usageOverrides: Record<string, unknown>,
   explicitKey: string | string[] | undefined,
@@ -185,6 +187,10 @@ async function generateWithPaidFallback(
         message: `Paid fallback succeeded for ${backend}/${requestModel}`,
         data: { model: requestModel, backend, fallback: 'paid', delayMs: 3000, responseLength: result.text?.length ?? 0 },
       });
+      // t/3110 (t/3274): the record() above is FR-ring only — never reaches stdout/Log Analytics, so
+      // DevOps's overflow-cost alert (#1733) that keys on "Paid fallback succeeded" could never fire.
+      // Emit the same marker to Pino/stdout too (record() kept for forensics). Pattern: log.api.warn @659.
+      log.api.info({ component: 'ai-generate', model: requestModel, backend, fallback: 'paid' }, `Paid fallback succeeded for ${backend}/${requestModel}`);
       return result;
     } catch (fallbackErr) {
       getGlobalRecorder()?.record({
@@ -209,22 +215,70 @@ function applyTokenBudgetHeaders(res: http.ServerResponse, result: Awaited<Retur
   }
 }
 
-/** Search-grounded generation (server.search usage) + success record. */
-async function generateWithSearch(
+/** Search-grounded generation (server.search usage) + success record.
+ *  t/3175: full parity with generateWithPaidFallback — the in-backend fix routes the
+ *  grounded-search provider call through key rotation + retry; this adds the same
+ *  route-level paid-overflow safety net: on a free-tier 429 with the whole free pool
+ *  exhausted, retry ONCE with the admin paid key after a 3s throttle (the paid key never
+ *  enters the free rotation). No-op until GEMINI_PAID_KEY is set (t/3143). */
+export async function generateWithSearch(
   prompt: string,
   effectiveModel: string | undefined,
   explicitKey: string | string[] | undefined,
-  ctx: { backend: AIBackend; requestModel: string; t0: number },
+  ctx: { isFree: boolean; backend: AIBackend; requestModel: string; t0: number },
 ): Promise<Awaited<ReturnType<typeof ai.generateTextWithSearchByUsage>>> {
-  const { backend, requestModel, t0 } = ctx;
-  const result = await ai.generateTextWithSearchByUsage('server.search', { prompt }, effectiveModel ? { model: effectiveModel } : undefined, explicitKey);
-  getGlobalRecorder()?.record({
-    type: 'ai.response', component: 'ai-generate', level: 'info',
-    duration_ms: Date.now() - t0,
-    message: `generate+search success ${backend}/${requestModel}`,
-    data: { model: requestModel, backend, responseLength: result.text?.length ?? 0, search: true },
-  });
-  return result;
+  const { isFree, backend, requestModel, t0 } = ctx;
+  const overrides = effectiveModel ? { model: effectiveModel } : undefined;
+  const recordSuccess = (result: Awaited<ReturnType<typeof ai.generateTextWithSearchByUsage>>, fallback?: 'paid') => {
+    getGlobalRecorder()?.record({
+      type: 'ai.response', component: 'ai-generate', level: 'info',
+      duration_ms: Date.now() - t0,
+      // t/3110: paid-success carries the shared "Paid fallback succeeded" marker DevOps's
+      // overflow-cost alert (#1733) keys on — the same token the non-search
+      // generateWithPaidFallback path emits — so the alert also counts debate-search overflow.
+      // Marker is on the SUCCESS record only (billed overflow), never the attempt/failure logs.
+      message: fallback === 'paid'
+        ? `Paid fallback succeeded (search) ${backend}/${requestModel}`
+        : `generate+search success ${backend}/${requestModel}`,
+      data: { model: requestModel, backend, responseLength: result.text?.length ?? 0, search: true, ...(fallback ? { fallback } : {}) },
+    });
+    // t/3110 (t/3274): the record() above is FR-ring only. On the PAID branch (billed overflow), also emit
+    // the "Paid fallback succeeded" marker to Pino/stdout so DevOps's overflow-cost alert (#1733) can fire —
+    // it can't see the FR ring. Paid branch only (never the non-fallback success), matching the record().
+    if (fallback === 'paid') {
+      log.api.info({ component: 'ai-generate', model: requestModel, backend, fallback: 'paid', search: true }, `Paid fallback succeeded (search) ${backend}/${requestModel}`);
+    }
+  };
+  try {
+    const result = await ai.generateTextWithSearchByUsage('server.search', { prompt }, overrides, explicitKey);
+    recordSuccess(result);
+    return result;
+  } catch (searchErr) {
+    const paidKey = (ai.is429Error(searchErr) && isFree) ? await getPaidGeminiFallbackKey() : null;
+    if (!paidKey) throw searchErr; // non-free, non-429, or no paid key → outer catch maps to 429
+    // t/3175 (TL GV): WARN, not info — free-pool exhaustion is the second-front signal we
+    // want visible (Fallback-Path Logging rule, docs/error-handling.md); at info it's below
+    // the detectable threshold. Records THAT the paid fallback fired and WHY (free 429).
+    getGlobalRecorder()?.record({
+      type: 'ai.fallback', component: 'ai-generate', level: 'warn',
+      message: 'Free-tier search keys exhausted (429) — falling back to paid key after 3s throttle',
+      data: { model: requestModel, backend, fallback: 'paid', delayMs: 3000, search: true, freeKeyCount: proxyTiers.parseFreeTierKeys(process.env.FREE_TIER_GEMINI_KEY).length },
+    });
+    await new Promise(r => setTimeout(r, 3000));
+    try {
+      const result = await ai.generateTextWithSearchByUsage('server.search:paid-fallback', { prompt }, overrides, paidKey);
+      recordSuccess(result, 'paid');
+      return result;
+    } catch (fallbackErr) {
+      getGlobalRecorder()?.record({
+        type: 'ai.error', component: 'ai-generate', level: 'warn',
+        message: 'Paid search fallback also failed',
+        data: { model: requestModel, backend, fallback: 'paid', search: true },
+        error: { name: (fallbackErr as Error).name ?? 'Error', message: String(fallbackErr), stack: (fallbackErr as Error).stack },
+      });
+      throw searchErr; // both exhausted → outer catch maps to a client 429
+    }
+  }
 }
 
 /** t/997: Gemini surfaces a too-long context window as RESOURCE_EXHAUSTED — a 400-class
@@ -253,7 +307,7 @@ function respondIfUpstream429(res: http.ServerResponse, err: unknown, modelLabel
   getGlobalRecorder()?.record({
     type: 'ai.error', component: 'ai-generate', level: 'warn',
     message: 'AI generate upstream rate-limited',
-    data: { model: modelLabel, retryAfterMs: retry, source: 'upstream' },
+    data: { model: modelLabel, retryAfterMs: retry, source: 'upstream', rate_limit_source: 'api_key_exhausted' },
   });
   res.setHeader('Retry-After', String(Math.max(1, Math.ceil(retry / 1000))));
   res.writeHead(429, { 'Content-Type': 'application/json' });
@@ -348,6 +402,11 @@ export function registerAiRoutes(r: Router, ctx: ServerCtx): void {
       // Free-tier cost is bounded by tokensPerDay + per-IP rate limits; the redundant
       // per-prompt char cap was removed in t/812 (broke long debate prompts).
       const { tier, isFree, limitKey, effectiveModel, backend } = resolveGenerationContext(req, model);
+      // t/3230: a single anonymous debate drains the shared free Gemini key pool (K=4) → 429 storm
+      // → ~485s retry → user-facing 500. Block free-tier debate generation (reversible via the
+      // `anon-debates` flag) BEFORE any key/provider call — covers debate rounds AND the fact-check
+      // `search` calls (both carry debateId). Authenticated debates + non-debate free-tier untouched.
+      if (enforceAnonDebateGate(res, isFree, debateId)) return; // 403 when anon debates disabled
       if (enforceBackendAllowed(res, tier, backend)) return; // 403 if backend not on tier
 
       // Rate limiting: per-IP RPM (free tier) / per-user RPM + daily token budget (429 on breach).
@@ -380,7 +439,7 @@ export function registerAiRoutes(r: Router, ctx: ServerCtx): void {
       };
 
       if (search) {
-        json(res, await generateWithSearch(prompt, effectiveModel, explicitKey, { backend, requestModel, t0 }));
+        json(res, await generateWithSearch(prompt, effectiveModel, explicitKey, { isFree, backend, requestModel, t0 }));
       } else {
         const result = await generateWithPaidFallback(prompt, usageOverrides, explicitKey, {
           isFree, backend, requestModel, t0,
@@ -446,7 +505,7 @@ export function registerAiRoutes(r: Router, ctx: ServerCtx): void {
         type: 'ai.error', component: 'ai-search', level: expected ? 'warn' : 'error',
         message: `AI search failed: ${String(err)}`,
         error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
-        data: { model: model ?? 'default', promptLength: prompt?.length, source: ai.isContextTooLongError(err) ? 'context_overflow' : ai.is429Error(err) ? 'upstream' : 'error' },
+        data: { model: model ?? 'default', promptLength: prompt?.length, source: ai.isContextTooLongError(err) ? 'context_overflow' : ai.is429Error(err) ? 'upstream' : 'error', ...(ai.is429Error(err) ? { rate_limit_source: 'api_key_exhausted', retryAfterMs: ai.retryAfterMs(err) } : {}) },
       });
       if (ai.isContextTooLongError(err)) log.server.warn({ component: 'ai-search', model: model ?? 'default' }, 'AI search input exceeds model context window');
       else if (ai.is429Error(err)) log.server.warn({ component: 'ai-search', model: model ?? 'default', retryAfterMs: ai.retryAfterMs(err) }, 'AI search upstream rate-limited — returning 429');
@@ -531,16 +590,37 @@ export function registerAiRoutes(r: Router, ctx: ServerCtx): void {
     return { blocked: false };
   }
 
+  // Invariant: MAX_EMBED_BATCH must be ≥ the client's chunk size (currently 512 per t/3072).
+  // A server cap below the client chunk size would 413 every legitimate request.
+  const MAX_EMBED_BATCH = 512;
+  // t/3165: a fully-recomputed batch at/above this size is flagged as a volume event (novel
+  // no-ids text). ≥64 catches the ~200/792 debate grounding batches; below it, small ad-hoc
+  // computes stay silent (TL p/522#111 threshold guidance).
+  // TIERED with aiBackends' NOVEL_TEXT_DEMAND_BASELINE=256 (t/3183, TL p/522#134) — NOT redundant:
+  // 64 here = "notable volume, a large recompute happened" (expected under cold cache); 256 there =
+  // "demand baseline exceeded — the demand ITSELF may be the bug" (the novel-text class's failure
+  // mode). Two rungs of the same ladder, different meanings.
+  const LARGE_RECOMPUTE_WARN_ITEMS = 64;
+
   post('/api/embeddings/compute', (req, res, body) => withEndpointTimeout(res, 50_000, 'embeddings-compute', async () => {
     const { texts, ids } = body as { texts: string[]; ids?: string[] };
+    // t/3074 Gap 1: reject oversized batches before they enter the compute path.
+    // Client (t/3072) chunks to ≤MAX_EMBED_BATCH; this is the server-side backstop.
+    if (!Array.isArray(texts) || texts.length > MAX_EMBED_BATCH) {
+      const count = Array.isArray(texts) ? texts.length : 'non-array';
+      error(res, `Batch too large (${count}) — max ${MAX_EMBED_BATCH} texts per request`, 413);
+      return;
+    }
     try {
       const gate = freeTierEmbeddingGate(req, res);
       if (gate.blocked) return;
       // t/2904: emit the pre-freeze load signals (event-loop delay + heap + rss +
       // in-flight count) at INFO so a liveness-probe kill under concurrent embedding
       // load is diagnosable in the ACA container logs — the 2026-08-21 crash had none.
+      // t/3079: requestId added so Get-DebateRateLimitSummary-style cmdlets can
+      // correlate a client 504/500 to the server-side cause.
       log.api.info(
-        { ...embeddingLoadSnapshot(), item_count: Array.isArray(texts) ? texts.length : 0 },
+        { ...embeddingLoadSnapshot(), item_count: Array.isArray(texts) ? texts.length : 0, request_id: getRequestId() },
         'embeddings.compute: entry',
       );
       // t/2905: load-shed to prevent the GC event-loop freeze that SIGKILL'd the
@@ -564,18 +644,70 @@ export function registerAiRoutes(r: Router, ctx: ServerCtx): void {
       beginEmbeddingCompute();
       try {
         // t/3061: local ONNX — no Gemini call, no key needed.
-        const vectors = await ai.computeEmbeddings(texts, ids, undefined);
+        // t/3183: name the caller so a worker-queue shed WARN (offload on) / demand-baseline WARN
+        // attributes the drop to this route rather than 'unknown'.
+        const { vectors, cacheHits, cacheMisses } = await ai.computeEmbeddings(texts, ids, undefined, { requester: 'embeddings-compute' });
         markEmbeddingModelWarm();
+        // t/3079: item_count; t/3086: cache_hits/cache_misses (sustained 0% hit = t/3085 condition).
         getGlobalRecorder()?.record({
           type: 'system.info', component: 'embeddings-compute', level: 'info',
           message: 'embedding.compute',
-          data: { duration_ms: Date.now() - t0, model_cold_start: !modelWarm, in_flight_at_entry: inFlightAtEntry },
+          data: { duration_ms: Date.now() - t0, item_count: texts.length, model_cold_start: !modelWarm, in_flight_at_entry: inFlightAtEntry, cache_hits: cacheHits, cache_misses: cacheMisses },
         });
-        json(res, { vectors });
+        // t/3166 item 2 / t/3165: a boot-only "loaded N nodes" signal (t/3081) can't see a
+        // MID-LIFE cache miss — the exact shape of t/3165 (present-but-non-resolving cache
+        // re-embedding keyed corpus texts). Emit a WARN when KEYED texts (ids provided) fail to
+        // resolve, so a re-embed is directly greppable instead of inferred from latency. Gated on
+        // `ids` because ad-hoc query embeds pass none (cacheHits=0 by construction) and would spam.
+        if (ids && cacheMisses > 0) {
+          const missMsg = `embeddings.compute: cache miss — re-computing ${cacheMisses} of ${texts.length} keyed texts (resolved ${cacheHits} from cache)`;
+          getGlobalRecorder()?.record({
+            type: 'system.error', component: 'embeddings-compute', level: 'warn',
+            message: missMsg,
+            data: { cache_hits: cacheHits, cache_misses: cacheMisses, item_count: texts.length, request_id: getRequestId() },
+          });
+          log.api.warn({ component: 'embeddings-compute', cache_hits: cacheHits, cache_misses: cacheMisses, item_count: texts.length, request_id: getRequestId() }, missMsg);
+        }
+        // t/3165 (TL p/522#111): the keyed-miss WARN above is ids-gated, so it MISSES the actual
+        // t/3165 mechanism — a large batch of NOVEL, no-ids text (frames/paras/claims) that
+        // legitimately re-computes (correct-miss → VOLUME, ties t/2977). Flag that volume case:
+        // a big batch (≥ LARGE_RECOMPUTE_WARN_ITEMS) that fully re-computes (cacheHits==0),
+        // regardless of ids. Threshold ≥64 catches the ~200/792 debate batches but stays silent
+        // on small legit ad-hoc computes (both arms — TL GV condition).
+        if (texts.length >= LARGE_RECOMPUTE_WARN_ITEMS && cacheHits === 0) {
+          const volMsg = `embeddings.compute: large no-cache recompute — ${texts.length} texts, 0 cache hits (${ids ? 'keyed but unresolved' : 'novel no-ids text — volume, not a cache miss'})`;
+          getGlobalRecorder()?.record({
+            type: 'system.error', component: 'embeddings-compute', level: 'warn',
+            message: volMsg,
+            data: { item_count: texts.length, cache_hits: 0, has_ids: !!ids, request_id: getRequestId() },
+          });
+          log.api.warn({ component: 'embeddings-compute', item_count: texts.length, cache_hits: 0, has_ids: !!ids, request_id: getRequestId() }, volMsg);
+        }
+        // t/3165: expose cacheHits/cacheMisses + corpusNodeCount so the t/3091 resolution gate
+        // (DevOps 2) can (1) assert a canary keyed lookup actually HITS the cache — presence≠resolution —
+        // and (2) disambiguate a DEAD cache from a bad canary id: cacheHits==0 && corpusNodeCount==0 →
+        // cache dead (rollback); cacheHits==0 && corpusNodeCount>0 → id not in corpus (config error, no rollback).
+        const corpusNodeCount = ai.getEmbeddingsCacheStatus?.()?.nodeCount ?? 0;
+        json(res, { vectors, cacheHits, cacheMisses, corpusNodeCount });
       } finally {
         endEmbeddingCompute();
       }
-    } catch (err) { getGlobalRecorder()?.record({ type: 'system.error', component: 'server', level: 'error', message: 'Failed to compute embeddings', error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } }); error(res, String(err), 500, err); }
+    } catch (err) {
+      getGlobalRecorder()?.record({ type: 'system.error', component: 'server', level: 'error', message: 'Failed to compute embeddings', error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } });
+      // t/3074 Sub-change B: per-chunk timeout is transient (server under load) → retryable 503
+      // so the client backs off instead of receiving an opaque 500. Branch on the typed
+      // .timeout marker set by resolveEmbeddingsChunked (not fragile-prose — t/2952).
+      // Deterministic errors (bad input, init failure) have no .timeout → remain 500.
+      if ((err as { timeout?: boolean }).timeout === true) {
+        // t/3079: log at warn (not error — this is a transient backpressure signal, not a fault)
+        // with requestId so the client 503 is correlatable to the server-side stall.
+        log.api.warn({ request_id: getRequestId(), item_count: Array.isArray(texts) ? texts.length : 0 }, 'embeddings.compute: chunk timeout → 503');
+        res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '5' });
+        res.end(JSON.stringify({ error: 'Embedding compute timed out — retry after backoff', retryable: true, retryAfterMs: 5000 }));
+        return;
+      }
+      error(res, String(err), 500, err);
+    }
   }));
 
   // t/1171: same free-tier exemption + rate limiting + key as /compute, so anonymous

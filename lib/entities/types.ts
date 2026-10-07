@@ -65,6 +65,98 @@ export type DolceCategory =
   | 'agentive-physical-object' | 'non-agentive-functional-artifact'
   | 'perdurant' | 'normative-description' | 'non-agentive-social-object';
 
+/**
+ * Provenance of an Entity's `description` (t/3131). Drives the person-approval gate in
+ * Import-Entity: a `person` is approvable only when this is `human-edited`/`human-authored`
+ * (or ABSENT with a non-empty description — grandfathered as human-authored, since the LLM
+ * never drafted person descriptions before t/3131). `ai-drafted` is proposable but NOT
+ * approvable until a human edits it. Any AI-drafting path for a person description MUST stamp
+ * `ai-drafted` at draft time — the grandfather rule (absent ⟺ legacy human-authored) rests
+ * entirely on no un-stamped AI draft ever existing (TL t/3131#2 safety condition).
+ */
+export type EntityDescriptionProvenance = 'ai-drafted' | 'human-edited' | 'human-authored';
+
+/**
+ * How a link (an `entity_refs[]` entry on a claim or BDI node) matched its target relative to the
+ * register (R4.2) — lets downstream consumers (conflict detection, FOL export) tell an exact match
+ * from a subsumption hop. `exact` = the surface names the target; the others = matched via ≤1–2
+ * relation hops. Shared match-level VOCABULARY only; the link-record shape and the direction
+ * semantics of each label are ASSIGNED by the resolution pass (t/3124) — see there for what each
+ * label means at assignment time. Split out of t/3119 to land early (pure enum, no relations/
+ * allowlist coupling — CL p/3#156), unblocking the t/3157 node link-refs + t/3124.
+ */
+export type EntityMatchLevel = 'exact' | 'instance_of' | 'subclass' | 'superclass' | 'related';
+
+/**
+ * Confirmation state of a link (t/3157, CL p/3#153). LOAD-BEARING — it's what lets a precise link
+ * coexist with a speculative one without contaminating it: `linked` = confirmed (a surface/exact/
+ * alias match, or a human/threshold-confirmed embedding hit); `proposed` = an unconfirmed embedding
+ * candidate that must NOT count until confirmed (the "Andreessen cos-matches 45 nodes it doesn't
+ * mention" problem). Required on every link ref — an unstatused ref is indistinguishable from a
+ * confirmed one, which is the failure this field exists to prevent.
+ */
+export type EntityLinkStatus = 'linked' | 'proposed';
+
+/**
+ * A resolved link from a container (a BDI node's `entity_refs[]` — t/3157 — or a claim's
+ * `entity_refs[]` — t/3124) to a register entity. ONE shape serves both containers (CL p/3#154).
+ * `ref` is the raw `ent-*` token (parsed on read via {@link parseEntityRef}); `method` records how
+ * it was found; `match_level` how it matched relative to the register ({@link EntityMatchLevel});
+ * `link_confidence` the method-dependent score (exact/alias = 1.0; embedding = cosine); `status`
+ * gates whether it counts. Assignment semantics (which label/method/status) are owned by the
+ * resolution pass (t/3124) — this is the persisted shape only.
+ */
+export interface EntityLinkRef {
+  ref: string;                                   // ent-* raw token
+  surface: string;                               // matched surface form
+  method: 'exact' | 'alias' | 'embedding';
+  link_confidence: number;                       // [0,1] — method-dependent: 1.0 for exact/alias, cosine for embedding
+  match_level: EntityMatchLevel;
+  status: EntityLinkStatus;
+}
+
+/**
+ * A resolved link from a BDI node's `concept_refs[]` to a dictionary concept (`term:*`) — t/3157.
+ * Parallel to {@link EntityLinkRef} but simpler: NO `match_level`, because a concept ref already
+ * names a kind/class, so there is no subsumption hop to record (CL p/3#154). `method` is narrower
+ * (a concept is matched by surface or embedding, never an alias table).
+ */
+export interface ConceptLinkRef {
+  ref: string;                                   // term:<slug> raw token
+  surface: string;
+  method: 'surface' | 'embedding';
+  link_confidence: number;                       // [0,1] — method-dependent: 1.0 for exact/alias, cosine for embedding
+  status: EntityLinkStatus;
+}
+
+/**
+ * A DOLCE-typed relation between two register entities (or an entity and a `term:*` type) — R4.1.
+ * The three types are kept explicitly DISTINCT (CL DOLCE review, t/3119#2):
+ * - `instance_of` — a particular → its type. This is the bridge that crosses `ent-*` → `term:*`
+ *   (a particular entity is an instance of a vocabulary kind). NOT interchangeable with subclass.
+ * - `subclass_of` — a type → its supertype (type-level subsumption, e.g. one term narrows another).
+ * - `part_of` — generic mereology (a particular part_of a particular, a sub-event part_of a
+ *   perdurant). Constitution is deliberately excluded (CL §7.2); `part_of` must NEVER be used to
+ *   encode an instance/subclass hop.
+ */
+export type EntityRelationType = 'instance_of' | 'subclass_of' | 'part_of';
+
+/**
+ * One relation edge on an {@link Entity}. `target` is a RAW `ent-*` | `term:<slug>` token (parsed on
+ * read via {@link parseEntityRef}, like `Mention.entity_ref` — never persist a pre-parsed form).
+ *
+ * INVARIANT (R4.3, enforced WRITE-SIDE — not by this type): the relation graph is a shallow DAG —
+ * acyclic, depth ≤ 3, `target` well-formed. A TypeScript interface cannot prevent a cycle or an
+ * over-depth graph, so enforcement lives at the relation-authoring path (Import-Entity when a
+ * relation is added) + the entity audit-cycle sweep, NOT here (TL t/3119, p/342#204). The DAG/
+ * depth/target validator is a separate ticket (t/3170) that hard-BLOCKS any relations-populating
+ * work — no path may persist an unvalidated `relations[]` (fast-follow enforced, not intended).
+ */
+export interface EntityRelation {
+  type: EntityRelationType;
+  target: string;                 // ent-* | term:<slug> raw token (parsed via parseEntityRef)
+}
+
 /** The new entity record (ent-*), stored in entities.json. */
 export interface Entity {
   id: string;                     // ent-NNN
@@ -72,10 +164,19 @@ export interface Entity {
   aliases: string[];
   entity_type: EntityType;
   dolce_category: DolceCategory;
-  /** Genus-differentia: "A [type] that [differentia]...". Human-authored for `person`. */
+  /** Genus-differentia: "A [type] that [differentia]...". For a `person`, AI may draft it but
+   *  approval requires a human edit — see `description_provenance` and the Import-Entity gate (t/3131). */
   description: string;
+  /** Provenance of `description` — gates person approval (t/3131). Absent = legacy/unset
+   *  (grandfathered as human-authored when the description is non-empty). See {@link EntityDescriptionProvenance}. */
+  description_provenance?: EntityDescriptionProvenance;
   external_refs?: { label: string; url: string }[];
   source_refs?: string[];         // doc_ids
+  /** DOLCE-typed relation edges (instance_of/subclass_of/part_of) to other entities/terms (R4.1).
+   *  Optional; shallow-DAG + depth≤3 + acyclic invariant is enforced write-side, NOT by this type —
+   *  see {@link EntityRelation}. Currently ACCEPTED-BUT-DROPPED by Import-Entity (allowlisted, not
+   *  persisted) until the relation-authoring path + DAG validator land (t/3119 fast-follow). */
+  relations?: EntityRelation[];
   status: 'proposed' | 'approved' | 'deprecated';
   /** Set ⇒ this record is a merge tombstone; resolve to the canonical id (Section 7). */
   merged_into?: string;

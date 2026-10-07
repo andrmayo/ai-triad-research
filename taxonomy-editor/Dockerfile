@@ -7,7 +7,7 @@
 # (see deploy/azure/Dockerfile.base)
 
 # ── Stage 1: Build ──
-FROM node:22.23.2-trixie-slim@sha256:db8a96a63e5264607ada2d206758876ebbed6a12be2ada7517793cbfb0c2a29c AS builder
+FROM node:22.23.2-trixie-slim@sha256:7b8a0c89c54499bee567618f96578e1a12a800f062fbdbfd1fb6a443fa6f6284 AS builder
 
 WORKDIR /build
 
@@ -94,7 +94,7 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
 # so onnxEmbedding.ts runs fully offline. Without this, each cold-start downloads
 # from HuggingFace at runtime, hitting the 50s route timeout (t/2784).
 # fp32 is required — quantized output diverges from the stored embeddings.json corpus.
-FROM node:22.23.2-trixie-slim@sha256:db8a96a63e5264607ada2d206758876ebbed6a12be2ada7517793cbfb0c2a29c AS onnx-model
+FROM node:22.23.2-trixie-slim@sha256:7b8a0c89c54499bee567618f96578e1a12a800f062fbdbfd1fb6a443fa6f6284 AS onnx-model
 # hadolint ignore=DL3008
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
@@ -108,7 +108,7 @@ RUN mkdir -p /onnx/all-MiniLM-L6-v2 \
          -o /onnx/all-MiniLM-L6-v2/tokenizer_config.json
 
 # ── Stage 2: Production dependencies (with build tools for native modules) ──
-FROM node:22.23.2-trixie-slim@sha256:db8a96a63e5264607ada2d206758876ebbed6a12be2ada7517793cbfb0c2a29c AS prod-deps
+FROM node:22.23.2-trixie-slim@sha256:7b8a0c89c54499bee567618f96578e1a12a800f062fbdbfd1fb6a443fa6f6284 AS prod-deps
 
 # node-pty requires make/g++/python3 for compilation when prebuilds
 # are unavailable. The runtime base image is intentionally slim (no
@@ -137,12 +137,22 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store pnpm install --prod 
 # (deploy-staging.yml Test-TaxEditorHealth /healthz). :2026-07-30 was exonerated in t/2047 —
 # root cause was t/2061 (isDataAvailable path mismatch, app-side). Bumped to :2026-08-15 for
 # Debian 13 Trixie upgrade + .trivyignore cleanup (t/2681).
+# Bumped to :2026-08-31 for the cache-bust security rebuild (t/3137) — the base now
+# genuinely re-runs apt/npm upgrades: openssl 3.5.7-1~deb13u2 (CVE-2026-14456) and
+# npm's bundled tar 7.5.21 (CVE-2026-73566), both proven by the base build tripwires.
 # Gate base bumps on staging /healthz, not CI green.
-FROM ghcr.io/jpsnover/ai-triad-base:2026-08-15@sha256:60a955b4523340536e9ed3e20a737304b58b56fe3a150fe643fb61699a58ca63 AS runtime
+FROM ghcr.io/jpsnover/ai-triad-base:2026-09-01@sha256:82fdf56b8dfeefd81fc09d5f69960e6c54d216043adc9a942df179f0ff74f77e AS runtime
 
 LABEL org.opencontainers.image.source="https://github.com/jpsnover/ai-triad-research"
 LABEL org.opencontainers.image.description="AI Triad Taxonomy Editor"
 LABEL org.opencontainers.image.licenses="MIT"
+
+# Build commit SHA baked into the RUNTIME image env (t/3278 drift-prevention). container.yml passes
+# --build-arg BUILD_SHA=<sha>; default 'unknown' keeps local/plain builds working. Makes "which
+# commit is running in prod?" answerable from the running image env instead of digest forensics.
+# ARG is re-declared here because ARGs do not cross stages (the builder stage's BUILD_SHA is for Vite).
+ARG BUILD_SHA=unknown
+ENV BUILD_SHA=${BUILD_SHA}
 
 # Cache dir created at runtime by the app (GitHubAPIBackend).
 # TAXONOMY_CACHE_DIR MUST match AI_TRIAD_DATA_ROOT (t/2061): config.ts's cacheDir
@@ -202,6 +212,20 @@ COPY --chown=aitriad:aitriad --from=builder /build/taxonomy-editor/THIRD-PARTY-N
 # 5. PTY broker script (Python, not compiled by tsc — copy to where config.ts expects it)
 COPY --chown=aitriad:aitriad taxonomy-editor/src/main/pty-broker.py ./src/main/pty-broker.py
 
+# 5b. Grounding reconciler (Python, G8 enable prereq — t/3213). The G8a inline write-hook
+#     (groundingReconcileHook.ts) and the G8b full sweep (groundingSweepScheduler.ts) shell out
+#     to this at RECONCILE_SCRIPT (config.ts:402 = /app/research/comp-linguist/scripts/
+#     reconcile_grounding.py; PROJECT_ROOT=/app). Without it every sweep would ENOENT/
+#     ModuleNotFoundError — dead-on-arrival as shipped (t/3172#4). The script is stdlib + numpy;
+#     numpy is NOT in the base image, so install it via apt (python3-numpy) — debian-native, no
+#     pip/PEP-668/venv dance, into the same system python3 the server's execFile('python3', …)
+#     uses. DevOps's container smoke asserts `python3 <script> --selftest` exits 0 (t/3213 AC).
+# hadolint ignore=DL3008
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends python3-numpy
+COPY --chown=aitriad:aitriad research/comp-linguist/scripts/reconcile_grounding.py ./research/comp-linguist/scripts/reconcile_grounding.py
+
 # 6. Fallback taxonomy snapshot — baked last-known-good data for GitHub outages.
 #    CI fetches from ai-triad-data HEAD; changes on every build — LAST layer.
 #    Contains snapshot-meta.json with generation timestamp for stale-data banner.
@@ -218,6 +242,19 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && rm /tmp/ms-prod.deb \
     && apt-get update \
     && apt-get install -y --no-install-recommends powershell
+
+# 8. Strip global npm from the runtime image (t/3135). npm is NOT reachable at
+# runtime — CMD is a direct `node`; npm/pnpm are used only in the discarded
+# builder/prod-deps stages; the web console spawns pwsh (not npm); there is no
+# start-time npm script. Removing it deletes the entire npm-bundled-dep CVE class
+# (e.g. tar CVE-2026-73566 under .../node_modules/npm/node_modules/tar) from the
+# deployed image in one shot. The `command -v npm` guard fails the build loudly if
+# a future base layout leaves npm behind, so the strip can't silently regress.
+RUN rm -rf /usr/local/lib/node_modules/npm \
+           /usr/local/bin/npm \
+           /usr/local/bin/npx \
+    && if command -v npm >/dev/null 2>&1; then echo "[t/3135] ERROR: npm still on PATH after strip" && exit 1; fi \
+    && echo "[t/3135] npm/npx stripped from runtime image"
 
 USER aitriad
 

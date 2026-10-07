@@ -66,10 +66,12 @@ jobs:
       debate: ${{ steps.filter.outputs.debate }}
       schema: ${{ steps.filter.outputs.schema }}
       lib: ${{ steps.filter.outputs.lib }}
+      embeddings: ${{ steps.filter.outputs.embeddings }}
       python: ${{ steps.filter.outputs.python }}
       container: ${{ steps.filter.outputs.container }}
       lockfile-sync: ${{ steps.filter.outputs.lockfile-sync }}
       bicep-env: ${{ steps.filter.outputs.bicep-env }}
+      bicep-resources: ${{ steps.filter.outputs.bicep-resources }}
     steps:
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         id: filter
@@ -115,9 +117,24 @@ jobs:
             lib:
               - 'lib/**'
               - '.github/workflows/ci.yml'
+            # 'embeddings' gates embedding-onnx-equivalence (t/3198): the real-ONNX bit-exact
+            # worker↔in-thread check. Narrower than 'lib' — only the embeddings subtree (worker,
+            # in-thread module, harness) or a ci.yml edit can change the equivalence outcome, so
+            # a broad lib change need not pay the build:server + model-download cost. Advisory job
+            # (not in ci-gate needs), so a too-narrow filter cannot false-green a required context.
+            embeddings:
+              - 'lib/embeddings/**'
+              - '.github/workflows/ci.yml'
             python:
               - 'scripts/**'
               - '.github/ci/**'
+              # research/comp-linguist/scripts/** — the G7 grounding reconciler
+              # (reconcile_grounding.py) + its selftest. Previously uncovered: a
+              # reconciler change matched NO filter → test-python skipped → ci-gate
+              # false-greened it through, and the selftest never gated (t/3189; #1726
+              # merged its disjoint-scope contract untested). test-python now runs the
+              # reconciler --selftest for these paths (see that job).
+              - 'research/comp-linguist/scripts/**'
               - '.github/workflows/ci.yml'
             # 'container' gates test-container (t/2094). SOUNDNESS: ci-gate treats
             # a SKIPPED gated job as satisfied, so this list must cover EVERYTHING
@@ -139,6 +156,11 @@ jobs:
             # change the image — it must trigger the build (t/2094 review, TL2).
             container:
               - 'taxonomy-editor/**'
+              # research/comp-linguist/scripts/** — the grounding reconciler is COPYd into
+              # the prod image (Dockerfile, Rosetta #1810). Per the t/2094 paths-filter
+              # soundness rule, every Dockerfile COPY input must gate test-container, or a
+              # reconciler-only change false-greens a SKIPPED container job.
+              - 'research/comp-linguist/scripts/**'
               - '.dockerignore'
               - 'lib/**'
               - 'scripts/**'
@@ -169,6 +191,12 @@ jobs:
               - '.github/workflows/deploy-azure.yml'
               - 'operations/devops/Get-BicepBaseEnv.ps1'
               - 'operations/devops/Test-BicepEnvDrift.ps1'
+              - '.github/workflows/ci.yml'
+            # 'bicep-resources' gates bicep-aca-resources (t/3212). Triggers when
+            # main.bicep or the validator script changes. Skip = OK through ci-gate.
+            bicep-resources:
+              - 'deploy/azure/main.bicep'
+              - 'operations/devops/Test-BicepAcaResourcePairs.ps1'
               - '.github/workflows/ci.yml'
 
   test-powershell:
@@ -357,6 +385,99 @@ jobs:
           Import-Module ./scripts/AITriad/AITriad.psd1 -Force
           $r = Test-PreloadHealth -CheckSyntax
           if (-not $r.Healthy) { $r.Checks | Where-Object { -not $_.Pass } | ForEach-Object { Write-Error $_.Detail }; exit 1 }
+
+  # ── render-smoke: "surface renders styled" gate (t/3026 / t/3059) ──
+  # Catches the failure class "a component's CSS lives in a lazy tab-chunk that is NOT
+  # loaded on the surface that uses the classes → the surface renders UNSTYLED with no
+  # error" (the .ga-* t/3024 incident + the t/3025 orphans). jsdom/vitest cannot compute
+  # stylesheet cascade → a unit test is a false-green; this must run in a REAL browser
+  # (Playwright-Chromium) against a PROD web build served by the real server, so lazy CSS
+  # code-splitting behaves exactly as in prod. Harness: taxonomy-editor/smoke/ (PR #1589).
+  #
+  # BLOCKING (t/3026 promotion — flipped from warn-phase): render-smoke is now in ci-gate's
+  # `needs`, so a RED render-smoke fails ci-gate (the required status context) and blocks merge.
+  # It is NOT itself a separately-required context — enforcement rides ci-gate, so a SKIPPED
+  # render-smoke (a non-electron PR) is treated as satisfied, exactly like every other gated job.
+  # Promotion evidence: 8 consecutive green real-env cycles on main (zero warn-phase noise) +
+  # real-env both-arms in the CI runner (deliberate .ga-* misfile → red; clean → green) + TL GV
+  # PASS. If this ever flakes it now blocks electron PRs — DEMOTE first (pull from ci-gate needs),
+  # then fix, per gate-signal integrity (a flaky blocking gate is the next incident).
+  #
+  # NODE 22 PIN IS LOAD-BEARING (t/3026#10 cond3 / t/3059 Part3): the @playwright/test
+  # runner hangs on Node ≥24.16.0 (yauzl stream-destruction regression; 24.15.0 is the only
+  # non-hanging 24). Pinned @playwright/test 1.60.0 vendors the fix (microsoft/playwright#40747),
+  # and Node 22 is belt-and-suspenders. Do NOT bump this job to Node 24 unless 1.60.0+ is
+  # re-verified green on the runner — a silent hang would wedge a by-then-blocking gate.
+  #
+  # Playwright browser caching (~/.cache/ms-playwright) is now wired (below) via the repo's first
+  # SHA-pinned actions/cache — trims the ~1min chromium download now that the gate blocks. (t/3059.)
+  render-smoke:
+    needs: [changes]
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.electron == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+        continue-on-error: true
+        with:
+          repository: jpsnover/ai-triad-data
+          path: ai-triad-data
+          fetch-depth: 1
+
+      - name: Symlink data repo to expected location
+        run: ln -s "$GITHUB_WORKSPACE/ai-triad-data" ../ai-triad-data
+        continue-on-error: true
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+        with:
+          version: '11.20.0'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v6
+        with:
+          node-version: '22'   # PIN — load-bearing; see header (Playwright runner hangs on Node 24)
+          cache: 'pnpm'
+          cache-dependency-path: 'pnpm-lock.yaml'
+
+      - name: Install dependencies (retry on transient failures — t/2968)
+        run: |
+          for i in 1 2 3; do
+            pnpm install --frozen-lockfile --side-effects-cache && break
+            if [ "$i" -lt 3 ]; then
+              echo "pnpm install attempt $i failed; retry in $((i * 15))s"
+              sleep $((i * 15))
+            else
+              echo "::error::pnpm install failed after $i attempts"
+              exit 1
+            fi
+          done
+
+      # Cache the Playwright browser binary — trims the ~1min chromium download now that
+      # render-smoke is a blocking gate (t/3026). Keyed on the standalone lockfile (which pins
+      # @playwright/test), so a Playwright bump busts the cache and re-fetches the matching
+      # browser. First SHA-pinned actions/cache in the repo.
+      - name: Cache Playwright browsers (~/.cache/ms-playwright)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ hashFiles('taxonomy-editor/pnpm-lock.yaml') }}
+          restore-keys: |
+            ms-playwright-${{ runner.os }}-
+
+      - name: Install Chromium (Playwright, pinned @playwright/test 1.60.0)
+        working-directory: taxonomy-editor
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Build prod web artifact + server (build:container)
+        working-directory: taxonomy-editor
+        run: pnpm run build:container
+
+      - name: Render smoke — styled surfaces (BLOCKING gate via ci-gate, t/3026)
+        working-directory: taxonomy-editor
+        run: pnpm run smoke:styled
 
   # ── renderer-tsc: renderer type-check gate (t/2252) ──
   # CI ran `tsc --noEmit -p tsconfig.main.json` for main-process code but NEVER
@@ -806,13 +927,13 @@ jobs:
           df -h /
 
       - name: Lint Dockerfiles
-        uses: hadolint/hadolint-action@2a66e89f53d0771bb131a7fa31f3136336094aa6  # v3.4.0
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387  # v3.5.0
         with:
           dockerfile: taxonomy-editor/Dockerfile
           failure-threshold: error
 
       - name: Lint base Dockerfile
-        uses: hadolint/hadolint-action@2a66e89f53d0771bb131a7fa31f3136336094aa6  # v3.4.0
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387  # v3.5.0
         with:
           dockerfile: deploy/azure/Dockerfile.base
           failure-threshold: error
@@ -840,7 +961,7 @@ jobs:
           done
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4
         with:
           driver-opts: image=moby/buildkit:buildx-stable-1
 
@@ -873,6 +994,18 @@ jobs:
           push: false
           load: true
           tags: ai-triad-test:ci
+
+      - name: Reconciler --selftest INSIDE the prod image (t/3213)
+        # Proves reconcile_grounding.py + its numpy dep are actually present and
+        # runnable IN the shipped image (Rosetta #1810 COPYs them in). The host-side
+        # selftest (test-python, t/3189) proves the source contract; this proves the
+        # image bakes it. G8-enable prereq — without this the reconciler could be
+        # dead-on-arrival in prod (t/3172#4) and no gate would catch it.
+        env:
+          IMAGE: ai-triad-test:ci
+        run: |
+          docker run --rm --entrypoint python3 "$IMAGE" \
+            research/comp-linguist/scripts/reconcile_grounding.py --selftest
 
       - name: Run container liveness smoke — server starts + answers (t/2048, t/2067)
         timeout-minutes: 8
@@ -941,6 +1074,15 @@ jobs:
           HF_HUB_OFFLINE: '1'
           TRANSFORMERS_OFFLINE: '1'
         run: python -m pytest test_*.py -v
+      # G7 grounding reconciler selftest (t/3189). reconcile_grounding.py ships a
+      # CLI selftest (--selftest: consistency / disjoint-scope / idempotence /
+      # change-detection / removal-purge — the G7 contract) that exits non-zero on
+      # failure. It is NOT a pytest test_*.py file, so the pytest step above cannot
+      # discover it; invoke it explicitly here. Self-contained (uses in-file
+      # fixtures, no external data/model), so no extra deps. This closes the gap
+      # where a reconciler change (e.g. #1726) merged with the contract untested.
+      - name: Reconciler G7 contract selftest
+        run: python research/comp-linguist/scripts/reconcile_grounding.py --selftest
 
   # ── python-embed-smoke: validate the pip embedding stack (t/1989) ──────────
   # The pip ecosystem (scripts/requirements.txt) was never installed or exercised
@@ -1135,6 +1277,92 @@ jobs:
           ALLOWED_ORIGINS: ''
         run: pnpm exec vitest run src/server/
 
+  # ── embedding-onnx-equivalence: real-ONNX bit-exact worker↔in-thread equivalence (t/3198) ──
+  # Runs the t/3181 condition-3 check in CI, closing the t/3189 "only-runs-on-one-box" gap: the
+  # off-thread worker (intra-op=1) must produce BIT-EXACT vectors vs the in-thread default path on
+  # the SAME execution provider. `offThreadEmbedding.test.ts`'s equivalence case is skip-guarded and
+  # cannot spawn the real worker under vitest (defaultWorkerFactory loads ./embeddingWorker.js next to
+  # the SOURCE, where no compiled sibling exists, and vitest doesn't transform code inside a spawned
+  # node worker_thread). So this job runs the harness against the BUILT server dist — build:server
+  # emits the runnable worker + in-thread module to dist/server/lib/embeddings/, the exact artifacts
+  # prod ships — with the fp32 model provisioned exactly as taxonomy-editor/Dockerfile's onnx-model
+  # stage does (same 3 HF files, cached).
+  #
+  # ADVISORY — deliberately NOT in ci-gate `needs`. A first-of-its-kind bit-exact float assertion
+  # stays non-blocking per the "no flaky blocking gates" rule until it proves stable across green
+  # cycles; a red here still surfaces as a failed check on the PR. Promotion to a required gate is a
+  # follow-up for TL Gate Verification. Path-filtered to lib/embeddings changes; skip = N/A.
+  embedding-onnx-equivalence:
+    needs: [changes]
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.embeddings == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+        with:
+          version: '11.20.0'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v6
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: 'pnpm-lock.yaml'
+
+      - name: Install dependencies (retry on transient failures)
+        run: |
+          for i in 1 2 3; do
+            pnpm install --frozen-lockfile && break
+            if [ "$i" -lt 3 ]; then
+              echo "pnpm install attempt $i failed; retry in $((i * 15))s"
+              sleep $((i * 15))
+            else
+              echo "::error::pnpm install failed after $i attempts"
+              exit 1
+            fi
+          done
+
+      - name: Build server (emits the runnable off-thread worker + in-thread module to dist)
+        working-directory: taxonomy-editor
+        run: pnpm run build:server
+
+      # Cache the flat fp32 model set (model.onnx + tokenizer.json + tokenizer_config.json). Keyed on
+      # the model contract (Xenova/all-MiniLM-L6-v2 fp32, t/1651). Bump the -v1 suffix if the contract
+      # changes. A cache hit skips the HF download → near-zero marginal cost (the t/3198 intent).
+      - name: Cache fp32 ONNX model
+        id: onnx-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: .cache/onnx-models/all-MiniLM-L6-v2
+          key: onnx-model-all-MiniLM-L6-v2-fp32-v1
+
+      - name: Provision fp32 model from Hugging Face (cache miss only)
+        if: steps.onnx-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          DIR=.cache/onnx-models/all-MiniLM-L6-v2
+          mkdir -p "$DIR"
+          BASE=https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main
+          # Retry the HF fetch — it 429s / times out intermittently on cache-miss, and a bare
+          # curl fails the job (DevOps review, p/27#41). curl's native retry backs off on all
+          # errors (incl. 429) + connection refusals; --fail keeps a non-200 an error.
+          fetch() { curl --retry 5 --retry-delay 5 --retry-connrefused --retry-all-errors -fSL "$1" -o "$2"; }
+          fetch "$BASE/onnx/model.onnx"       "$DIR/model.onnx"
+          fetch "$BASE/tokenizer.json"        "$DIR/tokenizer.json"
+          fetch "$BASE/tokenizer_config.json" "$DIR/tokenizer_config.json"
+          ls -l "$DIR"
+
+      - name: Real-ONNX bit-exact equivalence (off-thread intra-op=1 vs in-thread default, CPU EP)
+        env:
+          AI_TRIAD_ONNX_MODEL_DIR: ${{ github.workspace }}/.cache/onnx-models/all-MiniLM-L6-v2
+          # Pin the CPU EP — the EP CI and prod (ACA, no GPU) run, and the only one where the
+          # bit-exact contract holds (a GPU EP is non-deterministic across sessions). The harness
+          # also self-defaults this; set here for visibility.
+          AI_TRIAD_ONNX_FORCE_CPU: '1'
+        run: node lib/embeddings/onnx-equivalence-check.mjs
+
   # ── workflow-lint: enforce SHA-pinned actions, env-var indirection, permissions ──
   # Mechanically catches the M14/M15/L8 failure classes (t/2529). Always runs —
   # no path filter, since any workflow edit can introduce a violation.
@@ -1175,6 +1403,25 @@ jobs:
         shell: pwsh
         run: ./operations/devops/Test-BicepEnvDrift.ps1
 
+  # ── bicep-aca-resources: ACA cpu:memory allowed-pair validation (t/3212) ──
+  # Parses cpu:memory pairs from deploy/azure/main.bicep and validates each
+  # against the ACA Consumption fixed allowed-pairs table (co-located in the
+  # script). Catches the #1771 escape: 2.0vCPU+2Gi compiled fine with
+  # `az bicep build` but fails ARM deploy with ContainerAppInvalidResourceTotal.
+  # Path-filtered; skip = OK through ci-gate.
+  bicep-aca-resources:
+    needs: [changes]
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.bicep-resources == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+
+      - name: Validate ACA cpu:memory pairs in main.bicep (t/3212)
+        shell: pwsh
+        run: ./operations/devops/Test-BicepAcaResourcePairs.ps1
+
   # ── ci-gate: the SINGLE required status context (t/1962) ──────────────────
   # Replaces the 6 individual code-check contexts in branch protection. Those get
   # SKIPPED by path-filtering on non-electron PRs (docs-only, PS-only); a skipped
@@ -1208,9 +1455,11 @@ jobs:
   # lib/brief/schemas/*.write.json contract changes; path-filtered to lib, skip = OK.
   # test-python (t/2933) is gated here: runs scripts/test_*.py under pytest;
   # path-filtered to scripts/** changes, skip = OK.
+  # bicep-aca-resources (t/3212) is gated here: ACA cpu:memory allowed-pair
+  # validation in main.bicep; path-filtered to bicep-resources changes, skip = OK.
   ci-gate:
     name: ci-gate
-    needs: [changes, test-powershell, test-electron, test-container, python-embed-smoke, test-python, dependency-coverage, lockfile-overrides-check, lib-lint, renderer-tsc, contrast-check, test-server-prod-config, workflow-lint, bicep-env-drift, schema-version-bump]
+    needs: [changes, test-powershell, test-electron, test-container, python-embed-smoke, test-python, dependency-coverage, lockfile-overrides-check, lib-lint, renderer-tsc, contrast-check, test-server-prod-config, workflow-lint, bicep-env-drift, schema-version-bump, render-smoke, bicep-aca-resources]
     if: always()
     runs-on: ubuntu-latest
     steps:

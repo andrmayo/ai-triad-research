@@ -12,9 +12,12 @@ function Import-Entity {
         ever added, updated, tombstoned (`merged_into`), or `deprecated` — NEVER hard-deleted.
         That is the invariant the monotonic id allocator depends on (design §3, TL t/1804#2 Q3).
 
-        Person exception (owner decision, design §4/§9.3): a `person` record cannot be
-        `approved` without a human-authored `description` — approving one with an empty
-        description throws an ActionableError (no LLM ever drafts a person description).
+        Person policy (owner decision 2026-08-31, design §4/§9.3, t/3131): a `person` description
+        may be AI-DRAFTED, but approval requires a human editor. A `person` is `approved` only when
+        `description` is non-empty AND `description_provenance` is `human-edited` / `human-authored`
+        (or unset — grandfathered legacy, safe while no AI path drafts a person description without
+        stamping `ai-drafted`). Approving a `person` whose provenance is still `ai-drafted`, or whose
+        description is empty, throws an ActionableError directing the human to edit + set provenance.
 
         Approved records get one all-MiniLM-L6-v2 embedding (name + genus-differentia line)
         written to a SEPARATE entity_embeddings.json via the existing Get-TextEmbedding path
@@ -26,7 +29,8 @@ function Import-Entity {
         1-20 proposal records (hashtable or PSCustomObject). New records require `name`,
         `entity_type`, `dolce_category`; optional `description`, `aliases`, `source_refs`,
         `external_refs`, `discovered_by`, `confidence`, `status` (default 'proposed'), `id`
-        (to update an existing record), `merged_into` (to tombstone/merge into a canonical id).
+        (to update an existing record), `merged_into` (to tombstone/merge into a canonical id),
+        `description_provenance` (`ai-drafted` | `human-edited` | `human-authored`; gates person approval).
     .PARAMETER Path
         Override entities.json path (fixtures/tests). Defaults to Get-EntitiesFilePath.
     .PARAMETER EmbeddingsPath
@@ -94,6 +98,45 @@ function Import-Entity {
         $description = [string](& $prop $p 'description' '')
         $status      = [string](& $prop $p 'status' 'proposed')
         $mergedInto  = [string](& $prop $p 'merged_into' '')
+        $descProv    = [string](& $prop $p 'description_provenance' '')   # t/3131: '' = unset/legacy
+
+        # t/3133: reject UNKNOWN proposal fields loudly instead of silently dropping them. The t/3118
+        # near-miss: a stale (pre-t/3131) module didn't read description_provenance, dropped it, and
+        # the grandfather rule would have auto-approved unedited AI drafts. Erroring turns any
+        # stale-code / typo'd-field case into an immediate failure, not silent data-correctness drift.
+        # Top-level keys only (nested shapes like discovered_by.{usage_id,model} are not recursed);
+        # allowlist = the Entity contract (Get-EntityProposalFieldName, kept in sync by the parity test).
+        $knownFields   = Get-EntityProposalFieldName
+        $provKeys      = if ($p -is [hashtable]) { @($p.Keys) } else { @($p.PSObject.Properties.Name) }
+        $unknownFields = @($provKeys | Where-Object { $_ -notin $knownFields })
+        if ($unknownFields.Count -gt 0) {
+            $idLabel = if ($propId) { $propId } elseif ($name) { $name } else { '(unnamed)' }
+            throw (New-ActionableError -PassThru `
+                -Goal 'Import an entity proposal' `
+                -Problem "Proposal '$idLabel' carries unrecognized field(s): $($unknownFields -join ', ')" `
+                -Location 'Import-Entity' `
+                -NextSteps @(
+                    'Remove the unrecognized field(s) from the proposal, OR'
+                    'If a field is a new Entity contract field, add it to lib/entities/types.ts AND Get-EntityProposalFieldName (the drift-parity test guards the pairing)'
+                    'Older module versions silently DROP unknown fields — this refusal prevents a stale-module field-drop (t/3133)'
+                ))
+        }
+
+        # t/3170: write-side relation-DAG gate. `relations[]` is allowlisted (t/3119) but VALIDATE-ONLY
+        # (Q1, TL-approved t/3170#2) — invalid edges are rejected here and valid relations are still
+        # DROPPED (not persisted); persistence is the downstream ticket this gate blocks. Enforced now:
+        # target well-formedness, ent-* existence (from the store), acyclicity, depth<=3 (combined DAG,
+        # depth = edges). Term-target EXISTENCE is DEFERRED to Q4 (Shared Lib parseEntityRef parity) —
+        # until it lands we accept any WELL-FORMED term:* by treating the candidate's term targets as
+        # known, so well-formedness + acyclic + depth still bind on term edges.
+        $propRelations = @(& $prop $p 'relations' @())
+        if ($propRelations.Count -gt 0) {
+            $candId = if ($propId) { $propId } else { 'ent-NEW' }
+            $candTermRefs = @($propRelations |
+                    ForEach-Object { [string](& $prop $_ 'target') } |
+                    Where-Object { $_ -match '^term:' })
+            Assert-EntityRelationsValid -EntityId $candId -Relation $propRelations -ExistingEntity $existing -KnownTermRef $candTermRefs
+        }
 
         $idx = if ($propId) { & $findIndex $propId } else { -1 }
         $isUpdate = ($idx -ge 0)
@@ -106,18 +149,48 @@ function Import-Entity {
         if ($isUpdate -and -not $description -and $existing[$idx].PSObject.Properties['description']) {
             $description = [string]$existing[$idx].description
         }
+        # t/3131: resolve effective provenance from the existing record on updates, so an approval
+        # can't dodge the person gate by omitting description_provenance on the update. An explicit
+        # value on the proposal (e.g. flipping ai-drafted -> human-edited) still wins.
+        if ($isUpdate -and -not $descProv -and $existing[$idx].PSObject.Properties['description_provenance']) {
+            $descProv = [string]$existing[$idx].description_provenance
+        }
 
-        # Person-approval gate (design §4/§9.3): no approval without a human description.
-        if ($entityType -eq 'person' -and $status -eq 'approved' -and [string]::IsNullOrWhiteSpace($description)) {
-            throw (New-ActionableError -PassThru `
-                -Goal 'Approve a person entity' `
-                -Problem "Person entity '$(if ($propId) { $propId } else { $name })' cannot be approved without a human-authored description" `
-                -Location 'Import-Entity' `
-                -NextSteps @(
-                    'Author a genus-differentia description ("A person who ...") for the record',
-                    'The LLM never drafts person descriptions — a human writes every one (design §4)',
-                    'Re-run Import-Entity with the description populated'
-                ))
+        # Person-approval gate (design §4/§9.3, revised t/3131): AI may DRAFT a person description,
+        # but approval still requires a human. A person is approvable iff `description` is non-empty
+        # AND provenance is human (human-edited / human-authored) OR unset. It is NOT approvable when
+        # provenance is 'ai-drafted' (an unedited AI draft) or the description is empty.
+        #
+        # GRANDFATHER SAFETY INVARIANT (t/3131, TL-required): unset provenance is treated as
+        # human-authored ONLY because no code path AI-drafts a person description without stamping
+        # 'ai-drafted' — verified: Invoke-EntityExtraction mints person proposals with NO description
+        # (:40-43/:766). Any FUTURE person AI-drafter MUST stamp description_provenance='ai-drafted',
+        # or an unedited draft would land as unset+non-empty and be silently auto-approved here.
+        # ORDERING (t/3131): this cmdlet must READ+PERSIST description_provenance before any
+        # ai-drafted person is imported (else the marker drops -> grandfather misfires).
+        if ($entityType -eq 'person' -and $status -eq 'approved') {
+            $idLabel = if ($propId) { $propId } else { $name }
+            if ([string]::IsNullOrWhiteSpace($description)) {
+                throw (New-ActionableError -PassThru `
+                    -Goal 'Approve a person entity' `
+                    -Problem "Person entity '$idLabel' cannot be approved without a description" `
+                    -Location 'Import-Entity' `
+                    -NextSteps @(
+                        'Provide a genus-differentia description ("A person who ...")',
+                        "Set description_provenance to 'human-edited' (an AI draft a human edited) or 'human-authored'",
+                        'Re-run Import-Entity'
+                    ))
+            }
+            if ($descProv -eq 'ai-drafted') {
+                throw (New-ActionableError -PassThru `
+                    -Goal 'Approve a person entity' `
+                    -Problem "Person entity '$idLabel' has an AI draft that no human has edited" `
+                    -Location 'Import-Entity' `
+                    -NextSteps @(
+                        "Edit the drafted description and set description_provenance to 'human-edited', then re-run"
+                    ))
+            }
+            # else: description non-empty AND provenance in {human-edited, human-authored, unset} -> approvable.
         }
 
         if ($isUpdate) {
@@ -157,6 +230,15 @@ function Import-Entity {
         $rec.status        = $status
         $rec.last_modified = $now
 
+        # t/3131 (TL-required): READ + PERSIST description_provenance so an imported 'ai-drafted'
+        # marker survives on the stored record (that's what keeps the grandfather rule safe — an
+        # unedited AI draft stays blockable instead of degrading to unset+non-empty). Optional enum:
+        # only written when set; never write '' (not a valid contract value).
+        if ($descProv) {
+            if ($rec.PSObject.Properties['description_provenance']) { $rec.description_provenance = $descProv }
+            else { Add-Member -InputObject $rec -MemberType NoteProperty -Name 'description_provenance' -Value $descProv }
+        }
+
         foreach ($fld in @(
             @{ k = 'aliases';       d = @() },
             @{ k = 'source_refs';   d = @() },
@@ -192,16 +274,52 @@ function Import-Entity {
             if ($null -eq $embStore) {
                 $embStore = if (Test-Path $embPath) { Get-Content -Raw -Path $embPath -Encoding utf8 | ConvertFrom-Json } else { New-EmptyEntityEmbeddingsStore }
             }
-            $text = if ($description) { "$name`n$description" } else { $name }
-            $vecMap = Get-TextEmbedding -Texts @($text) -Ids @($newId)
-            if ($vecMap -and $vecMap.ContainsKey($newId)) {
-                if (-not $embStore.PSObject.Properties['vectors']) {
-                    Add-Member -InputObject $embStore -MemberType NoteProperty -Name 'vectors' -Value ([PSCustomObject]@{})
-                }
-                if ($embStore.vectors.PSObject.Properties[$newId]) { $embStore.vectors.$newId = @($vecMap[$newId]) }
-                else { Add-Member -InputObject $embStore.vectors -MemberType NoteProperty -Name $newId -Value (@($vecMap[$newId])) }
-                $embDirty = $true
+            # t/3121 v2 multi-vector: name_vector embeds label + aliases (drives the resolution
+            # ladder's cosine tie-break); description_vector embeds the description (future R6
+            # rung), OMITTED when description is empty (Shared Lib readers tolerate absence,
+            # entityVectors.ts nameVectorOf). One sub-id batch → one embed subprocess.
+            # `_src_hash` (envelope-side `_src_hashes` map, PS-owned — deliberately NOT in the
+            # EntityVectorRecord type) fingerprints the EXACT embedded source so a re-import and
+            # Update-EntityEmbeddings (t/3121 D) can skip unchanged records idempotently
+            # (staleness guard, t/3085 class). Hash over the same text the writer embeds.
+            # Get-EntityVectorSource is the SHARED source-text + fingerprint builder (also used by
+            # Update-EntityEmbeddings) so both writers compute a byte-identical `_src_hash`.
+            $src      = Get-EntityVectorSource -Name ([string]$rec.name) -Aliases @($rec.aliases) -Description ([string]$rec.description)
+            $srcHash  = $src.SrcHash
+
+            $priorHash = if ($embStore.PSObject.Properties['_src_hashes'] -and $embStore._src_hashes.PSObject.Properties[$newId]) { [string]$embStore._src_hashes.$newId } else { '' }
+            $hasV2Rec  = $embStore.PSObject.Properties['vectors'] -and $embStore.vectors.PSObject.Properties[$newId] -and ($embStore.vectors.$newId -isnot [array])
+            if ($hasV2Rec -and $priorHash -eq $srcHash) {
+                # Already current (v2 record + matching fingerprint): carries a vector, no re-embed.
                 $embedded = $true
+            }
+            else {
+                $subIds   = @("$newId#name")
+                $subTexts = @($src.NameText)
+                if ($src.DescText) { $subIds += "$newId#desc"; $subTexts += $src.DescText }
+                $vecMap = Get-TextEmbedding -Texts $subTexts -Ids $subIds
+                if ($vecMap -and $vecMap.ContainsKey("$newId#name")) {
+                    $descVec = if ($src.DescText -and $vecMap.ContainsKey("$newId#desc")) { $vecMap["$newId#desc"] } else { $null }
+                    $vrec = New-EntityVectorRecord -NameVector $vecMap["$newId#name"] -DescriptionVector $descVec
+                    if (-not $embStore.PSObject.Properties['vectors']) {
+                        Add-Member -InputObject $embStore -MemberType NoteProperty -Name 'vectors' -Value ([PSCustomObject]@{})
+                    }
+                    if ($embStore.vectors.PSObject.Properties[$newId]) { $embStore.vectors.$newId = $vrec }
+                    else { Add-Member -InputObject $embStore.vectors -MemberType NoteProperty -Name $newId -Value $vrec }
+
+                    if (-not $embStore.PSObject.Properties['_src_hashes']) {
+                        Add-Member -InputObject $embStore -MemberType NoteProperty -Name '_src_hashes' -Value ([PSCustomObject]@{})
+                    }
+                    if ($embStore._src_hashes.PSObject.Properties[$newId]) { $embStore._src_hashes.$newId = $srcHash }
+                    else { Add-Member -InputObject $embStore._src_hashes -MemberType NoteProperty -Name $newId -Value $srcHash }
+
+                    # This store now holds a v2 record — declare the schema (bumps a loaded v1 envelope).
+                    if ($embStore.PSObject.Properties['_schema_version']) { $embStore._schema_version = '2.0.0' }
+                    else { Add-Member -InputObject $embStore -MemberType NoteProperty -Name '_schema_version' -Value '2.0.0' }
+
+                    $embDirty = $true
+                    $embedded = $true
+                }
             }
         }
 

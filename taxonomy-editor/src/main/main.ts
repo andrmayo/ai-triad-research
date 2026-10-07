@@ -2,7 +2,7 @@
 // Licensed under the MIT License. See LICENSE file in the project root.
 
 console.log('[main] === STARTUP BEGIN ===');
-import { app, BrowserWindow, ipcMain, Menu, screen, shell } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, Menu, screen, shell } from 'electron';
 import fs from 'fs';
 import http from 'http';
 import path from 'path';
@@ -20,7 +20,7 @@ import { registerTerminalHandlers, cleanupTerminal } from './terminal.js';
 console.log('[main] terminal import OK');
 import { warmupEmbeddingModel } from './embeddings.js';
 console.log('[main] embeddings import OK');
-import { PROJECT_ROOT } from './fileIO.js';
+import { PROJECT_ROOT, validateDataRoot } from './fileIO.js';
 console.log('[main] fileIO import OK');
 import { registerChatWindowHandlers } from './ipc/chatWindowHandlers.js';
 
@@ -128,6 +128,25 @@ function hardenWindow(win: BrowserWindow): void {
 }
 
 function createWindow(): void {
+  // Fail loud if the data root is mis-provisioned so the user sees an actionable
+  // error dialog instead of silent-empty panels (t/3296, prevention for t/3290).
+  try {
+    validateDataRoot();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'main-process', level: 'error',
+      message: 'data-root validation failed at startup',
+      error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+    });
+    // console.error is load-bearing here: getGlobalRecorder() may be uninit this early
+    // (t/3110 sink trap) and app.quit() drains the ring buffer — this is the real stdout signal.
+    console.error('[main] Data root validation failed:', msg);
+    dialog.showErrorBox('Data root not found', msg);
+    app.quit();
+    return;
+  }
+
   const preloadPath = path.join(__dirname, 'preload.cjs');
   console.log('[main] preload path:', preloadPath);
   console.log('[main] app.isPackaged:', app.isPackaged);
@@ -149,9 +168,12 @@ function createWindow(): void {
   });
   hardenWindow(mainWindow);
 
-  // Use production build if launched with CLI file args (viewer mode) or if packaged
+  // Use production build if launched with CLI file args (viewer mode) or if packaged.
+  // --review-mode (or ELECTRON_REVIEW_MODE=1) forces the prod renderer path without registering
+  // the get-cli-file-arg viewer-mode IPC, so cross-scope agents can attach via CDP for design review.
   const hasFileArg = process.argv.some(a => a.startsWith('--diagnostics-file=') || a.startsWith('--harvest-file='));
-  const isDev = !app.isPackaged && !hasFileArg;
+  const isReviewMode = process.argv.includes('--review-mode') || process.env['ELECTRON_REVIEW_MODE'] === '1';
+  const isDev = !app.isPackaged && !hasFileArg && !isReviewMode;
   if (isDev) {
     console.log('[main] Loading dev URL: http://localhost:5173');
     void mainWindow.loadURL('http://localhost:5173');

@@ -15,19 +15,31 @@ import { checkRate } from '../security/rateLimiter.js';
 describe('free-tier RPM scales with key-pool size (t/906)', () => {
   afterEach(() => { delete process.env.FREE_TIER_GEMINI_KEY; });
 
-  it('scaledFreeTierRpm = 6 per key, capped at 30 (AC#1, #3)', () => {
-    expect(scaledFreeTierRpm(1)).toBe(6);
-    expect(scaledFreeTierRpm(2)).toBe(12);
+  // t/3111: FREE_TIER_RPM_PER_KEY reverted 24→12 (the t/3104 24 was sized against a paid
+  // Tier-2 key; on a real free key P_free≈15, so 12=0.8·P is the safe per-key value). The
+  // ~20/min debate burst is cleared by POOL SIZE (K=2 → min(12×2,30)=24), not one hot key.
+  // 30 hard cap untouched → 3+ keys saturate at 30.
+  it('scaledFreeTierRpm = 12 per key, capped at 30 (AC#1, #3; t/3111)', () => {
+    expect(scaledFreeTierRpm(1)).toBe(12);
+    expect(scaledFreeTierRpm(2)).toBe(24); // 12×2=24, under the 30 cap
+    expect(scaledFreeTierRpm(3)).toBe(30); // 12×3=36 → capped at 30
     expect(scaledFreeTierRpm(5)).toBe(30);
     expect(scaledFreeTierRpm(6)).toBe(30); // capped
     expect(scaledFreeTierRpm(0)).toBe(0);
   });
 
+  it('the locked K=2 free pool clears a debate opening burst (T≈20 ≤ 24 = scaledFreeTierRpm(2)) (t/3111)', () => {
+    // One key (12) intentionally does NOT clear ~20/min — pool size is the lever; the
+    // paid fallback (generateWithPaidFallback) catches rare bursts above 24.
+    expect(scaledFreeTierRpm(2)).toBeGreaterThanOrEqual(24);
+    expect(scaledFreeTierRpm(1)).toBeLessThan(20);
+  });
+
   it('resolveTier applies the scaled RPM for keyless free-tier users', () => {
     process.env.FREE_TIER_GEMINI_KEY = 'k1,k2';
-    expect(resolveTier('', 'github').limits.requestsPerMinute).toBe(12);
+    expect(resolveTier('', 'github').limits.requestsPerMinute).toBe(24); // 12×2, under the cap
     process.env.FREE_TIER_GEMINI_KEY = 'k1';
-    expect(resolveTier('', 'github').limits.requestsPerMinute).toBe(6);
+    expect(resolveTier('', 'github').limits.requestsPerMinute).toBe(12);
     process.env.FREE_TIER_GEMINI_KEY = 'k1,k2,k3,k4,k5,k6,k7';
     expect(resolveTier('', 'github').limits.requestsPerMinute).toBe(30); // capped
   });
@@ -69,7 +81,7 @@ describe('free tier (t/793)', () => {
     expect(tier.pinnedModel).toBe('gemini-3.5-flash-lite'); // = DEFAULT_MODEL (t/2687)
     // t/812: no per-prompt char cap — cost is bounded by tokensPerDay + per-IP RPM.
     expect(tier.maxPromptChars).toBeUndefined();
-    expect(tier.limits).toEqual({ requestsPerMinute: 6, tokensPerDay: 500_000 });
+    expect(tier.limits).toEqual({ requestsPerMinute: 12, tokensPerDay: 500_000 }); // t/3111: 24→12 (free-tier-safe per-key; pool size K=2 clears the burst)
     expect(tier.allowedBackends).toEqual(['gemini']);
   });
 
@@ -143,7 +155,7 @@ describe('t/3061 — embed:<ip> bucket is independent of free:<ip> (fix arm)', (
     const ip = embedIp();
     const freeKey = `free:${ip}`;
     const embedKey = `embed:${ip}`;
-    const apiRpm = 6; // matches scaledFreeTierRpm(1) — the generate gate limit
+    const apiRpm = 6; // arbitrary small bucket limit — this test asserts bucket independence, not the RPM value (scaledFreeTierRpm(1) is 24 since t/3104)
 
     // Exhaust the generate API bucket (free:<ip>).
     for (let i = 0; i < apiRpm; i++) {

@@ -357,12 +357,12 @@
     },
     {
       "name": "@types/node",
-      "version": "18.19.130",
+      "version": "22.20.1",
       "license": "MIT"
     },
     {
       "name": "@types/node",
-      "version": "26.2.0",
+      "version": "26.4.0",
       "license": "MIT"
     },
     {
@@ -642,7 +642,7 @@
     },
     {
       "name": "fast-uri",
-      "version": "3.1.5",
+      "version": "3.1.7",
       "license": "BSD-2-Clause"
     },
     {
@@ -732,7 +732,7 @@
     },
     {
       "name": "image-size",
-      "version": "1.2.1",
+      "version": "2.0.2",
       "license": "MIT"
     },
     {
@@ -897,7 +897,7 @@
     },
     {
       "name": "lucide-react",
-      "version": "1.33.0",
+      "version": "1.35.0",
       "license": "ISC"
     },
     {
@@ -1167,7 +1167,7 @@
     },
     {
       "name": "onnxruntime-common",
-      "version": "1.27.0",
+      "version": "1.29.0",
       "license": "MIT"
     },
     {
@@ -1177,7 +1177,7 @@
     },
     {
       "name": "onnxruntime-node",
-      "version": "1.27.0",
+      "version": "1.29.0",
       "license": "MIT"
     },
     {
@@ -1252,7 +1252,7 @@
     },
     {
       "name": "pptxgenjs",
-      "version": "3.12.0",
+      "version": "4.0.1",
       "license": "MIT"
     },
     {
@@ -1272,17 +1272,12 @@
     },
     {
       "name": "protobufjs",
-      "version": "7.6.5",
+      "version": "7.6.6",
       "license": "BSD-3-Clause"
     },
     {
       "name": "qrcode",
       "version": "1.5.4",
-      "license": "MIT"
-    },
-    {
-      "name": "queue",
-      "version": "6.0.2",
       "license": "MIT"
     },
     {
@@ -1517,7 +1512,7 @@
     },
     {
       "name": "undici-types",
-      "version": "5.26.5",
+      "version": "6.21.0",
       "license": "MIT"
     },
     {
@@ -1951,7 +1946,7 @@
         },
         {
           "name": "onnxruntime-common",
-          "version": "1.27.0"
+          "version": "1.29.0"
         },
         {
           "name": "onnxruntime-node",
@@ -1959,15 +1954,11 @@
         },
         {
           "name": "onnxruntime-node",
-          "version": "1.27.0"
+          "version": "1.29.0"
         },
         {
           "name": "onnxruntime-web",
           "version": "1.26.0-dev.20260416-b7804b056c"
-        },
-        {
-          "name": "undici-types",
-          "version": "5.26.5"
         }
       ],
       "licenseType": "MIT",
@@ -2053,11 +2044,11 @@
         },
         {
           "name": "@types/node",
-          "version": "18.19.130"
+          "version": "22.20.1"
         },
         {
           "name": "@types/node",
-          "version": "26.2.0"
+          "version": "26.4.0"
         },
         {
           "name": "@types/react",
@@ -2839,7 +2830,7 @@
       "packages": [
         {
           "name": "fast-uri",
-          "version": "3.1.5"
+          "version": "3.1.7"
         }
       ],
       "licenseType": "BSD-2-Clause",
@@ -2947,7 +2938,7 @@
       "packages": [
         {
           "name": "image-size",
-          "version": "1.2.1"
+          "version": "2.0.2"
         }
       ],
       "licenseType": "MIT",
@@ -3103,7 +3094,7 @@
       "packages": [
         {
           "name": "lucide-react",
-          "version": "1.33.0"
+          "version": "1.35.0"
         }
       ],
       "licenseType": "ISC",
@@ -3271,7 +3262,7 @@
       "packages": [
         {
           "name": "pptxgenjs",
-          "version": "3.12.0"
+          "version": "4.0.1"
         }
       ],
       "licenseType": "MIT",
@@ -3301,7 +3292,7 @@
       "packages": [
         {
           "name": "protobufjs",
-          "version": "7.6.5"
+          "version": "7.6.6"
         }
       ],
       "licenseType": "BSD-3-Clause",
@@ -3316,16 +3307,6 @@
       ],
       "licenseType": "MIT",
       "licenseText": "The MIT License (MIT)\n\nCopyright (c) 2012 Ryan Day\n\nPermission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the \"Software\"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE."
-    },
-    {
-      "packages": [
-        {
-          "name": "queue",
-          "version": "6.0.2"
-        }
-      ],
-      "licenseType": "MIT",
-      "licenseText": "The MIT License (MIT)\nCopyright (c) 2014 Jesse Tane <jesse.tane@gmail.com>\n\nPermission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the \"Software\"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE."
     },
     {
       "packages": [
@@ -3595,6 +3576,10 @@
     },
     {
       "packages": [
+        {
+          "name": "undici-types",
+          "version": "6.21.0"
+        },
         {
           "name": "undici-types",
           "version": "8.3.0"

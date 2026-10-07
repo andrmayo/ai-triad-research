@@ -13,6 +13,9 @@
 
     # Functions exported from this module
     FunctionsToExport = @(
+        'Clear-AICallLog'   # t/3241 — AI Call Log core (rotate/clear)
+        'Get-AICallLog'     # t/3243 — AI Call Log reader (filterable, pipeline)
+        'Show-AICallLog'    # t/3244 — AI Call Log HTML viewer (sortable/filterable)
         'Get-Tax'
         'Update-TaxEmbeddings'
         'Import-AITriadDocument'
@@ -50,6 +53,7 @@
         'Find-GraphPath'
         'Approve-Edge'
         'Approve-TaxonomyProposal'
+        'Get-Concept'   # t/3291 — standardized dictionary reader + concept<->node reverse map
         'Get-Edge'
         'Get-Situation'
         'Set-Edge'
@@ -142,6 +146,7 @@
         'Watch-DebateProgress'
         'Invoke-DebateBatch'
         'Get-FreeTierStatus'
+        'Sync-FreeTierKeys'
         'Invoke-TaxEditorSmokeTest'
         'Test-PreloadHealth'
         'Test-AnalyticsBackend'
@@ -183,11 +188,13 @@
         # t/1804 — Entity ontology (Phase 1): store + curation cmdlets
         'Get-Entity'
         'Import-Entity'
+        'Update-EntityEmbeddings'   # t/3121 D — backfill entity_embeddings.json to v2 multi-vector
         # t/1261 — UsageID registry
         'Invoke-AIByUsage'
         # t/1308 — cc→sit migration
         'Invoke-CcToSitMigration'
         'Test-AIApiKey'
+        'Test-GeminiKeyPool'
         'Test-AIBackendHealth'
         'Test-AIBackendQuota'
         'Test-AIModelsConfig'
@@ -225,6 +232,10 @@
         'Get-EntityReport'
         # t/1894 — Entity ontology Phase 2-B: batch mention indexer (entity_mentions.json)
         'Update-EntityMentionIndex'
+        # t/3124 — Claim-side entity grounding: writes entity_refs[] onto summary claims
+        'Update-ClaimEntityRef'
+        # t/3215 — FOL Phase 1: formalize claims into neo-Davidsonian logical_form (schema t/3126)
+        'Invoke-LogicalFormPass'
         # t/2196 — Vite dev server diagnostic
         'Get-ViteDevStatus'
         # t/2330 — Debate session state diagnostic
@@ -241,6 +252,14 @@
         'Test-DebatePersistence'
         # t/2765 — ACA server log retrieval with requestId correlation
         'Get-ServerLog'
+        # t/3082 — Log Analytics server-log query (deep history) by window/requestId/pattern
+        'Get-TaxEditorServerLogs'
+        # t/3168 — one-shot embeddings-cache resolving/re-computing verdict on the live revision
+        'Test-EmbeddingsCacheHealth'
+        # t/3195 — parse JSON tolerating truncation (recovers the valid prefix)
+        'ConvertFrom-TruncatableJson'
+        # t/3225 — stale-head-merge guard: verify PR headRefOid == remote tip before gh pr merge
+        'Invoke-VerifiedMerge'
     )
 
     # Aliases exported from this module

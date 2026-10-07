@@ -41,6 +41,16 @@ import { recordLockHolder } from '../../../../lib/debate/lockHolder.js';
 import { stampNodeAuthorship } from '../../server/storage/editMeta.js';
 import { getGlobalRecorder } from '../../../../lib/flight-recorder/index.js';
 import { VALID_POV } from '../ipcSchemas.js';
+import {
+  assembleNodeEmbeddings,
+  selectRelevantTaxonomy,
+  type ANClaimInput,
+  type SelectRelevantTaxonomyInput,
+} from '../../../../lib/debate/relevanceSelection.js';
+import { POVER_INFO } from '../../../../lib/debate/poverInfo.js';
+import { computeEmbeddings, computeQueryEmbedding } from '../embeddings.js';
+import { computeClaimTaxonomyAttribution } from '../../../../lib/debate/argumentNetwork/attribution.js';
+import type { ArgumentNetworkNode, ClaimTaxonomyAttribution } from '../../../../lib/debate/types.js';
 
 // Recorder-backed sink for the rationale re-merge's "baseline twin matched no incoming edge"
 // case: a real rationale isn't written, logged so a systematic tie-break mismatch is
@@ -190,9 +200,27 @@ export function registerTaxonomyHandlers(): void {
       const stdDir = path.join(dictDir, 'standardized');
       const colDir = path.join(dictDir, 'colloquial');
 
+      // t/3290 (mirrors the server-side t/3289 WARN): a missing/empty standardized dir silently
+      // blanked the Vocabulary panel with no signal. Emit a WARN recording the discriminating cause
+      // (dir-missing vs empty-listing) + the RESOLVED data root, so "which root did getDataRootPath()
+      // resolve to?" is answerable (the suspected Electron root cause — env not inherited at GUI launch).
       const standardized: unknown[] = [];
-      if (fs.existsSync(stdDir)) {
-        for (const f of fs.readdirSync(stdDir).filter(f => f.endsWith('.json'))) {
+      if (!fs.existsSync(stdDir)) {
+        getGlobalRecorder()?.record({
+          type: 'system.error', component: 'ipc-handlers', level: 'warn',
+          message: 'load-dictionary: standardized dir missing — returning empty (t/3290)',
+          data: { dir: stdDir, cause: 'dir-missing', dataRoot: getDataRootPath() },
+        });
+      } else {
+        const stdJson = fs.readdirSync(stdDir).filter(f => f.endsWith('.json'));
+        if (stdJson.length === 0) {
+          getGlobalRecorder()?.record({
+            type: 'system.error', component: 'ipc-handlers', level: 'warn',
+            message: 'load-dictionary: standardized dir present but zero .json files (empty-listing) — returning empty (t/3290)',
+            data: { dir: stdDir, cause: 'empty-listing' },
+          });
+        }
+        for (const f of stdJson) {
           try {
             standardized.push(JSON.parse(fs.readFileSync(path.join(stdDir, f), 'utf-8')));
           } catch { /* telemetry — silent by design;  skip malformed */ }
@@ -200,7 +228,13 @@ export function registerTaxonomyHandlers(): void {
       }
 
       const colloquial: unknown[] = [];
-      if (fs.existsSync(colDir)) {
+      if (!fs.existsSync(colDir)) {
+        getGlobalRecorder()?.record({
+          type: 'system.error', component: 'ipc-handlers', level: 'warn',
+          message: 'load-dictionary: colloquial dir missing — returning empty (t/3290)',
+          data: { dir: colDir, cause: 'dir-missing', dataRoot: getDataRootPath() },
+        });
+      } else {
         for (const f of fs.readdirSync(colDir).filter(f => f.endsWith('.json'))) {
           try {
             colloquial.push(JSON.parse(fs.readFileSync(path.join(colDir, f), 'utf-8')));
@@ -209,8 +243,14 @@ export function registerTaxonomyHandlers(): void {
       }
 
       return { standardized, colloquial, lintViolations: [] };
-    } catch {
-      /* telemetry — silent by design */
+    } catch (err) {
+      getGlobalRecorder()?.record({
+        type: 'system.error',
+        component: 'ipc-handlers',
+        level: 'warn',
+        message: 'get-conflict-definitions: failed to load conflict definition files — returning empty lists',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
       return { standardized: [], colloquial: [], lintViolations: [] };
     }
   });
@@ -239,8 +279,14 @@ export function registerTaxonomyHandlers(): void {
         try {
           const data = JSON.parse(fs.readFileSync(path.join(proposalDir, f), 'utf-8'));
           return { filename: f, ...data };
-        } catch {
-          /* telemetry — silent by design */
+        } catch (err) {
+          getGlobalRecorder()?.record({
+            type: 'system.error',
+            component: 'ipc-handlers',
+            level: 'warn',
+            message: `list-proposals: failed to parse proposal file ${f} — returning error entry`,
+            error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+          });
           return { filename: f, error: 'Failed to parse' };
         }
       });
@@ -449,5 +495,129 @@ export function registerTaxonomyHandlers(): void {
 
   ipcMain.handle('update-synthetic-embeddings', (_event, nodeId: string, pov: string, vectors: number[][]) => {
     updateSyntheticEmbeddings(nodeId, pov, vectors);
+  });
+
+  // t/3258 (T3): fetch-relevant-nodes — main-process mirror of server routes/relevantNodes.ts.
+  // Packaged Electron runs no embedded API server; the renderer reaches relevance selection via IPC.
+  // Logic is field-for-field identical to the server route (parity by construction — both invoke
+  // the same shared-lib assembleNodeEmbeddings + selectRelevantTaxonomy with ONNX embed cbs).
+  ipcMain.handle('fetch-relevant-nodes', async (_event, payload: unknown) => {
+    const POV_FILE_KEYS = new Set(['accelerationist', 'safetyist', 'skeptic']);
+    const b = (payload ?? {}) as {
+      pov: string;
+      topic: string;
+      recentTranscript: string;
+      threshold?: number;
+      session?: {
+        anClaimEmbeddings?: ANClaimInput[];
+        lineageFrame?: { cluster_id: string; label?: string }[];
+        sourceType?: string;
+        excludeGreatestHits?: boolean;
+        greatestHitsList?: string[];
+      };
+    };
+    const { pov, topic, recentTranscript } = b;
+    if (!POV_FILE_KEYS.has(pov)) throw new Error(`Invalid or missing pov (expected accelerationist|safetyist|skeptic), got: ${String(pov)}`);
+    if (typeof topic !== 'string' || typeof recentTranscript !== 'string') throw new Error('Missing topic/recentTranscript');
+
+    // Corpus embed cb — BATCH, mirrors the client's api.computeEmbeddings (t/3257#22).
+    const corpusEmbed = (texts: string[], ids?: string[]): Promise<number[][]> =>
+      computeEmbeddings(texts, ids);
+    // Boundary + topic-query embed cb — per-text, mirrors the client's api.computeQueryEmbedding.
+    const queryEmbed = (texts: string[]): Promise<number[][]> =>
+      Promise.all(texts.map(t => computeQueryEmbedding(t)));
+
+    const povFile = readTaxonomyFile(pov) as { nodes?: SelectRelevantTaxonomyInput['povNodes'] };
+    const povNodes = povFile?.nodes ?? [];
+    const sitFile = readTaxonomyFile('situations') as { nodes?: SelectRelevantTaxonomyInput['situationNodes'] };
+    const situationNodes = sitFile?.nodes ?? [];
+    const policyRaw = readPolicyRegistry() as { policies?: { id: string; action: string; source_povs?: string[] }[] } | null;
+    const policyRegistry = (policyRaw?.policies ?? []).map(p => ({ id: p.id, action: p.action, source_povs: p.source_povs }));
+    const lineageRaw = readLineageCategories() as { mapping?: Record<string, { l2: string }> } | null;
+    const lineageMapping = lineageRaw?.mapping;
+    const povInfo = Object.values(POVER_INFO).find(i => (i as { pov?: string }).pov === pov) as { doctrinal_boundaries?: string[] } | undefined;
+    const doctrinalBoundaries = (povInfo?.doctrinal_boundaries?.length ?? 0) > 0
+      ? { strings: povInfo!.doctrinal_boundaries ?? [] }
+      : undefined;
+
+    // Map loadSyntheticEmbeddings() ({pov,vectors}) → {nodeId: vectors[][]} for assembleNodeEmbeddings.
+    const synthRaw = loadSyntheticEmbeddings();
+    const synth: Record<string, number[][]> | null = synthRaw
+      ? Object.fromEntries(Object.entries(synthRaw).map(([id, e]) => [id, e.vectors]))
+      : null;
+
+    const { nodeEmbeddings } = await assembleNodeEmbeddings(pov, povNodes, situationNodes, corpusEmbed, synth);
+
+    const session = {
+      anClaimEmbeddings: b.session?.anClaimEmbeddings ?? [],
+      lineageFrame: b.session?.lineageFrame,
+      sourceType: b.session?.sourceType,
+      excludeGreatestHits: b.session?.excludeGreatestHits,
+      greatestHitsList: b.session?.greatestHitsList,
+    };
+
+    return selectRelevantTaxonomy({
+      povNodes, situationNodes, policyRegistry, nodeEmbeddings, lineageMapping, doctrinalBoundaries,
+      session,
+      params: { pov, topic, recentTranscript, threshold: b.threshold },
+      embed: queryEmbed,
+    });
+  });
+
+  // t/3322: compute-attribution — main-process mirror of server routes/attribution.ts.
+  // Same pure fn (computeClaimTaxonomyAttribution), same ONNX embed cbs, local corpus
+  // read (readTaxonomyFile) matching fetch-relevant-nodes — both desktop-local paths stay coherent.
+  ipcMain.handle('compute-attribution', async (_event, payload: unknown) => {
+    const POV_FILE_KEYS = new Set(['accelerationist', 'safetyist', 'skeptic']);
+    interface AttributionClaim {
+      id: string;
+      embedding?: number[];
+      attribution_embedding?: number[];
+      claim_taxonomy_attribution?: ClaimTaxonomyAttribution;
+    }
+    const b = (payload ?? {}) as { pov: string; claims: AttributionClaim[]; topN?: number };
+    const { pov } = b;
+    if (!POV_FILE_KEYS.has(pov)) throw new Error(`Invalid or missing pov (expected accelerationist|safetyist|skeptic), got: ${String(pov)}`);
+    if (!Array.isArray(b.claims)) throw new Error('Missing claims (expected array)');
+
+    const corpusEmbed = (texts: string[], ids?: string[]): Promise<number[][]> =>
+      computeEmbeddings(texts, ids);
+
+    const povFile = readTaxonomyFile(pov) as { nodes?: SelectRelevantTaxonomyInput['povNodes'] };
+    const povNodes = povFile?.nodes ?? [];
+    const sitFile = readTaxonomyFile('situations') as { nodes?: SelectRelevantTaxonomyInput['situationNodes'] };
+    const situationNodes = sitFile?.nodes ?? [];
+    const synthRaw = loadSyntheticEmbeddings();
+    const synth: Record<string, number[][]> | null = synthRaw
+      ? Object.fromEntries(Object.entries(synthRaw).map(([id, e]) => [id, e.vectors]))
+      : null;
+
+    const { nodeEmbeddings } = await assembleNodeEmbeddings(pov, povNodes, situationNodes, corpusEmbed, synth);
+    const candidateNodeIds = new Set(povNodes.map((n: { id: string }) => n.id));
+
+    const claims = b.claims;
+    const summary = computeClaimTaxonomyAttribution(
+      claims as unknown as ArgumentNetworkNode[],
+      pov,
+      nodeEmbeddings,
+      candidateNodeIds,
+      typeof b.topN === 'number' ? b.topN : undefined,
+    );
+
+    const attributions: Record<string, ClaimTaxonomyAttribution> = {};
+    for (const c of claims) {
+      if (c.claim_taxonomy_attribution) attributions[c.id] = c.claim_taxonomy_attribution;
+    }
+
+    return {
+      attributions,
+      summary: {
+        attributed: summary.attributed,
+        unattributed: summary.unattributed,
+        missing_embedding: summary.missing_embedding,
+        novel_argument: summary.novel_argument,
+        decisions: summary.decisions,
+      },
+    };
   });
 }

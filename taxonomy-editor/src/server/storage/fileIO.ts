@@ -36,6 +36,8 @@ export * from './calibrationStore.js';
 export * from './urlFetch.js';
 export type { OpEdSetSummary } from '../../../../lib/oped/types.js';
 export { listOpedSets, loadOpedSet, saveOpedSetInProgress, loadOpedSetInProgress, finalizeOpedSet, deleteOpedSet, getOpedSetsQuotaStatus } from './opedStore.js';
+export { upsertOpedRun, countRunningOpedRuns, getOpedRun } from './opedRunStore.js';
+export type { RunControlRecord, RunStatus, VoiceState as OpedVoiceState } from './opedRunStore.js';
 // ── Backend injection ──
 
 // Taxonomy / conflicts / calibration / summaries / sources use `backend`.
@@ -143,8 +145,12 @@ export async function getTaxonomyDirs(): Promise<string[]> {
       }
     }
     return dirs;
-  } catch {
-    /* telemetry — silent by design */
+  } catch (err: unknown) {
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'file-io', level: 'warn',
+      message: 'getTaxonomyDirs: listing failed, returning []',
+      data: { error: String(err) },
+    });
     return [];
   }
 }
@@ -219,9 +225,9 @@ async function resolveTaxonomyFilePath(pov: string): Promise<string> {
   return path.join(taxDir, `${pov}.json`);
 }
 
-export async function readTaxonomyFile(pov: string): Promise<unknown> {
+export async function readTaxonomyFile(pov: string, opts?: { ref?: string }): Promise<unknown> {
   const filePath = await resolveTaxonomyFilePath(pov);
-  const raw = await backend.readFile(filePath);
+  const raw = await backend.readFile(filePath, opts);
   if (raw === null) throw new ActionableError({
     goal: 'Read taxonomy file',
     problem: `Taxonomy file not found: ${filePath}`,
@@ -695,8 +701,12 @@ export async function readEdgesFile(): Promise<unknown | null> {
     const raw = await backend.readFile(getEdgesPath());
     if (raw === null) return null;
     return JSON.parse(raw);
-  } catch {
-    /* telemetry — silent by design */
+  } catch (err: unknown) {
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'file-io', level: 'warn',
+      message: 'readEdgesFile: read/parse failed, returning null',
+      data: { error: String(err) },
+    });
     return null;
   }
 }
@@ -969,8 +979,12 @@ export async function listProposals(): Promise<unknown[]> {
       }
     }
     return proposals;
-  } catch {
-    /* telemetry — silent by design */
+  } catch (err: unknown) {
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'file-io', level: 'warn',
+      message: 'listProposals: listing failed, returning []',
+      data: { error: String(err) },
+    });
     return [];
   }
 }
@@ -1349,6 +1363,9 @@ export async function readSourceDocumentPdf(docId: string): Promise<Buffer | nul
   return backend.readBinaryFile(pdfPath);
 }
 
+// ── Data-root validation (t/3296) — extracted to dataRootValidator.ts ──
+export { validateDataRoot } from './dataRootValidator.js';
+
 // ── Dictionary ──
 
 export async function loadDictionary(): Promise<{ standardized: unknown[]; colloquial: unknown[]; lintViolations: unknown[] }> {
@@ -1359,24 +1376,54 @@ export async function loadDictionary(): Promise<{ standardized: unknown[]; collo
   const standardized: unknown[] = [];
   try {
     const stdFiles = await backend.listDirectory(stdDir);
-    for (const f of stdFiles.filter(f => f.endsWith('.json'))) {
+    const stdJson = stdFiles.filter(f => f.endsWith('.json'));
+    if (stdJson.length === 0) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'file-io', level: 'warn',
+        message: 'loadDictionary: standardized dir present but zero .json files (empty-listing) — returning empty (t/3289)',
+        data: { dir: stdDir, cause: 'empty-listing', fileCount: stdFiles.length },
+      });
+    }
+    for (const f of stdJson) {
       try {
         const raw = await backend.readFile(path.join(stdDir, f));
         if (raw) standardized.push(JSON.parse(raw));
-      } catch { /* telemetry — silent by design;  skip malformed */ }
+      } catch { /* telemetry — silent by design; skip malformed */ }
     }
-  } catch { /* telemetry — silent by design;  directory may not exist */ }
+  } catch (err: unknown) {
+    const cause = (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'dir-missing' : 'read-error';
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'file-io', level: 'warn',
+      message: `loadDictionary: standardized dir unreadable — returning empty (${cause}) (t/3289)`,
+      data: { dir: stdDir, cause, error: String(err) },
+    });
+  }
 
   const colloquial: unknown[] = [];
   try {
     const colFiles = await backend.listDirectory(colDir);
-    for (const f of colFiles.filter(f => f.endsWith('.json'))) {
+    const colJson = colFiles.filter(f => f.endsWith('.json'));
+    if (colJson.length === 0) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'file-io', level: 'warn',
+        message: 'loadDictionary: colloquial dir present but zero .json files (empty-listing) — returning empty (t/3289)',
+        data: { dir: colDir, cause: 'empty-listing', fileCount: colFiles.length },
+      });
+    }
+    for (const f of colJson) {
       try {
         const raw = await backend.readFile(path.join(colDir, f));
         if (raw) colloquial.push(JSON.parse(raw));
-      } catch { /* telemetry — silent by design;  skip malformed */ }
+      } catch { /* telemetry — silent by design; skip malformed */ }
     }
-  } catch { /* telemetry — silent by design;  directory may not exist */ }
+  } catch (err: unknown) {
+    const cause = (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'dir-missing' : 'read-error';
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'file-io', level: 'warn',
+      message: `loadDictionary: colloquial dir unreadable — returning empty (${cause}) (t/3289)`,
+      data: { dir: colDir, cause, error: String(err) },
+    });
+  }
 
   return { standardized, colloquial, lintViolations: [] };
 }
@@ -1397,8 +1444,12 @@ export async function readPsPrompt(promptName: string, dir = 'ps'): Promise<{ te
   const filePath = path.join(promptsDir, `${promptName}.prompt`);
   try {
     return { text: await fs.readFile(filePath, 'utf-8') };
-  } catch {
-    /* telemetry — silent by design */
+  } catch (err: unknown) {
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'file-io', level: 'warn',
+      message: `readPsPrompt: prompt file not found or unreadable, returning error result: ${promptName}`,
+      data: { filePath, error: String(err) },
+    });
     return { text: null, error: `Prompt not found: ${promptName}` };
   }
 }
@@ -1410,8 +1461,12 @@ export async function listPsPrompts(): Promise<string[]> {
     return entries
       .filter(f => f.endsWith('.prompt'))
       .map(f => f.replace('.prompt', ''));
-  } catch {
-    /* telemetry — silent by design */
+  } catch (err: unknown) {
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'file-io', level: 'warn',
+      message: 'listPsPrompts: directory listing failed, returning []',
+      data: { promptsDir, error: String(err) },
+    });
     return [];
   }
 }
@@ -1422,8 +1477,12 @@ export async function loadAIModels(): Promise<unknown> {
   const configPath = path.join(getProjectRoot(), 'ai-models.json');
   try {
     return JSON.parse(await fs.readFile(configPath, 'utf-8'));
-  } catch {
-    /* telemetry — silent by design */
+  } catch (err: unknown) {
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'file-io', level: 'warn',
+      message: 'loadAIModels: failed to load ai-models.json, returning empty config',
+      data: { configPath, error: String(err) },
+    });
     return { backends: [], models: [], defaults: {} };
   }
 }

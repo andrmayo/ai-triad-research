@@ -131,6 +131,44 @@ describe('instrumentBridge — structured 429 retry_after_s (t/3054)', () => {
   });
 });
 
+describe('instrumentBridge — 429 rate-limit discriminators (t/3107)', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('surfaces rate_limit_source + limit + current on the ai.error event for a 429', async () => {
+    const err = Object.assign(new Error('Rate limit exceeded'), {
+      httpStatus: 429, rateLimitSource: 'per_ip_rpm', limit: 20, current: 21,
+    });
+    const api = instrumentBridge({ generateText: () => Promise.reject(err) } as unknown as AppAPI);
+    await expect((api as unknown as { generateText: () => Promise<unknown> }).generateText()).rejects.toThrow();
+
+    const data = lastRecord().data as Record<string, unknown>;
+    expect(data.rate_limit_source).toBe('per_ip_rpm');
+    expect(data.limit).toBe(20);
+    expect(data.current).toBe(21);
+  });
+
+  it('omits the rate-limit fields for a non-429 status', async () => {
+    const err = Object.assign(new Error('boom'), { httpStatus: 500, rateLimitSource: 'per_ip_rpm', limit: 20, current: 21 });
+    const api = instrumentBridge({ generateText: () => Promise.reject(err) } as unknown as AppAPI);
+    await expect((api as unknown as { generateText: () => Promise<unknown> }).generateText()).rejects.toThrow();
+
+    const data = lastRecord().data as Record<string, unknown>;
+    expect(data.rate_limit_source).toBeUndefined();
+    expect(data.limit).toBeUndefined();
+  });
+
+  it('omits fields absent from a partial 429 body (only what the server sent)', async () => {
+    const err = Object.assign(new Error('Rate limit exceeded'), { httpStatus: 429, rateLimitSource: 'api_key_exhausted' });
+    const api = instrumentBridge({ generateText: () => Promise.reject(err) } as unknown as AppAPI);
+    await expect((api as unknown as { generateText: () => Promise<unknown> }).generateText()).rejects.toThrow();
+
+    const data = lastRecord().data as Record<string, unknown>;
+    expect(data.rate_limit_source).toBe('api_key_exhausted');
+    expect(data.limit).toBeUndefined();
+    expect(data.current).toBeUndefined();
+  });
+});
+
 describe('instrumentBridge — expected-status downgrade (t/2395)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -173,5 +211,40 @@ describe('instrumentBridge — expected-status downgrade (t/2395)', () => {
       .map((c) => c[0] as { message: string })
       .find((e) => e.message === 'bridge.getDataRoot expected 403');
     expect(failure).toBeDefined();
+  });
+});
+
+describe('instrumentBridge — embedding batch_size (t/3071)', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  /** Find the request/start event for a bridge method (message `bridge.<method>`, no suffix). */
+  function startRecord(method: string): { data?: Record<string, unknown> } | undefined {
+    return mockRecord.mock.calls
+      .map((c) => c[0] as { message: string; data?: Record<string, unknown> })
+      .find((e) => e.message === `bridge.${method}`);
+  }
+
+  it('records batch_size = texts.length on the computeEmbeddings request event (the 2587 incident)', async () => {
+    const texts = Array.from({ length: 2587 }, (_v, i) => `t${i}`);
+    const api = instrumentBridge({ computeEmbeddings: () => Promise.resolve({ vectors: [] }) } as unknown as AppAPI);
+    await (api as unknown as { computeEmbeddings: (t: string[]) => Promise<unknown> }).computeEmbeddings(texts);
+
+    expect(startRecord('computeEmbeddings')?.data?.batch_size).toBe(2587);
+  });
+
+  it('records batch_size = 1 for a single-text computeQueryEmbedding', async () => {
+    const api = instrumentBridge({ computeQueryEmbedding: () => Promise.resolve({ vector: [] }) } as unknown as AppAPI);
+    await (api as unknown as { computeQueryEmbedding: (t: string) => Promise<unknown> }).computeQueryEmbedding('hello');
+
+    expect(startRecord('computeQueryEmbedding')?.data?.batch_size).toBe(1);
+  });
+
+  it('omits batch_size for a non-embedding AI method (field is embedding-scoped)', async () => {
+    const api = instrumentBridge({ generateText: () => Promise.resolve('ok') } as unknown as AppAPI);
+    await (api as unknown as { generateText: () => Promise<unknown> }).generateText();
+
+    const start = startRecord('generateText');
+    expect(start).toBeDefined();
+    expect(start?.data?.batch_size).toBeUndefined();
   });
 });

@@ -88,7 +88,22 @@ function Invoke-TaxEditorSmokeTest {
         [switch]$Detailed,
 
         [Parameter()]
-        [switch]$AssertDataPresence
+        [switch]$AssertDataPresence,
+
+        # t/3088 — wall-time ceiling (seconds) for the embedding-latency perf probe.
+        # Calibrated against real prod post-t/3085 numbers (Diagnostics verify, deploy-64c7772):
+        #   cache-HIT embeddings.compute is <200ms server-side (1ms pure hit / 183ms warm max
+        #   incl. ~4 genuine dynamic-text misses); a regressed cache-MISS runs 24-56s (some
+        #   500-ing at the 50s ONNX-init timeout) — a ~130x gap.
+        # 2s = ~11x headroom over the warm max (safe for client-side network variance and the
+        # thin n=2 sample) and ~12x below the miss floor, so it catches the regression with
+        # margin without false-warning on normal jitter. Deliberately NOT set below ~1s: a
+        # request landing on a cold revision before prewarm completes transiently recomputes
+        # (the 24-56s spikes; t/3112 /readyz will gate this), so the category stays WARN-FIRST
+        # (excluded from OverallPass) — a breach is a monitoring signal, not a hard failure.
+        [Parameter()]
+        [ValidateRange(0.1, 60)]
+        [double]$EmbeddingCeilingSec = 2
     )
 
     Set-StrictMode -Version Latest
@@ -465,6 +480,60 @@ function Invoke-TaxEditorSmokeTest {
         $OpedFilesResult.Error = $OpedFilesDetail
     }
 
+    # ── Phase 8: Embedding latency (t/3088) — perf-regression probe, its OWN category ──
+    # embeddings.json was unreachable in prod for 3.5 months (t/3085): every debate
+    # re-embedded ~3,600 static texts in-process at 25-48s/chunk where a cache hit is
+    # milliseconds — invisible to error-rate gates because nothing FAILED. This probe
+    # POSTs a small batch of known cached node ids and times the round-trip. Like the
+    # GitHub check (t/2673), a breach is a monitoring signal surfaced as a ::warning::,
+    # NOT a hard failure: it is EXCLUDED from $OverallPass (below) so a slow embed can't
+    # false-red Health/Endpoints/Azure. Warn-first — promote to gating only after the
+    # ceiling is calibrated against real post-t/3085 prod timings.
+    Write-Host '=== Embedding Latency ===' -ForegroundColor Cyan
+    $EmbeddingStatus = 'ok'
+    $EmbeddingMs     = 0
+    try {
+        $Perf = Measure-EmbeddingLatency -BaseUrl $BaseUrl -CeilingSec $EmbeddingCeilingSec -TimeoutSec $TimeoutSec
+        $EmbeddingStatus = $Perf.Status
+        $EmbeddingMs     = $Perf.DurationMs
+        $PerfIcon  = if ($Perf.Status -eq 'ok') { '[PASS]' } else { '[DEGRADED]' }
+        $PerfColor = if ($Perf.Status -eq 'ok') { 'Green' } else { 'Yellow' }
+        Write-Host "  $PerfIcon embeddings.compute — $($Perf.DurationMs)ms (ceiling $($EmbeddingCeilingSec)s, $($Perf.Count) vectors, http $($Perf.HttpStatus))" -ForegroundColor $PerfColor
+    } catch {
+        # New-ActionableError from an unreachable server — report degraded, do NOT crash the smoke.
+        $EmbeddingStatus = 'unreachable'
+        Write-Host "  [DEGRADED] embeddings.compute — unreachable: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+    if ($EmbeddingStatus -ne 'ok') {
+        Write-Host "::warning::Embedding latency $EmbeddingStatus — ${EmbeddingMs}ms vs ${EmbeddingCeilingSec}s ceiling (perf-regression probe t/3088; monitoring signal, does not block the gate). A sustained breach is the t/3085 cache-miss class."
+    }
+    Write-Host ''
+
+    # ── Phase 9: Embeddings cache presence (t/3088 follow-up #1) ────────────────
+    # t/3085/t/3086: the precomputed embeddings.json cache was silently dead for 3.5 months.
+    # /health exposes embeddings.cachePresent but ONLY to admins (meta.ts anon branch returns
+    # status+ai and early-returns), so an anon smoke can't read it. The anon /readyz (t/3112,
+    # PUBLIC_EXACT_PATHS) returns 200 IFF the precomputed-vector cache is loaded (present AND
+    # nodeCount>0) — the anon-accessible "cache present" signal this probe asserts, no creds.
+    # WARN-FIRST like Phase 8 (embedding latency): a fresh revision can be /healthz-ready but
+    # /readyz-503 during fire-and-forget prewarm, so a 503 surfaces as ::warning:: (a real but
+    # often transient signal), NOT a hard failure — EXCLUDED from $OverallPass so a cold-revision
+    # warmup can't false-red Health/Endpoints/Azure.
+    Write-Host '=== Embeddings Cache Presence ===' -ForegroundColor Cyan
+    $CacheCheck = Invoke-RemoteCheck -BaseUrl $BaseUrl -Path '/readyz' `
+        -Method 'GET' -TimeoutSec $TimeoutSec -AcceptableStatusCodes @(200, 503)
+    $EmbeddingCachePresent = ($CacheCheck.StatusCode -eq 200)
+    $EmbeddingCacheStatus  = if ($EmbeddingCachePresent) { 'present' }
+        elseif ($CacheCheck.StatusCode -eq 503) { 'warming' }
+        else { 'unreachable' }
+    $CCIcon  = if ($EmbeddingCachePresent) { '[PASS]' } else { '[DEGRADED]' }
+    $CCColor = if ($EmbeddingCachePresent) { 'Green' } else { 'Yellow' }
+    Write-Host "  $CCIcon GET /readyz — $($CacheCheck.StatusCode) $($CacheCheck.ResponseMs)ms — embeddings cache $EmbeddingCacheStatus" -ForegroundColor $CCColor
+    if (-not $EmbeddingCachePresent) {
+        Write-Host "::warning::Embeddings cache not present (/readyz=$($CacheCheck.StatusCode), $EmbeddingCacheStatus) — monitoring signal, does not block the gate. A sustained 'warming'/'unreachable' is the t/3085 dead-cache class."
+    }
+    Write-Host ''
+
     # ── Summary ──────────────────────────────────────────────────────────
     $AllResults = @($Endpoints) + @($AnonEndpoints) + @($Analytics) + @($DataPresence) + @($OpedFilesResult)
     $Passed = @($AllResults | Where-Object { $_.Pass }).Count
@@ -523,6 +592,11 @@ function Invoke-TaxEditorSmokeTest {
         AzureOk         = $Azure.Healthy
         GitHubOk        = $GitHub.Healthy
         OpedFilesOk     = $OpedFilesPass
+        EmbeddingStatus     = $EmbeddingStatus
+        EmbeddingLatencyMs  = $EmbeddingMs
+        EmbeddingCeilingSec = $EmbeddingCeilingSec
+        EmbeddingCachePresent = $EmbeddingCachePresent
+        EmbeddingCacheStatus  = $EmbeddingCacheStatus
         EndpointsPassed = $Passed
         EndpointsFailed = $Failed
         EndpointsTotal  = $Total

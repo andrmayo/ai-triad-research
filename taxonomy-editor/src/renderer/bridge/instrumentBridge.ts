@@ -48,6 +48,20 @@ function summarizeArgs(args: unknown[], method?: string): unknown[] {
   );
 }
 
+/**
+ * Named `batch_size` fragment for embedding requests (t/3071). The e8760507 incident's failing
+ * call was [Array(2587)] vs prior good 643/792 — as a first-class field (not just a truncated arg
+ * preview) the outlier jumps out in the dump. This is the *bridge-level* size, i.e. the full
+ * requested batch before web-bridge's chunker splits it into ≤EMBEDDINGS_MAX_BATCH sequential
+ * POSTs (t/3072). `computeQueryEmbedding` takes a single text, so its batch is always 1. Returns a
+ * spreadable object (`{}` when N/A) so the call site can splat it without adding a branch there.
+ */
+function embeddingBatchData(method: string, args: unknown[]): { batch_size?: number } {
+  if (method === 'computeEmbeddings') return Array.isArray(args[0]) ? { batch_size: args[0].length } : {};
+  if (method === 'computeQueryEmbedding') return typeof args[0] === 'string' ? { batch_size: 1 } : {};
+  return {};
+}
+
 /** Extract result metadata for data-loading methods to enrich completion events. */
 function extractResultMeta(method: string, args: unknown[], value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== 'object') return undefined;
@@ -159,6 +173,23 @@ function retryAfterSFromError(err: unknown, httpStatus: number | undefined): num
   return typeof v === 'number' ? v : undefined;
 }
 
+/**
+ * 429 rate-limit discriminators for FR `ai.error` events (t/3107). web-bridge attaches the
+ * parsed 429 body fields to the thrown error; surface them as named fields so a CLIENT-ONLY dump
+ * (all an anonymous free-tier user can produce — server dumps are gated to authed sessions) can
+ * tell a per-IP front-door 429 (`per_ip_rpm`) from a key-rotation-exhaustion 429
+ * (`api_key_exhausted`) without any server correlation.
+ */
+function rateLimitFieldsFromError(err: unknown, httpStatus: number | undefined): Record<string, unknown> {
+  if (httpStatus !== 429) return {};
+  const e = err as { rateLimitSource?: unknown; limit?: unknown; current?: unknown };
+  const out: Record<string, unknown> = {};
+  if (typeof e.rateLimitSource === 'string') out.rate_limit_source = e.rateLimitSource;
+  if (typeof e.limit === 'number') out.limit = e.limit;
+  if (typeof e.current === 'number') out.current = e.current;
+  return out;
+}
+
 /** Categorize bridge methods for the recorder. */
 function inferCategory(method: string): string {
   if (method.startsWith('generate') || method.startsWith('startChat') || method === 'nliClassify') return 'ai';
@@ -197,7 +228,7 @@ export function instrumentBridge(raw: AppAPI): AppAPI {
         component: recorder.intern('component', 'bridge') as string | number,
         level: 'debug',
         message: `bridge.${key}`,
-        data: { method: key, category, arg_count: args.length, args: summarizeArgs(args, key) },
+        data: { method: key, category, arg_count: args.length, args: summarizeArgs(args, key), ...embeddingBatchData(key, args) },
       });
 
       let result: unknown;
@@ -218,7 +249,7 @@ export function instrumentBridge(raw: AppAPI): AppAPI {
           message: expected ? `bridge.${key} expected ${httpStatus} (sync)` : `bridge.${key} failed (sync)`,
           duration_ms,
           error: normalizeError(err),
-          data: { method: key, category, ...(httpStatus !== undefined && { http_status: httpStatus }), ...(retryAfterS !== undefined && { retry_after_s: retryAfterS }) },
+          data: { method: key, category, ...(httpStatus !== undefined && { http_status: httpStatus }), ...(retryAfterS !== undefined && { retry_after_s: retryAfterS }), ...rateLimitFieldsFromError(err, httpStatus) },
         });
         throw err;
       }
@@ -264,7 +295,7 @@ export function instrumentBridge(raw: AppAPI): AppAPI {
             message: expected ? `bridge.${key} expected ${httpStatus}` : `bridge.${key} failed`,
             duration_ms,
             error: normalizeError(err),
-            data: { method: key, category, ...(httpStatus !== undefined && { http_status: httpStatus }), ...(retryAfterS !== undefined && { retry_after_s: retryAfterS }) },
+            data: { method: key, category, ...(httpStatus !== undefined && { http_status: httpStatus }), ...(retryAfterS !== undefined && { retry_after_s: retryAfterS }), ...rateLimitFieldsFromError(err, httpStatus) },
           });
           throw err;
         },

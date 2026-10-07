@@ -4,7 +4,9 @@
 import { useState, useMemo, useEffect, useRef } from 'react';
 import { getGlobalRecorder } from '@lib/flight-recorder/index';
 import { bridgeGet } from '../../bridge/web-bridge';
+import { DocLink } from './TheoryLink';
 import type { StandardizedTerm, ColloquialTerm, LintViolation, CampOrigin, CoinageStatus } from '@lib/dictionary';
+import './VocabularyPanel.css'; // t/3287 — readability styles, namespaced under .vocab-shared
 
 const POV_COLORS: Record<string, string> = {
   accelerationist: 'var(--color-acc)',
@@ -31,6 +33,9 @@ export function VocabularyPanel() {
   const [statusFilter, setStatusFilter] = useState<CoinageStatus | 'all'>('all');
   const [expandedTerm, setExpandedTerm] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  // t/3290: distinguish "load failed" (loadError set) from a genuine "no terms" empty result, so
+  // the panel never shows a silent blank list (owner reported no concepts in both Electron + web).
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   // A useRef guard survives React 19 Strict Mode's dev double-invoke of mount
   // effects, so the dictionary is loaded once rather than twice (t/2300, sibling
@@ -45,30 +50,27 @@ export function VocabularyPanel() {
 
   async function loadDictionary() {
     setLoading(true);
+    setLoadError(null);
+    // t/3290: mirror the load through BOTH transports; a throw sets loadError so the render shows a
+    // distinct "load failed" state (not a silent blank). Fallback-Path Logging: WARN, not debug — a
+    // blanked Vocabulary panel is invisible degradation (docs/error-handling.md).
+    const isElectron = typeof window !== 'undefined' && (window as any).electronAPI?.loadDictionary;
     try {
-      if (typeof window !== 'undefined' && (window as any).electronAPI?.loadDictionary) {
-        const data = await (window as any).electronAPI.loadDictionary();
-        setStandardized(data.standardized ?? []);
-        setColloquial(data.colloquial ?? []);
-        setLintResults(data.lintViolations ?? []);
-      } else {
-        // Web/fallback: load via bridge API
-        try {
-          const data = await bridgeGet<{ standardized?: StandardizedTerm[]; colloquial?: ColloquialTerm[]; lintViolations?: LintViolation[] }>('/api/dictionary');
-          setStandardized(data.standardized ?? []);
-          setColloquial(data.colloquial ?? []);
-          setLintResults(data.lintViolations ?? []);
-        } catch (err) {
-          // No dictionary API available — empty state
-          getGlobalRecorder()?.record({
-            type: 'system.error',
-            component: 'vocabulary-panel',
-            level: 'debug',
-            message: 'Dictionary API unavailable',
-            error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
-          });
-        }
-      }
+      const data = isElectron
+        ? await (window as any).electronAPI.loadDictionary()
+        : await bridgeGet<{ standardized?: StandardizedTerm[]; colloquial?: ColloquialTerm[]; lintViolations?: LintViolation[] }>('/api/dictionary');
+      setStandardized(data.standardized ?? []);
+      setColloquial(data.colloquial ?? []);
+      setLintResults(data.lintViolations ?? []);
+    } catch (err) {
+      setLoadError((err as Error).message || 'Unknown error');
+      getGlobalRecorder()?.record({
+        type: 'system.error',
+        component: 'vocabulary-panel',
+        level: 'warn',
+        message: `Dictionary load failed (${isElectron ? 'electron' : 'web'}) — panel shows load-error state`,
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
     } finally {
       setLoading(false);
     }
@@ -106,13 +108,27 @@ export function VocabularyPanel() {
   }, [colloquial, searchQuery]);
 
   if (loading) {
-    return <div className="vocabulary-panel loading">Loading dictionary...</div>;
+    return <div className="vocabulary-panel loading vocab-shared">Loading dictionary...</div>;
+  }
+
+  // t/3290: distinct load-FAILURE state (vs. a genuine empty result below) — never a silent blank.
+  if (loadError) {
+    return (
+      <div className="vocabulary-panel vocab-shared">
+        <div className="vocab-header"><h3>Vocabulary</h3></div>
+        <div className="empty-state vocab-load-error" role="alert">
+          <p>Couldn&apos;t load the dictionary — {loadError}.</p>
+          <button type="button" onClick={() => void loadDictionary()}>Retry</button>
+        </div>
+      </div>
+    );
   }
 
   return (
-    <div className="vocabulary-panel">
+    <div className="vocabulary-panel vocab-shared">
       <div className="vocab-header">
         <h3>Vocabulary</h3>
+        <DocLink docPath="research/comp-linguist/docs/theory-of-success/theory-of-success-vocabulary.md" label="Theory of success: Vocabulary" tooltip="Open the Vocabulary theory-of-success doc in GitHub" />
         <span className="vocab-stats">
           {standardized.length} terms / {colloquial.length} colloquial
           {lintResults.length > 0 && (
@@ -165,13 +181,30 @@ export function VocabularyPanel() {
       <div className="vocab-content">
         {activeTab === 'dictionary' && (
           <div className="vocab-list">
+            {filteredStandardized.length === 0 && (
+              <div className="empty-state">
+                {searchQuery || campFilter !== 'all' || statusFilter !== 'all'
+                  ? 'No terms match the current filters.'
+                  : 'No dictionary terms available.'}
+              </div>
+            )}
             {filteredStandardized.map(term => (
               <div
                 key={term.canonical_form}
                 className={`vocab-entry ${expandedTerm === term.canonical_form ? 'expanded' : ''}`}
+                role="button"
+                tabIndex={0}
+                aria-expanded={expandedTerm === term.canonical_form}
                 onClick={() => setExpandedTerm(
                   expandedTerm === term.canonical_form ? null : term.canonical_form,
                 )}
+                onKeyDown={e => {
+                  // t/3287 §7: keyboard-operable expandable row (Enter/Space toggles).
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    setExpandedTerm(expandedTerm === term.canonical_form ? null : term.canonical_form);
+                  }
+                }}
               >
                 <div className="vocab-entry-header">
                   <span
@@ -263,6 +296,11 @@ export function VocabularyPanel() {
 
         {activeTab === 'colloquial' && (
           <div className="vocab-list">
+            {filteredColloquial.length === 0 && (
+              <div className="empty-state">
+                {searchQuery ? 'No colloquial terms match the current search.' : 'No colloquial terms available.'}
+              </div>
+            )}
             {filteredColloquial.map(term => (
               <div key={term.colloquial_term} className="vocab-entry colloquial-entry">
                 <div className="vocab-entry-header">

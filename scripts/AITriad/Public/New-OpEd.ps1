@@ -260,14 +260,17 @@ function New-OpEd {
         $Prep = $SourcePrep
     } elseif ($PSCmdlet.ParameterSetName -eq 'FromUrl') {
         Write-Verbose "Fetching + converting source material from $Url"
-        $Prep = Get-OpEdSource -Url $Url -Verbose:($VerbosePreference -ne 'SilentlyContinue')
+        # Get-OpEdSource is convert-only (t/3307); the CLI's best-effort fetch lives in the localized
+        # Private helper Get-OpEdSourceFromUrl (WAF-limited interim, migrates to the shared Node
+        # fetch-CLI under t/3312 — one entry point for the migration + any WAF-fetch prevention guard).
+        $Prep = Get-OpEdSourceFromUrl -Url $Url -Verbose:($VerbosePreference -ne 'SilentlyContinue')
     }
 
     $SourceMaterial = '(no external source supplied — argue from the topic and general knowledge)'
     if ($null -ne $Prep) {
         $SourceMaterial = [string]$Prep.SourceMarkdown
         if (-not $PSBoundParameters.ContainsKey('Topic') -or [string]::IsNullOrWhiteSpace($Topic)) {
-            $Topic = "Write an op-ed responding to the source material below (from $($Prep.Url)). Choose the sharpest angle consistent with your camp's convictions."
+            $Topic = "Write an op-ed responding to the source material below (from $($Prep.SourceUrl)). Choose the sharpest angle consistent with your camp's convictions."
         }
     }
 

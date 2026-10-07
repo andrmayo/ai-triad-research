@@ -100,17 +100,85 @@ Describe 'Import-Entity — curation write (t/1804 §4)' -Tag 'unit' {
         (Get-Content -Raw -Path $tmp | ConvertFrom-Json).entity_count | Should -Be 20
     }
 
+    It 'Rejects a proposal carrying an UNRECOGNIZED field — loud, not silent drop (t/3133)' {
+        $tmp = Join-Path $TestDrive 'entities-unknownfield.json'
+        $p = New-Prop @{ bogus_field = 'oops' }
+        { Import-Entity -Proposal @($p) -Path $tmp -SkipEmbedding } | Should -Throw -ExpectedMessage '*bogus_field*'
+    }
+
+    It 'Accepts a proposal whose fields are all recognized — guard does not false-reject (t/3133)' {
+        $tmp = Join-Path $TestDrive 'entities-knownfields.json'
+        $p = New-Prop @{ status = 'proposed'; aliases = @('GPT4'); description_provenance = 'ai-drafted'; confidence = 0.9 }
+        { Import-Entity -Proposal @($p) -Path $tmp -SkipEmbedding } | Should -Not -Throw
+    }
+
+    It 'ACCEPTS but DROPS relations — allowlisted, not yet persisted (t/3119 fast-follow safety)' {
+        # relations is on the contract + allowlist (so it is NOT loud-rejected), but Import-Entity
+        # applies only NAMED fields — there is no copy-all step — so relations is NOT written to the
+        # record. This is the inert accepted-but-dropped window that lets the type land before the
+        # DAG/acyclic/depth≤3 validator (TL p/342#218). The drop-assertion is load-bearing: if a
+        # future writer starts PERSISTING relations without validation, this test reds and stops it.
+        $tmp = Join-Path $TestDrive 'entities-relations-dropped.json'
+        $p = New-Prop @{ relations = @(@{ type = 'instance_of'; target = 'term:language-model' }) }
+        # (1) allowlisted → no loud reject.
+        { Import-Entity -Proposal @($p) -Path $tmp -SkipEmbedding } | Should -Not -Throw
+        # (2) the persisted record carries NO relations property (dropped, not persisted).
+        $stored = (Get-Content -Raw -Path $tmp | ConvertFrom-Json).entities[0]
+        $stored.PSObject.Properties['relations'] | Should -BeNullOrEmpty
+    }
+
     It 'Rejects approving a PERSON record with no human description (§4/§9.3)' {
         $tmp = Join-Path $TestDrive 'entities-person.json'
         $p = @{ name = 'Jane Doe'; entity_type = 'person'; dolce_category = 'agentive-physical-object'; status = 'approved' }
         { Import-Entity -Proposal @($p) -Path $tmp -SkipEmbedding } | Should -Throw -ExpectedMessage '*description*'
     }
 
-    It 'Allows approving a PERSON record WITH a human description' {
+    It 'Allows approving a PERSON record WITH a human description (unset provenance = grandfathered, t/3131)' {
         $tmp = Join-Path $TestDrive 'entities-person-ok.json'
         $p = @{ name = 'Jane Doe'; entity_type = 'person'; dolce_category = 'agentive-physical-object'; status = 'approved'; description = 'A person who researches AI policy.' }
         { Import-Entity -Proposal @($p) -Path $tmp -SkipEmbedding } | Should -Not -Throw
         (Get-Content -Raw -Path $tmp | ConvertFrom-Json).entities[0].status | Should -Be 'approved'
+    }
+
+    It 'Blocks approving a PERSON with an ai-drafted (unedited) description — deliberate-fail arm (t/3131)' {
+        $tmp = Join-Path $TestDrive 'entities-person-aidraft.json'
+        $p = @{ name = 'Jane Doe'; entity_type = 'person'; dolce_category = 'agentive-physical-object'; status = 'approved'; description = 'A person who researches AI policy.'; description_provenance = 'ai-drafted' }
+        { Import-Entity -Proposal @($p) -Path $tmp -SkipEmbedding } | Should -Throw -ExpectedMessage '*AI draft*'
+    }
+
+    It 'Allows approving a PERSON once provenance is human-edited — clean arm (t/3131)' {
+        $tmp = Join-Path $TestDrive 'entities-person-edited.json'
+        $p = @{ name = 'Jane Doe'; entity_type = 'person'; dolce_category = 'agentive-physical-object'; status = 'approved'; description = 'A person who researches AI policy.'; description_provenance = 'human-edited' }
+        { Import-Entity -Proposal @($p) -Path $tmp -SkipEmbedding } | Should -Not -Throw
+        $stored = (Get-Content -Raw -Path $tmp | ConvertFrom-Json).entities[0]
+        $stored.status                 | Should -Be 'approved'
+        $stored.description_provenance  | Should -Be 'human-edited'
+    }
+
+    It 'Allows PROPOSING (not approving) a PERSON with an ai-drafted description (t/3131)' {
+        $tmp = Join-Path $TestDrive 'entities-person-propose.json'
+        $p = @{ name = 'Jane Doe'; entity_type = 'person'; dolce_category = 'agentive-physical-object'; status = 'proposed'; description = 'A person who researches AI policy.'; description_provenance = 'ai-drafted' }
+        { Import-Entity -Proposal @($p) -Path $tmp -SkipEmbedding } | Should -Not -Throw
+        $stored = (Get-Content -Raw -Path $tmp | ConvertFrom-Json).entities[0]
+        $stored.status                 | Should -Be 'proposed'
+        $stored.description_provenance  | Should -Be 'ai-drafted'
+    }
+
+    It 'PERSISTS ai-drafted on import; the stored marker blocks a later approval that omits provenance (persist + anti-dodge, t/3131)' {
+        $tmp = Join-Path $TestDrive 'entities-person-persist.json'
+        # 1) propose an ai-drafted person → provenance must PERSIST on the stored record
+        $prop = @{ name = 'Jane Doe'; entity_type = 'person'; dolce_category = 'agentive-physical-object'; status = 'proposed'; description = 'A person who researches AI policy.'; description_provenance = 'ai-drafted' }
+        $r1 = Import-Entity -Proposal @($prop) -Path $tmp -SkipEmbedding
+        $id = $r1[0].Id
+        (Get-Content -Raw -Path $tmp | ConvertFrom-Json).entities[0].description_provenance | Should -Be 'ai-drafted'
+        # 2) approve WITHOUT re-supplying provenance → anti-dodge resolves the persisted 'ai-drafted'
+        #    → still blocked (proves the marker survived import; grandfather cannot misfire)
+        { Import-Entity -Proposal @(@{ id = $id; status = 'approved' }) -Path $tmp -SkipEmbedding } | Should -Throw -ExpectedMessage '*AI draft*'
+        # 3) human edits + flips to human-edited → approval succeeds
+        { Import-Entity -Proposal @(@{ id = $id; status = 'approved'; description_provenance = 'human-edited' }) -Path $tmp -SkipEmbedding } | Should -Not -Throw
+        $final = (Get-Content -Raw -Path $tmp | ConvertFrom-Json).entities[0]
+        $final.status                 | Should -Be 'approved'
+        $final.description_provenance  | Should -Be 'human-edited'
     }
 
     It 'NEVER hard-deletes: deprecate + merge leave the record count monotonic (§3, TL Q3)' {
@@ -262,6 +330,9 @@ Describe 'Entity shape parity with lib/entities/types.ts (contract drift gate, T
         $script:RequiredFields | Should -Contain 'id'
         $script:RequiredFields | Should -Contain 'status'
         $script:OptionalFields | Should -Contain 'merged_into'
+        # t/3132: person-approval provenance marker — locks it as a known OPTIONAL contract field
+        # (absent = legacy/grandfathered) so a later removal from the TS Entity interface is caught here.
+        $script:OptionalFields | Should -Contain 'description_provenance'
     }
 
     It 'A record written by Import-Entity satisfies the contract (required present, no forked keys)' {
@@ -287,6 +358,15 @@ Describe 'Entity shape parity with lib/entities/types.ts (contract drift gate, T
         $keysMissingId = @($script:RequiredFields | Where-Object { $_ -ne 'id' }) + @('external_refs', 'source_refs')
         (Test-EntityKeyParity -RecordKeys $keysMissingId -Required $script:RequiredFields -Optional $script:OptionalFields) | Should -BeFalse
     }
+
+    It 'Import-Entity unknown-field allowlist stays in sync with the Entity contract (t/3133)' {
+        # The t/3133 guard rejects any proposal field not in Get-EntityProposalFieldName. That
+        # allowlist MUST equal the contract field set, else a newly-added contract field would be
+        # silently rejected (or a removed one silently accepted). Private fn → read via InModuleScope.
+        $allow    = @(InModuleScope AITriad { Get-EntityProposalFieldName }) | Sort-Object
+        $contract = (@($script:RequiredFields) + @($script:OptionalFields)) | Sort-Object
+        ($allow -join ',') | Should -Be ($contract -join ',')
+    }
 }
 
 Describe 'Entity cmdlets - manifest' -Tag 'unit' {
@@ -295,5 +375,93 @@ Describe 'Entity cmdlets - manifest' -Tag 'unit' {
         $manifest = Test-ModuleManifest -Path $manifestPath
         $manifest.ExportedFunctions.Keys | Should -Contain 'Get-Entity'
         $manifest.ExportedFunctions.Keys | Should -Contain 'Import-Entity'
+    }
+}
+
+Describe 'Import-Entity — v2 multi-vector embed (t/3121 C)' -Tag 'unit' {
+
+    BeforeEach {
+        # Deterministic embed: name (or any non-#desc id) → 0.1×384; description (#desc) → 0.2×384.
+        Mock -ModuleName AITriad Get-TextEmbedding {
+            $m = @{}
+            foreach ($id in $Ids) {
+                $fill = if ($id -like '*#desc') { 0.2 } else { 0.1 }
+                $m[$id] = @(1..384 | ForEach-Object { $fill })
+            }
+            return $m
+        }
+    }
+
+    It 'Writes a v2 EntityVectorRecord {name_vector, description_vector} + _src_hash for an approved entity with a description' {
+        $ent = Join-Path $TestDrive 'v2-ent.json'
+        $emb = Join-Path $TestDrive 'v2-emb.json'
+        $r = Import-Entity -Proposal @((New-Prop @{ status = 'approved'; aliases = @('GPT4', 'GPT-four') })) -Path $ent -EmbeddingsPath $emb
+        $r[0].Embedded | Should -BeTrue
+        Should -Invoke -ModuleName AITriad Get-TextEmbedding -Times 1 -Exactly
+
+        $store = Get-Content -Raw -Path $emb | ConvertFrom-Json
+        $store._schema_version | Should -Be '2.0.0'
+        $rec = $store.vectors.'ent-001'
+        @($rec.name_vector).Count        | Should -Be 384
+        @($rec.description_vector).Count | Should -Be 384
+        $rec.name_vector[0]        | Should -Be 0.1
+        $rec.description_vector[0] | Should -Be 0.2
+        $store._src_hashes.'ent-001' | Should -Match '^[0-9a-f]{64}$'
+    }
+
+    It 'OMITS description_vector when the entity has no description (readers tolerate absence)' {
+        $ent = Join-Path $TestDrive 'v2-nodesc-ent.json'
+        $emb = Join-Path $TestDrive 'v2-nodesc-emb.json'
+        Import-Entity -Proposal @((New-Prop @{ status = 'approved'; description = '' })) -Path $ent -EmbeddingsPath $emb | Out-Null
+        $rec = (Get-Content -Raw -Path $emb | ConvertFrom-Json).vectors.'ent-001'
+        @($rec.name_vector).Count | Should -Be 384
+        $rec.PSObject.Properties['description_vector'] | Should -BeNullOrEmpty
+    }
+
+    It 'Batches name + description in ONE Get-TextEmbedding call (sub-id #name/#desc)' {
+        $ent = Join-Path $TestDrive 'v2-batch-ent.json'
+        $emb = Join-Path $TestDrive 'v2-batch-emb.json'
+        Import-Entity -Proposal @((New-Prop @{ status = 'approved' })) -Path $ent -EmbeddingsPath $emb | Out-Null
+        Should -Invoke -ModuleName AITriad Get-TextEmbedding -Times 1 -Exactly -ParameterFilter {
+            ($Ids -contains 'ent-001#name') -and ($Ids -contains 'ent-001#desc')
+        }
+    }
+
+    It 'Is idempotent — a re-approve with unchanged source does NOT re-embed (_src_hash staleness guard)' {
+        $ent = Join-Path $TestDrive 'v2-idem-ent.json'
+        $emb = Join-Path $TestDrive 'v2-idem-emb.json'
+        Import-Entity -Proposal @((New-Prop @{ status = 'approved' })) -Path $ent -EmbeddingsPath $emb | Out-Null
+        $r2 = Import-Entity -Proposal @((New-Prop @{ id = 'ent-001'; status = 'approved' })) -Path $ent -EmbeddingsPath $emb
+        $r2[0].Embedded | Should -BeTrue   # still carries a vector
+        Should -Invoke -ModuleName AITriad Get-TextEmbedding -Times 1 -Exactly   # not re-embedded
+    }
+
+    It 'Re-embeds when the source changed (hash mismatch → fresh vectors)' {
+        $ent = Join-Path $TestDrive 'v2-change-ent.json'
+        $emb = Join-Path $TestDrive 'v2-change-emb.json'
+        Import-Entity -Proposal @((New-Prop @{ status = 'approved' })) -Path $ent -EmbeddingsPath $emb | Out-Null
+        Import-Entity -Proposal @((New-Prop @{ id = 'ent-001'; status = 'approved'; description = 'A different description entirely.' })) -Path $ent -EmbeddingsPath $emb | Out-Null
+        Should -Invoke -ModuleName AITriad Get-TextEmbedding -Times 2 -Exactly
+    }
+
+    It 'Upgrades a v1 flat-array record to a v2 record on the next approval (back-compat)' {
+        $ent = Join-Path $TestDrive 'v1up-ent.json'
+        $emb = Join-Path $TestDrive 'v1up-emb.json'
+        # Seed a v1 store: vectors[id] is a flat number[] (single blended vector), schema 1.0.0.
+        @{
+            _schema_version = '1.0.0'
+            model           = 'all-MiniLM-L6-v2'
+            dim             = 384
+            vectors         = @{ 'ent-001' = @(1..384 | ForEach-Object { 0.5 }) }
+        } | ConvertTo-Json -Depth 6 | Set-Content -Path $emb -Encoding utf8
+        Import-Entity -Proposal @((New-Prop)) -Path $ent -SkipEmbedding | Out-Null   # ent-001, proposed, no embed
+        Import-Entity -Proposal @((New-Prop @{ id = 'ent-001'; status = 'approved' })) -Path $ent -EmbeddingsPath $emb | Out-Null
+
+        $store = Get-Content -Raw -Path $emb | ConvertFrom-Json
+        $store._schema_version | Should -Be '2.0.0'
+        $rec = $store.vectors.'ent-001'
+        $rec -is [array]          | Should -BeFalse   # no longer a flat array
+        @($rec.name_vector).Count | Should -Be 384    # now a v2 record
+        Should -Invoke -ModuleName AITriad Get-TextEmbedding -Times 1 -Exactly   # v1 array ≠ v2 → re-embedded
     }
 }

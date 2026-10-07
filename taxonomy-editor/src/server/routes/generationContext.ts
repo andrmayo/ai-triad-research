@@ -19,6 +19,8 @@ import { type AIBackend } from '../config.js';
 import { getClientIp } from '../httpKit.js';
 import { callerTierIdentity } from '../security/accessControl.js';
 import { getCurrentUser } from '../security/userContext.js';
+import { isAnonDebatesEnabled } from '../featureFlags.js';
+import { log } from '../logger.js';
 
 export type ResolvedTier = ReturnType<typeof proxyTiers.resolveTier>;
 
@@ -56,5 +58,30 @@ export function enforceBackendAllowed(res: http.ServerResponse, tier: ResolvedTi
   });
   res.writeHead(403, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: `Backend '${backend}' not available on your tier`, tier_level: tier.level, requested_backend: backend }));
+  return true;
+}
+
+/** 403 + record when an anonymous/free-tier caller runs a DEBATE while anon debates are disabled
+ *  (t/3230: a single anon debate drains the shared free Gemini key pool (K=4) → 429 storm → ~485s
+ *  retry → user-facing 500). The `debateId` marker is present on every debate generate — including
+ *  the fact-check `search` calls, the biggest key burn — so `isFree && debateId` scopes the block
+ *  to exactly the free-tier debate flow; authenticated debates and all non-debate free-tier
+ *  generation are untouched. Reversible: an admin flip of the `anon-debates` flag → true re-enables
+ *  with no redeploy. Returns true when it has already sent a response (caller must return). */
+export function enforceAnonDebateGate(res: http.ServerResponse, isFree: boolean, debateId: string | undefined): boolean {
+  if (!isFree || !debateId || isAnonDebatesEnabled()) return false;
+  getGlobalRecorder()?.record({
+    type: 'ai.error', component: 'ai-generate', level: 'warn',
+    message: 'Anonymous debate generation blocked — anon debates disabled (t/3230)',
+    data: { tier_level: 'free', debateId: debateId.slice(0, 64), reason: 'anon-debates-disabled' },
+  });
+  // TL GV condition (observable): also emit to Pino/stdout so blocks are countable in Log Analytics
+  // (the FR record above lives in the ring buffer only). One line per blocked anon debate.
+  log.api.warn({ component: 'ai-generate', reason: 'anon-debates-disabled', tier_level: 'free', debateId: debateId.slice(0, 64) }, 'anon debate generation blocked (t/3230)');
+  res.writeHead(403, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    error: 'Anonymous debates are temporarily disabled. Sign in to run debates.',
+    reason: 'anon_debates_disabled', retryable: false,
+  }));
   return true;
 }

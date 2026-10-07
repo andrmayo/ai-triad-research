@@ -63,6 +63,13 @@ Files the Computational Linguist holds **mandatory review authority** over. Chan
 | `research/comp-linguist/docs/frame-survival-metric-spec.md` | Frame-survival metric family — definitions, thresholds, validation gates (t/2042) | Mandatory |
 | `research/comp-linguist/analyses/edge-rationale-quality/check_rationale_quality.py` | Edge-rationale mechanical quality screen — stipulated flag thresholds (t/2444 A′) | Mandatory |
 | `research/comp-linguist/analyses/edge-rationale-quality/judge-prompt.txt` | Edge-rationale LLM-judge scoring prompt (t/2444 A′) | Mandatory |
+| `research/comp-linguist/data/conflict-outcome-labels.json` | Labeled conflict-outcome set — Pollock attack-type labels + outcome labels (prevail-claim/prevail-dispute/tie/undecided) for all 19 dispute-bearing conflicts; gates Potyka-2021 pilot and attack_weights gradient validation (t/3152) | Mandatory |
+| **logical_form / prover tooling (t/3126, t/3162, t/3127, t/3239)** | | |
+| `research/comp-linguist/tools/formalize_node_lf.py` | Node `logical_form` populator — ports the formalization prompt over BDI nodes; one-identity grounding + mechanical modality; writes DOLCE-sorted frames (t/3162) | Mandatory |
+| `research/comp-linguist/tools/frame_to_tptp.py` | `logical_form` → TPTP FOF serializer + fail-safe prover harness; axiom-independent (axiom module held for TL review) (t/3127) | Mandatory |
+| `research/comp-linguist/tools/dolce_prover_pilot.py` | DOLCE-lite axiom module (5 flat-disjoint sorts, no covering, UNA grounded-ids, comparability filter — TL t/3127#4) + z3 frame-incompatibility prover + t/3128 edge-verification pilot (prover vs NLI) | Mandatory |
+| `research/comp-linguist/tools/build_lf_golden_worksheet.py` | Deterministic stratified sampler → human-labeling worksheet for the `logical_form` golden set (t/3239) | Mandatory |
+| `research/comp-linguist/tools/score_lf_golden.py` | `formalization_accuracy` scorer (per-stratum/macro/overall) + deterministic off-enum-sort hard gate over all frames (t/3239) | Mandatory |
 
 ## Maintenance rule
 

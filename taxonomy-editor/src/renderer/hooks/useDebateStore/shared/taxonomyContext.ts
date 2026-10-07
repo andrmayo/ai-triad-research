@@ -2,7 +2,7 @@
 // Licensed under the MIT License. See LICENSE file in the project root.
 
 import type { PovNode, CrossCuttingNode as SituationNode } from '../../../types/taxonomy';
-import { AI_POVERS, POVER_INFO, POV_KEYS } from '../../../types/debate';
+import { POV_KEYS } from '../../../types/debate';
 import { useTaxonomyStore } from '../../useTaxonomyStore';
 // Circular import — safe because all references are at call-time, never at module init
 import { useDebateStore } from '../store';
@@ -10,23 +10,26 @@ import type { NodeScoringSource, RelevanceSourceEntry } from '../types';
 
 import { getGlobalRecorder } from '@lib/flight-recorder/index';
 import { nodeTypeFromId } from '@lib/debate/nodeIdUtils';
-import { embedDoctrinalBoundaries, computeDoctrinalAnchoring, checkThresholdAnomalies } from '@lib/debate/doctrinalAnchoring';
-import type { BoundaryEmbeddings } from '@lib/debate/doctrinalAnchoring';
 import { computeLineageDistribution, formatLineageContext } from '@lib/debate/topicCritique';
-import { cosineSimilarity, scoreNodeRelevanceMeanTopN, selectRelevantNodes, selectRelevantSituationNodes, buildRelevanceQuery, scoreNodesViaAN } from '../../../utils/taxonomyRelevance';
-import type { ANClaimEmbedding, RelevanceOptions } from '../../../utils/taxonomyRelevance';
+// t/3257: the relevance-selection pipeline moved to lib-pure; this file is now the thin CLIENT
+// wrapper (build corpus embeddings + fetch greatest-hits + assemble session state → call the pure
+// fn → re-apply anchoring + emit diagnostics + map the result). The server calls the SAME fn (T2).
+// t/3258 (T3): the client no longer calls selectRelevantTaxonomy locally — it delegates to the
+// server/main via api.fetchRelevantNodes (both run the SAME lib fn → parity by construction).
+// assembleNodeEmbeddings stays for buildNodeEmbeddingMap, which the t/3165 corpus-dedup regression
+// test still exercises (the production corpus-fetch path is now dead — cleanup deferred to a
+// follow-up, gated on this flip being parity-GV-proven so the old path stays as rollback).
+import { assembleNodeEmbeddings } from '@lib/debate/relevanceSelection';
+import type { ANClaimInput } from '@lib/debate/relevanceSelection';
+// t/3257#21: corpus assembly + synthetic merge relocated to lib so the server (T2) + client build
+// the corpus map identically (parity by construction). Re-exported here for argumentNetwork.ts.
+export { mergeSyntheticVectors } from '@lib/debate/relevanceSelection';
 import type { TaxonomyContext } from '../../../utils/taxonomyContext';
-import { applyGreatestHitsExclusion } from './getGreatestHits';
+import { getGreatestHits } from './getGreatestHits';
 import { getLineageMapping, getL2Categories, isLineageDataLoaded } from '../../../data/lineageCategories';
 import { api } from '@bridge';
 
 export type { TaxonomyContext };
-
-// ── Doctrinal anchoring cache ────────────────────────────────────────
-// Tracks which POVs have had doctrinal anchoring applied in this session.
-// Once anchored, PovNode objects are mutated in place (doctrinally_anchored, confidence floor).
-let _doctrinalAnchoringApplied = new Set<string>();
-let _boundaryEmbeddingsCache: BoundaryEmbeddings | null = null;
 
 // ── Synthetic embeddings cache ───────────────────────────────────────
 // Loaded once per session from synthetic_embeddings.json via the bridge.
@@ -34,9 +37,10 @@ let _syntheticVectorsCache: Record<string, number[][]> | null = null;
 let _syntheticVectorsLoaded = false;
 
 /** Reset doctrinal anchoring cache (call when debate changes or taxonomy reloads). */
+/** Reset the session embedding caches (call when the debate changes or the taxonomy reloads).
+ *  t/3257: doctrinal anchoring is now stateless in the lib fn (re-applied idempotently per call),
+ *  so there is no longer an anchoring cache to clear — only the synthetic-vector cache remains. */
 export function resetDoctrinalAnchoringCache(): void {
-  _doctrinalAnchoringApplied = new Set();
-  _boundaryEmbeddingsCache = null;
   _syntheticVectorsCache = null;
   _syntheticVectorsLoaded = false;
 }
@@ -57,18 +61,6 @@ export async function loadSyntheticVectors(): Promise<Record<string, number[][]>
   }
   _syntheticVectorsLoaded = true;
   return _syntheticVectorsCache;
-}
-
-export function mergeSyntheticVectors(
-  nodeEmbeddings: Record<string, { pov: string; vector: number[] }>,
-  syntheticVectors: Record<string, number[][]>,
-): Record<string, { pov: string; vector: number[]; vectors?: number[][] }> {
-  const merged: Record<string, { pov: string; vector: number[]; vectors?: number[][] }> = {};
-  for (const [nodeId, entry] of Object.entries(nodeEmbeddings)) {
-    const sv = syntheticVectors[nodeId];
-    merged[nodeId] = sv ? { ...entry, vectors: sv } : entry;
-  }
-  return merged;
 }
 
 export function enrichPolicyRefs(
@@ -172,162 +164,45 @@ export function serializeNodeSourceMap(
 // phase is independently testable.
 type NodeEmbeddingMap = Record<string, { pov: string; vector: number[]; vectors?: number[][] }>;
 
-/** Embed all POV+CC nodes into a combined map, merging synthetic multi-vectors when available. */
-async function buildNodeEmbeddingMap(pov: string, allPovNodes: PovNode[], allCCNodes: SituationNode[]): Promise<{ nodeEmbeddings: NodeEmbeddingMap; allNodeIds: string[] }> {
-  const allNodeTexts = [
-    ...allPovNodes.map(n => `${n.label}: ${n.description}`),
-    ...allCCNodes.map(n => `${n.label}: ${n.description}`),
-  ];
-  const allNodeIds = [
-    ...allPovNodes.map(n => n.id),
-    ...allCCNodes.map(n => n.id),
-  ];
-  const { vectors: allVectors } = await api.computeEmbeddings(allNodeTexts, allNodeIds);
-  const baseNodeEmbeddings: Record<string, { pov: string; vector: number[] }> = {};
-  for (let i = 0; i < allNodeIds.length; i++) {
-    baseNodeEmbeddings[allNodeIds[i]] = { pov, vector: allVectors[i] };
-  }
+// Per-debate base-embedding memo (t/3165 blast-radius mitigation — DEFENSE-IN-DEPTH, not the root
+// fix). getRelevantTaxonomyContext runs once per speaker (acc/saf/skp); each call re-embeds
+// current-POV nodes + ALL situations, and the ~443 situations are identical across all 3 speakers,
+// so they recompute 3×. Each ~800-text recompute is what starves the event loop when prod's
+// embeddings.json is stale vs the taxonomy data (the real driver — DevOps-owned coverage/reseed).
+// Memoizing base vectors by node-id within a debate embeds the shared corpus ONCE, not per speaker.
+// Behaviour-equivalent: embeddings are a deterministic fn of text; the memo keys on node-id and is
+// scoped to the active debate (cleared when the debate id changes), so a node whose text changed
+// between debates is re-embedded.
+const corpusEmbedMemo = new Map<string, number[]>();
+let corpusEmbedMemoDebateId: string | null = null;
 
-  // Merge synthetic multi-vector embeddings when available
+/**
+ * Embed all POV+CC nodes into a combined map, merging synthetic multi-vectors when available.
+ * Exported for the t/3165 corpus-dedup regression test.
+ */
+export async function buildNodeEmbeddingMap(pov: string, allPovNodes: PovNode[], allCCNodes: SituationNode[]): Promise<{ nodeEmbeddings: NodeEmbeddingMap; allNodeIds: string[] }> {
+  // Reset the per-debate memo when the active debate changes.
+  const debateId = useDebateStore.getState().activeDebate?.id ?? null;
+  if (debateId !== corpusEmbedMemoDebateId) {
+    corpusEmbedMemo.clear();
+    corpusEmbedMemoDebateId = debateId;
+  }
+  // Memoizing corpus-embed adapter: embed ONLY the ids not yet seen this debate (the shared
+  // situations are embedded on the first speaker, resolved from the memo for the rest — t/3165),
+  // returning every id's vector in order. This client optimization stays out of the pure lib fn.
+  const corpusEmbed = async (texts: string[], ids?: string[]): Promise<number[][]> => {
+    const idList = ids ?? [];
+    const missIdx: number[] = [];
+    for (let i = 0; i < idList.length; i++) if (!corpusEmbedMemo.has(idList[i])) missIdx.push(i);
+    if (missIdx.length > 0) {
+      const { vectors } = await api.computeEmbeddings(missIdx.map(i => texts[i]), missIdx.map(i => idList[i]));
+      for (let k = 0; k < missIdx.length; k++) corpusEmbedMemo.set(idList[missIdx[k]], vectors[k]);
+    }
+    return idList.map(id => corpusEmbedMemo.get(id) as number[]);
+  };
   const synVecs = await loadSyntheticVectors();
-  const nodeEmbeddings = synVecs
-    ? mergeSyntheticVectors(baseNodeEmbeddings, synVecs)
-    : baseNodeEmbeddings;
-  return { nodeEmbeddings, allNodeIds };
-}
-
-/** Doctrinal anchoring: embed boundary strings once, then apply confidence floors to Beliefs (once per POV). */
-/** Embed doctrinal boundary strings into the shared cache once (across POVs). */
-async function ensureBoundaryEmbeddingsCache(): Promise<void> {
-  if (_boundaryEmbeddingsCache) return;
-  const boundaries: Record<string, string[]> = {};
-  for (const p of AI_POVERS) {
-    const info = POVER_INFO[p];
-    if ((info?.doctrinal_boundaries?.length ?? 0) > 0) {
-      boundaries[info.pov] = info.doctrinal_boundaries ?? [];
-    }
-  }
-  if (Object.keys(boundaries).length > 0) {
-    _boundaryEmbeddingsCache = await embedDoctrinalBoundaries(
-      boundaries,
-      async (text: string) => {
-        const { vector } = await api.computeQueryEmbedding(text);
-        return vector;
-      },
-    );
-  }
-}
-
-async function applyDoctrinalAnchoring(pov: string, allPovNodes: PovNode[], nodeEmbeddings: NodeEmbeddingMap): Promise<void> {
-  if (_doctrinalAnchoringApplied.has(pov)) return;
-  try {
-    // Embed boundary strings (cached across POVs)
-    await ensureBoundaryEmbeddingsCache();
-
-    const povBoundary = _boundaryEmbeddingsCache?.[pov];
-    if (povBoundary && povBoundary.vectors.length > 0) {
-      const beliefs = allPovNodes.filter(n => n.category === 'Beliefs');
-      const results = computeDoctrinalAnchoring(beliefs, povBoundary.vectors, nodeEmbeddings, undefined, undefined, povBoundary.isRejection);
-      const anomaly = checkThresholdAnomalies(results, beliefs.length);
-      if (anomaly) console.warn(anomaly.warning);
-      const anchoredCount = results.filter(r => r.anchored).length;
-      const floorCount = results.filter(r => r.floorApplied).length;
-      if (anchoredCount > 0) {
-        console.log(`[doctrinal] ${pov}: ${anchoredCount}/${beliefs.length} Beliefs anchored, ${floorCount} floor-applied`);
-      }
-    }
-    _doctrinalAnchoringApplied.add(pov);
-  } catch (err) {
-    getGlobalRecorder()?.record({
-      type: 'system.error',
-      component: 'debate-store',
-      level: 'warn',
-      message: 'Doctrinal anchoring failed',
-      error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
-    });
-    console.warn('[doctrinal] Anchoring failed (non-blocking):', err);
-    _doctrinalAnchoringApplied.add(pov); // don't retry on failure
-  }
-}
-
-/** Per-node source attribution: best-matching AN claim + AN-vs-topic comparison for each node. */
-function buildNodeSourceMap(
-  allNodeIds: string[],
-  scores: Map<string, number>,
-  topicScores: Map<string, number>,
-  nodeEmbeddings: NodeEmbeddingMap,
-  claimEmbeddings: ANClaimEmbedding[],
-  anNodes: { id: string; text?: string }[],
-): Map<string, NodeScoringSource> {
-  const nodeSourceMap = new Map<string, NodeScoringSource>();
-  for (const nodeId of allNodeIds) {
-    const anScore = scores.get(nodeId) ?? 0;
-    const topicScore = topicScores.get(nodeId) ?? 0;
-    const entry = nodeEmbeddings[nodeId];
-    if (!entry?.vector) continue;
-
-    // Find best matching AN claim for this node
-    let bestSim = 0;
-    let bestClaim: typeof claimEmbeddings[0] | null = null;
-    for (const claim of claimEmbeddings) {
-      const sim = cosineSimilarity(entry.vector, claim.vector);
-      if (sim > bestSim) { bestSim = sim; bestClaim = claim; }
-    }
-
-    const anNode = bestClaim ? anNodes.find(n => n.id === bestClaim!.id) : null;
-    nodeSourceMap.set(nodeId, {
-      source: anScore >= topicScore * 0.5 ? 'an' : 'topic',
-      anScore,
-      topicScore,
-      bestClaimId: bestClaim?.id,
-      bestClaimText: anNode?.text,
-      bestClaimSim: bestSim,
-    });
-  }
-  return nodeSourceMap;
-}
-
-/** Score nodes by relevance: AN-claim similarity when embeddings exist (with per-node source tracking), else topic query. */
-async function computeRelevanceScores(
-  topic: string,
-  recentTranscript: string,
-  nodeEmbeddings: NodeEmbeddingMap,
-  allNodeIds: string[],
-): Promise<{ scores: Map<string, number>; nodeSourceMap?: Map<string, NodeScoringSource> }> {
-  const debate = useDebateStore.getState().activeDebate;
-  const anNodes = debate?.argument_network?.nodes ?? [];
-  let scores: Map<string, number>;
-  let nodeSourceMap: Map<string, NodeScoringSource> | undefined;
-
-  // Use pre-computed embeddings from AN nodes (set by t/442 on extraction)
-  const embeddedAnNodes = anNodes.filter(n => n.embedding && n.embedding.length > 0);
-
-  if (embeddedAnNodes.length > 0) {
-    // AN-based scoring: use cached embeddings from extraction, score nodes by max similarity
-    const claimEmbeddings: ANClaimEmbedding[] = embeddedAnNodes.map(n => ({
-      id: n.id,
-      vector: n.embedding!,
-      strength: n.computed_strength,
-    }));
-
-    scores = scoreNodesViaAN(claimEmbeddings, nodeEmbeddings, undefined, true);
-    console.log(`[taxonomy] AN-based scoring: ${claimEmbeddings.length}/${anNodes.length} claims (with embeddings) against ${allNodeIds.length} nodes`);
-
-    // Also compute topic-only scores for hybrid source tracking
-    const query = buildRelevanceQuery(topic, recentTranscript);
-    const { vector: queryVector } = await api.computeQueryEmbedding(query);
-    const topicScores = scoreNodeRelevanceMeanTopN(queryVector, nodeEmbeddings);
-
-    // Build per-node source tracking: which AN claim matched best, AN vs topic comparison
-    nodeSourceMap = buildNodeSourceMap(allNodeIds, scores, topicScores, nodeEmbeddings, claimEmbeddings, anNodes);
-  } else {
-    // No AN yet (pre-opening) — fall back to single topic query
-    const query = buildRelevanceQuery(topic, recentTranscript);
-    const { vector: queryVector } = await api.computeQueryEmbedding(query);
-    scores = scoreNodeRelevanceMeanTopN(queryVector, nodeEmbeddings);
-    console.log(`[taxonomy] Topic-query scoring (no AN claims yet): ${allNodeIds.length} nodes`);
-  }
-  return { scores, nodeSourceMap };
+  // Shared lib assembly → the server (T2) and client build the corpus map identically (t/3257#21).
+  return assembleNodeEmbeddings(pov, allPovNodes, allCCNodes, corpusEmbed, synVecs);
 }
 
 /** Build the lineage→node map (intellectual_lineage graph attribute) for the given nodes. */
@@ -373,49 +248,6 @@ function recordLineageBoostCheck(lineageFrame: { cluster_id: string }[] | undefi
   });
 }
 
-/** Build relevance-selection options, applying a lineage-tradition boost when a frame + lineage data are available. */
-function buildRelevanceOptions(threshold: number, debate: ReturnType<typeof useDebateStore.getState>['activeDebate'], allPovNodes: PovNode[]): RelevanceOptions {
-  const relevanceOpts: RelevanceOptions = { threshold, minPerCategory: 3, maxTotal: 35 };
-  const lineageFrame = debate?.topic?.critique?.lineage_frame;
-  recordLineageBoostCheck(lineageFrame, debate?.source_type === 'topic');
-  if (lineageFrame && lineageFrame.length > 0 && isLineageDataLoaded()) {
-    const mapping = getLineageMapping();
-    const lineageByNode = buildLineageByNode(allPovNodes);
-    const nameToCluster = buildNameToCluster(mapping);
-    relevanceOpts.lineageBoost = {
-      traditions: lineageFrame.map(f => f.cluster_id),
-      boost: 0.08,
-      lineageByNode,
-      nameToCluster,
-    };
-    getGlobalRecorder()?.record({
-      type: 'lineage.boost-applied',
-      component: 'debate-store',
-      level: 'info',
-      message: 'Lineage boost applied',
-      data: {
-        traditions: lineageFrame.map((f: { cluster_id: string; label?: string }) => f.label ?? f.cluster_id),
-        node_count_with_lineage: Object.keys(lineageByNode).length,
-        cluster_count: Object.keys(nameToCluster).length,
-        boost_value: 0.08,
-      },
-    });
-  } else if (lineageFrame) {
-    getGlobalRecorder()?.record({
-      type: 'lineage.boost-skipped',
-      component: 'debate-store',
-      level: 'warn',
-      message: 'Lineage boost skipped',
-      data: {
-        reason: lineageFrame.length === 0 ? 'empty_frame' : 'data_not_loaded',
-        frame_count: lineageFrame.length,
-        lineage_data_loaded: isLineageDataLoaded(),
-      },
-    });
-  }
-  return relevanceOpts;
-}
-
 /**
  * Surface a user-visible debate warning when greatest-hits exclusion was requested but
  * not applied (t/1998 loud-degrade). Store-touching companion to the store-free
@@ -430,42 +262,18 @@ function surfaceGreatestHitsWarning(outcome: { requested: boolean; applied: bool
   }
 }
 
-/** Build the diagnostics injection manifest and log the lineage-boost promotion outcome. */
-function buildInjectionManifest(
-  scoredPov: ReturnType<typeof selectRelevantNodes>,
-  scoredCC: ReturnType<typeof selectRelevantSituationNodes>,
-  threshold: number,
-  allPovNodes: PovNode[],
-): Record<string, unknown> {
-  // Log lineage boost outcome — confirms how many nodes were actually promoted
-  const _lb = (scoredPov as unknown as { _lineageBoost?: { boostedNodeIds: string[]; promotedNodeIds: string[]; promotedCount: number } })._lineageBoost;
-  if (_lb) {
-    getGlobalRecorder()?.record({
-      type: 'lineage.boost-result',
-      component: 'debate-store',
-      level: _lb.promotedCount > 0 ? 'info' : 'debug',
-      message: _lb.promotedCount > 0
-        ? `Lineage boost promoted ${_lb.promotedCount} nodes`
-        : 'Lineage boost applied but promoted 0 nodes',
-      data: { boosted_count: _lb.boostedNodeIds.length, promoted_count: _lb.promotedCount, promoted_node_ids: _lb.promotedNodeIds?.slice(0, 10), total_selected: scoredPov.length, total_candidates: allPovNodes.length },
-    });
-  }
-
-  // Build injection manifest for diagnostics (mirrors debateEngine's _lastInjectionManifest)
-  const injectionManifest: Record<string, unknown> = {
-    povNodeIds: scoredPov.map(s => s.node.id),
-    povPrimaryIds: scoredPov.filter(s => s.score >= threshold + 0.1).map(s => s.node.id).slice(0, 5),
-    situationNodeIds: scoredCC.map(s => s.node.id),
-  };
-  if (_lb && _lb.boostedNodeIds.length > 0) {
-    injectionManifest.lineage_boost = {
-      boosted: _lb.boostedNodeIds.length,
-      promoted: _lb.promotedCount,
-      boostedNodeIds: _lb.boostedNodeIds.slice(0, 20),
-      promotedNodeIds: _lb.promotedNodeIds.slice(0, 20),
-    };
-  }
-  return injectionManifest;
+/** Log the lineage-boost promotion outcome from the lib fn's returned injectionManifest (the
+ *  manifest is built pure inside selectRelevantTaxonomy now; this is the client-side FR logging). */
+function logLineageBoostResult(injectionManifest: Record<string, unknown>, totalSelected: number, totalCandidates: number): void {
+  const lb = injectionManifest.lineage_boost as { boosted: number; promoted: number; promotedNodeIds: string[] } | undefined;
+  if (!lb) return;
+  getGlobalRecorder()?.record({
+    type: 'lineage.boost-result',
+    component: 'debate-store',
+    level: lb.promoted > 0 ? 'info' : 'debug',
+    message: lb.promoted > 0 ? `Lineage boost promoted ${lb.promoted} nodes` : 'Lineage boost applied but promoted 0 nodes',
+    data: { boosted_count: lb.boosted, promoted_count: lb.promoted, promoted_node_ids: lb.promotedNodeIds?.slice(0, 10), total_selected: totalSelected, total_candidates: totalCandidates },
+  });
 }
 
 /** Emit the situation interpretation-divergence summary — surfaces interpretation alignment at debate setup. */
@@ -533,44 +341,81 @@ export async function getRelevantTaxonomyContext(
   const allCCNodes: SituationNode[] = state.situations?.nodes ?? [];
 
   try {
-    const { nodeEmbeddings, allNodeIds } = await buildNodeEmbeddingMap(pov, allPovNodes, allCCNodes);
-
-    // Doctrinal anchoring: embed boundary strings once, then apply confidence floors to Beliefs
-    await applyDoctrinalAnchoring(pov, allPovNodes, nodeEmbeddings);
-
-    // Score nodes by relevance (AN-claim-based when embeddings exist, else topic-query fallback)
-    const { scores, nodeSourceMap } = await computeRelevanceScores(topic, recentTranscript, nodeEmbeddings, allNodeIds);
-
-    // Build relevance options with optional lineage boost
     const debate = useDebateStore.getState().activeDebate;
-    const relevanceOpts = buildRelevanceOptions(threshold, debate, allPovNodes);
 
-    // Greatest-hits exclusion (t/1998) — app mirror of the CLI engine (debateEngine/
-    // taxonomyContext.ts:266). Degrades LOUDLY, not by throwing (TL decision, PM p/19#120):
-    // when the flag is On but the exclusion list is unavailable, exclusion is skipped and
-    // surfaceGreatestHitsWarning raises a user-visible note so the overview can show
-    // "On — not applied".
-    const ghOutcome = await applyGreatestHitsExclusion(relevanceOpts, debate?.exclude_greatest_hits);
-    surfaceGreatestHitsWarning(ghOutcome);
+    // ── T3 (t/3258): assemble ONLY the per-session state that crosses the wire. The server/main side
+    // derives everything static itself — the corpus (assembleNodeEmbeddings), taxonomy nodes,
+    // policyRegistry, lineage L2 map and doctrinal boundaries — then runs the SAME shared lib fn
+    // (selectRelevantTaxonomy) → parity by construction. The client no longer fetches the corpus to
+    // score locally (the t/3165 architectural fast-follow). ──
+    const anClaimEmbeddings: ANClaimInput[] = (debate?.argument_network?.nodes ?? [])
+      .filter(n => n.embedding && n.embedding.length > 0)
+      .map(n => ({ id: n.id, vector: n.embedding!, strength: n.computed_strength, text: n.text }));
+    const lineageFrame = debate?.topic?.critique?.lineage_frame;
+    const excludeGreatestHits = !!debate?.exclude_greatest_hits;
+    // Greatest-hits is per-debate session state the server can't reconstruct — fetch client-side and
+    // send it (Set→string[]) or the exclusion silently no-ops server-side (TL D3, t/3256#2).
+    const greatestHitsList = excludeGreatestHits ? await getGreatestHits() : undefined;
 
-    const scoredPov = selectRelevantNodes(allPovNodes, scores, relevanceOpts);
-    const scoredCC = selectRelevantSituationNodes(allCCNodes, scores, threshold, 3, 15);
+    recordLineageBoostCheck(lineageFrame, debate?.source_type === 'topic');
 
-    const injectionManifest = buildInjectionManifest(scoredPov, scoredCC, threshold, allPovNodes);
+    // Single transport call — web: REST POST /api/taxonomy/relevant-nodes; electron: IPC → a main
+    // handler mirroring the server route. Returns the full RelevantTaxonomyResult (W1) — the client
+    // presentation below (anchoring re-apply, diagnostics, id→node mapping) is unchanged.
+    const result = await api.fetchRelevantNodes({
+      pov,
+      topic,
+      recentTranscript,
+      threshold,
+      session: { anClaimEmbeddings, lineageFrame, sourceType: debate?.source_type, excludeGreatestHits, greatestHitsList },
+    });
 
-    // Unwrap ScoredPovNode → PovNode and build nodeScores map
-    const filteredPov = scoredPov.map(s => s.node);
-    const filteredCC = scoredCC.map(s => s.node);
+    // ── ADR-001 graceful-empty guard (t/3258, TL t/3258#14) ──
+    // A real debate never legitimately selects 0 nodes, so an empty selection means the endpoint's
+    // github-api-backed read returned empty (a data-read FAILURE), not "no relevant nodes." Make it
+    // observable + degrade to the unfiltered fallback rather than silently shipping empty grounding to
+    // the debate (make-degradation-observable rule). Worst case is observable-unfiltered, never
+    // silent-empty — this keeps the hard client-swap safe regardless of the endpoint's deploy state.
+    if (result.povNodes.length === 0 && result.situationNodes.length === 0) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'debate-store', level: 'warn',
+        message: 'relevant-nodes returned 0 selected on a real debate — suspected server-side data-read gap (ADR-001 graceful-empty); using unfiltered fallback',
+        data: { pov, candidatePovNodes: allPovNodes.length, candidateCcNodes: allCCNodes.length, anClaims: anClaimEmbeddings.length, sourceType: debate?.source_type },
+      });
+      return buildUnfilteredFallback(state, allPovNodes, allCCNodes, new Error('relevant-nodes returned empty selection (suspected data-read failure)'));
+    }
+
+    // ── Re-apply the doctrinal-anchoring side-effect to the store's Belief nodes ──
+    // (mirrors the old in-place mutation EXACTLY: doctrinally_anchored always; confidence floor
+    // only when applied — that's why DoctrinalAdjustment carries floorApplied, t/3257#16 Δ1.)
+    const povById = new Map(allPovNodes.map(n => [n.id, n] as const));
+    for (const adj of result.anchoring) {
+      const node = povById.get(adj.nodeId);
+      if (!node) continue;
+      node.doctrinally_anchored = adj.doctrinallyAnchored || undefined;
+      if (adj.floorApplied) {
+        node.evidential_confidence = adj.evidentialConfidence;
+        node.confidence = adj.confidence;
+      }
+    }
+
+    // Greatest-hits loud-degrade warning (t/1998): requested but the list was unavailable.
+    surfaceGreatestHitsWarning({ requested: excludeGreatestHits, applied: !!(greatestHitsList && greatestHitsList.length > 0) });
+
+    // ── Map the lib result (ids + scores) back to full node objects + the consumer-facing maps ──
+    const ccById = new Map(allCCNodes.map(n => [n.id, n] as const));
+    const filteredPov = result.povNodes.map(r => povById.get(r.nodeId)).filter((n): n is PovNode => !!n);
+    const filteredCC = result.situationNodes.map(r => ccById.get(r.nodeId)).filter((n): n is SituationNode => !!n);
     const nodeScores = new Map<string, number>();
-    for (const s of scoredPov) nodeScores.set(s.node.id, s.score);
-    for (const s of scoredCC) nodeScores.set(s.node.id, s.score);
+    for (const r of result.povNodes) nodeScores.set(r.nodeId, r.score);
+    for (const r of result.situationNodes) nodeScores.set(r.nodeId, r.score);
+    const nodeSourceMap = new Map(Object.entries(result.nodeSourceMap));
 
     console.log(`[taxonomy] Relevance-filtered: ${filteredPov.length} POV nodes (from ${allPovNodes.length}), ${filteredCC.length} CC nodes (from ${allCCNodes.length})`);
-
+    logLineageBoostResult(result.injectionManifest, filteredPov.length, allPovNodes.length);
     recordSituationDivergence(filteredCC, allCCNodes);
 
-    const policyRegistry = (state.policyRegistry ?? []).map(p => ({ id: p.id, action: p.action, source_povs: p.source_povs }));
-    return { povNodes: filteredPov, situationNodes: filteredCC, policyRegistry, nodeScores, nodeSourceMap, injectionManifest };
+    return { povNodes: filteredPov, situationNodes: filteredCC, policyRegistry: result.policyRegistry, nodeScores, nodeSourceMap, injectionManifest: result.injectionManifest };
   } catch (err) {
     getGlobalRecorder()?.record({
       type: 'system.error',

@@ -532,6 +532,27 @@ var baseEnv = [
   // Azure Blob Storage — user content (chats, debates) and community library.
   // Auth via managed identity (DefaultAzureCredential), no connection string needed.
   { name: 'AZURE_STORAGE_ACCOUNT_URL', value: storageAccount.properties.primaryEndpoints.blob }
+  // t/3165 DURABLE close: the worker-offload flag lives HERE (baseEnv), not a CLI --set-env-vars —
+  // a CLI value is wiped by the next full template deploy (the ephemeral-drift trap). It routes the
+  // ONNX embedding compute to the off-thread worker (t/3183) so a large novel-text batch can't starve
+  // the event loop past ACA's liveness deadline — the t/3165 fabricated-500 root cause. Requires the
+  // 2 vCPU worker floor above (t/3182). Proven: staging storm-canary GREEN + prod staged-flip AC-1/AC-3
+  // green (loop max 39.6ms under 1536 concurrent computes). MUST stay in sync with deploy-azure.yml's
+  // ExpectedEnvVars config-drift gate (Gate Co-Location — the gate verifies this value is deployed).
+  { name: 'EMBEDDING_WORKER_OFFLOAD', value: '1' }
+  // t/3163 G8a (STAGED enable, TL GO): enable inline grounding reconcile on the write path.
+  // Deployed AHEAD of G8b (GROUNDING_SWEEP_ENABLED), which TL holds until this deploy's real
+  // write-cycle lock telemetry is clean (grounding_lock held ≤~2s, zero stale-break/contention).
+  // baseEnv — never a CLI --set-env-vars (wiped by the next template apply). MUST stay in sync with
+  // deploy-azure.yml ExpectedEnvVars (Gate Co-Location — the config-drift gate verifies it's deployed).
+  { name: 'GROUNDING_RECONCILE_INLINE', value: '1' }
+  // t/3163 G8b (staged enable, TL GO t/3163#9): arm the scheduled grounding sweep (backstop to the
+  // G8a inline reconcile). Gate cleared — Option C measured grounding_lock held 0.00s + zero
+  // stale-break/contention (≤~2s bar), corroborating the code-level lock-safety GV (t/3163#5).
+  // MUST land + deploy TOGETHER WITH the git-ops-timeout fix (#1872, t/3267): the sweep does git
+  // ops, so it must run on the undici-timeout/degrade-and-proceed code, not the untimed-fetch code.
+  // baseEnv (never CLI --set-env-vars) + MUST stay in sync with deploy-azure.yml ExpectedEnvVars.
+  { name: 'GROUNDING_SWEEP_ENABLED', value: '1' }
 ]
 var envWithToken = githubTokenProvided
   ? concat(baseEnv, [ { name: 'GITHUB_TOKEN', secretRef: githubTokenSecretName } ])
@@ -565,6 +586,12 @@ var stagingEnvOverrides = [
   { name: 'AI_TRIAD_STATE_ROOT', value: '/mnt/staging-state' }
   // github-api writes go to the staging branch, not main (t/2650 class-B isolation)
   { name: 'GITHUB_BRANCH',       value: 'staging' }
+  // t/3305: promote the data-root boot validation (t/3296) to HARD-FAIL on staging first —
+  // a misprovisioned data root crash-loops VISIBLY here (real backend + real creds) before we
+  // set this in prod baseEnv. Gated real-env-first (t/2683): staging proves the exit(1) path
+  // against the live github-api ref:'main' corpus, which validated CLEAN on the warn-only boot
+  // (rev staging-4826363, no "validation failed" WARN), so enforce mode boots green not looping.
+  { name: 'DATA_ROOT_VALIDATION_ENFORCE', value: '1' }
 ]
 // stagingBaseEnv = baseEnv with the isolation overrides applied.
 // filter() removes the baseEnv entries that stagingEnvOverrides supersedes.
@@ -623,8 +650,21 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
           name: 'taxonomy-editor'
           image: containerImage
           resources: {
-            cpu: json('1.0')
-            memory: '2Gi'
+            // 2 vCPU is the CORRECTNESS FLOOR for the embedding worker-offload
+            // (t/3182 / t/2977 C1). The off-thread ONNX worker (EMBEDDING_WORKER_OFFLOAD)
+            // needs a REAL second core: on 1 vCPU the worker time-slices the same core
+            // as the event loop, so a big embed still starves liveness (defeats the
+            // offload). 2 vCPU keeps the loop responsive while the worker computes.
+            // Stays within the ACA Consumption plan (0.25-4 vCPU) - one-line resources
+            // edit, no workload-profile/topology migration. Cost ~$0 (free grant, t/2977#4).
+            // Memory MUST be 4Gi: ACA Consumption only permits FIXED cpu:memory pairs, and
+            // 2.0 vCPU is valid ONLY with 4.0Gi. ARM rejects 2.0/2Gi with
+            // ContainerAppInvalidResourceTotal (the #1771 bug — a deploy would fail the ARM
+            // step; t/3182). Headroom is ample regardless: incident RSS ~650MB/2048 + ~250MB
+            // worker model copy ~= 900MB (embeddings.json is NOT copied to the worker — the
+            // cache resolve stays main-thread, only miss-texts marshal).
+            cpu: json('2.0')
+            memory: '4Gi'
           }
           env: containerEnv
           probes: [
@@ -633,6 +673,15 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
               httpGet: { path: '/healthz', port: 7862 }
               periodSeconds: 30
               failureThreshold: 3
+              // timeoutSeconds made EXPLICIT (was defaulting to ACA's ~1s). This is
+              // the DETERMINISTIC liveness deadline the storm-replay canary gates on
+              // (t/3182/t/3199, Diagnostics p/168#13): /healthz can't answer while the
+              // event loop is ONNX-blocked, so a loop-block > this timeout fails
+              // liveness → 503/kill. The worker-offload must keep p99 loop-lag under
+              // this with margin. Explicit (not defaulted) so the pass line is a
+              // documented value, not a silent platform default. 1s preserves current
+              // prod behavior (the ACA default) — it does NOT loosen liveness.
+              timeoutSeconds: 1
             }
             {
               type: 'Readiness'
@@ -1013,8 +1062,8 @@ resource authConfigStaging 'Microsoft.App/containerApps/authConfigs@2024-10-02-p
 @description('Email address for budget alerts')
 param budgetAlertEmail string = ''
 
-@description('First day of the current month at deploy time — Azure Consumption budgets reject a monthly startDate prior to the current month')
-param budgetStartDate string = utcNow('yyyy-MM-01')
+@description('IMMUTABLE start date of budget-aitriad-monthly, pinned to its original creation month (2026-08-01). Azure Consumption Budgets FORBID updating startDate in place ("Start date of budgets cannot be updated"), so this MUST NOT be recomputed per-deploy with utcNow() — doing so rolls the date forward each month and fails every deploy in a later month (t/3155). For a brand-new environment with no existing budget, override this param to the first of the current month at create time.')
+param budgetStartDate string = '2026-08-01'
 
 var budgetAlertConfigured = !empty(budgetAlertEmail)
 
@@ -1306,6 +1355,154 @@ resource fallbackActive 'Microsoft.Insights/scheduledQueryRules@2023-03-15-previ
   }
 }
 
+// ── G8b Grounding-Sweep Stall Alert (t/3279) ──
+// Detects the failed-inline-then-cold edge: a G8a inline reconcile FAILED (emitting the stdout
+// `log.server.warn 'inline grounding reconcile failed'` from groundingReconcileHook.ts → Log_s;
+// condition 1 pre-verified) AND no `Grounding sweep complete` drained the backlog within N hours.
+// Scoped to the REAL edge, NOT bare sweep-absence — under minReplicas=0, no-sweep-while-cold is
+// benign (cold ⇒ no writes ⇒ no failures ⇒ correctly silent). Grace period: only failures OLDER
+// than N are considered (a fresh failure's sweep may still come — TL GV t/3279#2, cond. 2).
+// Correlation logic mirrors operations/devops/Get-SweepStallVerdict.ps1 (both arms unit-proven);
+// the KQL is validated against real prod Log_s for ≥1 cycle before it's trusted (real-env-first).
+//
+// N = 2h (cond. 4): MUST exceed the 15-min sweep cadence with margin so one benign cold gap +
+// container-warmth jitter can't trip it. windowSize 6h covers a failure + its 2h window + slack.
+resource sweepStallAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'alert-grounding-sweep-stall'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'G8b Grounding Sweep Stalled (failed inline reconcile un-swept > N)'
+    description: 'A G8a inline grounding reconcile FAILED and no G8b sweep drained the backlog within N hours — grounding may be silently stale (the failed-inline-then-cold edge, t/3279).'
+    severity: 2
+    enabled: true
+    scopes: [ logAnalytics.id ]
+    evaluationFrequency: 'PT30M'
+    windowSize: 'PT6H'
+    criteria: {
+      allOf: [
+        {
+          // Rows = inline-reconcile failures older than N with NO sweep-complete in [failTime, failTime+N].
+          // k=1 cross-join is cheap: both markers are rare. Fire iff any such stale failure exists.
+          query: '''
+            let N = 2h;
+            let sweeps = ContainerAppConsoleLogs_CL
+              | where TimeGenerated > ago(6h)
+              | where Log_s has "Grounding sweep complete"
+              | project sweepTime = TimeGenerated, k = 1;
+            ContainerAppConsoleLogs_CL
+            | where TimeGenerated > ago(6h)
+            | where Log_s has "inline grounding reconcile failed"
+            | where TimeGenerated < ago(N)
+            | project failTime = TimeGenerated, k = 1
+            | join kind=leftouter (sweeps) on k
+            | summarize sweptInWindow = countif(sweepTime >= failTime and sweepTime <= failTime + N) by failTime
+            | where sweptInWindow == 0
+          '''
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+        }
+      ]
+    }
+    actions: {
+      actionGroups: budgetAlertConfigured ? [ restartAlertActionGroup.id ] : []
+    }
+  }
+}
+
+// Paid Gemini fallback overflow (t/3110). The anon key pool is free-primary +
+// single paid key as overflow-only fallback (t/3111); the default path is free,
+// so paid-fallback usage should be ~0. Any sustained nonzero is a real operational
+// signal that the free pool is under-provisioned or throttling — NOT steady-state
+// cost. 60-min window distinguishes sustained overflow from a lone transient.
+//
+// MATCH-TOKEN IS A CONTRACT: the substring "Paid fallback succeeded" below is a
+// shared marker that EVERY paid-fallback success emitter must include verbatim, or
+// its overflow goes unmonitored. Emitters today: routes/ai.ts:187 (generate) ✓ and
+// routes/ai.ts:232 (generate+search) — the search path must carry the same marker
+// (t/3110 GV coverage-gap fix, ServerAPI). A mirror of this comment lives at each
+// emitter. Change the token in one place → change it in all, or this alert silently
+// misses the overflow it exists to catch (the t/3165 debate-search second front).
+resource paidFallbackOverflow 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'alert-paid-fallback-overflow'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'Paid Gemini Fallback Overflow'
+    description: 'The paid Gemini fallback key served a request (expected ~0 on the free-primary path). Sustained hits mean the free key pool is under-provisioned or throttling into billable overflow — consider adding a free key.'
+    severity: 2
+    enabled: true
+    scopes: [ logAnalytics.id ]
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT1H'
+    criteria: {
+      allOf: [
+        {
+          query: '''
+            ContainerAppConsoleLogs_CL
+            | where Log_s contains "Paid fallback succeeded"
+            | summarize PaidFallbacks = count()
+            | where PaidFallbacks > 0
+          '''
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+        }
+      ]
+    }
+    actions: {
+      actionGroups: budgetAlertConfigured ? [ restartAlertActionGroup.id ] : []
+    }
+  }
+}
+
+// Data-root boot validation WARN (t/3308 — observability backstop for the t/3296 warn-only default).
+// server.ts validates taxonomy/ + dictionary/ are present & non-empty at boot via the ACTIVE backend.
+// When DATA_ROOT_VALIDATION_ENFORCE is unset (default) a failed validation is WARN-only and the
+// container KEEPS SERVING — empty panels with just a log line nobody watches. This alert is what makes
+// warn-only safe: it fires on that WARN so a misprovisioned data root is never silent (the t/3110 trap,
+// one layer up). Especially load-bearing until DATA_ROOT_VALIDATION_ENFORCE=1 lands in prod (t/3305) —
+// until then this is the ONLY signal a prod revision is serving empty. Still useful for staging + any
+// un-flagged env after ENFORCE lands (ENFORCE crash-loops visibly; this keeps catching the WARN).
+//
+// MATCH-TOKEN IS A CONTRACT: the substring "Data root validation failed at boot" is emitted by
+// server.ts:1314 (ENFORCE → refuse-to-start error) and :1317 (WARN-only) — matching the shared prefix
+// catches BOTH paths (a superset: any misprovisioned boot). Change that message prefix in server.ts →
+// change it here, or a misprovisioned boot goes unmonitored (the paid-fallback-overflow lesson, t/3110).
+resource dataRootBootWarn 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'alert-data-root-boot-warn'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'Data Root Boot Validation Failed (warn-only serving empty)'
+    description: 'The server failed to validate the data root at boot (taxonomy/ or dictionary/ missing or empty) and — in warn-only mode — kept serving. Panels may be empty. Re-check data-root provisioning for the affected revision. Load-bearing until DATA_ROOT_VALIDATION_ENFORCE=1 lands in prod (t/3305).'
+    severity: 1
+    enabled: true
+    scopes: [ logAnalytics.id ]
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT1H'
+    criteria: {
+      allOf: [
+        {
+          query: '''
+            ContainerAppConsoleLogs_CL
+            | where Log_s contains "Data root validation failed at boot"
+            | summarize BootValidationFailures = count()
+            | where BootValidationFailures > 0
+          '''
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+        }
+      ]
+    }
+    actions: {
+      actionGroups: budgetAlertConfigured ? [ restartAlertActionGroup.id ] : []
+    }
+  }
+}
+
 resource branchDivergence 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
   name: 'alert-branch-divergence'
   location: location
@@ -1416,6 +1613,94 @@ resource prodBackoffAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pre
     actions: {
       actionGroups: budgetAlertConfigured ? [ restartAlertActionGroup.id ] : []
     }
+  }
+}
+
+// ── Ingress 5xx Observability Alerts (t/3167) ──
+// Root cause: ACA ingress fabricates empty-body 5xx when Node event loop is starved
+// (no server-side record — only the client sees it). ACA exposes no per-request Envoy
+// access log, so we can't grep upstream_response_time directly (platform limitation).
+//
+// Two-arm detection:
+//   PRIMARY  — event-loop-lag WARN (server-side, fires BEFORE ingress fabricates the 5xx)
+//   BACKSTOP — ACA Requests/5xx metric rate (advisory; whether it counts envoy-fabricated
+//              5xx unverified — deferred to natural repro or controlled synthetic)
+//
+// Diagnosis: AppInsights `requests` absent + client log present → envoy-fabricated.
+// See operational-commands.md for the KQL cross-reference runbook.
+
+resource eventLoopLagAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'alert-event-loop-blocked'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'Event Loop Blocked (>1s starvation) — t/3167'
+    description: '''Node.js event loop blocked >1s — leading indicator of ingress-fabricated 5xx under load (t/3165 pattern).
+Signal: Pino WARN "event loop blocked" fires ONLY on blocks >EVENT_LOOP_LAG_WARN_MS (1000ms); routine 5s gauges say "event-loop max…" without "blocked" and do not trip this.
+Structured fields: component="event-loop", level=warn(40). Primary detector for t/3167. (t/3167)'''
+    severity: 1
+    enabled: true
+    scopes: [ logAnalytics.id ]
+    evaluationFrequency: 'PT1M'
+    windowSize: 'PT5M'
+    criteria: {
+      allOf: [
+        {
+          query: '''
+            ContainerAppConsoleLogs_CL
+            | where Log_s has "event loop blocked"
+          '''
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+        }
+      ]
+    }
+    actions: {
+      actionGroups: budgetAlertConfigured ? [ restartAlertActionGroup.id ] : []
+    }
+  }
+}
+
+resource ingressFiveXxBackstopAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
+  // Metric alerts must use 'global' location regardless of resource region.
+  name: 'alert-ingress-5xx-backstop'
+  location: 'global'
+  tags: tags
+  properties: {
+    description: '''Advisory backstop: ACA Requests metric >2 5xx in 5 min → possible ingress-fabricated 500 or app error burst.
+Threshold 2/5min: incident window (t/3165, 07:14–07:15 UTC) showed 3–4 5xx; normal baseline outside incident is 0–1/5min.
+NOT load-bearing: whether this metric counts envoy-fabricated 5xx (Node-never-ran) is unverified — deferred to natural repro.
+Primary detector is eventLoopLagAlert. (t/3167)'''
+    severity: 2
+    enabled: true
+    scopes: [ containerApp.id ]
+    evaluationFrequency: 'PT1M'
+    windowSize: 'PT5M'
+    criteria: {
+      'odata.type': 'Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria'
+      allOf: [
+        {
+          name: '5xx-rate'
+          criterionType: 'StaticThresholdCriterion'
+          metricName: 'Requests'
+          metricNamespace: 'Microsoft.App/containerApps'
+          dimensions: [
+            {
+              name: 'statusCodeCategory'
+              operator: 'Include'
+              values: [ '5xx' ]
+            }
+          ]
+          operator: 'GreaterThan'
+          threshold: 2
+          timeAggregation: 'Total'
+        }
+      ]
+    }
+    actions: budgetAlertConfigured ? [
+      { actionGroupId: restartAlertActionGroup.id }
+    ] : []
   }
 }
 

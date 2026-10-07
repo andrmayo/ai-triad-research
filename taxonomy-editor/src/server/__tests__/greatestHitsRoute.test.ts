@@ -33,20 +33,20 @@ describe('loadGreatestHitsNodeIds (t/1998)', () => {
     fs.rmSync(dataRoot, { recursive: true, force: true });
   });
 
-  it('returns null when the file is absent', () => {
-    expect(loadGreatestHitsNodeIds()).toBeNull();
+  it('returns null when the file is absent', async () => {
+    expect(await loadGreatestHitsNodeIds()).toBeNull();
   });
 
-  it('returns { node_ids } — a plain array, not a Set — when present', () => {
+  it('returns { node_ids } — a plain array, not a Set — when present', async () => {
     writeGreatestHits(JSON.stringify({ version: 1, node_ids: ['acc-bel-001', 'saf-des-002'] }));
-    const result = loadGreatestHitsNodeIds();
+    const result = await loadGreatestHitsNodeIds();
     expect(result).toEqual({ node_ids: ['acc-bel-001', 'saf-des-002'] });
     // Guards the exact bug the contract warns about: it JSON-round-trips as an array,
     // never `{}` (which is what json(res, new Set()) would serialize to).
     expect(JSON.parse(JSON.stringify(result))).toEqual({ node_ids: ['acc-bel-001', 'saf-des-002'] });
   });
 
-  it('t/2003: reads the v2 shape (nodes[].node_id) into { node_ids }', () => {
+  it('t/2003: reads the v2 shape (nodes[].node_id) into { node_ids }', async () => {
     writeGreatestHits(JSON.stringify({
       version: 2,
       nodes: [
@@ -54,33 +54,33 @@ describe('loadGreatestHitsNodeIds (t/1998)', () => {
         { node_id: 'acc-beliefs-032', pov: 'accelerationist', bdi_category: 'beliefs', debate_count: 85, crux_link_count: 21 },
       ],
     }));
-    expect(loadGreatestHitsNodeIds()).toEqual({ node_ids: ['acc-beliefs-085', 'acc-beliefs-032'] });
+    expect(await loadGreatestHitsNodeIds()).toEqual({ node_ids: ['acc-beliefs-085', 'acc-beliefs-032'] });
   });
 
-  it('t/2003: v1 node_ids take precedence when both shapes are present', () => {
+  it('t/2003: v1 node_ids take precedence when both shapes are present', async () => {
     writeGreatestHits(JSON.stringify({ version: 2, node_ids: ['v1-id'], nodes: [{ node_id: 'v2-id' }] }));
-    expect(loadGreatestHitsNodeIds()).toEqual({ node_ids: ['v1-id'] });
+    expect(await loadGreatestHitsNodeIds()).toEqual({ node_ids: ['v1-id'] });
   });
 
-  it('t/2003: v2 filters entries with a non-string or missing node_id', () => {
+  it('t/2003: v2 filters entries with a non-string or missing node_id', async () => {
     writeGreatestHits(JSON.stringify({ version: 2, nodes: [{ node_id: 'ok' }, { node_id: 42 }, {}] }));
-    expect(loadGreatestHitsNodeIds()).toEqual({ node_ids: ['ok'] });
+    expect(await loadGreatestHitsNodeIds()).toEqual({ node_ids: ['ok'] });
   });
 
-  it('returns null on malformed JSON (graceful no-op)', () => {
+  it('returns null on malformed JSON (graceful no-op)', async () => {
     writeGreatestHits('{ not valid json');
-    expect(loadGreatestHitsNodeIds()).toBeNull();
+    expect(await loadGreatestHitsNodeIds()).toBeNull();
   });
 
-  it('coerces a missing / non-array node_ids to an empty list', () => {
+  it('coerces a missing / non-array node_ids to an empty list', async () => {
     writeGreatestHits(JSON.stringify({ version: 1 }));
-    expect(loadGreatestHitsNodeIds()).toEqual({ node_ids: [] });
+    expect(await loadGreatestHitsNodeIds()).toEqual({ node_ids: [] });
     writeGreatestHits(JSON.stringify({ node_ids: 'oops' }));
-    expect(loadGreatestHitsNodeIds()).toEqual({ node_ids: [] });
+    expect(await loadGreatestHitsNodeIds()).toEqual({ node_ids: [] });
   });
 
-  it('filters out non-string entries', () => {
+  it('filters out non-string entries', async () => {
     writeGreatestHits(JSON.stringify({ node_ids: ['ok', 42, null, 'also-ok'] }));
-    expect(loadGreatestHitsNodeIds()).toEqual({ node_ids: ['ok', 'also-ok'] });
+    expect(await loadGreatestHitsNodeIds()).toEqual({ node_ids: ['ok', 'also-ok'] });
   });
 });

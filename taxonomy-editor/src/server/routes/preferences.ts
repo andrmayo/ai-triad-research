@@ -15,14 +15,12 @@ import { json, error } from '../httpKit.js';
 import { getGlobalRecorder } from '../../../../lib/flight-recorder/index.js';
 import { resolveDataPath } from '../config.js';
 import { getStorageUserId } from '../security/userContext.js';
+import { readDataFile } from '../storage/readDataFile.js';
+import { ActionableError } from '../../../../lib/debate/errors.js';
 
 const UserPreferencesSchema = z.object({
   viewMode: z.enum(['simple', 'advanced']),
 });
-
-function prefsFilePath(): string {
-  return resolveDataPath(path.join('preferences', `${getStorageUserId()}.json`));
-}
 
 export function registerPreferencesRoutes(r: Router, _ctx: ServerCtx): void {
   const { get, put } = r;
@@ -31,10 +29,12 @@ export function registerPreferencesRoutes(r: Router, _ctx: ServerCtx): void {
   // NB: path is a string literal (not a const) so extractRoutes.ts can see it.
   get('/api/preferences', async (_req, res) => {
     try {
-      const raw = fs.readFileSync(prefsFilePath(), 'utf8');
-      json(res, JSON.parse(raw));
+      const relPath = path.join('preferences', `${getStorageUserId()}.json`);
+      const buf = await readDataFile(relPath);
+      json(res, JSON.parse(buf.toString('utf8')));
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') { json(res, null); return; }
+      // readDataFile throws ActionableError for missing/empty file — no prefs yet.
+      if (err instanceof ActionableError) { json(res, null); return; }
       getGlobalRecorder()?.record({
         type: 'system.error', component: 'server', level: 'error',
         message: 'Failed to read preferences',
@@ -52,7 +52,7 @@ export function registerPreferencesRoutes(r: Router, _ctx: ServerCtx): void {
         error(res, 'Invalid preferences: ' + parsed.error.message, 400);
         return;
       }
-      const filePath = prefsFilePath();
+      const filePath = resolveDataPath(path.join('preferences', `${getStorageUserId()}.json`));
       fs.mkdirSync(path.dirname(filePath), { recursive: true });
       fs.writeFileSync(filePath, JSON.stringify(parsed.data), 'utf8');
       json(res, null, 204);

@@ -26,6 +26,51 @@ export function json(res: ServerResponse, data: unknown, status = 200): void {
   res.end(JSON.stringify(data));
 }
 
+/** t/3165: serialize a large array or plain object to a JSON Buffer WITHOUT a single un-yielded
+ *  JSON.stringify. A ~4144-entry synthetic-embeddings map (or a big number[][]) stringified at once
+ *  blocked the prod event loop ~3s. This builds the JSON incrementally, yielding to the loop every
+ *  `yieldEvery` top-level items. Output is byte-identical to JSON.stringify for arrays / plain objects
+ *  of JSON-safe values (same key order, no whitespace, undefined/function-valued keys omitted, array
+ *  holes → null). Non-array/non-object values fall back to a direct stringify.
+ *  CAVEAT (t/3237): assumes a PLAIN top-level array/object — a top-level `toJSON()` is NOT honored
+ *  (the top level is iterated by entries/elements directly). Nested `toJSON()` IS honored (handled by
+ *  the inner JSON.stringify of each value). Callers with a custom top-level toJSON should use json(). */
+export async function jsonStringifyChunked(value: unknown, yieldEvery = 256): Promise<Buffer> {
+  const yieldToLoop = (): Promise<void> => new Promise<void>((r) => setImmediate(r));
+  if (Array.isArray(value)) {
+    if (value.length === 0) return Buffer.from('[]');
+    const parts: string[] = new Array(value.length);
+    for (let i = 0; i < value.length; i++) {
+      parts[i] = JSON.stringify(value[i]) ?? 'null'; // array slot of undefined/function → null
+      if ((i + 1) % yieldEvery === 0) await yieldToLoop();
+    }
+    return Buffer.from('[' + parts.join(',') + ']');
+  }
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>);
+    const parts: string[] = [];
+    for (let i = 0; i < entries.length; i++) {
+      const sv = JSON.stringify(entries[i][1]);
+      if (sv === undefined) continue; // undefined/function/symbol values are omitted, like JSON.stringify
+      parts.push(JSON.stringify(entries[i][0]) + ':' + sv);
+      if ((i + 1) % yieldEvery === 0) await yieldToLoop();
+    }
+    return Buffer.from('{' + parts.join(',') + '}');
+  }
+  return Buffer.from(JSON.stringify(value) ?? 'null');
+}
+
+/** t/3165: send a pre-serialized JSON Buffer. Mirrors json()'s idempotent-write guard; use with a
+ *  cached Buffer (e.g. the serialize-once synthetic-embeddings cache) to skip re-stringifying. */
+export function sendJsonBuffer(res: ServerResponse, buffer: Buffer, status = 200): void {
+  if (res.writableEnded || res.headersSent) {
+    log.server.warn({ component: 'httpKit', status }, 'sendJsonBuffer(): response already sent — skipping duplicate write');
+    return;
+  }
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(buffer);
+}
+
 // t/1379: record 4xx client errors to the flight recorder (warn — expected
 // client errors, not server faults) so a client-side 4xx can be correlated with
 // server state by requestId. Server-side dump only; never leaked to the client.
@@ -79,7 +124,15 @@ export function error(res: ServerResponse, message: string, status = 500, cause?
   }
   // t/853: strip ActionableError internals (location, resolve steps) from <500
   // responses in production; keep the user-actionable summary.
-  json(res, { error: clientSafeMessage(message, cause), requestId: getRequestId(), ...extra }, status);
+  // t/3261 (TL ruling t/3261#1, option B): CodeQL js/stack-trace-exposure here is a FALSE POSITIVE —
+  // clientSafeMessage (security/accessControl.ts) NEVER returns cause.stack: in production it returns
+  // only the ActionableError `goal: problem` or a Goal/Error-stripped summary; the prod 5xx branch above
+  // returns a constant. The only uncurated path is DEV (!isProduction), which returns `message`
+  // (= String(err), the message — not the stack). CodeQL taints the caught `cause` Error into the
+  // response but can't see the sanitizer barrier. A true structural fix = modeling clientSafeMessage as a
+  // CodeQL sanitizer (query-side, DevOps), not app code — so suppress with justification here.
+  // REVISIT if that sanitizer model lands or clientSafeMessage's contract changes.
+  json(res, { error: clientSafeMessage(message, cause), requestId: getRequestId(), ...extra }, status); // codeql[js/stack-trace-exposure]
 }
 
 /** t/1515/t/1516 — defense-in-depth wall-clock cap for handlers that call out to

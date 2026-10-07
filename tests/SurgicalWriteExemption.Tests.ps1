@@ -29,21 +29,63 @@
 BeforeAll {
     Import-Module (Join-Path $PSScriptRoot '..' 'scripts' 'AITriad' 'AITriad.psm1') -Force -WarningAction SilentlyContinue
 
-    # Shared detector (t/2916#10 hardening) — defined in BeforeAll so it is visible to It
-    # blocks at run time. Scans REPO-WIDE *.ps1 (InModuleScope reach — a writer can live
-    # outside scripts/), and matches ABBREVIATED params: `-Surg` binds -SurgicalWrite and
-    # evades a -SimpleMatch on the full name. The negative lookbehind `(?<![\w-])` requires
-    # a real parameter boundary before the dash, so the English word "field-surgical" in a
-    # comment (preceded by a word char) is NOT a false positive, while " -SurgicalWrite" /
-    # " -Surg" (preceded by whitespace) is. Vendored/checkout trees are excluded.
+    # Shared detector (t/2916#10 hardening; t/3208 invocation-only refinement) — defined in
+    # BeforeAll so it is visible to It blocks at run time. Scans REPO-WIDE (a writer can live
+    # outside scripts/). The exemption is a real CLAIM only when it is an actual INVOCATION —
+    # a `-Surg*` parameter passed to a command (PS) or a `surgical_write=True` call (Python).
+    # A mere MENTION in a comment or string is NOT a claim (t/3208: a #1775 comment describing
+    # `Write-Utf8NoBom -SurgicalWrite` tripped the old token scan). PS uses the AST so comments
+    # and string literals — which are not command-parameter nodes — never false-positive;
+    # Python strips line comments before matching. Vendored/checkout trees are excluded.
     function Get-SurgicalExemptionViolations {
-        param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string[]]$Allowed)
-        $rx = '(?<![\w-])-Surg\w*'
+        # Scans REPO-WIDE for unauthorized INVOCATIONS that claim the surgical-write exemption.
+        # PS files: an AST CommandParameterAst named -Surg* (binds -SurgicalWrite + abbrevs).
+        # Python files (t/2926): assert_clean_data_tree calls with surgical_write=True (call
+        # sites, not comments). Both allowlists are checked independently so a PS allowlist
+        # entry does not accidentally exclude a Python file with the same basename.
+        param(
+            [Parameter(Mandatory)][string]$Root,
+            [Parameter(Mandatory)][string[]]$Allowed,
+            [string[]]$PyAllowed = @()
+        )
+        $rxPy  = 'surgical_write\s*=\s*True'
+        $excl  = '[\\/](node_modules|\.git|\.worktrees|\.claude)[\\/]'
+
+        # A PS file claims the exemption iff it INVOKES a command with a -Surg* parameter.
+        # AST parsing ignores comments and string literals by construction. If the file fails
+        # to parse (a rogue writer could add a syntax error to defeat the AST), fall back to
+        # the raw token scan for THAT file so evasion-via-broken-parse still flags.
+        function Test-PsClaimsExemption {
+            param([Parameter(Mandatory)][string]$FilePath)
+            $errs = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($FilePath, [ref]$null, [ref]$errs)
+            if ($null -eq $ast -or @($errs).Count -gt 0) {
+                return [bool](Select-String -Path $FilePath -Pattern '(?<![\w-])-Surg\w*' -Quiet)
+            }
+            $hits = $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.CommandParameterAst] -and
+                $node.ParameterName -like 'Surg*'
+            }, $true)
+            return (@($hits).Count -gt 0)
+        }
+
         @(
+            # PowerShell: actual -Surg* invocations (AST — not comment/string mentions)
             Get-ChildItem -Path $Root -Recurse -Filter '*.ps1' -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.FullName -notmatch '[\\/](node_modules|\.git|\.worktrees|\.claude)[\\/]' } |
+                Where-Object { $_.FullName -notmatch $excl } |
                 Where-Object { $_.Name -notin $Allowed } |
-                Where-Object { Select-String -Path $_.FullName -Pattern $rx -Quiet } |
+                Where-Object { Test-PsClaimsExemption -FilePath $_.FullName } |
+                ForEach-Object { $_.FullName }
+            # Python: assert_clean_data_tree(..., surgical_write=True) call sites (t/2926),
+            # excluding matches that fall after a `#` line-comment marker (t/3208).
+            Get-ChildItem -Path $Root -Recurse -Filter '*.py' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -notmatch $excl } |
+                Where-Object { $_.Name -notin $PyAllowed } |
+                Where-Object {
+                    @(Select-String -Path $_.FullName -Pattern $rxPy |
+                        Where-Object { ($_.Line -replace '#.*$', '') -match $rxPy }).Count -gt 0
+                } |
                 ForEach-Object { $_.FullName }
         )
     }
@@ -90,6 +132,8 @@ Describe 'Surgical-write exemption — reachable ONLY via the orchestrator (dete
 
     # Allowed to reference the exemption: the orchestrator (claims it), the sink (forwards
     # it), the guard (declares it), and THIS both-arms test (exercises it directly).
+    # Python allowlist (t/2926): test_data_tree_guard.py exercises the Python surgical_write
+    # parameter directly in both-arms tests; no other Python consumer is currently authorized.
     BeforeAll {
         $script:Allowed = @(
             'Save-JsonNodeFieldEdits.ps1'
@@ -97,29 +141,85 @@ Describe 'Surgical-write exemption — reachable ONLY via the orchestrator (dete
             'Assert-DataWriteAllowed.ps1'
             'SurgicalWriteExemption.Tests.ps1'
         )
+        $script:PyAllowed = @(
+            'data_tree_guard.py'        # declares the surgical_write parameter (analogous to Assert-DataWriteAllowed.ps1)
+            'test_data_tree_guard.py'   # both-arms GV for the Python surgical_write exemption (t/2926)
+        )
     }
 
-    It 'CLEAN arm — repo-wide, only the allowlisted files reference the exemption' {
+    It 'CLEAN arm — repo-wide, only the allowlisted files reference the exemption (PS and Python)' {
         $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-        Get-SurgicalExemptionViolations -Root $repoRoot -Allowed $script:Allowed |
-            Should -BeNullOrEmpty -Because 'only Save-JsonNodeFieldEdits may claim the surgical exemption; a whole-file writer must not bypass the BLOCK tier'
+        Get-SurgicalExemptionViolations -Root $repoRoot -Allowed $script:Allowed -PyAllowed $script:PyAllowed |
+            Should -BeNullOrEmpty -Because 'only Save-JsonNodeFieldEdits (PS) and test_data_tree_guard.py (Python GV) may claim the surgical exemption; a whole-file writer must not bypass the BLOCK tier'
     }
 
-    It 'FIRE arm — the detector FLAGS a non-allowlisted writer that claims the exemption (via an abbreviated -Surg)' {
+    It 'FIRE arm — the detector FLAGS a non-allowlisted PS writer that claims the exemption (via an abbreviated -Surg)' {
         # A detection gate never proven to fire is assumed, not verified (TL t/2916#10).
         # The rogue writer uses the ABBREVIATED form to also prove the grep catches it.
         $rogue = Join-Path $TestDrive 'Rogue-Writer.ps1'
         Set-Content -LiteralPath $rogue -Value 'Write-Utf8NoBom -Path $p -Value $x -Surg' -Encoding utf8
-        $found = Get-SurgicalExemptionViolations -Root $TestDrive -Allowed $script:Allowed
+        $found = Get-SurgicalExemptionViolations -Root $TestDrive -Allowed $script:Allowed -PyAllowed $script:PyAllowed
         @($found).Count | Should -BeGreaterThan 0
         ($found -join ';')            | Should -Match 'Rogue-Writer'
+    }
+
+    It 'FIRE arm (Python) — the detector FLAGS a non-allowlisted Python writer that claims surgical_write=True (t/2926)' {
+        # Proves the Python scanner fires; mirrors the PS FIRE arm (TL t/2916#10 bar).
+        $rogue = Join-Path $TestDrive 'rogue_writer.py'
+        Set-Content -LiteralPath $rogue -Value 'assert_clean_data_tree(path, surgical_write=True)' -Encoding utf8
+        $found = Get-SurgicalExemptionViolations -Root $TestDrive -Allowed $script:Allowed -PyAllowed $script:PyAllowed
+        @($found).Count | Should -BeGreaterThan 0
+        ($found -join ';') | Should -Match 'rogue_writer'
     }
 
     It 'the "field-surgical" prose in a comment is NOT a false positive (lookbehind boundary)' {
         $benign = Join-Path $TestDrive 'Benign-Comment.ps1'
         Set-Content -LiteralPath $benign -Value '# performs a field-surgical, byte-surgical write; see byte-surgery notes' -Encoding utf8
-        Get-SurgicalExemptionViolations -Root $TestDrive -Allowed $script:Allowed |
+        Get-SurgicalExemptionViolations -Root $TestDrive -Allowed $script:Allowed -PyAllowed $script:PyAllowed |
             Where-Object { $_ -match 'Benign-Comment' } |
+            Should -BeNullOrEmpty
+    }
+
+    It 'surgical_write=False in a Python comment/declaration is NOT a false positive' {
+        # The parameter declaration "surgical_write: bool = False" in data_tree_guard.py
+        # must not trigger the scanner — only "surgical_write=True" (the call site) is flagged.
+        $benign = Join-Path $TestDrive 'benign_decl.py'
+        Set-Content -LiteralPath $benign -Value 'def assert_clean_data_tree(path, force=False, surgical_write=False): pass' -Encoding utf8
+        Get-SurgicalExemptionViolations -Root $TestDrive -Allowed $script:Allowed -PyAllowed $script:PyAllowed |
+            Where-Object { $_ -match 'benign_decl' } |
+            Should -BeNullOrEmpty
+    }
+
+    It 'a whitespace-preceded -SurgicalWrite in a COMMENT is NOT a false positive (t/3208 — the #1775 regression)' {
+        # #1775 tripped the old token scan with a comment DESCRIBING the flag. The exemption is
+        # claimed only by an actual -Surg* invocation, not by a mention in a comment.
+        $benign = Join-Path $TestDrive 'Comment-Mention.ps1'
+        Set-Content -LiteralPath $benign -Value @(
+            '# The surgical exemption is claimed inside Save-JsonNodeFieldEdits'
+            '# (Write-Utf8NoBom -SurgicalWrite), so this consumer does not claim it directly.'
+            '$r = Save-JsonNodeFieldEdits -Path $p -Edits $e'
+        ) -Encoding utf8
+        Get-SurgicalExemptionViolations -Root $TestDrive -Allowed $script:Allowed -PyAllowed $script:PyAllowed |
+            Where-Object { $_ -match 'Comment-Mention' } |
+            Should -BeNullOrEmpty -Because 'a comment mentioning the flag is not an invocation (t/3208)'
+    }
+
+    It 'a -SurgicalWrite token inside a STRING literal is NOT a false positive (t/3208)' {
+        # Help/doc strings that print the flag name must not be read as a claim; the old token
+        # scan flagged this (whitespace-preceded dash), the AST does not (string, not a param).
+        $benign = Join-Path $TestDrive 'String-Mention.ps1'
+        Set-Content -LiteralPath $benign -Value 'Write-Host "pass -SurgicalWrite to opt in"' -Encoding utf8
+        Get-SurgicalExemptionViolations -Root $TestDrive -Allowed $script:Allowed -PyAllowed $script:PyAllowed |
+            Where-Object { $_ -match 'String-Mention' } |
+            Should -BeNullOrEmpty
+    }
+
+    It 'surgical_write=True in a Python COMMENT is NOT a false positive (t/3208)' {
+        # Mirror of the PS comment case for the Python arm (comment-strip before match).
+        $benign = Join-Path $TestDrive 'py_comment.py'
+        Set-Content -LiteralPath $benign -Value '# do NOT call assert_clean_data_tree(p, surgical_write=True) here' -Encoding utf8
+        Get-SurgicalExemptionViolations -Root $TestDrive -Allowed $script:Allowed -PyAllowed $script:PyAllowed |
+            Where-Object { $_ -match 'py_comment' } |
             Should -BeNullOrEmpty
     }
 }

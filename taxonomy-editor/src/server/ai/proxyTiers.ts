@@ -184,8 +184,17 @@ export function byokGeminiFallbackKey(
   return freeKeys.length === 1 ? freeKeys[0] : freeKeys;
 }
 
-/** Per-Gemini-key free-tier RPM — single source of truth (also used by keyRotator.ts). */
-export const FREE_TIER_RPM_PER_KEY = 6;
+/** Per-Gemini-key free-tier RPM — single source of truth (also used by keyRotator.ts).
+ * t/3111: reverted 24→12. The t/3104 raise to 24 was sized against a *paid* Tier-2 key
+ * (10k RPM ceiling), which was the wrong shape — the anon pool should be FREE keys as
+ * primary with a single paid key as overflow-only fallback (generateWithPaidFallback,
+ * t/948). On a real free key the upstream ceiling is P_free≈15 RPM (firm, AI Studio),
+ * so 24 (> 0.8·P=12) would trip an UPSTREAM Gemini 429. 12 = 0.8·15 stays safe, and the
+ * debate's ~20/min burst is cleared by POOL SIZE: with K=2 free keys, front-door =
+ * min(12×2, 30) = 24 ≥ 1.2·T. The paid fallback catches rare >24 bursts. (TL-locked
+ * V=12/K=2, p/542.) Scale to a 3rd free key only if the paid-overflow alert (t/3110)
+ * shows frequent paid hits — data-driven, not now. */
+export const FREE_TIER_RPM_PER_KEY = 12;
 
 /**
  * Per-IP RPM for LOCAL embedding + NLI ops (ONNX / Python encoder — zero Gemini quota).

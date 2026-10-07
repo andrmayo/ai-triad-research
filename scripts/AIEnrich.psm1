@@ -120,6 +120,12 @@ if (Test-Path $_aiModelsPath) {
         Write-Warning "AIEnrich: failed to load ai-models.json — $($_.Exception.Message). Using hardcoded fallback."
     }
 }
+else {
+    # Fallback-Path Logging (docs/error-handling.md; t/3179 Finding 7): the file-not-found path is
+    # as anomalous as a parse failure (which warns above) — warn rather than silently dropping to
+    # the hardcoded registry, which may be stale relative to ai-models.json.
+    Write-Warning "AIEnrich: ai-models.json not found at any candidate path (last tried: $_aiModelsPath) — using hardcoded fallback model list (may be stale)."
+}
 
 # Fallback if ai-models.json missing or empty
 if ($script:ModelRegistry.Count -eq 0) {
@@ -133,6 +139,80 @@ if ($script:ModelRegistry.Count -eq 0) {
         'claude-haiku-3.5'      = @{ Backend = 'claude';  ApiModelId = 'claude-3-5-haiku-20241022' }
         'groq-llama-3.3-70b'    = @{ Backend = 'groq';    ApiModelId = 'llama-3.3-70b-versatile' }
         'groq-llama-4-scout'    = @{ Backend = 'groq';    ApiModelId = 'meta-llama/llama-4-scout-17b-16e-instruct' }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Protect-SensitiveText — secret redaction for AI error logging (t/2530 L14, t/3140).
+# MUST live in THIS module: Invoke-AIApi's all-retries-exhausted error path (below) calls it,
+# and AIEnrich is imported as a SEPARATE module (own scope) — a copy in AITriad/Private is NOT
+# visible here, so the error path threw 'Protect-SensitiveText not recognized', masking the real
+# HTTP error and failing every caller on any AI error (t/3123 smoke-batch finding).
+# ─────────────────────────────────────────────────────────────────────────────
+function Protect-SensitiveText {
+    <#
+    .SYNOPSIS
+        Redacts secret-looking tokens from text before it is logged.
+    .DESCRIPTION
+        AI API error bodies and exception messages can echo API keys, bearer
+        tokens, or `key=` query parameters straight into warnings and logs.
+        This replaces known secret shapes — and any explicitly-supplied literal
+        secret values — with [REDACTED], then caps the length, so diagnostics
+        never leak credentials.
+    .PARAMETER Text
+        The text to scrub. Null/empty is returned unchanged.
+    .PARAMETER Secret
+        Zero or more literal secret values to redact wherever they appear
+        (e.g. the resolved API key in scope at the call site).
+    .PARAMETER MaxLength
+        Cap the returned length (default 1000). 0 disables the cap.
+    .EXAMPLE
+        Write-Warning "Response body: $(Protect-SensitiveText -Text $ErrBody -Secret $ResolvedKey)"
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0, ValueFromPipeline)]
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string]$Text,
+
+        [string[]]$Secret = @(),
+
+        [int]$MaxLength = 1000
+    )
+
+    process {
+        if ([string]::IsNullOrEmpty($Text)) { return $Text }
+
+        $out = $Text
+
+        # 1) Explicit literal secrets first, longest-first so a shorter secret
+        #    that is a substring of a longer one doesn't leave a partial behind.
+        foreach ($s in (@($Secret) | Where-Object { $_ } | Sort-Object { $_.Length } -Descending)) {
+            $out = $out.Replace($s, '[REDACTED]')
+        }
+
+        # 2) Known secret shapes. Token-shaped patterns run BEFORE the header
+        #    key/value pattern: otherwise "Authorization: Bearer <tok>" has only
+        #    "Bearer" eaten as the value, leaving the token behind.
+        $patterns = @(
+            '(?i)\bBearer\s+[A-Za-z0-9._\-]+'
+            'AIza[0-9A-Za-z\-_]{20,}'        # Google API key (AIza… classic)
+            'AQ\.[0-9A-Za-z\-_\.]{20,}'      # Google API key (AQ.… newer format, t/3140)
+            'sk-[A-Za-z0-9\-_]{16,}'         # OpenAI / Anthropic style
+            'gsk_[A-Za-z0-9]{16,}'           # Groq
+            '(?i)\bkey=[^&\s"'']+'           # ?key= query parameter
+            '(?i)(x-goog-api-key|api[_-]?key|authorization)["'']?\s*[:=]\s*["'']?[^\s"'',&}]+'
+        )
+        foreach ($p in $patterns) {
+            $out = [regex]::Replace($out, $p, '[REDACTED]')
+        }
+
+        if ($MaxLength -gt 0 -and $out.Length -gt $MaxLength) {
+            $out = $out.Substring(0, $MaxLength) + '…[truncated]'
+        }
+
+        return $out
     }
 }
 
@@ -281,7 +361,10 @@ function Measure-PromptTokens {
                 Accurate   = $true
             }
         } catch {
-            Write-Verbose "Measure-PromptTokens: Gemini countTokens failed — $($_.Exception.Message). Using heuristic."
+            # Fallback-Path Logging (docs/error-handling.md; t/3179 Finding 6): WARN, not Verbose.
+            # The pre-flight token-overflow check downstream depends on this count, so a silent
+            # heuristic undercount can suppress that warning — surface the degraded accuracy.
+            Write-Warning "Measure-PromptTokens: Gemini countTokens failed ($($_.Exception.Message)) — falling back to character heuristic (Accurate=`$false)"
         }
     }
 
@@ -458,7 +541,11 @@ function Invoke-AIApi {
         [int]   $MaxRetries  = 5,
         [int[]] $RetryDelays = @(15, 45, 90, 120),
         [string[]]$FallbackModels,
-        [switch]$SkipTokenCheck
+        [switch]$SkipTokenCheck,
+        # t/3242 — optional AI Call Log hook (IoC). A scriptblock invoked once per call with
+        # ($RetryCount, $Status). Defined in AITriad (Invoke-AIByUsage) so it retains that module's
+        # affinity and can reach the AITriad-private Write-AICallLogEntry across the module boundary.
+        [scriptblock]$CallLogger
     )
 
     # -- Resolve model info from registry -------------------------------------
@@ -968,6 +1055,18 @@ function Invoke-AIApi {
         }
     }
 
+    # t/3242 — AI Call Log capture (IoC). Fire the injected logger ONCE per call HERE, before the
+    # failure $null-return AND the success extraction, so a failed call is logged too (TL C, cond.3).
+    # Fail-safe (cond.2): the logger — and the audit write it drives — must never break the AI call.
+    if ($CallLogger) {
+        if ($null -ne $Response -and $null -eq $LastError) { $LogStatus = 200 }
+        elseif ($LastError -and $LastError.Exception.Response) { $LogStatus = $LastError.Exception.Response.StatusCode.value__ }
+        elseif ($LastError) { $LogStatus = 'error' }
+        else { $LogStatus = '?' }
+        try { & $CallLogger $Attempt ([string]$LogStatus) }
+        catch { Write-Warning "Invoke-AIApi: call-logger threw ($($_.Exception.Message)); continuing (audit log is non-fatal)." }
+    }
+
     if ($null -ne $LastError -or $null -eq $Response) {
         if ($LastError) { $StatusCode = $LastError.Exception.Response.StatusCode.value__ } else { $StatusCode = '?' }
         $Hint = switch ($StatusCode) {
@@ -982,12 +1081,24 @@ function Invoke-AIApi {
         $SafeMsg = Protect-SensitiveText -Text $LastError.Exception.Message -Secret $ResolvedKey
         Write-Warning "$($Backend): API call failed (HTTP $StatusCode) — $SafeMsg"
         if ($Hint) { Write-Warning "$($Backend): $Hint" }
+        # Capture the HTTP error BODY — it carries the real reason (e.g. a 400's message). t/3196:
+        # Invoke-RestMethod (HttpClient) surfaces the response body on $_.ErrorDetails.Message, NOT
+        # on Exception.Response.GetResponseStream() (the old WebRequest shape) — so the previous
+        # read silently caught nothing on every HttpClient failure, and the body was invisible
+        # (this masked the t/3123 400 during diagnosis). Prefer ErrorDetails.Message; fall back to
+        # the WebRequest stream for any caller still on that path.
         try {
-            if ($LastError.Exception.Response) {
+            $ErrBody = $null
+            if ($LastError.PSObject.Properties['ErrorDetails'] -and $LastError.ErrorDetails -and $LastError.ErrorDetails.Message) {
+                $ErrBody = [string]$LastError.ErrorDetails.Message
+            }
+            elseif ($LastError.Exception.Response -and ($LastError.Exception.Response | Get-Member -Name GetResponseStream -MemberType Method -ErrorAction SilentlyContinue)) {
                 $ErrStream = $LastError.Exception.Response.GetResponseStream()
                 $ErrReader = [System.IO.StreamReader]::new($ErrStream)
                 $ErrBody   = $ErrReader.ReadToEnd()
                 $ErrReader.Close()
+            }
+            if (-not [string]::IsNullOrWhiteSpace($ErrBody)) {
                 $SafeBody = Protect-SensitiveText -Text $ErrBody -Secret $ResolvedKey
                 Write-Warning "$($Backend): Response body: $SafeBody"
             }
@@ -1018,6 +1129,7 @@ function Invoke-AIApi {
                     RetryDelays    = @(5, 15)
                     FallbackModels = @()
                     SkipTokenCheck = $true
+                    CallLogger     = $CallLogger   # t/3242 cond.1: forward the logger through the cascade
                 }
                 if ($SystemInstruction) { $FbParams['SystemInstruction'] = $SystemInstruction }
                 if ($JsonMode)          { $FbParams['JsonMode'] = $true }
@@ -1667,5 +1779,5 @@ function Repair-TruncatedJson {
 Set-Alias -Name 'Invoke-GeminiApi'   -Value 'Invoke-AIApi'
 Set-Alias -Name 'Get-GeminiMetadata' -Value 'Get-AIMetadata'
 
-Export-ModuleMember -Function Invoke-AIApi, Get-AIMetadata, Resolve-AIApiKey, Get-AIApiKeySource, Repair-TruncatedJson, Measure-PromptTokens, Set-AIApiCorrelationId `
+Export-ModuleMember -Function Invoke-AIApi, Get-AIMetadata, Resolve-AIApiKey, Get-AIApiKeySource, Repair-TruncatedJson, Measure-PromptTokens, Set-AIApiCorrelationId, Protect-SensitiveText `
                     -Alias    Invoke-GeminiApi, Get-GeminiMetadata

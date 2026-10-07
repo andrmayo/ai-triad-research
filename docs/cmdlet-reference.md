@@ -18,6 +18,7 @@ Get-Help <CmdletName> -Full                     # full docs for any cmdlet
 | `Get-Tax` | Load full taxonomy (nodes, edges, metadata) |
 | `Get-GraphNode` | Look up a specific node by ID |
 | `Get-Edge` | Fetch edges (filter by source/target/type) |
+| `Get-Concept` | Read the standardized dictionary (concepts, `term:*`) as objects; filter by `-Slug`/`-Camp`/`-Status`, reverse concept↔node map via `-UsedByNode <id>`, `-IncludeColloquial` adds colloquial terms (t/3291) |
 | `Get-Situation` | List/filter situations (by id/label/text/linked-node/camp); reports per-POV supporting-evidence counts derived from `linked_nodes` |
 | `Get-Policy` | Look up policy actions from the registry |
 | `Get-TaxonomyHealth` | Check node/edge counts, orphans, structural issues |
@@ -48,9 +49,12 @@ Get-Help <CmdletName> -Full                     # full docs for any cmdlet
 |--------|----------|
 | `Get-Entity` | Resolve an entity record (ent-*) from entities.json; follows merge tombstones to the canonical record and stamps `redirected_from` (t/1804) |
 | `Import-Entity` | Curation write: upsert 1-20 proposed/approved/deprecated entity records with a never-reused ent-NNN allocator; person records need a human description to approve (t/1804) |
+| `Update-EntityEmbeddings` | Backfill/refresh entity_embeddings.json to the v2 multi-vector shape ({name_vector, description_vector?}) for all approved entities; idempotent via per-entity `_src_hash` (skips unchanged), batches all re-embeds into one call, `-Force` re-embeds all, `-WhatIf` previews. Use when populating vectors after approvals or a model swap (t/3121) |
 | `Invoke-EntityExtraction` | Phase 1 entity extraction from source_evidence_index.json facts; resolves against existing entities/orgs/taxonomy/dictionary/policy before minting only the unmatched remainder (t/1806) |
-| `Get-EntityReport` | Maintenance reports: near-duplicate entities, provenance orphans, dictionary-collision candidates, merge-chain defects (t/1806) |
-| `Update-EntityMentionIndex` | Phase 2-B batch re-index: rebuilds the derived `entity_mentions.json` by alias-first, deterministic matching of entities against curated container text (SEI facts + POV nodes). Indexes `-Status` entities only (default `approved`, per §5 / the D1 caller-filters-to-approved contract); widen to `-Status approved,proposed` for an explicit preview before curation. Populated statuses recorded in the envelope's `indexed_status`. Idempotent via per-container `text_sha256`, human mentions win, normalization mirrors the D1 parity contract (t/1894, t/1982) |
+| `Get-EntityReport` | Maintenance reports: near-duplicate entities, provenance orphans, dictionary-collision candidates, merge-chain defects, `relation-dag` invariants (acyclic + depth≤3 over persisted `relations[]`, t/3170) (t/1806) |
+| `Update-EntityMentionIndex` | Phase 2-B batch re-index: rebuilds the derived `entity_mentions.json` by alias-first, deterministic matching of entities against **`{sei:*, summary:*}`** container text (SEI facts + summary key-points/claims). **`node:*` grounding moved to CL's Python reconciler** (t/3160 G7 disjoint-scope contract); this cmdlet never emits a `node:*` key. Indexes `-Status` entities only (default `approved`, per §5 / the D1 caller-filters-to-approved contract); widen to `-Status approved,proposed` for an explicit preview. Populated statuses recorded in the envelope's `indexed_status`. Idempotent via per-container `text_sha256`, human mentions win, normalization mirrors the D1 parity contract (t/1894, t/1982, t/3122, t/3160) |
+| `Update-ClaimEntityRef` | Claim-side entity grounding: writes `entity_refs[]` (Shared Lib `EntityLinkRef`) onto summary `key_points`/`factual_claims` by **precise-only** surface/alias matching against the approved register — mirrors CL's node reconciler; **no entity-embedding rung** (§13.3 propose-only, Andreessen-45). Refs written by this pass, never the extraction LLM (R2.3). Idempotent (only changed files rewritten; a claim that resolves to nothing has its `entity_refs` removed). `-Status` (default `approved`), `-SummariesPath`, `-Force`, `-WhatIf` (t/3124) |
+| `Invoke-LogicalFormPass` | FOL Phase-1 formalization: attaches a neo-Davidsonian `logical_form` (schema t/3126, `logical-form-schema.md`) to summary `key_points`/`factual_claims` via the `enrichment.logical-form-formalization` UsageID. Runs **after** `Update-ClaimEntityRef` — reads each claim's `entity_refs[]`, joins `dolce_category`→`args[].sort`, and **enforces** grounding (every `ent-*` arg must come from the claim's refs — no minted ids, R6/t/2294), copy-not-judge on `sort`/`match_level`, mechanical `modality`, and enum validation before persisting. Defaults to the grounded set (claims with `entity_refs`); `-IncludeUngrounded`, `-MaxClaims`, `-Model`, `-Force`, `-WhatIf`. Produces the batch CL's `score_golden.py` scores for `formalization_accuracy` (t/3215) |
 
 ### Graph & Conflict Analysis
 | Cmdlet | Use when |
@@ -83,8 +87,8 @@ Get-Help <CmdletName> -Full                     # full docs for any cmdlet
 ### Op-Ed Generation
 | Cmdlet | Use when |
 |--------|----------|
-| `Get-OpEdSource` | Fetch, convert (PDF/DOCX/HTML routing), and validate a source URL once — returns a SourcePrep object to pass to New-OpEd for one or multiple POVs (t/2586) |
-| `New-OpEd` | Generate a publication-ready op-ed in a POV camp voice, grounded in the project taxonomy; accepts -Topic, -Url (fetches internally via Get-OpEdSource), or -SourcePrep (pre-built prep object for multi-voice runs) |
+| `Get-OpEdSource` | Convert (PDF/DOCX/HTML, dispatched on Content-Type) and validate PRE-FETCHED source content — takes a temp-file path + content-type, returns a SourcePrep object for New-OpEd. Convert-only: the URL fetch moved to the shared Node fetcher (t/2586, t/3307) |
+| `New-OpEd` | Generate a publication-ready op-ed in a POV camp voice, grounded in the project taxonomy; accepts -Topic, -Url (CLI best-effort fetch then convert — desktop fetches via the hardened Node fetcher, t/3312), or -SourcePrep (pre-built prep object for multi-voice runs) |
 
 ### Sources & Ingestion
 | Cmdlet | Use when |
@@ -110,6 +114,13 @@ Get-Help <CmdletName> -Full                     # full docs for any cmdlet
 | `Invoke-AphorismBatch` | Backfill camp-voiced sober aphorisms (~3-8 words) on POV nodes — presentational only, never a scoring input; skips pillars/deprecated (t/1550) |
 | `New-SyntheticCorpus` | Generate synthetic training data |
 
+### AI Call Log (t/3235)
+| Cmdlet | Use when |
+|--------|----------|
+| `Clear-AICallLog` | Rotate/clear the AI call log (`ai-call-log.jsonl`) so the next logged call restarts `ID` at 1 — a "session" is one log file. No-op if absent; honors `-WhatIf`. Capture is behind the default-off `AI_CALL_LOG_ENABLED` flag (t/3241) |
+| `Get-AICallLog` | Read the AI call log as filterable, pipeline-friendly `[AICallLogEntry]` objects — filter by `-Scenario`/`-Status` (wildcards) and `-After`/`-Before` date range. Reading ignores the capture flag; absent/empty log → empty result (t/3243) |
+| `Show-AICallLog` | Render the AI call log as a self-contained, sortable/filterable HTML viewer and open it in the browser (same filters as `Get-AICallLog`). `-PassThru` returns the generated HTML path instead of opening (t/3244) |
+
 ### Health & Diagnostics
 | Cmdlet | Use when |
 |--------|----------|
@@ -120,12 +131,14 @@ Get-Help <CmdletName> -Full                     # full docs for any cmdlet
 | `Test-PersonaEndpoints` | Auth-gate regression matrix across anonymous/authenticated/admin personas |
 | `Test-ServiceWorkerHealth` | Parse deployed /sw.js for skipWaiting mode, denylist coverage, precache stats |
 | `Get-FreeTierStatus` | Live free-tier budget/usage report (live config + token consumption) |
+| `Sync-FreeTierKeys` | Validate-then-set the FREE_TIER_GEMINI_KEY pool — auth-probes each key, excludes failures, sets passing keys as the comma-separated pool value (GHA secret / local env), reports K and resulting front-door RPM |
 | `Test-AnalyticsBackend` | Analytics storage round-trip probe — POST synthetic event, wait, GET query, verify event appears; confirms write failures in <60s (t/2668) |
 | `Test-AzureHealth` | Azure infra status |
 | `Test-AnalyticsBlobHealth` | Verify the analytics blob container exists, is accessible, and has recent data (daily NDJSON blobs, event counts, stale-write threshold) |
 | `Get-AnalyticsEventTypes` | Read-side analytics check — per-event-type counts from `GET /api/analytics/query` (surfaces instrumentation gaps like `view.dwell: 0`); `-Days`/`-Env prod\|staging` |
 | `Test-GitHubHealth` | GitHub platform + CI status |
 | `Test-AIApiKey` | Probe AI backend auth endpoints (no tokens consumed) — confirm a key is present and accepted before running jobs |
+| `Test-GeminiKeyPool` | Definitive count + per-key validity of the Gemini free-key pool from a key file (AIza + AQ. formats) via the auth-only probe; masked fingerprints only, never raw keys (t/3141) |
 | `Test-AIBackendHealth` | Full completion round-trip probe per backend — use before a debate run to surface degraded/unreachable models (t/2212) |
 | `Test-AIBackendQuota` | Per-backend quota probe — flags quota-exhausted backends (Status='quota') with a best-effort ResetAt; use at session start to catch quota exhaustion before a wall of judge failures (t/3029) |
 | `Test-DebateIndexIntegrity` | Validate debate-*.json field types for UI-crash regressions — catches the object-as-title bug (t/2335) |
@@ -134,6 +147,9 @@ Get-Help <CmdletName> -Full                     # full docs for any cmdlet
 | `Test-DebatePersistence` | Pre-flight atomic write+rename probe for the debates output dir — call before AI generation to surface LOCKED/NO_PERMISSION early (t/2545) |
 | `Get-ContainerAppRevision` | Query ACA revisions by mode (Active/Stale/Fqdn) — replaces raw `az containerapp revision` calls (t/1498) |
 | `Get-ServerLog` | Retrieve + filter ACA server logs, correlate by Pino requestId — `-RequestId`/`-Recent`/`-StartTime`/`-Pattern` sets, `-Level`/`-Component`/`-Follow`/`-Raw` (t/2765) |
+| `Get-TaxEditorServerLogs` | Pull **deep** server-log history from Log Analytics (past the live-tail buffer) by `-From`/`-To`/`-RequestId`/`-Pattern`; parses Pino fields (Level/RequestId/Component/Method/Path/Status/DurationMs); `-System` for revision/restart events (t/3082) |
+| `Test-EmbeddingsCacheHealth` | One-shot `resolving`/`re-computing`/`no-traffic`/`unknown` verdict on whether the precomputed embeddings cache is serving on the live revision — compute p50/p95, load-shed 503s, cache-ready signal over `-From`/`-To` (default 30m); baseline-validation for the embedding-saturation class (t/3168) |
+| `ConvertFrom-TruncatableJson` | Parse JSON, recovering the valid prefix when a structured-output response was truncated mid-JSON (via `Repair-TruncatedJson`); WARNs on the repair path, re-throws the original error when unrepairable. Used by `Invoke-EntityExtraction` so entity-dense nodes don't hard-fail (t/3195) |
 | `Test-PreloadHealth` | Validate the built `preload.cjs` before launch — exists, calls `contextBridge.exposeInMainWorld`, self-contained (no relative `require('./…')`), optional `node --check` (t/2775, t/2777) |
 | `New-ContainerAppRevision` | Blue-green: deploy a new ACA revision at 0% traffic; returns real `RevisionName` for the promotion chain (t/1500 Phase 3) |
 | `Set-ContainerAppTraffic` | Shift traffic to a named revision with retry — call BEFORE `Disable-ContainerAppRevision` in rollback (t/1500 Phase 3) |

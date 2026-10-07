@@ -18,16 +18,20 @@
 import tseslint from 'typescript-eslint';
 import reactHooks from 'eslint-plugin-react-hooks';
 import requireFlightRecorderInCatch from '../lib/eslint-rules/require-flight-recorder-in-catch.js';
+import requireWarnOnDegradedCatchReturn from '../lib/eslint-rules/require-warn-on-degraded-catch-return.js';
 import noActionableErrorMessageNesting from '../lib/eslint-rules/no-actionable-error-message-nesting.js';
 import noUnmanagedModuleResources from './eslint-rules/no-unmanaged-module-resources.js';
 import noInlineStyle from './eslint-rules/no-inline-style.js';
+import noRawDataRootRead from './eslint-rules/no-raw-data-root-read.js';
 
 const localPlugin = {
   rules: {
     'require-flight-recorder-in-catch': requireFlightRecorderInCatch,
+    'require-warn-on-degraded-catch-return': requireWarnOnDegradedCatchReturn,
     'no-unmanaged-module-resources': noUnmanagedModuleResources,
     'no-inline-style': noInlineStyle,
     'no-actionable-error-message-nesting': noActionableErrorMessageNesting,
+    'no-raw-data-root-read': noRawDataRootRead,
   },
 };
 
@@ -77,6 +81,12 @@ export default tseslint.config(
       // ADR-003 enforcement (t/1323, repo-review B-401): every catch records to the
       // flight recorder. Flipped warn→error once the tree was clean (0 violations).
       'local/require-flight-recorder-in-catch': 'error',
+      // t/3200/t/3205 (Fallback-Path Logging): a degraded-default return (`[]`/`{}`/`null`/`undefined`)
+      // from a data/IO catch must record at WARN/ERROR. Flipped warn→error at zero-noise (TL Gate
+      // Promotion, t/3200#2 / p/342#254): the per-owner cleanup (t/3219–t/3223) + the predicate
+      // refinement (#1812) drove the flagged count to 0. Separate rule from the base one so severity
+      // is independent.
+      'local/require-warn-on-degraded-catch-return': 'error',
       'max-lines': MAX_LINES_SRC,
       // ActionableError nesting gate (t/2764 / t/2761): forbid err.message in problem:.
       // Custom rule (not no-restricted-syntax) so it restricts to error-named identifiers
@@ -103,6 +113,26 @@ export default tseslint.config(
         message:
           'Module-level call expressions are banned in server/storage — they fire at import time and can crash Vitest collection or the container on startup. Move invariant checks into a constructor or explicit init function. See undiciInvariant.ts + GitHubRestClient constructor as the canonical pattern. (t/2113, t/2114)',
       }],
+    },
+  },
+  // ── Block A-dataroot: data-root read gate (t/3093 / t/3087) ──
+  // Flags a raw fs read whose path traces to a data-root resolver (the t/3085 migration-remnant
+  // class). Promoted warn->error after >=1 green CI cycle since #1633 (TL GV p/336#231, promotion
+  // p/392#21; flip t/3113).
+  // exit-2 = ESLint unmatched-pattern on explicit file targets; lint by DIRECTORY (`eslint src/`) —
+  // a directory target never yields the No-files-matching exit-2, so this error-level gate is
+  // deterministic (t/3109).
+  // tripwire: green != verified — a new hit is a true positive; silence it only with an inline
+  // eslint-disable + TL-approved rationale at the call site, never by baselining here.
+  {
+    files: ['src/server/**/*.ts'],
+    ignores: [
+      ...TEST_GLOBS,             // tests hit resolver + fs.read constantly — not migration remnants
+      'src/server/storage/**',   // sanctioned home for data-root reads (readDataFile lives here)
+      'src/server/config.ts',    // defines the resolver functions themselves
+    ],
+    rules: {
+      'local/no-raw-data-root-read': 'error',
     },
   },
   // ── Block B: LOC budget for test source (syntactic parse; tests are outside the

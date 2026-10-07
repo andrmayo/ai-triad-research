@@ -15,6 +15,7 @@ import type { OpEdSet, OpEdSetSummary } from '../../../../lib/oped/types';
 import { encryptKeysForSharing, decryptKeysFromSharing } from '../utils/keyShareCrypto';
 import { resilientFetch, categorizeEndpoint, registerConnectionPoolProvider, type EndpointCategory } from './resilience';
 import { nextStepsForStatus } from './httpErrorSteps';
+import { computeEmbeddingsChunked } from './embeddingsBatch';
 import { runChatStream, chatStreamBus } from './chatStream';
 import { runOpEdCreate, cancelActiveOpEdRun, opedProgressBus } from './opedStream';
 import { onQuotaMilestone } from '../hooks/useQuotaWarning';
@@ -269,7 +270,7 @@ async function post<T = unknown>(path: string, body?: unknown, opts?: FetchOptio
       location: 'web-bridge.post',
       nextSteps: ['Wait for the rate limit to reset', 'Use your own API key to avoid shared limits'],
     });
-    Object.assign(err, { limitType: String(data.limitType ?? ''), retryAfterS: Math.ceil((data.retryAfterMs as number || 60000) / 1000) }); // + 429 retry_after_s for FR (t/3054)
+    Object.assign(err, { limitType: String(data.limitType ?? ''), retryAfterS: Math.ceil((data.retryAfterMs as number || 60000) / 1000), rateLimitSource: data.rate_limit_source, limit: data.limit, current: data.current }); // 429 retry_after_s (t/3054) + rate_limit_source/limit/current for anon client-only FR (t/3107)
     throwHttpError(429, err);
   }
   if (res.status === 400 && (path === '/api/ai/generate' || path === '/api/ai/search')) {
@@ -991,12 +992,11 @@ const rawApi: AppAPI = {
   getProxyUsage: () => get('/api/proxy/usage'),
 
   // Embeddings & NLI
-  computeEmbeddings: (texts, ids) => post('/api/embeddings/compute', { texts, ids }, { idempotent: true }), // idempotent:true → 1 retry so a load-shed 503 (retryable:true+Retry-After) recovers; embeddings are a pure fn of inputs (t/2922)
-  // Web transport: the server embedding backend (Python/Gemini) has no DirectML GPU-OOM failure
-  // mode, so nothing goes stale on this path → always [] (t/2060 staleNodeIds contract). If the
-  // server route later reports partial failures, thread them through here.
-  updateNodeEmbeddings: (nodes) => post('/api/embeddings/update-nodes', { nodes }).then(() => ({ staleNodeIds: [] as string[] })),
+  computeEmbeddings: (texts, ids) => computeEmbeddingsChunked(post, texts, ids), // ≤EMBEDDINGS_MAX_BATCH sequential chunks so an oversized batch can't blow the 50s server timeout (t/3072)
+  updateNodeEmbeddings: (nodes) => post('/api/embeddings/update-nodes', { nodes }).then(() => ({ staleNodeIds: [] as string[] })), // Web: server embed backend has no GPU-OOM mode → nothing stale → always [] (t/2060).
   computeQueryEmbedding: (text) => post('/api/embeddings/query', { text }),
+  fetchRelevantNodes: (payload) => post('/api/taxonomy/relevant-nodes', payload), // t/3258 (T3): EXACT path — anon free-tier gate is exact-match (TL t/3284#2)
+  fetchClaimAttribution: (payload) => post('/api/argument-network/attribution', payload), // t/3316 (t/3297 client half): server-side per-claim attribution
   nliClassify: (pairs) => post('/api/nli/classify', { pairs }),
 
   // Source evidence
@@ -1055,9 +1055,9 @@ const rawApi: AppAPI = {
   createOpEdSet: (payload) => runOpEdCreate(fetchWithSessionRecovery, payload),
   cancelOpEdSet: () => cancelActiveOpEdRun(), // aborts the in-flight POST → server cancels voices
   onOpEdProgress: (cb) => opedProgressBus.onProgress(cb),
-  // t/2728: publish/revoke a durable public share link (server: routes/oped.ts + opedShare.ts).
-  shareOpEdSet: (id) => post<{ shareId: string; url: string }>(`/api/oped-sets/${encodeURIComponent(id)}/share`, {}),
+  shareOpEdSet: (id) => post<{ shareId: string; url: string }>(`/api/oped-sets/${encodeURIComponent(id)}/share`, {}), // t/2728: publish/revoke a public share link (routes/oped.ts)
   unshareOpEdSet: (id) => del<{ ok: boolean }>(`/api/oped-sets/${encodeURIComponent(id)}/share`),
+  shareCommunityOpEd: (id) => post<{ shareId: string; url: string }>(`/api/community/opeds/${encodeURIComponent(id)}/share`, {}), // t/3315: public link for a community op-ed
   exportDebateToFile: async (session, format = 'json', exportOptions) => {
     const { debateToText, debateToMarkdown, debateToHtml, debateToPackage, debateExportFilename } = await import('@lib/debate/debateExport');
     const debate = session as Parameters<typeof debateToText>[0] & { diagnostics?: unknown };

@@ -396,3 +396,50 @@ export const PORT = parseInt(process.env.PORT || '7862', 10);
 export const EMBED_SCRIPT = path.join(PROJECT_ROOT, 'scripts', 'embed_taxonomy.py');
 export const SCRIPTS_DIR = path.join(PROJECT_ROOT, 'scripts');
 export const BROKER_SCRIPT = path.join(PROJECT_ROOT, 'src', 'main', 'pty-broker.py');
+// t/3171 (G8a): the CL-owned grounding reconciler (t/3160/#1736), invoked in scoped mode
+// (`--nodes <ids> --apply`) by the inline write-hook after a PUT /api/taxonomy/:pov. Resolved off
+// PROJECT_ROOT like EMBED_SCRIPT; the script is stdlib+numpy (present in the web container).
+export const RECONCILE_SCRIPT = path.join(PROJECT_ROOT, 'research', 'comp-linguist', 'scripts', 'reconcile_grounding.py');
+
+// t/3183 (t/2977 Item B): per-build capability switch that routes embedding miss-text compute
+// off the main thread to the lib/embeddings worker (t/3181). DEFAULT OFF, web-first — when off,
+// computeEmbeddings runs the ONNX fallback in-thread exactly as before (byte-identical). Read
+// per-call (not a module-load const) so the both-arms liveness test can toggle it around a single
+// compute. `EMBEDDING_WORKER_OFFLOAD=1` (or `true`) enables. This is a build/deploy capability, not
+// the admin runtime feature-flag surface (feature-flags.json) — the worker's availability is a
+// property of the build, and the canary flip is an ops action, not a per-user admin toggle.
+export function isEmbeddingWorkerOffloadEnabled(): boolean {
+  const v = process.env.EMBEDDING_WORKER_OFFLOAD?.trim().toLowerCase();
+  return v === '1' || v === 'true';
+}
+
+/** t/3211: desired embedding-worker POOL size (K). DEFAULT 1 → today's single-worker behavior exactly,
+ *  so this lands inert until EMBEDDING_WORKER_POOL_SIZE>1 AND a container with spare cores is deployed.
+ *  The RAW value is passed to configureEmbeddingWorkerPool, which SELF-CLAMPS to
+ *  min(size, availableParallelism()-1) + WARNs (Shared Lib owns the safety) so a mis-set value can never
+ *  oversubscribe the main event loop. A non-positive/NaN env → 1. */
+export function getEmbeddingWorkerPoolSize(): number {
+  const n = Number.parseInt(process.env.EMBEDDING_WORKER_POOL_SIZE ?? '', 10);
+  return Number.isFinite(n) && n >= 1 ? n : 1;
+}
+
+// t/3206 (t/3165 storm-replay canary): per-revision capability switch for the canary loop-lag
+// sampler + its two /internal/canary/loop-sampler routes. DEFAULT OFF — when off the routes 404 AND
+// the anon-exemption for /internal/canary/* does not exist (double-closed; zero prod exposure).
+// DevOps sets it on the isolated STAGING canary revision only (same mechanism as
+// EMBEDDING_WORKER_OFFLOAD). Read per-call so route/auth checks see the live value.
+export function isCanaryLoopSamplerEnabled(): boolean {
+  const v = process.env.CANARY_LOOP_SAMPLER?.trim().toLowerCase();
+  return v === '1' || v === 'true';
+}
+
+// t/3172 (G8b): per-deploy switch for the scheduled full-taxonomy grounding sweep. DEFAULT OFF —
+// when off, startGroundingSweep() never arms its timer (zero behavior). Enable is sequenced behind
+// the reconciler tool-lock (t/3194, landed) AND the PS cmdlet lock-honoring (t/3203) with TL
+// lock-symmetry sign-off — the SAME lock-symmetry dependency as G8a's grounding_reconcile_inline
+// flag (t/3163#1); an unlocked concurrent writer could otherwise lost-update the shared grounding
+// file mid-sweep. Read per-call so the enable can be flipped via a revision env without a rebuild.
+export function isGroundingSweepEnabled(): boolean {
+  const v = process.env.GROUNDING_SWEEP_ENABLED?.trim().toLowerCase();
+  return v === '1' || v === 'true';
+}
