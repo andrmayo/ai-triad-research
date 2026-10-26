@@ -15,6 +15,7 @@ function createMockAdapter(): ExtendedAIAdapter {
     async generateText(_prompt: string, _model: string, _options?: GenerateOptions) {
       return '{"response": "mock"}';
     },
+    registry: { backends: [], models: [] },
   };
 }
 

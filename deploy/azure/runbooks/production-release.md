@@ -11,6 +11,10 @@
 - `ADMIN_USERS` GitHub Actions variable set
 - Access to trigger `workflow_dispatch` on the repo
 
+## Conditional Gate: Serialize-Phase Canary (staging, pre-promotion)
+
+If this release touches the **serialize path specifically** — the synthetic-embeddings endpoint (`routes/taxonomy.ts`, `getSyntheticEmbeddingsBuffer`), the chunk-yield JSON serializer (`httpKit.ts` `jsonStringifyChunked`), or the corpus loader (`fileIO.loadSyntheticEmbeddings`) — run the **[serialize-canary](./serialize-canary.md)** probe on a fresh staging revision **before** promoting to production. It exercises *and* asserts the response serialize phase under the loop-sampler — the phase the t/3165 storm-canary silently omitted (phase-blind false-green; t/3236). **Compute-path-only deltas** (worker-pool internals, queue-depth gauges, shed-token observability) leave the serialize tail byte-identical and are **N/A** (t/3236#11) — do not confuse "embeddings load/serve" broadly with the serialize phase this gate guards.
+
 ## Step 1: Pre-Build Verification (App Side)
 
 1. Run the full verify gate:
@@ -40,17 +44,17 @@
 
 3. Verify the image exists in GHCR:
    ```bash
-   gh api user/packages/container/taxonomy-editor/versions --jq '.[0].metadata.container.tags'
+   gh api orgs/ai-rosetta-stone/packages/container/taxonomy-editor/versions --jq '.[0].metadata.container.tags'
    ```
 
 ## Step 3: Deploy to Azure
 
-1. Trigger the deploy workflow (**once only** — duplicate dispatches are cancelled):
+1. Trigger the deploy workflow (**once only** — duplicate dispatches are cancelled). Pass the **commit SHA** you built in Step 2 — the deploy resolves its permanent `sha-<commit>` tag to an immutable `@sha256` digest and pins the revision to it (deploy-by-digest, t/3679). There is **no `image_tag`/`:latest` path** — an empty/missing `sha` aborts with an actionable message:
    ```bash
    gh workflow run deploy-azure.yml --ref main \
      -f environment=production \
      -f auth_mode=optional \
-     -f image_tag=latest
+     -f sha=<full-or-short-commit-sha>   # the SAME sha passed to Invoke-ContainerBuild.ps1 in Step 2
    ```
 
 2. Monitor the deploy:
@@ -60,11 +64,12 @@
    ```
 
 3. The workflow automatically:
-   - Verifies CI passed for the commit (test-electron + test-container)
-   - Verifies the container image exists in GHCR
+   - Verifies CI passed for the **deployed commit** (`sha`), not the dispatch HEAD (test-electron + test-container)
+   - Resolves the commit's per-SHA tag to an immutable `@sha256` digest and pins to it — aborts fail-closed if the tag is absent (this replaces the old tag-existence check)
    - Runs Bicep what-if (checks for unexpected deletions)
-   - Deploys Bicep template (infra + app config)
-   - Creates new revision at 0% traffic
+   - Deploys Bicep template (infra + app config) with the digest-pinned image
+   - Creates new revision at 0% traffic (pinned to the digest; `IMAGE_DIGEST`/`IMAGE_DEPLOYED_AT` stamped as env)
+   - Asserts the revision's resolved image ref equals the intended digest before any traffic shift
    - Health checks the new revision (Phase 1: server up, Phase 2: data loaded)
    - Runs acceptance tests (18 endpoint checks across 8 categories)
    - Shifts 100% traffic to new revision on success
@@ -125,6 +130,8 @@ If post-deploy issues are found after traffic shift:
 
 The deploy workflow handles this automatically when health checks or acceptance tests fail. Manual rollback is only needed for issues discovered after the workflow completes.
 
+**Rollback-anchor durability (t/3679 + t/3756).** A rollback target is only valid while its image is **tagged** or within the untagged-retention window. `ghcr-cleanup.yml` deletes **untagged** images older than 30 days (keeping the 5 most-recent untagged). Since deploy-by-digest (t/3679) makes `container.yml` push a **permanent `sha-<commit>` tag** for every built image, every deploy-pinnable image now stays **tagged → preserved**, so its digest remains pullable as a rollback target indefinitely — this is the going-forward fix. **Caveat for images built before t/3679 landed:** those were only ever tagged `:latest`, so once `:latest` moved past them they went untagged and prune at ~30 days. To roll back to a pre-t/3679 image, first confirm it still exists (`gh api orgs/ai-rosetta-stone/packages/container/taxonomy-editor/versions`) before relying on it; if you need a specific old digest preserved, tag it durably (`docker buildx imagetools create --tag ghcr.io/ai-rosetta-stone/taxonomy-editor:rollback-<date> <digest-ref>`). To forward-deploy a known-good digest directly, see the recovery path in [digest-pin-upgrade.md](digest-pin-upgrade.md).
+
 ## Deploy Hold
 
 **Lifted.** The 2026-07-04 hold (below) was superseded by subsequent authorized deploys (revisions `taxonomy-editor--anonpull` on 2026-07-05, `taxonomy-editor--deploy-d6a05b2-9294` on 2026-07-07) — this note just wasn't updated at the time. No hold is in effect as of 2026-07-07; deploys proceed under normal owner-request authorization.
@@ -157,13 +164,13 @@ All alerts route to the `ag-aitriad-restart-alert` action group, which emails `A
 
 ### Response Steps
 
-1. **ImagePullBackOff alert:** Check GHCR package visibility (`ghcr.io/jpsnover/taxonomy-editor` must be public). Verify `registries` is empty on the container app (`az containerapp show --name taxonomy-editor -g ai-triad --query 'properties.configuration.registries'`). If a credential was re-added, remove it and create a new revision.
+1. **ImagePullBackOff alert:** Check GHCR package visibility (`ghcr.io/ai-rosetta-stone/taxonomy-editor` must be public). Verify `registries` is empty on the container app (`az containerapp show --name taxonomy-editor -g ai-triad --query 'properties.configuration.registries'`). If a credential was re-added, remove it and create a new revision.
 2. **Restart loop alert:** Check container logs (`az containerapp logs show --name taxonomy-editor -g ai-triad --type console`). May indicate app crash, OOM, or bad deploy. Rollback to previous revision if needed.
 3. **Health check issue:** Run `Invoke-TaxEditorSmokeTest -Detailed` for full diagnosis. Check Azure status page for platform outages.
 
 ## Registry Auth (GHCR)
 
-**`ghcr.io/jpsnover/taxonomy-editor` must remain a public package.** Anonymous pulls are the production auth mode — no registry credentials are configured on the container apps. A visibility flip on the GHCR package = outage.
+**`ghcr.io/ai-rosetta-stone/taxonomy-editor` must remain a public package.** Anonymous pulls are the production auth mode — no registry credentials are configured on the container apps. A visibility flip on the GHCR package = outage.
 
 If the image ever needs to go private, design around **ACR + managed identity**. Do not rotate or re-add a PAT — PATs rot, and the 2026-07-05 outage (expired GHCR PAT → ImagePullBackOff on every replica recycle) is the proof.
 

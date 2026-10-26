@@ -81,6 +81,7 @@
         'Test-TaxonomyDir'
         'Assert-CleanDataTree'
         'Save-JsonNodeFieldEdits'
+        'Set-PovNodeTags'
         'Invoke-HierarchyProposal'
         'Set-TaxonomyHierarchy'
         'Invoke-SchemaMigration'
@@ -97,6 +98,7 @@
         'Get-AITSBOM'
         'Test-OntologyCompliance'
         'Test-SituationBdiCompliance'
+        'Get-SituationBdiViolationsFromJson'
         'Get-RelevantTaxonomyNodes'
         'Invoke-QbafConflictAnalysis'
         'Test-ExtractionQuality'
@@ -113,10 +115,14 @@
         'Invoke-DebateAB'
         'Show-OSSLicenses'
         'Get-AICostReport'
+        'Get-AITierModel'
+        'Build-NodeSourceIndex'
+        'Test-CitationLinkIntegrity'
         'Get-FlightRecorderDump'
         'Get-LatestFlightRecorderDump'
         'Get-AzureFlightRecorder'
         'Show-FlightRecorder'
+        'Export-SourcesIndex',
         'Update-AITSourceIndex'
         'Get-PovLineage'
         'Get-IntellectualLineage'
@@ -125,6 +131,11 @@
         'Get-TaxonomyProcess'
         'Request-FlightRecorderDump'
         'Get-FlightRecorderReport'
+        'Read-FlightRecorderDump'
+        'Invoke-DebateDiagnosis'
+        'Measure-CodeComplexity'
+        'Update-ComplexityBaseline'
+        'Test-ComplexityBudget'
         'Get-AITClaim'
         'Compare-EmbeddingModel'
         'Test-RerankerBaseline'
@@ -133,11 +144,13 @@
         'New-SyntheticCorpus'
         'Update-SyntheticCorpus'
         'Sync-SyntheticCorpus'
+        'Get-SyntheticStatement'
         'Export-SyntheticEmbeddings'
         'Test-SynthesisCompleteness'
         'Get-ImportReport'
         'Get-CalibrationTrend'
         'Test-TaxEditorHealth'
+        'Test-TaxEditorInquiry'
         'Test-EmbeddingHealth'
         'Test-TaxEditorEndpoints'
         'Test-AnonymousDebateFlow'
@@ -148,6 +161,7 @@
         'Get-FreeTierStatus'
         'Sync-FreeTierKeys'
         'Invoke-TaxEditorSmokeTest'
+        'Invoke-TaxEditorLoadTest'
         'Test-PreloadHealth'
         'Test-AnalyticsBackend'
         'Test-AnalyticsBlobHealth'
@@ -168,6 +182,7 @@
         'Deploy-TaxEditorInfra'
         'Get-TaxEditorBlob'
         'Restore-TaxEditorBlob'
+        'Move-GitHubIdentityData'
         'Get-CriticalInteraction'
         'Test-CriticalInteractions'
         'Merge-FlightRecorderDumps'
@@ -175,6 +190,7 @@
         'Set-TriadConfig'
         'Invoke-TriadConfigReload'
         'Invoke-VernacularBatch'
+        'Invoke-DebateGroundingBatch'
         # t/1224 — Organization data model
         'Get-Organization'
         'Find-OrganizationByPOV'
@@ -230,6 +246,8 @@
         # t/1806 — Entity ontology Phase 1: extraction + maintenance reports
         'Invoke-EntityExtraction'
         'Get-EntityReport'
+        # t/4075 — review surface for advisory existing-entity candidates (never links)
+        'Get-EntityExtractionCandidates'
         # t/1894 — Entity ontology Phase 2-B: batch mention indexer (entity_mentions.json)
         'Update-EntityMentionIndex'
         # t/3124 — Claim-side entity grounding: writes entity_refs[] onto summary claims
@@ -238,6 +256,8 @@
         'Invoke-LogicalFormPass'
         # t/2196 — Vite dev server diagnostic
         'Get-ViteDevStatus'
+        # t/3869 — resolves the true main-checkout root from inside any worktree (nested or sibling)
+        'Get-WorktreeMainRoot'
         # t/2330 — Debate session state diagnostic
         'Get-DebateSessionState'
         # t/2335 — Debate index field-type integrity check (per-session files)

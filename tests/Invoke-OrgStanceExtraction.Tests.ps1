@@ -88,6 +88,30 @@ Describe 'Invoke-OrgStanceExtraction (t/1553 Stage 1)' -Tag 'taxonomy' {
         }
     }
 
+    It 'Persists anchors when the model returns it, and defaults to [] when absent (t/4482)' {
+        InModuleScope AITriad -Parameters @{ ClaimsPath = $script:tmpClaims } {
+            param($ClaimsPath)
+            Mock Invoke-AIByUsage -MockWith {
+                [PSCustomObject]@{
+                    Text = '{"claims":[' +
+                        '{"text":"a","canonical_proposition":"X ought Y","anchors":["EU AI Act Article 62"],"polarity":"asserts","extraction_confidence":0.9},' +
+                        '{"text":"b","canonical_proposition":"Z ought W","polarity":"asserts","extraction_confidence":0.9}' +
+                    ']}'
+                    Model = 'stub'
+                }
+            }
+            $null = Invoke-OrgStanceExtraction -Concurrency 1 -OutputPath $ClaimsPath -Confirm:$false 3>$null 6>$null
+
+            $store = Get-Content $ClaimsPath -Raw | ConvertFrom-Json
+            # The fixture has 2 approved on-disk sources (src-a, src-b), and the mocked AI response is
+            # the same for both, so each stub claim is written once per source — select one of each.
+            $withAnchor = @($store.claims | Where-Object { $_.text -eq 'a' })[0]
+            $withoutAnchor = @($store.claims | Where-Object { $_.text -eq 'b' })[0]
+            @($withAnchor.anchors) | Should -Be @('EU AI Act Article 62')
+            @($withoutAnchor.anchors).Count | Should -Be 0 -Because 'a claim the model returns with no anchors field defaults to an empty array, not null or a dropped field'
+        }
+    }
+
     It 'Idempotence: re-run against the same set writes zero new claims' {
         InModuleScope AITriad -Parameters @{ ClaimsPath = $script:tmpClaims } {
             param($ClaimsPath)
@@ -190,6 +214,44 @@ Describe 'Invoke-OrgStanceExtraction (t/1553 Stage 1)' -Tag 'taxonomy' {
             $r = Invoke-OrgStanceExtraction -Concurrency 1 -OutputPath $ClaimsPath -Confirm:$false 3>$null 6>$null
             $r.ClaimsWritten | Should -Be 2 -Because 'fence stripping must not lose the JSON payload'
             $r.Failed        | Should -Be 0
+        }
+    }
+
+    It 'records text_verbatim per claim and WARNs on a paraphrase (t/4382)' {
+        InModuleScope AITriad -Parameters @{ ClaimsPath = $script:tmpClaims } {
+            param($ClaimsPath)
+            # Snapshot body: "Body of src-a — plausible policy paragraph." One claim quotes it with a line
+            # break and markdown emphasis (verbatim); the other rewords it (a paraphrase).
+            Mock Invoke-AIByUsage -MockWith {
+                [PSCustomObject]@{
+                    Text = '{"claims":[{"text":"plausible\n*policy* paragraph","canonical_proposition":"X ought Y","polarity":"asserts","extraction_confidence":0.9},{"text":"a reasonable paragraph about policy","canonical_proposition":"Z ought W","polarity":"asserts","extraction_confidence":0.8}]}'
+                    Model = 'stub'
+                }
+            }
+            $r = Invoke-OrgStanceExtraction -Concurrency 1 -OutputPath $ClaimsPath -Confirm:$false -WarningVariable w 6>$null 3>$null
+            $r.ClaimsWritten | Should -Be 4
+            $stored = @((Get-Content $ClaimsPath -Raw | ConvertFrom-Json).claims)
+            @($stored | Where-Object { $_.text -like 'plausible*' -and $_.text_verbatim -eq $true }).Count | Should -Be 2
+            @($stored | Where-Object { $_.text -like 'a reasonable*' -and $_.text_verbatim -eq $false }).Count | Should -Be 2
+            @($w | Where-Object { "$_" -match 'not a verbatim span' }).Count | Should -Be 2
+        }
+    }
+}
+
+Describe 'Test-StanceTextVerbatim (t/4382)' -Tag 'taxonomy' {
+    It '<Name>' -ForEach @(
+        @{ Name = 'exact span';                         Text = 'policy paragraph';                      Expected = $true }
+        @{ Name = 'differs only in whitespace';         Text = "policy`n   paragraph";                  Expected = $true }
+        # Curly quotes built from code points: PowerShell treats U+2018/U+2019 as string delimiters.
+        @{ Name = 'differs only in curly vs straight quotes'; Text = ('the ' + [char]0x201C + 'Act' + [char]0x201D + ' isn' + [char]0x2019 + 't enough'); Expected = $true }
+        @{ Name = 'differs only in markdown emphasis';  Text = 'the "**Act**" isn''t _enough_';         Expected = $true }
+        @{ Name = 'paraphrase';                         Text = 'the law is insufficient';               Expected = $false }
+        @{ Name = 'empty text';                         Text = '';                                      Expected = $false }
+    ) {
+        InModuleScope AITriad -Parameters @{ T = $Text; E = $Expected } {
+            param($T, $E)
+            $snapshot = "Intro.`n`nA policy paragraph says the ""Act"" isn't enough.`n"
+            Test-StanceTextVerbatim -Text $T -Snapshot $snapshot | Should -Be $E
         }
     }
 }

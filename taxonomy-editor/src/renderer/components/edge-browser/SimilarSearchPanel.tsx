@@ -3,8 +3,9 @@
 
 import { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import { nodePovFromId, SITUATION_PREFIX } from '@lib/debate/nodeIdUtils';
-import { POV_KEYS } from '@lib/debate/types';
 import { useTaxonomyStore } from '../../hooks/useTaxonomyStore';
+import { allNodesById, isSuperseded } from '../../hooks/useTaxonomyStore/superseded';
+import { useLongPressContextMenu, type ContextMenuLikeEvent } from '../../hooks/useLongPressContextMenu';
 import { ApiKeyErrorMessage } from '../settings/ApiKeyErrorMessage';
 import { useDescriptionMode, resolveDescription } from '../shared/DescriptionToggle';
 import './SimilarSearchPanel.css';
@@ -23,6 +24,37 @@ interface ResolvedRow {
 interface SimilarSearchPanelProps {
   width?: number;
   onAnalyze?: (elementB: { label: string; description: string; category: string }) => void;
+}
+
+// t/3382 follow-up: extracted so useLongPressContextMenu can be called once per row
+// instance (can't call a hook inside .map()).
+function SimilarSearchRow({ row, showIds, onRowClick, onContextMenu }: {
+  row: ResolvedRow;
+  showIds: boolean;
+  onRowClick: (id: string) => void;
+  onContextMenu: (e: ContextMenuLikeEvent, row: ResolvedRow) => void;
+}) {
+  const longPress = useLongPressContextMenu(useCallback((e) => onContextMenu(e, row), [onContextMenu, row]));
+  return (
+    <tr
+      className="similar-table-row"
+      onClick={() => onRowClick(row.id)}
+      onContextMenu={longPress.onContextMenu}
+      onTouchStart={longPress.onTouchStart}
+      onTouchMove={longPress.onTouchMove}
+      onTouchEnd={longPress.onTouchEnd}
+      onTouchCancel={longPress.onTouchCancel}
+    >
+      <td className="similar-table-match">
+        {Math.round(row.score * 100)}%
+      </td>
+      {showIds && (
+        <td className="similar-table-id">{row.id}</td>
+      )}
+      <td className="similar-table-label">{row.label}</td>
+      <td className="similar-table-desc">{row.description}</td>
+    </tr>
+  );
 }
 
 export function SimilarSearchPanel({ width, onAnalyze }: SimilarSearchPanelProps) {
@@ -110,40 +142,30 @@ export function SimilarSearchPanel({ width, onAnalyze }: SimilarSearchPanelProps
       const conflict = state.conflicts.find(c => c.claim_id === id);
       return conflict?.description || '';
     }
-    for (const pov of POV_KEYS) {
-      const file = state[pov];
-      if (file) {
-        const node = file.nodes.find(n => n.id === id);
-        if (node) return resolveDescription(node, descMode).text;
-      }
-    }
-    return '';
+    const node = allNodesById(state).get(id);
+    return node ? resolveDescription(node, descMode).text : '';
   };
 
   const getCategory = (id: string): string => {
     const state = useTaxonomyStore.getState();
     if (id.startsWith(SITUATION_PREFIX)) return 'situations';
     if (id.startsWith('conflict-')) return 'conflict';
-    for (const pov of POV_KEYS) {
-      const file = state[pov];
-      if (file) {
-        const node = file.nodes.find(n => n.id === id);
-        if (node) return node.category;
-      }
-    }
-    return '';
+    return allNodesById(state).get(id)?.category ?? '';
   };
 
   // Build resolved rows once, then filter & sort
   const resolvedRows = useMemo((): ResolvedRow[] => {
     if (!similarResults) return [];
-    return similarResults.map(r => ({
-      id: r.id,
-      score: r.score,
-      label: getLabelForId(r.id) || r.id,
-      description: getDescription(r.id),
-      category: getCategory(r.id),
-    }));
+    const state = useTaxonomyStore.getState();
+    return similarResults
+      .filter(r => !isSuperseded(state, r.id))
+      .map(r => ({
+        id: r.id,
+        score: r.score,
+        label: getLabelForId(r.id) || r.id,
+        description: getDescription(r.id),
+        category: getCategory(r.id),
+      }));
   }, [similarResults]);
 
   const filteredAndSorted = useMemo(() => {
@@ -208,7 +230,7 @@ export function SimilarSearchPanel({ width, onAnalyze }: SimilarSearchPanelProps
     if (tab) navigateToNode(tab, id);
   };
 
-  const handleContextMenu = (e: React.MouseEvent, row: ResolvedRow) => {
+  const handleContextMenu = (e: ContextMenuLikeEvent, row: ResolvedRow) => {
     e.preventDefault();
     setContextMenu({ x: e.clientX, y: e.clientY, row });
   };
@@ -320,21 +342,13 @@ export function SimilarSearchPanel({ width, onAnalyze }: SimilarSearchPanelProps
                   </tr>
                 ) : (
                   filteredAndSorted.map((r) => (
-                    <tr
+                    <SimilarSearchRow
                       key={r.id}
-                      className="similar-table-row"
-                      onClick={() => handleRowClick(r.id)}
-                      onContextMenu={(e) => handleContextMenu(e, r)}
-                    >
-                      <td className="similar-table-match">
-                        {Math.round(r.score * 100)}%
-                      </td>
-                      {showIds && (
-                        <td className="similar-table-id">{r.id}</td>
-                      )}
-                      <td className="similar-table-label">{r.label}</td>
-                      <td className="similar-table-desc">{r.description}</td>
-                    </tr>
+                      row={r}
+                      showIds={showIds}
+                      onRowClick={handleRowClick}
+                      onContextMenu={handleContextMenu}
+                    />
                   ))
                 )}
               </tbody>

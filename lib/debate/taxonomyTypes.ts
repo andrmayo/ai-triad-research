@@ -42,6 +42,14 @@ export interface GraphAttributes {
   node_scope?: 'claim' | 'scheme' | 'bridging';
   attribution_text?: string;
   aphorism?: string;
+  /** First-person present-tense own-voice declarative restatement of the node claim (1-2 sentences).
+   *  Debate-grounding register (t/3367). Absent on most nodes until backfill (t/3366); loader treats
+   *  absence as normal and falls back to description, as today. */
+  debate_grounding?: string;
+  /** LIVE transient dirty-flag: the renderer enrichment flow sets it mid-regen and clears it on
+   *  completion (debateReflectionSlice), and AdminPanel surfaces stuck-pending nodes. Schema-of-record
+   *  status: transient — legal-but-ephemeral, never long-lived in data (residue cleaned t/3451).
+   *  Do NOT remove while that flow exists. */
   _phrase_regen_pending?: boolean;
   debate_tested?: DebateTestedRecord;
   /** Data-integrity provenance signal (t/3264). Absent = 'curated'. Used by formatTaxonomyContext
@@ -184,6 +192,10 @@ export interface PovNode {
   description_history?: TextHistoryEntry[];
   /** Last 5 modifications to this node (FIFO). */
   change_history?: ChangeHistoryEntry[];
+  /** POV tags (t/3955): ids from this node's own POV in lib/debate/soul-docs/pov-tags.json. Curated,
+   *  editor-owned. Absent or empty = untagged, which means EXCLUDED under a tag in Scope mode. Validate
+   *  with validatePovTags (lib/schema/povTags.ts). Always an array; never a bare string. */
+  pov_tags?: string[];
   /** Auto-generated plain-language version of description (display-only, never sent to debate prompts). */
   plain_description?: string | null;
   /** Model+prompt version string (e.g., "flash-lite:v1") for staleness detection. */
@@ -196,6 +208,10 @@ export interface PovNode {
   /** Forward grounding links to dictionary concepts (term:*) (t/3157). Optional; {@link ConceptLinkRef}
    *  (no match_level — a concept ref already names a kind). */
   concept_refs?: ConceptLinkRef[];
+  /** ID of the node that supersedes this one. Selection skips superseded nodes; resolveNode still
+   *  returns them. Chains resolve to the final non-superseded node; cycles and dangling targets
+   *  resolve to the node itself. See taxonomyLoader.ts › loadTaxonomy. */
+  superseded_by?: string;
   _edit_meta?: NodeEditMeta;
   _edit_history?: EditHistoryEntry[];
 }
@@ -232,19 +248,60 @@ export interface BdiInterpretation {
   summary: string;
 }
 
-/** Interpretation is either a plain string (legacy) or BDI-decomposed object. */
-export type Interpretation = string | BdiInterpretation;
+/** Raw interpretation as stored on disk — either a legacy plain string or BDI-decomposed object. */
+export type RawInterpretation = string | BdiInterpretation;
+
+/** Strict interpretation type — BDI-decomposed only, for validated code paths. */
+export type Interpretation = BdiInterpretation;
 
 /** Extract the display text from an interpretation (handles both formats). */
-export function interpretationText(interp: Interpretation | undefined): string {
+export function interpretationText(interp: RawInterpretation | undefined): string {
   if (!interp) return '';
   if (typeof interp === 'string') return interp;
   return interp.summary;
 }
 
 /** Check if an interpretation is BDI-decomposed. */
-export function isBdiInterpretation(interp: Interpretation | undefined): interp is BdiInterpretation {
+export function isBdiInterpretation(interp: RawInterpretation | undefined): interp is BdiInterpretation {
   return typeof interp === 'object' && interp !== null && 'belief' in interp;
+}
+
+// Whole-value null sentinels (case-insensitive) — from t/3018.
+const NULL_SENTINELS = new Set(['null', 'none', 'n/a', 'tbd', '-']);
+
+/**
+ * Check a single interpretation value for BDI compliance — matches Test-SituationBdiCompliance exactly.
+ * Checks belief, desire, intention (not summary). Returns a violation reason string, or null if compliant.
+ */
+export function validateBdiFields(interp: unknown): string | null {
+  if (typeof interp !== 'object' || interp === null) return 'not-object';
+  const obj = interp as Record<string, unknown>;
+  for (const field of ['belief', 'desire', 'intention'] as const) {
+    const val = typeof obj[field] === 'string' ? (obj[field] as string).trim() : '';
+    if (!val || NULL_SENTINELS.has(val.toLowerCase())) {
+      return `${field}: blank or sentinel`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Validate a set of situation nodes for BDI compliance, matching PS Test-SituationBdiCompliance exactly.
+ * Nodes whose description starts with [DEPRECATED] (after trimming leading whitespace) are exempted.
+ * Returns an array of violations — empty means all nodes are compliant.
+ */
+export function findSituationBdiViolations(
+  nodes: SituationNode[],
+): Array<{ id: string; pov: string; reason: string }> {
+  const out: Array<{ id: string; pov: string; reason: string }> = [];
+  for (const node of nodes) {
+    if (node.description.trimStart().startsWith('[DEPRECATED]')) continue;
+    for (const pov of ['accelerationist', 'safetyist', 'skeptic'] as const) {
+      const reason = validateBdiFields(node.interpretations[pov]);
+      if (reason) out.push({ id: node.id, pov, reason });
+    }
+  }
+  return out;
 }
 
 export interface SituationNode {
@@ -254,9 +311,9 @@ export interface SituationNode {
   parent_id?: string | null;
   parent_relationship?: ParentRelationship | null;
   interpretations: {
-    accelerationist: Interpretation;
-    safetyist: Interpretation;
-    skeptic: Interpretation;
+    accelerationist: RawInterpretation;
+    safetyist: RawInterpretation;
+    skeptic: RawInterpretation;
   };
   linked_nodes: string[];
   conflict_ids: string[];

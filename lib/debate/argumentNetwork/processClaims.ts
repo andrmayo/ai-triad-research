@@ -6,13 +6,27 @@
 import { SUPPORT_MOVES, wordOverlap, bestOverlapMatch, lookupTaxonomyEdgeWeight } from '../helpers.js';
 import type { ArgumentNetworkNode, ArgumentNetworkEdge } from '../types.js';
 import { retrieveEvidence } from '../evidenceRetriever.js';
-import { computeFactCheckStrength } from '../qbaf.js';
-import type { WebEvidenceItem } from '../qbaf.js';
+import { buildEvidenceQbaf } from '../evidenceQbaf.js';
+import type { AIAdapter } from '../aiAdapter.js';
 import { detectAmbiguityCollapse, findSourcePassage } from '../ambiguityDetector.js';
 import { fuzzyCorrectNodeId } from '../nodeIdUtils.js';
 import { disambiguateTerms } from '../vocabularyDisambiguation.js';
 import type { CampOrigin } from '../../dictionary/types.js';
 import { getGlobalRecorder } from '../../flight-recorder/index.js';
+import { normalizeSteelmanTarget } from '../steelman.js';
+
+/** Normalize an extracted steelman_of to a camp id (t/3514); log what gets dropped and why. */
+function normalizeClaimSteelmanTarget(raw: string | null | undefined, speaker: string, nodeId: string): string | undefined {
+  const { target, rejected } = normalizeSteelmanTarget(raw, speaker);
+  if (rejected) {
+    getGlobalRecorder()?.record({
+      type: 'an.extract', component: 'argument-network', level: 'warn',
+      message: `Dropped steelman_of "${raw}" on ${nodeId}: ${rejected === 'self_steelman' ? 'a debater cannot steelman themselves' : 'not a camp'}`,
+      data: { node_id: nodeId, raw, speaker, reason: rejected },
+    });
+  }
+  return target ?? undefined;
+}
 import {
   BELIEF_SPECIFICITY_MAP,
   beliefVerificationToStrength,
@@ -71,9 +85,15 @@ export interface ProcessClaimsOptions {
   maxClaims?: number;
   isClassifyPath: boolean;
   /** Path to sources directory for evidence retrieval (t/455 Stage 2).
-   *  When provided, Belief claims get QBAF-adjusted base_strength from
-   *  retrieved evidence. Requires Node.js filesystem access. */
+   *  When provided together with `adapter`, Belief claims get QBAF-adjusted
+   *  base_strength from retrieved evidence with LLM polarity classification.
+   *  Requires Node.js filesystem access. */
   sourcesDir?: string;
+  /** AI adapter for LLM-based evidence polarity classification in Stage 2.
+   *  Required alongside `sourcesDir` — without it Stage 2 is skipped. */
+  adapter?: AIAdapter;
+  /** Model to use for evidence classification. Defaults to debate model. */
+  evidenceModel?: string;
   /** Colloquial terms for post-extraction vocabulary disambiguation. When provided,
    *  bare terms in claim text are resolved to canonical forms based on speaker POV. */
   colloquialTerms?: import('../../dictionary/types.js').ColloquialTerm[];
@@ -92,6 +112,9 @@ export interface ProcessClaimsInput {
   taxonomyEdges?: { source: string; target: string; weight?: number }[];
   /** Known valid node IDs for taxonomy ref sanitization. When provided, invalid refs are corrected or stripped. */
   knownNodeIds?: Set<string>;
+  /** Resolve a node ID to its canonical survivor. Called after knownNodeIds validation so superseded IDs are
+   *  accepted (not fuzzy-corrected to unrelated nodes) and then silently redirected to their live successor. */
+  resolveRef?: (id: string) => string;
   /** IDs of nodes identified as crux nodes. Used by marginal value filter to exempt crux-connected claims. */
   cruxNodeIds?: Set<string>;
   /** Activated situation nodes for claim-level grounding. When provided, claims with sufficient word overlap
@@ -117,28 +140,41 @@ export interface ProcessClaimsResult {
 
 const VALID_ATTACK_TYPES = new Set(['rebut', 'undercut', 'undermine']);
 
-export function processExtractedClaims(
+export async function processExtractedClaims(
   input: ProcessClaimsInput,
   options: ProcessClaimsOptions,
-): ProcessClaimsResult {
+): Promise<ProcessClaimsResult> {
   const {
     claims, statement, speaker, entryId,
     turnNumber, existingNodes, existingEdgeCount, startNodeId, taxonomyEdges,
-    knownNodeIds,
+    knownNodeIds, resolveRef,
   } = input;
 
   // Sanitize taxonomy ref IDs — final safety net against hallucinated IDs
   let taxonomyRefIds = input.taxonomyRefIds;
   if (knownNodeIds && knownNodeIds.size > 0) {
     taxonomyRefIds = taxonomyRefIds.map(id => {
-      if (knownNodeIds.has(id)) return id;
-      const corrected = fuzzyCorrectNodeId(id, knownNodeIds);
-      if (corrected) {
-        console.log(`[AN] Taxonomy ref ID correction: ${id} → ${corrected}`);
-        return corrected;
+      let accepted: string;
+      if (knownNodeIds.has(id)) {
+        accepted = id;
+      } else {
+        const corrected = fuzzyCorrectNodeId(id, knownNodeIds);
+        if (corrected) {
+          console.log(`[AN] Taxonomy ref ID correction: ${id} → ${corrected}`);
+          accepted = corrected;
+        } else {
+          console.log(`[AN] Taxonomy ref ID removed (unknown): ${id}`);
+          return null;
+        }
       }
-      console.log(`[AN] Taxonomy ref ID removed (unknown): ${id}`);
-      return null;
+      if (resolveRef) {
+        const resolved = resolveRef(accepted);
+        if (resolved !== accepted) {
+          console.log(`[AN] Taxonomy ref ID superseded: ${accepted} → ${resolved}`);
+          return resolved;
+        }
+      }
+      return accepted;
     }).filter((id): id is string => id !== null);
   }
 
@@ -220,7 +256,7 @@ export function processExtractedClaims(
       bdi_confidence: bdiConfidenceMap[claim.bdi_category ?? ''] ?? 0.5,
       bdi_category: claim.bdi_category as ArgumentNetworkNode['bdi_category'],
       specificity: claim.specificity as ArgumentNetworkNode['specificity'],
-      steelman_of: claim.steelman_of || undefined,
+      steelman_of: normalizeClaimSteelmanTarget(claim.steelman_of, String(speaker), nodeId),
       extraction_confidence: overlapToExtractionConfidence(overlap),
     };
 
@@ -286,36 +322,37 @@ export function processExtractedClaims(
         beliefScored = true;
       }
 
-      // Stage 2: Evidence-retrieval-augmented scoring via QBAF
-      // Converts the unreliable "rate evidence quality" judgment into a tractable
-      // comparison task: "does this passage support or contradict this claim?"
+      // Stage 2: Evidence-retrieval-augmented scoring via QBAF with LLM polarity classification.
+      // Retrieves evidence, classifies each item as support/contradict/irrelevant via LLM,
+      // then builds a QBAF sub-graph. Requires both sourcesDir and adapter — cosine similarity
+      // alone is polarity-blind (a negated proposition embeds near its affirmative twin).
       // Only runs if Stage 3 (ThinkPRM) didn't already score the claim.
-      if (!beliefScored && options.sourcesDir) {
+      if (!beliefScored && options.sourcesDir && options.adapter) {
         try {
           const evidence = retrieveEvidence(node.text, options.sourcesDir, { topK: 5 });
           if (evidence.length > 0) {
-            // Map EvidenceItem → WebEvidenceItem for the QBAF pipeline.
-            // Evidence items with high similarity likely support; low similarity
-            // items are neutral. We classify as supporting since retrieveEvidence
-            // already filters by relevance — truly contradicting evidence would
-            // require NLI classification which is Stage 3 territory.
-            const webEvidence: WebEvidenceItem[] = evidence.map(e => ({
-              id: e.id,
-              text: e.text,
-              relation: 'supports' as const,
-              source_reliability: Math.min(1, e.similarity_score + 0.2),
-              relevance: e.similarity_score,
-            }));
-
             const specStrength = BELIEF_SPECIFICITY_MAP[node.specificity ?? ''] ?? 0.50;
-            const result = computeFactCheckStrength(specStrength, webEvidence);
-            node.base_strength = result.adjusted_strength;
+            const qbafResult = await buildEvidenceQbaf(
+              node.text,
+              evidence,
+              options.adapter,
+              options.evidenceModel ?? 'gemini-3.5-flash-lite',
+              { claimBaseStrength: specStrength },
+            );
+            node.base_strength = qbafResult.computed_strength;
             node.scoring_method = 'evidence_qbaf';
             beliefScored = true;
           }
         } catch {
-          // Evidence retrieval failed (filesystem unavailable, etc.) — fall through
+          // Evidence retrieval or LLM classification failed — fall through to Stage 1
         }
+      } else if (!beliefScored && options.sourcesDir && !options.adapter) {
+        getGlobalRecorder()?.record({
+          type: 'an.evidence_qbaf_skipped', component: 'argument-network', level: 'warn',
+          speaker,
+          message: 'Stage 2 evidence QBAF skipped: sourcesDir provided but no adapter — polarity classification requires an adapter',
+          data: { node_id: nodeId },
+        });
       }
 
       // Stage 1: Specificity proxy fallback

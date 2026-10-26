@@ -28,7 +28,11 @@ import type { FlightRecorder, RecordInput } from '../../../../lib/flight-recorde
 import { getCurrentUserId, getSessionBranchName } from '../security/userContext.js';
 import { GitHubRestClient, normalizeErrorForEvent, type CircuitState } from './githubRestClient.js';
 import { getDataRoot } from '../config.js';
+import { gitBlobSha } from './gitBlobSha.js';
 import { writeFramedNdjson, log } from '../logger.js';
+import { BlobLease } from './blobLease.js';
+import { BlobServiceClient, type ContainerClient, type BlockBlobClient, RestError } from '@azure/storage-blob';
+import { DefaultAzureCredential } from '@azure/identity';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -75,6 +79,40 @@ export interface GitHubAPIBackendConfig {
   pollIntervalMs?: number;
   coherencyProbeRate?: number;   // 0.0–1.0, default 0.01
   maxOverlayBytesPerUser?: number; // per-user uncommitted-overlay cap (t/727)
+  /** t/4179 (TL design, t/4179#2/#7): cross-replica single-holder poll
+   *  coordination via `blobLease.ts`. Omitted, or `maxReplicas <= 1`, keeps
+   *  today's behavior unchanged — every replica polls GitHub directly. */
+  pollLease?: {
+    accountUrl: string;
+    container?: string; // default 'poll-coordination'
+    maxReplicas: number;
+    serviceClient?: BlobServiceClient; // test seam (Azurite)
+  };
+}
+
+/** Published to the poll-coordination blob by the current holder. */
+interface PollState {
+  holderId: string;
+  generation: number;
+  lastCommitSha: string;
+  /** Capped-length history of per-generation changed paths, oldest first —
+   *  lets a non-holder catch up without replaying every tick, and lets it
+   *  detect a gap (its last-seen generation predates the oldest entry here). */
+  changedSinceGeneration: Array<{ generation: number; paths: string[] }>;
+  publishedAt: string; // ISO timestamp — staleness detection
+}
+
+async function streamToStringForPoll(readable: NodeJS.ReadableStream | undefined): Promise<string> {
+  if (!readable) return '';
+  const chunks: Buffer[] = [];
+  for await (const chunk of readable) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array | string));
+  }
+  return Buffer.concat(chunks).toString('utf-8');
+}
+
+function isBlobNotFoundForPoll(err: unknown): boolean {
+  return err instanceof RestError ? (err.statusCode === 404 || err.code === 'BlobNotFound') : false;
 }
 
 // ── Constants ────────────────────────────────────────────────────────────
@@ -85,6 +123,19 @@ const DEFAULT_MAX_OVERLAY_BYTES_PER_USER = 20 * 1024 * 1024; // 20 MB
 
 const POLL_INTERVAL_MS = 60_000;
 const ERROR_BUFFER_CAPACITY = 100;
+
+// t/4179 (TL R1/R2/R3): single-holder poll coordination constants.
+const POLL_STATE_BLOB = 'poll-state.json';
+const POLL_STATE_HISTORY_CAP = 50;
+// A non-holder falls back to direct polling once the published state is
+// older than this multiple of the poll interval — fails toward coherence,
+// never toward silent staleness (TL t/4179#2 §2 point 2).
+const POLL_STATE_STALE_FACTOR = 3;
+
+// t/4215: bounds how long a plain session-branch read can serve stale
+// content after a head move the server didn't make (a resync conflict
+// resolved on GitHub, another replica) before re-checking the live ref.
+const SESSION_READ_CACHE_REVALIDATE_MS = 30_000;
 
 const MANIFEST_FILE = 'manifest.json';
 
@@ -120,6 +171,51 @@ export class GitHubAPIBackend implements StorageBackend {
   private sessionOverlays: Map<string, Map<string, string>> = new Map();
   private maxOverlayBytesPerUser: number = DEFAULT_MAX_OVERLAY_BYTES_PER_USER;
 
+  // t/4312: per-path base blob sha, recorded once when a path first enters a
+  // clean overlay slot (never reset by a later same-path rewrite — see
+  // recordOverlayBaseShaOnce). null = file was absent when staged; 'unknown' =
+  // the live lookup failed, which fails CLOSED (always treated as a conflict)
+  // rather than silently trusting an unverifiable base.
+  private sessionOverlayBaseShas: Map<string, Map<string, string | null | 'unknown'>> = new Map();
+
+  // t/4312 (SO F1): the most recently detected conflicted paths per user —
+  // persists across scheduler retries so "Use theirs"/"Keep mine" (below)
+  // can resolve "all of them" without the caller having to already know
+  // which paths are conflicted.
+  private sessionOverlayConflicts: Map<string, Set<string>> = new Map();
+
+  // t/4258/t/4277 (C2): per-user commit serialization. A commit already
+  // queued-but-not-started for a user is shared (`commitPending`); the chain
+  // (`commitChain`) makes any later call wait for the current run to finish
+  // before starting its own — so two PATCH /git/refs/heads/<branch> calls for
+  // one user are never in flight at once, and no trigger is silently dropped.
+  // @INMEMORY_CACHE_SINGLE_REPLICA (t/4181, Server Storage t/4181#9): this serialization is per-process,
+  // so it does not hold across replicas. Remove once t/4311's cross-replica commit lock lands.
+  private commitChain: Map<string, Promise<void>> = new Map();
+  private commitPending: Map<string, {
+    promise: Promise<{ commitSha: string; filesCommitted: number; conflictedPaths?: string[] } | null>;
+    resolve: (result: { commitSha: string; filesCommitted: number; conflictedPaths?: string[] } | null) => void;
+    reject: (err: unknown) => void;
+  }> = new Map();
+
+  // t/4215 (TL design, t/4215#2): userId → (repoPath → content) for a plain
+  // readFile() on a session branch, once the overlay has no entry for that
+  // path. Unlike readFileWithVersion's always-live read (t/4224), this is
+  // called from read-modify-write loops over many paths — filled for free at
+  // commitOverlay/mergeBranch, with the branch-head SHA tracked alongside so
+  // a stale cache (an out-of-band move the server didn't make) is detected
+  // within SESSION_READ_CACHE_REVALIDATE_MS, not served indefinitely.
+  private sessionReadCache: Map<string, Map<string, string>> = new Map();
+  private sessionReadCacheHeadSha: Map<string, { sha: string; checkedAt: number; checkedAtActivitySeq: number }> = new Map();
+  // t/4215 budget addendum (TL t/4215#7): monotonic per-user write-activity
+  // counter — gates the plain-read ref-check so an idle/view-only session
+  // never pays it. A counter (not a wall-clock timestamp) deliberately,
+  // since a write and the read checking against it can land in the same
+  // Date.now() millisecond tick; a timestamp-equality comparison would then
+  // wrongly read as "no activity since the last check".
+  private sessionWriteActivitySeq: Map<string, number> = new Map();
+  private sessionWriteActivityCounter = 0;
+
   // Resilient GitHub HTTP transport — rate limit + circuit breaker live here (t/1698).
   private readonly rest: GitHubRestClient;
 
@@ -129,8 +225,26 @@ export class GitHubAPIBackend implements StorageBackend {
   // Polling timer
   private pollTimer: ReturnType<typeof setInterval> | null = null;
 
+  // t/4179: single-holder poll coordination (undefined/null → today's
+  // unchanged every-replica-polls-directly behavior).
+  private readonly pollLeaseContainer: string | undefined;
+  private readonly blobLease: BlobLease | null = null;
+  private readonly blobLeaseContainerClient: ContainerClient | null = null;
+  private readonly pollLeaseDurationSeconds: number = 0;
+  private leaseRenewTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly holderId = crypto.randomUUID();
+  private pollStateGeneration = 0;
+  private pollStateHistory: Array<{ generation: number; paths: string[] }> = [];
+  private pollLastSeenGeneration = 0;
+  private pollLastSeenHolderId: string | null = null;
+  private repoTreeRefillInFlight: Promise<void> | null = null;
+
   // Coherency probe stats
   private coherencyViolations = 0;
+
+  // t/4298/t/4299/t/4300: counts main-cache misses this process has paid
+  // GitHub for since boot — never reset, so it reads as "since cold start".
+  private coldCacheMissCount = 0;
 
   // Manifest write mutex — serializes all manifest mutations to prevent
   // concurrent read-modify-write races (see t/479). Without this, parallel
@@ -153,6 +267,23 @@ export class GitHubAPIBackend implements StorageBackend {
     this.coherencyProbeRate = config.coherencyProbeRate ?? 0.01;
     this.maxOverlayBytesPerUser = config.maxOverlayBytesPerUser
       ?? (process.env.OVERLAY_MAX_BYTES_PER_USER ? parseInt(process.env.OVERLAY_MAX_BYTES_PER_USER, 10) : DEFAULT_MAX_OVERLAY_BYTES_PER_USER);
+
+    if (config.pollLease && config.pollLease.maxReplicas > 1) {
+      this.pollLeaseContainer = config.pollLease.container ?? 'poll-coordination';
+      // Azure Blob leases must be 15-60s; match the poll interval so a
+      // renewal cadence of duration/3 (R1) stays sane at both ends.
+      this.pollLeaseDurationSeconds = Math.min(60, Math.max(15, Math.round(this.pollIntervalMs / 1000)));
+      this.blobLease = new BlobLease({
+        accountUrl: config.pollLease.accountUrl,
+        container: this.pollLeaseContainer,
+        blobName: POLL_STATE_BLOB,
+        durationSeconds: this.pollLeaseDurationSeconds,
+        serviceClient: config.pollLease.serviceClient,
+      });
+      const pollService = config.pollLease.serviceClient
+        ?? new BlobServiceClient(config.pollLease.accountUrl, new DefaultAzureCredential());
+      this.blobLeaseContainerClient = pollService.getContainerClient(this.pollLeaseContainer);
+    }
 
     this.rest = new GitHubRestClient({
       record: (input) => this.recordEvent(input),
@@ -189,17 +320,21 @@ export class GitHubAPIBackend implements StorageBackend {
         level: 'warn',
         message: 'No GitHub credentials available — running in fallback mode',
       });
+      // t/4258/t/4281: AGENTS.md mandates a console WARN on every fallback path;
+      // recordEvent() alone never reached one. Also feeds alert-fallback-active.
+      log.github.warn({}, 'storage.fallback: no GitHub credentials available — running in fallback mode');
       return;
     }
 
     const mainSha = await this.getLatestCommitSha();
     if (this.manifest && this.manifest.lastCommitSha === mainSha) {
+      const treeSource = await this.loadTreeOnCacheHit(mainSha);
       this.recordEvent({
         type: 'cache.hit',
         component: 'cache',
         level: 'info',
         message: 'Cache manifest matches main HEAD — serving from cache',
-        data: { sha: mainSha, fileCount: Object.keys(this.manifest.files).length },
+        data: { sha: mainSha, fileCount: Object.keys(this.manifest.files).length, treeSource, treeSize: this.repoTree.size },
       });
       this._dataLoadStatus = 'ready';
     } else {
@@ -216,6 +351,10 @@ export class GitHubAPIBackend implements StorageBackend {
           message: 'initialize: data load failed — /healthz will report 503 until recovery',
           data: { sha: mainSha },
         });
+        // t/4258/t/4281: recordEvent() alone is console-invisible (FlightRecorder-only);
+        // alert-github-api-error-spike (main.bicep) needs "github.api.error" in
+        // ContainerAppConsoleLogs_CL to count this as a GitHub-outage/auth-failure signal.
+        log.github.error({ sha: mainSha }, 'github.api.error: initialize data load failed — /healthz will report 503 until recovery');
       }
       if (this.manifest && mainSha) {
         await this.invalidateChangedFiles(this.manifest.lastCommitSha, mainSha);
@@ -233,6 +372,65 @@ export class GitHubAPIBackend implements StorageBackend {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    if (this.leaseRenewTimer) {
+      clearInterval(this.leaseRenewTimer);
+      this.leaseRenewTimer = null;
+    }
+    // t/4258/t/4302: this runs BEFORE server.ts's SIGTERM flush
+    // (flushOverlaysWithDeadline) even starts, so a non-empty overlay here
+    // isn't data loss yet — it's about to be flushed. INFO, not WARN;
+    // shutdownOverlayFlush.ts's own post-flush WARN (t/4276) is the one that
+    // correctly reports what's still uncommitted after the flush actually
+    // ran. Best-effort — logging must never be able to break shutdown itself.
+    try {
+      this.logUncommittedOverlay(this.uncommittedOverlaySummary(), 'info');
+    } catch { /* telemetry — silent by design; never let logging break shutdown */ }
+    // Best-effort — so a graceful shutdown hands the lease off immediately
+    // rather than making the next holder wait out the full lease duration.
+    if (this.blobLease) void this.blobLease.release();
+  }
+
+  /**
+   * t/4258/t/4276: public access to the uncommitted-overlay summary, for the
+   * SIGTERM flush (ServerAPI, p/541#75) to sweep actual overlay contents
+   * directly instead of the fileIO.ts scheduler's own pending-commit
+   * bookkeeping — and to re-check after the flush, so the deadline WARN
+   * reflects what's really still uncommitted (a dirty overlay with no
+   * scheduler status would otherwise produce no WARN).
+   */
+  getUncommittedOverlaySummary(): { userId: string; entryCount: number; paths: string[] }[] {
+    return this.uncommittedOverlaySummary();
+  }
+
+  /** t/4258: pure summary of uncommitted overlay state — no content, paths capped per user. */
+  private uncommittedOverlaySummary(): { userId: string; entryCount: number; paths: string[] }[] {
+    const summary: { userId: string; entryCount: number; paths: string[] }[] = [];
+    for (const [userId, overlay] of this.sessionOverlays) {
+      if (overlay.size === 0) continue;
+      summary.push({ userId, entryCount: overlay.size, paths: [...overlay.keys()].slice(0, 20) });
+    }
+    return summary;
+  }
+
+  /**
+   * t/4258/t/4302: log + flight-record a non-empty uncommitted-overlay
+   * summary. No-op when empty. `level: 'info'` is for a pre-flush notice
+   * (nothing lost yet — a flush is about to run); `level: 'warn'` is for a
+   * genuine loss (e.g. a failed commitOverlay with no further flush coming).
+   */
+  private logUncommittedOverlay(
+    summary: { userId: string; entryCount: number; paths: string[] }[],
+    level: 'info' | 'warn',
+    context = 'shutdown',
+  ): void {
+    if (summary.length === 0) return;
+    const totalEntries = summary.reduce((sum, s) => sum + s.entryCount, 0);
+    const outcome = level === 'warn' ? '— will be lost' : '— flushing';
+    const message = `${totalEntries} uncommitted overlay entries across ${summary.length} user(s) at ${context} (t/4258/t/4302) ${outcome}`;
+    log.storage[level]({ context, summary }, message);
+    getGlobalRecorder()?.record({
+      type: level === 'warn' ? 'system.error' : 'storage.mode', component: 'storage', level, message, data: { context, summary },
+    });
   }
 
   // ── Session context ────────────────────────────────────────────────────
@@ -278,6 +476,34 @@ export class GitHubAPIBackend implements StorageBackend {
   // ── StorageBackend interface ───────────────────────────────────────────
 
   /**
+   * Session-overlay lookup shared by readFile and readFileWithVersion (t/4201,
+   * p/775#30) so both check the overlay with identical precedence. Returns
+   * `undefined` when there's nothing to consult (base-branch read, no user, or
+   * no overlay entry) — distinct from a tombstone, which is a real hit whose
+   * value happens to be `GitHubAPIBackend.TOMBSTONE`.
+   */
+  private checkSessionOverlay(repoPath: string): string | undefined {
+    const readBranch = this.getEffectiveRef();
+    const readUserId = this.getEffectiveUserId();
+    if (readBranch === this.baseBranch || !readUserId) return undefined;
+
+    const overlay = this.sessionOverlays.get(readUserId);
+    if (overlay?.has(repoPath)) {
+      const val = overlay.get(repoPath)!;
+      this.recordEvent({
+        type: 'cache.hit',
+        component: 'cache',
+        level: 'debug',
+        message: `Session overlay hit: ${repoPath}`,
+        data: { path: repoPath, layer: 'session', userId: readUserId },
+      });
+      return val;
+    }
+
+    return undefined;
+  }
+
+  /**
    * Read a file as UTF-8, or null if absent.
    *
    * `opts.ref` pins the GitHub API fallback to a specific ref (e.g. 'main') for
@@ -291,28 +517,40 @@ export class GitHubAPIBackend implements StorageBackend {
    * read-modify-write flows in community/calibration curation, where the same
    * shared file is appended to multiple times within one request.
    */
-  async readFile(filePath: string, opts?: { ref?: string; optional?: boolean }): Promise<string | null> {
+  /**
+   * `opts.forWrite`: this read precedes a write by the caller (t/4215
+   * budget addendum, TL t/4215#7) — the session-branch revalidation below
+   * always does the live ref-check for it, ignoring both the 30s throttle
+   * and the write-activity gate. A plain display read only revalidates if
+   * the session has written something since the last check (an idle/
+   * view-only session trusts its cache indefinitely instead of paying a ref
+   * call it gets no benefit from) — see revalidateSessionReadCache().
+   */
+  async readFile(filePath: string, opts?: { ref?: string; optional?: boolean; forWrite?: boolean }): Promise<string | null> {
     const repoPath = this.toRepoPath(filePath);
 
     // Check session overlay first
-    const readBranch = this.getEffectiveRef();
-    const readUserId = this.getEffectiveUserId();
-    if (readBranch !== this.baseBranch && readUserId) {
-      const overlay = this.sessionOverlays.get(readUserId);
-      if (overlay?.has(repoPath)) {
-        const val = overlay.get(repoPath)!;
-        this.recordEvent({
-          type: 'cache.hit',
-          component: 'cache',
-          level: 'debug',
-          message: `Session overlay hit: ${repoPath}`,
-          data: { path: repoPath, layer: 'session', userId: readUserId },
-        });
-        return val === GitHubAPIBackend.TOMBSTONE ? null : val;
-      }
+    const overlayVal = this.checkSessionOverlay(repoPath);
+    if (overlayVal !== undefined) {
+      return overlayVal === GitHubAPIBackend.TOMBSTONE ? null : overlayVal;
     }
 
-    // Check main cache (on-disk)
+    // Pinned ref (e.g. 'main') for shared data; else the effective session ref.
+    const ref = opts?.ref ?? this.getEffectiveRef();
+
+    // t/4215: a session-branch read with no overlay entry must not fall
+    // through to main's on-disk cache below — that cache represents main
+    // only, so using it here is exactly the bug this fix closes (a read
+    // right after a commit showing pre-commit content).
+    if (ref !== this.baseBranch) {
+      return this.readSessionBranchFile(repoPath, ref, opts?.optional, opts?.forWrite ?? false);
+    }
+
+    return this.readFileFromMainCache(repoPath, ref, opts?.optional);
+  }
+
+  /** The pre-t/4215 main-cache path for readFile, unchanged. */
+  private async readFileFromMainCache(repoPath: string, ref: string, optional: boolean | undefined): Promise<string | null> {
     const cached = await this.readFromDiskCache(repoPath);
     if (cached !== null) {
       this.recordEvent({
@@ -332,6 +570,7 @@ export class GitHubAPIBackend implements StorageBackend {
     }
 
     // Cache miss — fetch from GitHub
+    this.coldCacheMissCount++;
     this.recordEvent({
       type: 'cache.miss',
       component: 'cache',
@@ -339,14 +578,19 @@ export class GitHubAPIBackend implements StorageBackend {
       message: `Cache miss: ${repoPath}`,
       data: { path: repoPath, reason: 'missing' },
     });
+    // t/4258/t/4281: recordEvent() alone is console-invisible; alert-cache-degraded
+    // needs "cache.miss" in Log_s. Info-level, one line per miss — matches this
+    // call's own existing level choice. Flagged to TL/DevOps: this is the one fix
+    // in this batch with a real log-volume question (every cache miss, not just a
+    // degraded state), unlike the other five which only fire in already-abnormal
+    // conditions. Revisit sampling/throttling here if ingestion volume proves material.
+    log.cache.info({ path: repoPath }, `cache.miss: ${repoPath}`);
 
     if (this.rest.isTripped()) {
       return null; // Circuit open — serve null (file not available)
     }
 
-    // Pinned ref (e.g. 'main') for shared data; else the effective session ref.
-    const ref = opts?.ref ?? this.getEffectiveRef();
-    const result = await this.fetchFileFromGitHub(repoPath, ref, opts?.optional);
+    const result = await this.fetchFileFromGitHub(repoPath, ref, optional);
     if (result === null) return null;
 
     // Write-through to disk cache
@@ -354,19 +598,251 @@ export class GitHubAPIBackend implements StorageBackend {
     return result.content;
   }
 
-  async readBinaryFile(filePath: string): Promise<Buffer | null> {
+  /**
+   * t/4215 (TL design, t/4215#2): a plain read on a session branch, once the
+   * overlay has no entry for this path. Unlike readFileWithVersion's always-
+   * live read (t/4224 — low call volume, correctness-critical), this is
+   * called from read-modify-write loops over many paths (harvest, policy
+   * recount, edges) — a live GitHub call per call would reintroduce the
+   * t/4201 cost. Instead: a per-session cache filled for free at
+   * commitOverlay/mergeBranch, with the branch-head SHA re-verified against
+   * the live ref at most once every SESSION_READ_CACHE_REVALIDATE_MS so an
+   * out-of-band move (a resync conflict resolved on GitHub, another replica)
+   * is bounded, not missed entirely. A miss, or a stale-head mismatch, does
+   * one live fetch for this path.
+   */
+  private async readSessionBranchFile(repoPath: string, ref: string, optional: boolean | undefined, forWrite: boolean): Promise<string | null> {
+    const userId = this.getEffectiveUserId();
+    if (!userId) return this.liveReadSessionBranchFile(repoPath, ref, optional);
+
+    const cacheTrustworthy = await this.revalidateSessionReadCache(userId, ref, forWrite);
+    if (cacheTrustworthy) {
+      const cached = this.sessionReadCache.get(userId)?.get(repoPath);
+      if (cached !== undefined) {
+        return cached === GitHubAPIBackend.TOMBSTONE ? null : cached;
+      }
+    }
+
+    return this.liveReadSessionBranchFile(repoPath, ref, optional, userId);
+  }
+
+  /**
+   * One live fetch for a session-branch path, caching the result for the
+   * given user if present. Fails closed on an unavailable fetch (503
+   * VERSION_UNAVAILABLE, same as t/4224) — a silent `null` here reads as
+   * "file doesn't exist" to read-modify-write callers, which would rebuild
+   * the file from empty and overwrite it (worse than a visible error).
+   * `optional: true` opts a caller (typically a viewer) into `null` plus a
+   * WARN instead, explicitly accepting that degradation.
+   */
+  private async liveReadSessionBranchFile(
+    repoPath: string, ref: string, optional: boolean | undefined, userId?: string,
+  ): Promise<string | null> {
+    if (this.rest.isTripped()) {
+      return this.handleSessionBranchUnavailable(repoPath, ref, optional);
+    }
+
+    const status = await this.getSessionBranchFileStatus(repoPath, ref);
+    if (status.kind === 'unavailable') {
+      return this.handleSessionBranchUnavailable(repoPath, ref, optional);
+    }
+
+    if (userId) {
+      let cache = this.sessionReadCache.get(userId);
+      if (!cache) { cache = new Map(); this.sessionReadCache.set(userId, cache); }
+      cache.set(repoPath, status.kind === 'present' ? status.content : GitHubAPIBackend.TOMBSTONE);
+    }
+
+    return status.kind === 'present' ? status.content : null;
+  }
+
+  private handleSessionBranchUnavailable(repoPath: string, ref: string, optional: boolean | undefined): null {
+    if (optional) {
+      this.recordEvent({
+        type: 'github.api.error', component: 'github-api', level: 'warn',
+        message: `readFile(${repoPath}): session-branch lookup failed on ${ref} — returning null for an optional read (not an absent file)`,
+        data: { path: repoPath, ref },
+      });
+      return null;
+    }
+    this.throwVersionUnavailable(repoPath, ref);
+  }
+
+  /**
+   * Returns true if sessionReadCache can be trusted for this call (fresh, or
+   * still within SESSION_READ_CACHE_REVALIDATE_MS); false if a ref-check
+   * failed, in which case the caller must skip the cache and go live for
+   * this read (TL: "treat it as a miss, which goes live and fails closed").
+   * A genuine head-sha mismatch clears the whole per-user cache rather than
+   * guessing which paths changed.
+   *
+   * t/4215 budget addendum (TL t/4215#7): unthrottled, this ref-check can
+   * cost up to 120 calls/hour/session (one per 30s continuously) — close to
+   * the cost of saving, and enough to cut the editor ceiling from ~33 to
+   * ~18 against the shared GitHub budget. Revalidate only when it can
+   * matter:
+   *   - the very first check for a session always goes live, regardless of
+   *     `forWrite`/activity — there's no baseline yet to trust.
+   *   - `forWrite` (a read that precedes a write): always live after that
+   *     too, no throttle — correctness for the write that follows depends
+   *     on it.
+   *   - a plain display read, once a baseline exists: only if the session
+   *     has written something since the LAST check (an idle/view-only
+   *     session trusts its cache indefinitely — nothing it did could have
+   *     gone stale), and even then still no more than once per
+   *     SESSION_READ_CACHE_REVALIDATE_MS.
+   */
+  private async revalidateSessionReadCache(userId: string, ref: string, forWrite: boolean): Promise<boolean> {
+    const tracked = this.sessionReadCacheHeadSha.get(userId);
+
+    if (!forWrite && tracked) {
+      const currentActivitySeq = this.sessionWriteActivitySeq.get(userId) ?? 0;
+      if (currentActivitySeq <= tracked.checkedAtActivitySeq) return true; // nothing written since we last looked — trust the cache
+      if (Date.now() - tracked.checkedAt < SESSION_READ_CACHE_REVALIDATE_MS) {
+        return true; // activity happened, but still within the throttle window
+      }
+    }
+
+    const liveSha = await this.getBranchHeadSha(ref);
+    if (liveSha === null) {
+      return false;
+    }
+
+    if (!tracked || tracked.sha !== liveSha) {
+      this.sessionReadCache.delete(userId);
+    }
+    this.sessionReadCacheHeadSha.set(userId, {
+      sha: liveSha, checkedAt: Date.now(), checkedAtActivitySeq: this.sessionWriteActivitySeq.get(userId) ?? 0,
+    });
+    return true;
+  }
+
+  private async getBranchHeadSha(branch: string): Promise<string | null> {
+    if (this.rest.isTripped()) return null;
+    const creds = await this.getCredsCached();
+    if (!creds) return null;
+    const resp = await this.rest.request(creds, 'GET',
+      `/repos/${creds.repo}/git/refs/heads/${branch}`, undefined, undefined, { optional: true });
+    if (!resp.ok) return null;
+    return (resp.data as { object: { sha: string } }).object.sha;
+  }
+
+  /**
+   * t/4187: like readFile, but also returns the version (GitHub blob SHA) the
+   * content came from — the route's save flow needs to hand this back to the
+   * client as the precondition (`ETag`) for its *next* write.
+   *
+   * Content and version must come from the SAME cache snapshot (TL design
+   * review, t/4187#3) — a manifest entry whose `.sha` moved between reading
+   * the content and reading the sha would hand the client a version newer
+   * than what it's actually editing, reopening the lost update this whole fix
+   * closes. Two independent guards, because a mismatch can happen two ways:
+   *   1. A concurrent write/eviction moves the manifest entry mid-read —
+   *      caught by re-checking the entry after the (async) disk read.
+   *   2. The disk file is simply stale relative to its own manifest entry
+   *      (e.g. a half-written cache file, or disk/manifest drift) — the
+   *      manifest doesn't *move*, so guard 1 alone wouldn't catch it. Caught
+   *      by verifying the disk content's own git blob SHA against the
+   *      manifest's claimed SHA (TL fault-arm requirement, t/4187#3: "stale
+   *      content with a fresh manifest SHA must produce a conflict, not a
+   *      silent save").
+   * Either guard failing retries rather than returning a torn pair.
+   *
+   * Checks the session overlay first, same precedence as readFile() — t/4201
+   * review (p/775#30): without this, a hosted user's GET after a save served
+   * main's stale content instead of the overlay, so every later save in that
+   * session got WRITE_CONFLICT until the overlay committed. The overlay's
+   * version is its own git blob SHA (gitBlobSha(overlay content)), computed
+   * the same way writeFile's overlay fast path does, so a write that follows
+   * this read with that version as baseSha matches cleanly.
+   */
+  async readFileWithVersion(filePath: string, opts?: { ref?: string }): Promise<{ content: string; version: string } | null> {
     const repoPath = this.toRepoPath(filePath);
 
-    const cached = await this.readBinaryFromDiskCache(repoPath);
-    if (cached !== null) return cached;
+    const overlayVal = this.checkSessionOverlay(repoPath);
+    if (overlayVal !== undefined) {
+      return overlayVal === GitHubAPIBackend.TOMBSTONE ? null : { content: overlayVal, version: gitBlobSha(overlayVal) };
+    }
+
+    const ref = opts?.ref ?? this.getEffectiveRef();
+
+    // t/4224 (TL design, p/538#40/#43): an edit-load on a session branch with
+    // no pending overlay entry must read the branch's own current content and
+    // version, not main's cache — the manifest/disk-cache path below
+    // represents main only, so using it here is exactly the bug this fix
+    // closes (an edit-load that silently shows pre-commit, pre-merge, or
+    // pre-out-of-band content instead of what the session branch actually
+    // holds). Absent (a genuinely missing file) returns null, matching this
+    // method's existing contract — only unavailable (a real fetch failure)
+    // fails closed with a 503.
+    if (ref !== this.baseBranch) {
+      const status = await this.getSessionBranchFileStatus(repoPath, ref);
+      if (status.kind === 'absent') return null;
+      if (status.kind === 'unavailable') this.throwVersionUnavailable(repoPath, ref);
+      return { content: status.content, version: status.sha };
+    }
+
+    return this.readFileWithVersionFromMainCache(repoPath, ref);
+  }
+
+  /**
+   * The pre-t/4224 main-cache path for readFileWithVersion, unchanged —
+   * split out to keep readFileWithVersion's own complexity down once the
+   * session-branch live-read branch above was added.
+   */
+  private async readFileWithVersionFromMainCache(repoPath: string, ref: string): Promise<{ content: string; version: string } | null> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const entry = this.manifest?.files[repoPath];
+      if (!entry) break; // no cache entry — fall through to a fresh GitHub fetch
+
+      const content = await this.readFromDiskCache(repoPath);
+      const after = this.manifest?.files[repoPath];
+      if (content !== null && after && after.sha === entry.sha) {
+        if (gitBlobSha(content) === entry.sha) {
+          return { content, version: entry.sha };
+        }
+        this.recordEvent({
+          type: 'cache.coherency_violation', component: 'cache', level: 'error',
+          message: `readFileWithVersion: disk content hash doesn't match its own manifest SHA for ${repoPath} — torn/corrupt cache entry, forcing a fresh fetch`,
+          data: { path: repoPath, claimedSha: entry.sha },
+        });
+        break; // don't retry against the same bad disk state — go straight to a fresh fetch
+      }
+      // The manifest entry moved (a write or eviction landed mid-read) — the
+      // pair we just read is torn. Retry against the new state.
+    }
+
+    // Cache miss (or torn-read retries exhausted) — one GitHub response gives
+    // content + sha atomically by construction.
+    if (this.rest.isTripped()) return null;
+    const result = await this.fetchFileFromGitHub(repoPath, ref);
+    if (result === null) return null;
+
+    await this.writeToDiskCache(repoPath, result.content, result.sha, result.etag);
+    return { content: result.content, version: result.sha };
+  }
+
+  // t/4393: the disk cache holds `main` content only (same as readFileFromMainCache/
+  // readFileAtRef) — gating it on `ref === this.baseBranch` fixes a latent bug: before
+  // this ref param existed, every call used getEffectiveRef() unconditionally and could
+  // serve or pollute the main cache from a non-main session branch.
+  async readBinaryFile(filePath: string, opts?: { ref?: string }): Promise<Buffer | null> {
+    const repoPath = this.toRepoPath(filePath);
+    const ref = opts?.ref ?? this.getEffectiveRef();
+
+    if (ref === this.baseBranch) {
+      const cached = await this.readBinaryFromDiskCache(repoPath);
+      if (cached !== null) return cached;
+    }
 
     if (this.rest.isTripped()) return null;
 
-    const ref = this.getEffectiveRef();
     const result = await this.fetchBinaryFileFromGitHub(repoPath, ref);
     if (result === null) return null;
 
-    await this.writeBinaryToDiskCache(repoPath, result.content, result.sha, result.etag);
+    if (ref === this.baseBranch) {
+      await this.writeBinaryToDiskCache(repoPath, result.content, result.sha, result.etag);
+    }
     return result.content;
   }
 
@@ -384,7 +860,7 @@ export class GitHubAPIBackend implements StorageBackend {
     return result.content;
   }
 
-  async writeFile(filePath: string, content: string, opts?: { ref?: string }): Promise<void> {
+  async writeFile(filePath: string, content: string, opts?: { ref?: string; baseSha?: string }): Promise<{ version: string }> {
     const repoPath = this.toRepoPath(filePath);
     // opts.ref pins the write to a specific ref (e.g. 'main') for shared data
     // that must commit straight to main rather than the caller's session branch
@@ -396,14 +872,110 @@ export class GitHubAPIBackend implements StorageBackend {
 
     // When on a session branch (and no ref is forced), write to overlay only —
     // no API call. The overlay is flushed via commitOverlay() (Trees API batch).
+    // t/4187 (Rosetta Stone, p/775#18): this is the path EVERY hosted user save
+    // actually takes — the baseSha precondition has to apply here, not just on
+    // the direct-commit path below, or the fix protects no one on the web.
     if (!forceRef && ref !== this.baseBranch && this.hasSessionContext()) {
       this.recordEvent({ type: 'cache.hit', component: 'cache', level: 'debug',
         message: `writeFile: overlay fast-path taken: ${repoPath}`, data: { path: repoPath, ref } });
-      this.writeToOverlay(filePath, content);
-      return;
+      return this.writeOverlayWithPrecondition(filePath, repoPath, content, ref, opts?.baseSha);
     }
 
-    // Guard: a forced ref that differs from the configured base branch would bypass
+    this.assertDirectWriteAllowed(forceRef, ref, repoPath);
+
+    if (this.rest.isTripped()) {
+      throw new ActionableError({
+        goal: 'Write file to GitHub',
+        problem: 'GitHub API is unavailable (circuit breaker open). Edits temporarily disabled.',
+        location: `GitHubAPIBackend.writeFile(${repoPath})`,
+        nextSteps: ['Wait for GitHub API to recover', 'Check /health for circuit breaker status'],
+      });
+    }
+
+    // t/4187: the caller's `baseSha` (the version it last read) is the precondition
+    // when supplied — it wins over the server's own cache, which is what actually
+    // fixes the N=1 two-tabs case (the cache's SHA is always "correct" from the
+    // server's point of view; it's just not what the client saw). Only a direct
+    // fileIO caller with no client in the loop (harvest/pipeline writers) falls
+    // back to the cache-derived SHA — WARN-logged, never silent.
+    let fileSha: string | null;
+    if (opts?.baseSha !== undefined) {
+      fileSha = opts.baseSha;
+    } else {
+      fileSha = await this.getFileSha(repoPath, ref);
+      this.recordEvent({
+        type: 'storage.fallback', component: 'github-api', level: 'warn',
+        message: `writeFile(${repoPath}): no baseSha supplied — falling back to the server's cache-derived SHA (direct fileIO caller, not the save route)`,
+        data: { path: repoPath, ref },
+      });
+      log.github.warn({ path: repoPath, ref },
+        `storage.fallback: writeFile(${repoPath}) had no baseSha — using the cache-derived SHA`);
+    }
+
+    const creds = await this.getCredsCached();
+    if (!creds) throw this.noCredsError('writeFile');
+
+    const callId = crypto.randomUUID();
+    const encodedContent = Buffer.from(content, 'utf-8').toString('base64');
+
+    const doWrite = async (sha: string | null) => {
+      const body: Record<string, unknown> = {
+        message: `Update ${repoPath}`,
+        content: encodedContent,
+        branch: ref,
+      };
+      if (sha) body.sha = sha;
+
+      const resp = await this.rest.request(creds, 'PUT',
+        `/repos/${creds.repo}/contents/${repoPath}`, body, callId);
+
+      // t/4184: NEVER retry a 409 with the same (pre-read) content — the caller
+      // computed `content` from a snapshot that's now stale, so re-sending it
+      // with a fresh SHA silently overwrites whatever the other writer committed
+      // (a lost update, defeating the SHA precondition). `writeFile` receives
+      // whole-file content, not a mutator, so a correct read-modify-write isn't
+      // possible at this layer — fail loud instead (TL design review, t/4184#1).
+      if (resp.status === 409) {
+        this.recordEvent({
+          type: 'github.api.conflict',
+          component: 'github-api',
+          level: 'warn',
+          message: `409 SHA conflict on ${repoPath} — failing (no retry; would lose the other writer's change)`,
+          call_id: callId,
+          data: { path: repoPath, ref, staleSha: sha },
+        });
+        await this.evictPathFromCache(repoPath); // SO C1: next readFile fetches fresh, not the same stale state
+        throw this.writeConflictError(repoPath, 'writeFile');
+      }
+
+      if (!resp.ok) {
+        throw new ActionableError({
+          goal: `Write ${repoPath} to GitHub`,
+          problem: `GitHub API returned ${resp.status}: ${resp.error}`,
+          location: `GitHubAPIBackend.writeFile(${repoPath})`,
+          nextSteps: ['Check GitHub API status', 'Retry the operation'],
+        });
+      }
+
+      return resp;
+    };
+
+    const resp = await doWrite(fileSha);
+
+    // Write-through: update cache only after confirmed 2xx
+    const respData = resp.data as { content?: { sha?: string } };
+    const newSha = respData?.content?.sha ?? '';
+    await this.writeToDiskCache(repoPath, content, newSha, '');
+    return { version: newSha };
+  }
+
+  /**
+   * Guard rails for the direct-commit write path (not taken on a session
+   * branch — see the overlay fast path above). Split out of writeFile to
+   * keep its own complexity down (t/4187 cleanup).
+   */
+  private assertDirectWriteAllowed(forceRef: string | undefined, ref: string, repoPath: string): void {
+    // A forced ref that differs from the configured base branch would bypass
     // base-branch isolation (e.g. forced 'main' on a staging deployment leaks to prod).
     // Zero current consumers (t/2657) — this future-proofs against re-arming the incident.
     if (forceRef && forceRef !== this.baseBranch) {
@@ -428,67 +1000,89 @@ export class GitHubAPIBackend implements StorageBackend {
         nextSteps: ['Create a session branch via the Session Branch Manager'],
       });
     }
+  }
 
-    if (this.rest.isTripped()) {
-      throw new ActionableError({
-        goal: 'Write file to GitHub',
-        problem: 'GitHub API is unavailable (circuit breaker open). Edits temporarily disabled.',
-        location: `GitHubAPIBackend.writeFile(${repoPath})`,
-        nextSteps: ['Wait for GitHub API to recover', 'Check /health for circuit breaker status'],
+  /**
+   * t/4187 (Rosetta Stone, p/775#18): apply the baseSha precondition on the
+   * overlay fast path — this is where every hosted user save actually lands,
+   * so the precondition has to hold here or it protects no one on the web.
+   *
+   * "Current version" is the git blob SHA of whatever this user's overlay (or,
+   * if nothing's staged yet this session, the last committed content) holds
+   * for this path. Computed locally via gitBlobSha — the same hash GitHub
+   * would report as `sha` for that exact content, whether or not it's actually
+   * been committed. This lets an overlay write be versioned without a round
+   * trip, and lets a second overlay write to the same path in the same
+   * session (two tabs) detect that the first one already landed.
+   */
+  private async writeOverlayWithPrecondition(
+    filePath: string, repoPath: string, content: string, ref: string, baseSha: string | undefined,
+  ): Promise<{ version: string }> {
+    // t/4224 (TL design, p/538#40/#43): with no pending overlay entry for
+    // this path, the current version must come from the session branch
+    // itself — never from getFileSha()'s main-cache fallback, which ignores
+    // `ref` and is exactly the bug this fix closes (a save right after a
+    // commit, a resync merge, or any other out-of-band move of the branch
+    // head would otherwise compare against main's stale SHA instead of the
+    // branch's real current content). The precondition CHECK only runs when
+    // there's a `baseSha` to check against — a writer with no precondition
+    // (p/538#43: harvest, conflicts, edges, any new taxonomy-side file) keeps
+    // its existing no-check behavior. But t/4312 still needs this path's base
+    // recorded regardless (condition 1), so the live lookup below always
+    // happens on first staging even when there's no precondition to validate.
+    const existing = this.checkSessionOverlay(repoPath);
+    const userId = this.getEffectiveUserId();
+
+    if (baseSha === undefined) {
+      this.recordEvent({
+        type: 'storage.fallback', component: 'github-api', level: 'warn',
+        message: `writeFile(${repoPath}): no baseSha supplied on overlay write — falling back to no precondition (direct fileIO caller, not the save route)`,
+        data: { path: repoPath, ref },
       });
+      log.github.warn({ path: repoPath, ref },
+        `storage.fallback: writeFile(${repoPath}) overlay write had no baseSha — no precondition`);
+      await this.maybeRecordBaseShaForFreshStage(userId, repoPath, ref, existing !== undefined);
+    } else {
+      let currentVersion: string | null;
+      if (existing !== undefined && existing !== GitHubAPIBackend.TOMBSTONE) {
+        currentVersion = gitBlobSha(existing);
+      } else {
+        const status = await this.getSessionBranchFileStatus(repoPath, ref);
+
+        // SO fault (C1, e/302#4): a concurrent save of the same path by the
+        // same user (two tabs — exactly the case this precondition exists
+        // for) can land its overlay entry while this call was awaiting the
+        // live lookup above. Re-check the overlay now, synchronously — from
+        // here to writeToOverlay() below there's no more await, so this
+        // closes the check-then-write race the first (`existing`) check
+        // alone left open.
+        const landedWhileAwaiting = this.checkSessionOverlay(repoPath);
+        if (landedWhileAwaiting !== undefined) {
+          currentVersion = landedWhileAwaiting === GitHubAPIBackend.TOMBSTONE ? null : gitBlobSha(landedWhileAwaiting);
+        } else {
+          if (status.kind === 'unavailable') this.throwVersionUnavailable(repoPath, ref);
+          // 'absent' → null: a baseSha was supplied, so the client expects a
+          // file that does not exist on the branch — that mismatch is itself
+          // the conflict, same as any other currentVersion !== baseSha below.
+          currentVersion = status.kind === 'present' ? status.sha : null;
+        }
+        // t/4312: this lookup IS the live base — record it (idempotent; a
+        // concurrent write that landed first already recorded its own).
+        if (userId) this.recordOverlayBaseShaOnce(userId, repoPath, status.kind === 'present' ? status.sha : status.kind === 'absent' ? null : 'unknown');
+      }
+
+      if (currentVersion === null || baseSha !== currentVersion) {
+        this.recordEvent({
+          type: 'github.api.conflict', component: 'github-api', level: 'warn',
+          message: `Overlay write conflict on ${repoPath} — staged content moved since the client's last read`,
+          data: { path: repoPath, ref, staleSha: baseSha, currentSha: currentVersion },
+        });
+        throw this.writeConflictError(repoPath, 'writeFile');
+      }
     }
 
-    // Get the current file SHA for the update (required by Contents API)
-    const fileSha = await this.getFileSha(repoPath, ref);
-
-    const creds = await this.getCredsCached();
-    if (!creds) throw this.noCredsError('writeFile');
-
-    const callId = crypto.randomUUID();
-    const encodedContent = Buffer.from(content, 'utf-8').toString('base64');
-
-    const doWrite = async (sha: string | null, attempt: number) => {
-      const body: Record<string, unknown> = {
-        message: `Update ${repoPath}`,
-        content: encodedContent,
-        branch: ref,
-      };
-      if (sha) body.sha = sha;
-
-      const resp = await this.rest.request(creds, 'PUT',
-        `/repos/${creds.repo}/contents/${repoPath}`, body, callId);
-
-      if (resp.status === 409 && attempt === 0) {
-        this.recordEvent({
-          type: 'github.api.conflict',
-          component: 'github-api',
-          level: 'warn',
-          message: `409 SHA conflict on ${repoPath}, retrying with fresh SHA`,
-          call_id: callId,
-          data: { path: repoPath, ref, staleSha: sha },
-        });
-        const freshSha = await this.getFileSha(repoPath, ref);
-        return doWrite(freshSha, 1);
-      }
-
-      if (!resp.ok) {
-        throw new ActionableError({
-          goal: `Write ${repoPath} to GitHub`,
-          problem: `GitHub API returned ${resp.status}: ${resp.error}`,
-          location: `GitHubAPIBackend.writeFile(${repoPath})`,
-          nextSteps: ['Check GitHub API status', 'Retry the operation'],
-        });
-      }
-
-      return resp;
-    };
-
-    const resp = await doWrite(fileSha, 0);
-
-    // Write-through: update cache only after confirmed 2xx
-    const respData = resp.data as { content?: { sha?: string } };
-    const newSha = respData?.content?.sha ?? '';
-    await this.writeToDiskCache(repoPath, content, newSha, '');
+    this.writeToOverlay(filePath, content);
+    return { version: gitBlobSha(content) };
   }
 
   async writeBinaryFile(filePath: string, content: Buffer, opts?: { ref?: string }): Promise<void> {
@@ -511,7 +1105,7 @@ export class GitHubAPIBackend implements StorageBackend {
     const callId = crypto.randomUUID();
     const encodedContent = content.toString('base64');
 
-    const doWrite = async (sha: string | null, attempt: number): Promise<{ ok: boolean; status: number; data: unknown }> => {
+    const doWrite = async (sha: string | null): Promise<{ ok: boolean; status: number; data: unknown }> => {
       const body: Record<string, unknown> = {
         message: `Update ${repoPath}`,
         content: encodedContent,
@@ -522,17 +1116,19 @@ export class GitHubAPIBackend implements StorageBackend {
       const resp = await this.rest.request(creds, 'PUT',
         `/repos/${creds.repo}/contents/${repoPath}`, body, callId);
 
-      if (resp.status === 409 && attempt === 0) {
+      // t/4184: see writeFile() — never retry a 409 with the same (pre-read)
+      // content; it's a lost update, not a recoverable conflict at this layer.
+      if (resp.status === 409) {
         this.recordEvent({
           type: 'github.api.conflict',
           component: 'github-api',
           level: 'warn',
-          message: `409 SHA conflict on ${repoPath}, retrying with fresh SHA`,
+          message: `409 SHA conflict on ${repoPath} — failing (no retry; would lose the other writer's change)`,
           call_id: callId,
           data: { path: repoPath, ref, staleSha: sha },
         });
-        const freshSha = await this.getFileSha(repoPath, ref);
-        return doWrite(freshSha, 1);
+        await this.evictPathFromCache(repoPath); // SO C1
+        throw this.writeConflictError(repoPath, 'writeBinaryFile');
       }
 
       if (!resp.ok) {
@@ -547,7 +1143,7 @@ export class GitHubAPIBackend implements StorageBackend {
       return resp;
     };
 
-    const resp = await doWrite(fileSha, 0);
+    const resp = await doWrite(fileSha);
     const respData = resp.data as { content?: { sha?: string } };
     const newSha = respData?.content?.sha ?? '';
     await this.writeBinaryToDiskCache(repoPath, content, newSha, '');
@@ -562,6 +1158,8 @@ export class GitHubAPIBackend implements StorageBackend {
     // merge below can add/remove entries idempotently.
     const seen = new Set<string>();
 
+    if (this.repoTree.size === 0 && this.blobLease) await this.ensureRepoTreeFilled();
+
     if (this.repoTree.size > 0) {
       for (const [p] of this.repoTree) {
         if (prefix && !p.startsWith(prefix)) continue;
@@ -570,8 +1168,13 @@ export class GitHubAPIBackend implements StorageBackend {
         // Direct children only — first path segment under the prefix.
         seen.add(rest.split('/')[0]);
       }
-    } else if (!(this.rest.isTripped())) {
+    } else if (this.mayFallBackToContentsApi() && !(this.rest.isTripped())) {
       await this.fetchDirectoryFromAPI(repoPath, opts, seen);
+    } else if (!this.mayFallBackToContentsApi()) {
+      // t/4179 R3: a non-holder with an empty tree even after a refill
+      // attempt never hits the Contents API per-call — that's the N>1
+      // crash-loop pattern t/4201/t/4176 fixed. Degraded [] instead.
+      log.server.warn({ dir: repoPath, cause: 'non-holder-tree-empty' }, 'listDirectory returning [] — coordinated non-holder with no tree, avoiding per-call Contents API (t/4179)');
     } else {
       log.server.warn({ dir: repoPath, cause: 'circuit-breaker-open' }, 'listDirectory returning [] — circuit breaker open, may be false-empty (t/3300)');
     }
@@ -678,7 +1281,7 @@ export class GitHubAPIBackend implements StorageBackend {
 
     // When on a session branch, tombstone in overlay — no API call.
     if (ref !== this.baseBranch && this.hasSessionContext()) {
-      this.deleteFromOverlay(filePath);
+      await this.deleteFromOverlay(filePath, ref);
       return;
     }
 
@@ -717,39 +1320,60 @@ export class GitHubAPIBackend implements StorageBackend {
     await this.removeFromDiskCache(repoPath);
   }
 
-  async fileExists(filePath: string): Promise<boolean> {
+  async fileExists(filePath: string, opts?: { ref?: string }): Promise<boolean> {
     const repoPath = this.toRepoPath(filePath);
+    const effectiveRef = this.getEffectiveRef();
+    const ref = opts?.ref ?? effectiveRef;
 
-    // Check session overlay
-    const existsBranch = this.getEffectiveRef();
+    // Check session overlay — only when this call isn't pinned away from the
+    // session's own ref (t/4428#2 condition 1). An explicit opts.ref that
+    // differs from the effective ref is asking for that ref's real content,
+    // and answering from this session's overlay would defeat the pin.
     const existsUserId = this.getEffectiveUserId();
-    if (existsBranch !== this.baseBranch && existsUserId) {
+    if (ref === effectiveRef && effectiveRef !== this.baseBranch && existsUserId) {
       const overlay = this.sessionOverlays.get(existsUserId);
       if (overlay?.has(repoPath)) return overlay.get(repoPath) !== GitHubAPIBackend.TOMBSTONE;
     }
 
-    // Check disk cache manifest
+    // t/4428: the disk-cache manifest and in-memory repoTree represent
+    // `baseBranch` only — same reasoning as t/4215/t/4393's "a session read
+    // must not fall through to main's cache." A ref other than baseBranch
+    // (explicit pin or active session) always goes straight to the
+    // Contents-API fallback below, which resolves the real ref.
+    if (ref === this.baseBranch && await this.fileExistsInBaseBranchCache(repoPath)) return true;
+
+    // t/4179 R3: a non-holder never falls through to the per-call Contents
+    // API below — same reasoning as listDirectory.
+    if (!this.mayFallBackToContentsApi()) return false;
+    return this.fileExistsViaContentsApi(repoPath, ref);
+  }
+
+  /** Extracted from fileExists() to keep its own complexity under budget.
+   *  `baseBranch`-only: manifest, then the in-memory tree (file or directory). */
+  private async fileExistsInBaseBranchCache(repoPath: string): Promise<boolean> {
     if (this.manifest?.files[repoPath]) return true;
 
-    // Check in-memory tree
+    if (this.repoTree.size === 0 && this.blobLease) await this.ensureRepoTreeFilled();
+
     if (this.repoTree.has(repoPath)) return true;
 
-    // Check for directory in tree
     if (this.repoTree.size > 0) {
       const prefix = repoPath + '/';
       for (const [p] of this.repoTree) {
         if (p.startsWith(prefix)) return true;
       }
     }
+    return false;
+  }
 
-    // Fallback: HEAD request to Contents API
+  /** Extracted from fileExists() to keep its own complexity under budget. */
+  private async fileExistsViaContentsApi(repoPath: string, ref: string): Promise<boolean> {
     if (this.rest.isTripped()) return false;
 
     const creds = await this.getCredsCached();
     if (!creds) return false;
 
-    const ref = this.getEffectiveRef();
-    const qRef = ref === 'main' ? '' : `?ref=${encodeURIComponent(ref)}`;
+    const qRef = ref === this.baseBranch ? '' : `?ref=${encodeURIComponent(ref)}`;
     const resp = await this.rest.request(creds, 'HEAD',
       `/repos/${creds.repo}/contents/${repoPath}${qRef}`);
     return resp.ok;
@@ -947,11 +1571,74 @@ export class GitHubAPIBackend implements StorageBackend {
    * Handles both writes and deletes (tombstones). Clears the overlay only on success.
    * Returns { commitSha, filesCommitted } or null if no pending changes.
    */
-  async commitOverlay(userId: string, message?: string): Promise<{ commitSha: string; filesCommitted: number } | null> {
+  async commitOverlay(
+    userId: string, message?: string, opts?: { branchName?: string },
+  ): Promise<{ commitSha: string; filesCommitted: number; conflictedPaths?: string[] } | null> {
+    // t/4258/t/4277 (C2): a commit already queued-but-not-started for this
+    // user absorbs this trigger — join its promise instead of racing a
+    // second PATCH /git/refs/heads/<branch> against it. A commit already
+    // *running* gets its follow-up queued on commitChain, so this trigger's
+    // own pending writes still get committed, just serialized after it.
+    const pending = this.commitPending.get(userId);
+    if (pending) return pending.promise;
+
+    let resolve!: (result: { commitSha: string; filesCommitted: number; conflictedPaths?: string[] } | null) => void;
+    let reject!: (err: unknown) => void;
+    const promise = new Promise<{ commitSha: string; filesCommitted: number; conflictedPaths?: string[] } | null>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    this.commitPending.set(userId, { promise, resolve, reject });
+
+    const prevChain = this.commitChain.get(userId) ?? Promise.resolve();
+    const nextChain = prevChain.then(() => {
+      // This run now owns the batch — any call from here on starts a new,
+      // separately-queued follow-up rather than joining this one. No try/catch
+      // here: commitOverlayGuarded already records its own failure (ADR-003)
+      // before rethrowing — this is pure promise-settlement plumbing for the
+      // manual Promise wrapper above, not a new error path to record.
+      this.commitPending.delete(userId);
+      return this.commitOverlayGuarded(userId, message, opts?.branchName).then(resolve, reject);
+    });
+    this.commitChain.set(userId, nextChain);
+
+    return promise;
+  }
+
+  private async commitOverlayGuarded(
+    userId: string, message?: string, branchName?: string,
+  ): Promise<{ commitSha: string; filesCommitted: number; conflictedPaths?: string[] } | null> {
+    try {
+      return await this.commitOverlayImpl(userId, message, branchName);
+    } catch (err) {
+      const summary = this.uncommittedOverlaySummary().filter(s => s.userId === userId);
+      const warnMsg = `commitOverlay failed for ${userId} — overlay entries remain uncommitted (t/4258)`;
+      log.storage.warn({ summary }, warnMsg);
+      getGlobalRecorder()?.record({
+        type: 'system.error',
+        component: 'storage',
+        level: 'warn',
+        message: warnMsg,
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+        data: { summary },
+      });
+      throw err;
+    }
+  }
+
+  private async commitOverlayImpl(
+    userId: string, message?: string, branchName?: string,
+  ): Promise<{ commitSha: string; filesCommitted: number; conflictedPaths?: string[] } | null> {
     const entries = this.getOverlayEntries(userId);
     if (!entries) return null;
 
-    const branch = this.getEffectiveRef();
+    // t/4258/t/4277 (C3a): an explicit branchName is required for callers
+    // running outside request scope (a debounced commit timer, a SIGTERM
+    // flush) — getEffectiveRef()'s AsyncLocalStorage lookup only resolves
+    // inside the request that set it, so a setTimeout callback would
+    // silently fall back to baseBranch and hit the guard below on every
+    // scheduled commit in production.
+    const branch = branchName ?? this.getEffectiveRef();
     if (branch === this.baseBranch) {
       throw new ActionableError({
         goal: 'Commit overlay to GitHub',
@@ -980,70 +1667,24 @@ export class GitHubAPIBackend implements StorageBackend {
     }
     const currentSha = ((refResp.data as { object: { sha: string } }).object).sha;
 
+    // t/4312 (SO condition F2, e/333#2 — TL ruling p/538#94): all-or-nothing
+    // per batch. A per-path base-sha fence that only excluded the conflicting
+    // paths could leave git cross-file-inconsistent (e.g. a POV file commits
+    // while the edges file it's referenced from conflicts and stays out) —
+    // durability doesn't need a partial commit, since everything stays
+    // staged either way. Any conflict means nothing commits this round.
+    const { conflictedPaths } = await this.partitionOverlayEntriesByBase(creds, userId, entries, currentSha, callId);
+    if (conflictedPaths.length > 0) {
+      this.recordOverlayConflicts(userId, branch, conflictedPaths);
+      this.sessionOverlayConflicts.set(userId, new Set(conflictedPaths)); // t/4312 SO F1: resolvable via discard/rebase below
+      return { commitSha: currentSha, filesCommitted: 0, conflictedPaths };
+    }
+    this.sessionOverlayConflicts.delete(userId); // t/4312 SO F1: a clean commit clears any stale conflict record
+
     // Step 2: Create tree with writes + deletes
-    const treeEntries: Record<string, unknown>[] = [
-      ...entries.writes.map(f => ({
-        path: f.path,
-        mode: '100644',
-        type: 'blob',
-        content: f.content,
-      })),
-      ...entries.deletes.map(path => ({
-        path,
-        mode: '100644',
-        type: 'blob',
-        sha: null, // null SHA = delete from tree
-      })),
-    ];
-
-    const commitMsg = message || `Update ${entries.writes.length} file(s)${entries.deletes.length > 0 ? `, delete ${entries.deletes.length}` : ''}`;
-
-    const treeResp = await this.rest.request(creds, 'POST',
-      `/repos/${creds.repo}/git/trees`, {
-        base_tree: currentSha,
-        tree: treeEntries,
-      }, callId);
-    if (!treeResp.ok) {
-      throw new ActionableError({
-        goal: `Commit overlay to ${branch}`,
-        problem: `Failed to create tree: ${treeResp.status} ${treeResp.error}`,
-        location: 'GitHubAPIBackend.commitOverlay step 2',
-        nextSteps: ['Check file paths and content', 'Verify GitHub App permissions'],
-      });
-    }
-    const newTreeSha = (treeResp.data as { sha: string }).sha;
-
-    // Step 3: Create commit
-    const commitResp = await this.rest.request(creds, 'POST',
-      `/repos/${creds.repo}/git/commits`, {
-        message: commitMsg,
-        tree: newTreeSha,
-        parents: [currentSha],
-      }, callId);
-    if (!commitResp.ok) {
-      throw new ActionableError({
-        goal: `Commit overlay to ${branch}`,
-        problem: `Failed to create commit: ${commitResp.status} ${commitResp.error}`,
-        location: 'GitHubAPIBackend.commitOverlay step 3',
-        nextSteps: ['Retry — dangling tree is harmless'],
-      });
-    }
-    const commitSha = (commitResp.data as { sha: string }).sha;
-
-    // Step 4: Update branch ref
-    const updateResp = await this.rest.request(creds, 'PATCH',
-      `/repos/${creds.repo}/git/refs/heads/${branch}`, {
-        sha: commitSha,
-        force: false,
-      }, callId);
-    if (!updateResp.ok) {
-      throw new ActionableError({
-        goal: `Commit overlay to ${branch}`,
-        problem: `Failed to update branch ref: ${updateResp.status} ${updateResp.error}`,
-        location: 'GitHubAPIBackend.commitOverlay step 4',
-        nextSteps: ['Retry — tree and commit are already created'],
-      });
-    }
+    const treeEntries = this.buildOverlayTreeEntries(entries);
+    const commitMsg = message || this.buildOverlayCommitMessage(entries);
+    const commitSha = await this.createTreeCommitAndUpdateRef(creds, branch, currentSha, treeEntries, commitMsg, callId);
 
     const filesCommitted = entries.writes.length + entries.deletes.length;
     const durationMs = Date.now() - startMs;
@@ -1057,8 +1698,22 @@ export class GitHubAPIBackend implements StorageBackend {
       data: { branch, writes: entries.writes.length, deletes: entries.deletes.length, commitSha, durationMs },
     });
 
-    // Clear overlay only on success (Tech Lead note #2)
-    this.clearSessionOverlay(userId);
+    // t/4215: populate the session read cache for free — we already have
+    // the content and the new branch-head sha from this commit, so a plain
+    // readFile() right after this doesn't need to go live at all.
+    let readCache = this.sessionReadCache.get(userId);
+    if (!readCache) { readCache = new Map(); this.sessionReadCache.set(userId, readCache); }
+    for (const w of entries.writes) readCache.set(w.path, w.content);
+    for (const d of entries.deletes) readCache.set(d, GitHubAPIBackend.TOMBSTONE);
+    this.sessionReadCacheHeadSha.set(userId, {
+      sha: commitSha, checkedAt: Date.now(), checkedAtActivitySeq: this.sessionWriteActivitySeq.get(userId) ?? 0,
+    });
+
+    // Clear overlay only on success (Tech Lead note #2), and only the
+    // entries this commit actually captured (t/4258/t/4277 C1) — anything
+    // written during the awaits above stays staged for the next commit.
+    // t/4312: also refreshes/clears sessionOverlayBaseShas (conditions 2/3).
+    this.clearCommittedOverlayEntries(userId, entries);
 
     return { commitSha, filesCommitted };
   }
@@ -1197,6 +1852,24 @@ export class GitHubAPIBackend implements StorageBackend {
     }
 
     const data = resp.data as { sha: string };
+
+    // t/4224 (TL design, p/538#40): no baseline to refresh — getSessionBranchVersion()
+    // reads the write/edit-load path live on every call, so a merge is covered there
+    // without this method needing to know about it.
+    //
+    // t/4215: the plain-readFile cache is a different story — it IS filled by
+    // this method's own content. The merge just moved the head to a tree we
+    // don't have path-by-path deltas for, so drop the whole cache (next read
+    // per path goes live and refills) and record the new head sha so the
+    // revalidation window (SESSION_READ_CACHE_REVALIDATE_MS) resets too.
+    const userId = this.getEffectiveUserId();
+    if (userId) {
+      this.sessionReadCache.delete(userId);
+      this.sessionReadCacheHeadSha.set(userId, {
+        sha: data.sha, checkedAt: Date.now(), checkedAtActivitySeq: this.sessionWriteActivitySeq.get(userId) ?? 0,
+      });
+    }
+
     return { ok: true, sha: data.sha, conflicts: false, message: `Merged main into ${branch}` };
   }
 
@@ -1381,65 +2054,97 @@ export class GitHubAPIBackend implements StorageBackend {
   private async writeToDiskCache(
     repoPath: string, content: string, sha: string, etag: string,
   ): Promise<void> {
-    const diskPath = path.join(this.cacheDir, repoPath);
-    await fs.mkdir(path.dirname(diskPath), { recursive: true });
+    try {
+      const diskPath = path.join(this.cacheDir, repoPath);
+      await fs.mkdir(path.dirname(diskPath), { recursive: true });
 
-    const tmpPath = diskPath + '.tmp.' + crypto.randomBytes(8).toString('hex');
-    await fs.writeFile(tmpPath, content, 'utf-8');
-    await this.renameWithRetry(tmpPath, diskPath);
+      const tmpPath = diskPath + '.tmp.' + crypto.randomBytes(8).toString('hex');
+      await fs.writeFile(tmpPath, content, 'utf-8');
+      await this.renameWithRetry(tmpPath, diskPath);
 
-    await this.withManifestLock(async () => {
-      if (!this.manifest) {
-        this.manifest = {
-          version: 1,
-          generation: 1,
-          lastCommitSha: '',
-          lastUpdated: new Date().toISOString(),
-          files: {},
+      await this.withManifestLock(async () => {
+        if (!this.manifest) {
+          this.manifest = {
+            version: 1,
+            generation: 1,
+            lastCommitSha: '',
+            lastUpdated: new Date().toISOString(),
+            files: {},
+          };
+        }
+
+        this.manifest.files[repoPath] = {
+          sha,
+          etag,
+          cachedAt: new Date().toISOString(),
         };
-      }
-
-      this.manifest.files[repoPath] = {
-        sha,
-        etag,
-        cachedAt: new Date().toISOString(),
-      };
-      this.manifest.generation++;
-      this.manifest.lastUpdated = new Date().toISOString();
-      await this.saveManifest();
-    });
+        this.manifest.generation++;
+        this.manifest.lastUpdated = new Date().toISOString();
+        await this.saveManifest();
+      });
+    } catch (err) {
+      // t/4298/t/4299: a disk-cache write-through is an optimization, not
+      // the read it follows — staging's share went read-only (taxonomy-data-ro)
+      // and this would otherwise crash a read that had already succeeded.
+      // Warn and move on; the next read just misses the cache again.
+      const message = `Disk cache write-through failed for ${repoPath} — serving the fetched content, but it won't be cached (t/4298/t/4299)`;
+      log.storage.warn({ repoPath, error: String(err) }, message);
+      this.recordEvent({
+        type: 'storage.fallback',
+        component: 'storage',
+        level: 'warn',
+        message,
+        error: { name: (err as Error)?.name ?? 'Error', message: String(err), stack: (err as Error)?.stack },
+        data: { repoPath },
+      });
+    }
   }
 
   private async writeBinaryToDiskCache(
     repoPath: string, content: Buffer, sha: string, etag: string,
   ): Promise<void> {
-    const diskPath = path.join(this.cacheDir, repoPath);
-    await fs.mkdir(path.dirname(diskPath), { recursive: true });
+    try {
+      const diskPath = path.join(this.cacheDir, repoPath);
+      await fs.mkdir(path.dirname(diskPath), { recursive: true });
 
-    const tmpPath = diskPath + '.tmp.' + crypto.randomBytes(8).toString('hex');
-    await fs.writeFile(tmpPath, content);
-    await this.renameWithRetry(tmpPath, diskPath);
+      const tmpPath = diskPath + '.tmp.' + crypto.randomBytes(8).toString('hex');
+      await fs.writeFile(tmpPath, content);
+      await this.renameWithRetry(tmpPath, diskPath);
 
-    await this.withManifestLock(async () => {
-      if (!this.manifest) {
-        this.manifest = {
-          version: 1,
-          generation: 1,
-          lastCommitSha: '',
-          lastUpdated: new Date().toISOString(),
-          files: {},
+      await this.withManifestLock(async () => {
+        if (!this.manifest) {
+          this.manifest = {
+            version: 1,
+            generation: 1,
+            lastCommitSha: '',
+            lastUpdated: new Date().toISOString(),
+            files: {},
+          };
+        }
+
+        this.manifest.files[repoPath] = {
+          sha,
+          etag,
+          cachedAt: new Date().toISOString(),
         };
-      }
-
-      this.manifest.files[repoPath] = {
-        sha,
-        etag,
-        cachedAt: new Date().toISOString(),
-      };
-      this.manifest.generation++;
-      this.manifest.lastUpdated = new Date().toISOString();
-      await this.saveManifest();
-    });
+        this.manifest.generation++;
+        this.manifest.lastUpdated = new Date().toISOString();
+        await this.saveManifest();
+      });
+    } catch (err) {
+      // t/4298/t/4299: see writeToDiskCache's catch — a write-through cache
+      // failure must never crash the read it follows.
+      const message = `Disk cache write-through failed for ${repoPath} — serving the fetched content, but it won't be cached (t/4298/t/4299)`;
+      log.storage.warn({ repoPath, error: String(err) }, message);
+      this.recordEvent({
+        type: 'storage.fallback',
+        component: 'storage',
+        level: 'warn',
+        message,
+        error: { name: (err as Error)?.name ?? 'Error', message: String(err), stack: (err as Error)?.stack },
+        data: { repoPath },
+      });
+    }
   }
 
   private async removeFromDiskCache(repoPath: string): Promise<void> {
@@ -1463,9 +2168,18 @@ export class GitHubAPIBackend implements StorageBackend {
 
   private getCachedEtag(pathAndQuery: string): string | null {
     if (!this.manifest) return null;
-    // Extract repo path from the API endpoint
+    // Extract repo path and an explicit ?ref= from the API endpoint.
     const match = pathAndQuery.match(/\/contents\/(.+?)(\?|$)/);
     if (!match) return null;
+    // t/4258/t/4295: the manifest/disk cache this etag was recorded from is
+    // main-only (writeToDiskCache/writeBinaryToDiskCache) — reusing it for a
+    // session-branch GET on the same path is wrong whenever the branch's
+    // content happens to equal main's (the common case right after a branch
+    // is created). GitHub legitimately 304s, and nothing downstream has a
+    // branch-scoped body to fall back on, so scope the cache to main/no ref.
+    const refMatch = pathAndQuery.match(/[?&]ref=([^&]*)/);
+    const ref = refMatch ? decodeURIComponent(refMatch[1]) : this.baseBranch;
+    if (ref !== this.baseBranch) return null;
     const entry = this.manifest.files[match[1]];
     return entry?.etag || null;
   }
@@ -1485,7 +2199,10 @@ export class GitHubAPIBackend implements StorageBackend {
       `/repos/${creds.repo}/contents/${repoPath}${qRef}`,
       undefined, undefined, optional ? { optional: true } : undefined);
 
-    if (!resp.ok) return null;
+    // t/4258/t/4295: a 304 (ok: true, data: null) means the body is unchanged
+    // from a cached etag — getCachedEtag() no longer sends one for a non-main
+    // ref, but treat it as a miss defensively rather than crash on null data.
+    if (!resp.ok || resp.status === 304) return null;
 
     const data = resp.data as {
       content?: string;
@@ -1539,7 +2256,8 @@ export class GitHubAPIBackend implements StorageBackend {
     const resp = await this.rest.request(creds, 'GET',
       `/repos/${creds.repo}/contents/${repoPath}${qRef}`);
 
-    if (!resp.ok) return null;
+    // t/4258/t/4295: see fetchFileFromGitHub — a 304 carries no data.
+    if (!resp.ok || resp.status === 304) return null;
 
     const data = resp.data as {
       content?: string;
@@ -1553,7 +2271,7 @@ export class GitHubAPIBackend implements StorageBackend {
 
     if (!data.content || data.encoding !== 'base64') {
       if (data.sha && (data.size ?? 0) > 0) {
-        return this.fetchBinaryBlobFromGitHub(creds, data.sha, resp.etag ?? '');
+        return this.fetchBinaryRawFromGitHub(creds, repoPath, qRef, data.sha, resp.etag ?? '');
       }
       return null;
     }
@@ -1562,21 +2280,29 @@ export class GitHubAPIBackend implements StorageBackend {
     return { content, sha: data.sha, etag: resp.etag ?? '' };
   }
 
-  private async fetchBinaryBlobFromGitHub(
+  /** t/4286: for a file too large for the Contents API's inline `content` (>1MB),
+   *  re-request the SAME Contents endpoint with the raw media type instead of the
+   *  Git Blobs API (`/git/blobs/{sha}`) — GitHub serves raw bytes up to 100MB this
+   *  way, with no JSON envelope and no base64. The Blobs API has no raw mode, so it
+   *  always pays a `res.text()` + `JSON.parse()` pass (base64-in-JSON) followed by a
+   *  SECOND synchronous `Buffer.from(..., 'base64')` decode — both over the full
+   *  body, both unyielded. Confirmed as the ~700ms-class event-loop block on a cold
+   *  read of the synthetic-embeddings .npy files (t/4286#25/#27/#28). One raw
+   *  `res.arrayBuffer()` read in `GitHubRestClient.request()`'s `raw` path replaces
+   *  both decodes with zero synchronous full-body passes. */
+  private async fetchBinaryRawFromGitHub(
     creds: SyncCredentials,
+    repoPath: string,
+    qRef: string,
     sha: string,
     etag: string,
   ): Promise<{ content: Buffer; sha: string; etag: string } | null> {
     const resp = await this.rest.request(creds, 'GET',
-      `/repos/${creds.repo}/git/blobs/${sha}`);
+      `/repos/${creds.repo}/contents/${repoPath}${qRef}`, undefined, undefined, { raw: true });
 
     if (!resp.ok) return null;
 
-    const data = resp.data as { content: string; encoding: string; sha: string };
-    const content = data.encoding === 'base64'
-      ? Buffer.from(data.content, 'base64')
-      : Buffer.from(data.content);
-    return { content, sha: data.sha, etag: resp.etag ?? etag };
+    return { content: resp.data as Buffer, sha, etag: resp.etag ?? etag };
   }
 
   private async getFileSha(repoPath: string, ref: string): Promise<string | null> {
@@ -1596,11 +2322,38 @@ export class GitHubAPIBackend implements StorageBackend {
     const qRef = ref === 'main' ? '' : `?ref=${encodeURIComponent(ref)}`;
     const resp = await this.rest.request(creds, 'GET',
       `/repos/${creds.repo}/contents/${repoPath}${qRef}`);
-    if (!resp.ok) return null;
+    // t/4258/t/4295: see fetchFileFromGitHub — a 304 carries no data.
+    if (!resp.ok || resp.status === 304) return null;
     return (resp.data as { sha: string }).sha;
   }
 
   // ── Repo tree ──────────────────────────────────────────────────────────
+
+  /**
+   * t/4201: populate `repoTree` on a cache-hit start. Without it, `listDirectory` and `exists` fall back
+   * to the GitHub Contents API on EVERY call — including every /healthz probe — so GitHub load scaled
+   * with replicas × probes, and at 5 replicas GitHub refused and every replica crash-looped (t/4176,
+   * 2026-10-13). One recursive-tree fetch (2 API calls) per start replaces that per-request traffic.
+   * If the fetch fails, seed the tree from the manifest's known files instead (logged WARN), so
+   * listings keep working from the shared cache while GitHub is unavailable.
+   */
+  private async loadTreeOnCacheHit(mainSha: string): Promise<'api' | 'manifest' | 'none'> {
+    if (await this.fetchRepoTree(mainSha)) return 'api';
+    const files = Object.entries(this.manifest?.files ?? {});
+    for (const [repoPath, f] of files) {
+      this.repoTree.set(repoPath, { path: repoPath, mode: '100644', type: 'blob', sha: f.sha });
+    }
+    this.recordEvent({
+      type: 'github.api.error',
+      component: 'github-api',
+      level: 'warn',
+      message: `initialize: tree fetch failed on a cache hit — seeded repoTree from the manifest (${files.length} files); listings may omit files not yet cached`,
+      data: { sha: mainSha, seeded: files.length },
+    });
+    log.server.warn({ sha: mainSha, seeded: files.length, cause: 'tree-fetch-failed-on-cache-hit' },
+      'initialize: tree fetch failed on a cache hit — seeded repoTree from the manifest (t/4201)');
+    return files.length > 0 ? 'manifest' : 'none';
+  }
 
   private async fetchRepoTree(commitSha: string): Promise<boolean> {
     if (!commitSha) return false;
@@ -1635,6 +2388,10 @@ export class GitHubAPIBackend implements StorageBackend {
         message: 'fetchRepoTree: 0 blobs loaded — data-load failed (check GitHub API response and undici version)',
         data: { commitSha, treeSha },
       });
+      // t/4258/t/4281: the comment above says "log at error-level so ops has a
+      // signal" but recordEvent() alone never reached console — this was the
+      // signal that never fired. Also feeds alert-github-api-error-spike.
+      log.github.error({ commitSha, treeSha }, 'github.api.error: fetchRepoTree 0 blobs loaded — data-load failed');
       return false;
     }
 
@@ -1660,12 +2417,146 @@ export class GitHubAPIBackend implements StorageBackend {
   private startPolling(): void {
     if (this.pollTimer) return;
 
-    this.pollTimer = setInterval(() => void (async () => {
-      try {
-        const currentSha = await this.getLatestCommitSha();
-        if (!currentSha || currentSha === this.manifest?.lastCommitSha) return;
+    this.pollTimer = setInterval(() => void this.pollTick(), this.pollIntervalMs);
 
-        const changed = this.manifest?.lastCommitSha
+    if (this.blobLease) {
+      // t/4179 R1 (TL p/538#66): renew on its OWN timer, independent of tick
+      // latency. With duration == pollIntervalMs, renewing only on the tick
+      // would renew right at the expiry boundary — any slow tick (a GitHub
+      // call, GC) lets the lease lapse and the holder churns every minute.
+      // duration/3 gives two full retry windows before expiry.
+      const renewMs = Math.max(1000, Math.floor((this.pollLeaseDurationSeconds * 1000) / 3));
+      this.leaseRenewTimer = setInterval(() => void this.renewPollLease(), renewMs);
+      void this.renewPollLease(); // first attempt now, not after a full renewMs wait
+    }
+  }
+
+  /**
+   * t/4179 R1: the ONLY place that calls `blobLease.acquireOrRenew()`. The
+   * poll tick itself just reads `blobLease.isHolder()` (a cheap local flag)
+   * to pick its branch — safety against that flag being stale comes from the
+   * fenced write in publishPollState(), not from this timer being perfectly
+   * accurate.
+   */
+  private async renewPollLease(): Promise<void> {
+    if (!this.blobLease) return;
+    const wasHolder = this.blobLease.isHolder();
+    let isHolder: boolean;
+    try {
+      isHolder = await this.blobLease.acquireOrRenew();
+    } catch (err: unknown) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'cache', level: 'warn',
+        message: 'Poll-lease acquire/renew failed',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+      this.recordEvent({
+        type: 'system.error', component: 'cache', level: 'warn',
+        message: 'Poll-lease acquire/renew failed — holder status uncertain, pollTick will fall back to direct polling',
+        error: normalizeErrorForEvent(err),
+      });
+      return;
+    }
+    if (isHolder && !wasHolder) await this.seedGenerationAfterAcquiring();
+  }
+
+  /**
+   * t/4179 R2 (TL p/538#66): read the published state AFTER acquiring, never
+   * before — a dying holder can still publish right up to expiry, and once
+   * we hold the lease the fence guarantees this read is the final word.
+   * Seeds at remote.generation + 1 so numbering stays continuous across a
+   * holder handoff; a missing/unparseable state seeds at 0 with a WARN.
+   */
+  private async seedGenerationAfterAcquiring(): Promise<void> {
+    let remote: PollState | null = null;
+    try {
+      remote = await this.readPollState();
+    } catch (err: unknown) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'cache', level: 'warn',
+        message: 'Became poll-lease holder: reading existing poll-state failed',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+      this.recordEvent({
+        type: 'system.error', component: 'cache', level: 'warn',
+        message: 'Became poll-lease holder: reading existing poll-state failed — seeding generation at 0',
+        error: normalizeErrorForEvent(err),
+      });
+    }
+    if (remote === null) {
+      this.recordEvent({
+        type: 'system.error', component: 'cache', level: 'warn',
+        message: 'Became poll-lease holder: poll-state missing or unparseable — seeding generation at 0',
+      });
+    }
+    this.pollStateGeneration = remote && Number.isFinite(remote.generation) ? remote.generation + 1 : 0;
+    this.pollStateHistory = [];
+  }
+
+  private async pollTick(): Promise<void> {
+    if (!this.blobLease) return this.pollDirect();
+    if (this.blobLease.isHolder()) return this.pollAsHolder();
+    return this.pollAsNonHolder();
+  }
+
+  /** The pre-t/4179 poll body, unchanged — used when no pollLease is
+   *  configured, and as the fallback when coordination is unavailable
+   *  (TL t/4179#2 §2 point 2: fail toward coherence, never toward silent
+   *  staleness). */
+  private async pollDirect(): Promise<void> {
+    try {
+      const currentSha = await this.getLatestCommitSha();
+      if (!currentSha || currentSha === this.manifest?.lastCommitSha) return;
+
+      const changed = this.manifest?.lastCommitSha
+        ? await this.getChangedFiles(this.manifest.lastCommitSha, currentSha)
+        : [];
+
+      if (changed.length > 0) {
+        this.recordEvent({
+          type: 'cache.invalidate',
+          component: 'cache',
+          level: 'info',
+          message: `Poll: ${changed.length} files changed`,
+          data: { paths: changed.slice(0, 20), trigger: 'poll', sha: currentSha },
+        });
+        await this.withManifestLock(async () => {
+          for (const filePath of changed) {
+            if (this.manifest?.files[filePath]) delete this.manifest.files[filePath];
+          }
+        });
+      }
+
+      await this.fetchRepoTree(currentSha);
+      await this.updateManifestSha(currentSha);
+    } catch (err: unknown) {
+      getGlobalRecorder()?.record({
+        type: 'system.error',
+        component: 'github-api',
+        level: 'error',
+        message: 'Operation failed',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+      this.recordEvent({
+        type: 'system.error',
+        component: 'cache',
+        level: 'error',
+        message: 'Polling loop error',
+        error: normalizeErrorForEvent(err),
+        data: { context: 'background-task' },
+      });
+    }
+  }
+
+  /** The current holder's poll: does the real GitHub work (unchanged from
+   *  pollDirect), then publishes the result for non-holders to consume. */
+  private async pollAsHolder(): Promise<void> {
+    let currentSha = '';
+    let changed: string[] = [];
+    try {
+      currentSha = await this.getLatestCommitSha();
+      if (currentSha && currentSha !== this.manifest?.lastCommitSha) {
+        changed = this.manifest?.lastCommitSha
           ? await this.getChangedFiles(this.manifest.lastCommitSha, currentSha)
           : [];
 
@@ -1677,38 +2568,215 @@ export class GitHubAPIBackend implements StorageBackend {
             message: `Poll: ${changed.length} files changed`,
             data: { paths: changed.slice(0, 20), trigger: 'poll', sha: currentSha },
           });
-
-          // Invalidate changed files from disk cache (under manifest lock)
           await this.withManifestLock(async () => {
             for (const filePath of changed) {
-              if (this.manifest?.files[filePath]) {
-                delete this.manifest.files[filePath];
-              }
+              if (this.manifest?.files[filePath]) delete this.manifest.files[filePath];
             }
           });
         }
 
-        // Update tree
         await this.fetchRepoTree(currentSha);
         await this.updateManifestSha(currentSha);
-      } catch (err: unknown) {
-        getGlobalRecorder()?.record({
-          type: 'system.error',
-          component: 'github-api',
-          level: 'error',
-          message: 'Operation failed',
-          error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
-        });
-        this.recordEvent({
-          type: 'system.error',
-          component: 'cache',
-          level: 'error',
-          message: 'Polling loop error',
-          error: normalizeErrorForEvent(err),
-          data: { context: 'background-task' },
-        });
       }
-    })(), this.pollIntervalMs);
+    } catch (err: unknown) {
+      getGlobalRecorder()?.record({
+        type: 'system.error',
+        component: 'github-api',
+        level: 'error',
+        message: 'Operation failed',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+      this.recordEvent({
+        type: 'system.error',
+        component: 'cache',
+        level: 'error',
+        message: 'Polling loop error',
+        error: normalizeErrorForEvent(err),
+        data: { context: 'background-task' },
+      });
+      return;
+    }
+    await this.publishPollState(currentSha || this.manifest?.lastCommitSha || '', changed);
+  }
+
+  /** Publish the holder's result, fenced to its current lease — a holder
+   *  that renewed too late (another replica already took over) gets a 412
+   *  here and just skips the publish, instead of silently writing stale
+   *  state under a lease it no longer holds. */
+  private async publishPollState(lastCommitSha: string, changedPaths: string[]): Promise<void> {
+    if (!this.blobLease) return;
+    const leaseId = this.blobLease.getLeaseId();
+    if (!leaseId) return; // lost holder status — next tick re-evaluates via isHolder()
+
+    this.pollStateGeneration++;
+    if (changedPaths.length > 0) {
+      this.pollStateHistory.push({ generation: this.pollStateGeneration, paths: changedPaths });
+      if (this.pollStateHistory.length > POLL_STATE_HISTORY_CAP) this.pollStateHistory.shift();
+    }
+    const state: PollState = {
+      holderId: this.holderId,
+      generation: this.pollStateGeneration,
+      lastCommitSha,
+      changedSinceGeneration: this.pollStateHistory,
+      publishedAt: new Date().toISOString(),
+    };
+    const payload = JSON.stringify(state);
+    try {
+      await this.pollStateBlobClient().upload(payload, Buffer.byteLength(payload), { conditions: { leaseId } });
+    } catch (err: unknown) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'cache', level: 'warn',
+        message: 'Poll-state publish rejected (fence) — another replica took over the lease',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+      this.recordEvent({
+        type: 'system.error', component: 'cache', level: 'warn',
+        message: 'Poll-state publish rejected (fence) — another replica took over the lease',
+        error: normalizeErrorForEvent(err),
+      });
+    }
+  }
+
+  private async readPollState(): Promise<PollState | null> {
+    if (!this.blobLeaseContainerClient) return null;
+    try {
+      const resp = await this.pollStateBlobClient().download();
+      const raw = await streamToStringForPoll(resp.readableStreamBody);
+      return JSON.parse(raw) as PollState;
+    } catch (err: unknown) {
+      if (isBlobNotFoundForPoll(err)) return null;
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'cache', level: 'warn',
+        message: 'readPollState: poll-state blob read failed (not a 404)',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+      throw err;
+    }
+  }
+
+  private pollStateBlobClient(): BlockBlobClient {
+    return this.blobLeaseContainerClient!.getBlockBlobClient(POLL_STATE_BLOB);
+  }
+
+  /**
+   * Non-holder poll: read the holder's published state instead of calling
+   * GitHub. Falls back to pollDirect() (TL t/4179#2 §2 point 2) if the state
+   * is missing, unreadable, or older than POLL_STATE_STALE_FACTOR × the poll
+   * interval — never trusts a state we can't confirm is current.
+   */
+  private async pollAsNonHolder(): Promise<void> {
+    let state: PollState | null;
+    try {
+      state = await this.readPollState();
+    } catch (err: unknown) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'cache', level: 'warn',
+        message: 'Poll-state read failed — falling back to direct poll',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+      this.recordEvent({
+        type: 'system.error', component: 'cache', level: 'warn',
+        message: 'Poll-state read failed — falling back to direct poll',
+        error: normalizeErrorForEvent(err),
+      });
+      return this.pollDirect();
+    }
+    if (state === null) return this.pollDirect();
+
+    const ageMs = Date.now() - Date.parse(state.publishedAt);
+    if (!Number.isFinite(ageMs) || ageMs > this.pollIntervalMs * POLL_STATE_STALE_FACTOR) {
+      this.recordEvent({
+        type: 'system.error', component: 'cache', level: 'warn',
+        message: `Poll-state stale (${ageMs}ms old, limit ${this.pollIntervalMs * POLL_STATE_STALE_FACTOR}ms) — falling back to direct poll`,
+        data: { ageMs },
+      });
+      return this.pollDirect();
+    }
+
+    await this.applyPollState(state);
+
+    this.pollLastSeenGeneration = state.generation;
+    this.pollLastSeenHolderId = state.holderId;
+  }
+
+  /** Extracted from pollAsNonHolder() to keep its own complexity under
+   *  budget. Decides gap vs. incremental catch-up and applies it to the
+   *  local manifest/tree caches; does not touch pollLastSeen* bookkeeping. */
+  private async applyPollState(state: PollState): Promise<void> {
+    // t/4179 R2: a generation that goes backwards, or stays the same/lower
+    // while the holderId changed, is a gap — never trust it as "no change".
+    const generationWentBackwards = state.generation < this.pollLastSeenGeneration;
+    const suspiciousHolderChange = this.pollLastSeenHolderId !== null
+      && state.holderId !== this.pollLastSeenHolderId
+      && state.generation <= this.pollLastSeenGeneration;
+
+    if (this.pollLastSeenGeneration === 0 || generationWentBackwards || suspiciousHolderChange) {
+      await this.fullCacheInvalidation();
+      await this.ensureRepoTreeFilled();
+    } else if (state.generation > this.pollLastSeenGeneration) {
+      await this.applyIncrementalPollChanges(state);
+    }
+
+    if (state.lastCommitSha && state.lastCommitSha !== this.manifest?.lastCommitSha) {
+      await this.updateManifestSha(state.lastCommitSha);
+    }
+  }
+
+  /** Extracted from applyPollState(): the "generation moved forward, no gap
+   *  detected yet" branch — still checks the history-list gap case. */
+  private async applyIncrementalPollChanges(state: PollState): Promise<void> {
+    const oldestTracked = state.changedSinceGeneration[0]?.generation;
+    const hasHistoryGap = oldestTracked === undefined || oldestTracked > this.pollLastSeenGeneration + 1;
+    if (hasHistoryGap) {
+      await this.fullCacheInvalidation();
+      await this.ensureRepoTreeFilled();
+      return;
+    }
+
+    const toApply = state.changedSinceGeneration.filter(e => e.generation > this.pollLastSeenGeneration);
+    const paths = new Set<string>();
+    for (const entry of toApply) for (const p of entry.paths) paths.add(p);
+    if (paths.size === 0) return;
+
+    await this.withManifestLock(async () => {
+      for (const p of paths) if (this.manifest?.files[p]) delete this.manifest.files[p];
+    });
+    this.repoTree.clear();
+    this.treeSha = null;
+    await this.ensureRepoTreeFilled();
+    this.recordEvent({
+      type: 'cache.invalidate', component: 'cache', level: 'info',
+      message: `Poll (non-holder): ${paths.size} files changed`,
+      data: { paths: [...paths].slice(0, 20), trigger: 'poll-shared-state' },
+    });
+  }
+
+  /**
+   * t/4179 R3 (TL p/538#66): single-flight lazy repoTree refill for
+   * non-holders. On failure, takes the SAME t/4201 manifest-seed path
+   * `loadTreeOnCacheHit` already uses on a cold start — it NEVER falls
+   * through to a per-call Contents API, which at N>1 non-holder replicas is
+   * exactly the crash-loop pattern t/4201/t/4176 fixed. Concurrent callers
+   * share one in-flight refill.
+   */
+  private async ensureRepoTreeFilled(): Promise<void> {
+    if (this.repoTree.size > 0) return;
+    if (!this.repoTreeRefillInFlight) {
+      const sha = this.manifest?.lastCommitSha;
+      this.repoTreeRefillInFlight = (sha ? this.loadTreeOnCacheHit(sha) : Promise.resolve('none' as const))
+        .then(() => undefined)
+        .finally(() => { this.repoTreeRefillInFlight = null; });
+    }
+    await this.repoTreeRefillInFlight;
+  }
+
+  /** t/4179 R3: only the holder (or a no-pollLease/single-replica backend)
+   *  may fall back to a per-call Contents API hit when the tree is empty. A
+   *  non-holder doing that at N>1 replicas reintroduces the t/4201 storm —
+   *  it takes the manifest-seed path instead, even degraded to an empty
+   *  listing on a cold cache, never a per-replica API call. */
+  private mayFallBackToContentsApi(): boolean {
+    return !this.blobLease || this.blobLease.isHolder();
   }
 
   private async invalidateChangedFiles(fromSha: string, toSha: string): Promise<void> {
@@ -1832,6 +2900,109 @@ export class GitHubAPIBackend implements StorageBackend {
     });
   }
 
+  /**
+   * t/4184 (SO condition C1): evict a single path's cache entries after a 409
+   * so the NEXT readFile fetches fresh from GitHub instead of serving the same
+   * stale content/SHA that just conflicted — without this, "reload and
+   * re-apply" reloads the same stale state and 409s again indefinitely.
+   */
+  private async evictPathFromCache(repoPath: string): Promise<void> {
+    this.repoTree.delete(repoPath);
+    await this.withManifestLock(async () => {
+      if (this.manifest?.files[repoPath]) {
+        delete this.manifest.files[repoPath];
+        this.manifest.generation++;
+        this.manifest.lastUpdated = new Date().toISOString();
+        await this.saveManifest();
+      }
+    });
+  }
+
+  /**
+   * t/4184: the 409-conflict error for writeFile/writeBinaryFile. No retry —
+   * the caller's `content` was computed from a now-stale read, so re-sending
+   * it with a fresh SHA would silently discard the other writer's commit.
+   * `httpStatus`/`code` let the route layer (ServerAPI, t/4185) map this to a
+   * clean HTTP 409 and the renderer (Sync, t/4186) show a conflict message
+   * instead of a generic 500 — contract finalized at t/4185#2.
+   */
+  private writeConflictError(repoPath: string, method: string): ActionableError {
+    return new ActionableError({
+      goal: `Save ${repoPath}`,
+      problem: 'The file changed since you loaded it (someone else saved a conflicting change).',
+      location: `GitHubAPIBackend.${method}(${repoPath})`,
+      nextSteps: ['Reload the file to see the latest version', 'Re-apply your change and save again'],
+      httpStatus: 409,
+      code: 'WRITE_CONFLICT',
+    });
+  }
+
+  /**
+   * t/4224 (TL design, p/538#40/#43): the current state of `repoPath` on a
+   * session branch, read live from GitHub — the one authoritative source for
+   * every route that can move the branch head (commitOverlay, mergeBranch, a
+   * resync conflict resolved on GitHub, another replica, SessionBranchManager
+   * .commitBatch, or anything else). A session-branch precondition or
+   * edit-load checked against main's SHA instead is exactly the t/4224 bug —
+   * a stale or wrong baseline silently reverting this session's own commits.
+   *
+   * Tells a genuinely missing file ('absent' — a 404, a legitimate "nothing
+   * here yet" for a new path) apart from a real fetch failure ('unavailable'
+   * — no creds, 5xx, timeout, a directory). Collapsing those (p/538#43) made
+   * every session-branch write that CREATES a file 503 — this never throws;
+   * callers decide what each outcome means for their own operation.
+   */
+  private async getSessionBranchFileStatus(
+    repoPath: string, ref: string,
+  ): Promise<{ kind: 'present'; content: string; sha: string } | { kind: 'absent' } | { kind: 'unavailable' }> {
+    const creds = await this.getCredsCached();
+    if (!creds) return { kind: 'unavailable' };
+
+    const qRef = ref === 'main' ? '' : `?ref=${encodeURIComponent(ref)}`;
+    const resp = await this.rest.request(creds, 'GET',
+      `/repos/${creds.repo}/contents/${repoPath}${qRef}`,
+      undefined, undefined, { optional: true });
+
+    if (resp.status === 404) return { kind: 'absent' };
+    // t/4258/t/4295: a 304 (ok: true, data: null) means the body is unchanged
+    // from a cached etag — getCachedEtag() no longer sends one for a non-main
+    // ref, but treat it as unavailable defensively rather than crash reading
+    // `.type` off null data.
+    if (!resp.ok || resp.status === 304) return { kind: 'unavailable' };
+
+    const data = resp.data as { content?: string; encoding?: string; sha: string; size?: number; type?: string };
+    if (data.type === 'dir') return { kind: 'unavailable' }; // not a valid target for a file precondition/edit-load
+
+    if (!data.content || data.encoding !== 'base64') {
+      // Large file — use Blobs API
+      if (data.sha && (data.size ?? 0) > 0) {
+        const blob = await this.fetchBlobFromGitHub(creds, data.sha, resp.etag ?? '');
+        return blob ? { kind: 'present', content: blob.content, sha: blob.sha } : { kind: 'unavailable' };
+      }
+      return { kind: 'unavailable' };
+    }
+
+    const content = Buffer.from(data.content, 'base64').toString('utf-8');
+    return { kind: 'present', content, sha: data.sha };
+  }
+
+  /** Shared 503, for both writeOverlayWithPrecondition and readFileWithVersion. */
+  private throwVersionUnavailable(repoPath: string, ref: string): never {
+    this.recordEvent({
+      type: 'github.api.error', component: 'github-api', level: 'warn',
+      message: `Could not verify the current version of ${repoPath} on ${ref} — failing closed rather than falling back to main`,
+      data: { path: repoPath, ref },
+    });
+    throw new ActionableError({
+      goal: `Read the current version of ${repoPath} on ${ref}`,
+      problem: 'Could not reach GitHub to verify the current version of this file on your session branch.',
+      location: `GitHubAPIBackend.getSessionBranchFileStatus(${repoPath})`,
+      nextSteps: ['Retry in a moment', 'Check GitHub API status'],
+      httpStatus: 503,
+      code: 'VERSION_UNAVAILABLE',
+    });
+  }
+
   // ── Flight recorder helpers ────────────────────────────────────────────
 
   private recordEvent(input: RecordInput): void {
@@ -1863,11 +3034,59 @@ export class GitHubAPIBackend implements StorageBackend {
   getCoherencyViolations(): number { return this.coherencyViolations; }
   getErrorBuffer(): Array<RecordInput & { _wall: number }> { return [...this.errorBuffer]; }
   getActiveBranchCount(): number { return this.sessionOverlays.size; }
+  /**
+   * @deprecated t/4307: only instruments one of several miss-then-fetch code
+   *  paths in this file (readFileFromMainCache) — readFileWithVersion,
+   *  readBinaryFile and readFileAtRef each have their own uncounted miss
+   *  branch, and this never saw session-branch reads at all (t/4300#18).
+   *  Use getRequestMetrics() instead — it counts every real outbound GitHub
+   *  call at the REST-client layer, regardless of which method issued it.
+   */
+  getColdCacheMissCount(): number { return this.coldCacheMissCount; }
+
+  /** t/4307: since-boot outbound GitHub request count by route class, plus
+   *  the latest x-ratelimit-remaining. Supersedes getColdCacheMissCount(). */
+  getRequestMetrics(): { totalRequests: number; byRouteClass: Record<string, number>; rateLimitRemaining: number } {
+    return this.rest.getRequestMetrics();
+  }
   getCacheHitRate(): number {
     // Approximation from tree + manifest coverage
     if (this.repoTree.size === 0) return 0;
     const cachedCount = this.manifest ? Object.keys(this.manifest.files).length : 0;
     return Math.min(1, cachedCount / Math.max(1, this.repoTree.size));
+  }
+
+  /** t/4312: record this path's base blob sha the first time it's staged in a
+   *  clean overlay slot. Idempotent — a later call for an already-recorded
+   *  path (a same-path rewrite, or a concurrent write that landed first) is a
+   *  no-op, because what's actually sitting in git for this path hasn't
+   *  changed since it was first staged; only the overlay's in-memory content has. */
+  private recordOverlayBaseShaOnce(userId: string, repoPath: string, baseSha: string | null | 'unknown'): void {
+    let bases = this.sessionOverlayBaseShas.get(userId);
+    if (!bases) { bases = new Map(); this.sessionOverlayBaseShas.set(userId, bases); }
+    if (!bases.has(repoPath)) bases.set(repoPath, baseSha);
+  }
+
+  /** t/4312: for the no-precondition write path, resolve+record a base on
+   *  first staging only — extracted to keep writeOverlayWithPrecondition's
+   *  complexity down. A no-op when already staged or no active session. */
+  private async maybeRecordBaseShaForFreshStage(
+    userId: string | undefined, repoPath: string, ref: string, alreadyStaged: boolean,
+  ): Promise<void> {
+    if (!userId || alreadyStaged) return;
+    if (this.sessionOverlayBaseShas.get(userId)?.has(repoPath)) return;
+    this.recordOverlayBaseShaOnce(userId, repoPath, await this.resolveLiveBaseSha(repoPath, ref));
+  }
+
+  /** t/4312: live lookup used to resolve a path's base blob sha at first
+   *  staging. 'unknown' (not a thrown error) on an unreachable session branch —
+   *  fails CLOSED at commit time (always conflicts) rather than risking a
+   *  silent overwrite from trusting an unverifiable base. */
+  private async resolveLiveBaseSha(repoPath: string, ref: string): Promise<string | null | 'unknown'> {
+    const status = await this.getSessionBranchFileStatus(repoPath, ref);
+    if (status.kind === 'present') return status.sha;
+    if (status.kind === 'absent') return null;
+    return 'unknown';
   }
 
   /**
@@ -1879,6 +3098,7 @@ export class GitHubAPIBackend implements StorageBackend {
     const repoPath = this.toRepoPath(filePath);
     const userId = this.getEffectiveUserId();
     if (!userId) return;
+    this.sessionWriteActivitySeq.set(userId, ++this.sessionWriteActivityCounter); // t/4215 budget addendum
     let overlay = this.sessionOverlays.get(userId);
     if (!overlay) {
       overlay = new Map();
@@ -1938,11 +3158,17 @@ export class GitHubAPIBackend implements StorageBackend {
    * Mark a file as deleted in the overlay (tombstone).
    * readFile() returns null, fileExists() returns false, and commitOverlay()
    * will remove the file from the Git tree.
+   * t/4312: deletes get the same base-sha fencing as writes — a live lookup
+   * on first staging, since deletes have no client-supplied baseSha to reuse.
    */
-  deleteFromOverlay(filePath: string): void {
+  async deleteFromOverlay(filePath: string, ref: string): Promise<void> {
     const repoPath = this.toRepoPath(filePath);
     const userId = this.getEffectiveUserId();
     if (!userId) return;
+    this.sessionWriteActivitySeq.set(userId, ++this.sessionWriteActivityCounter); // t/4215 budget addendum
+    if (!this.sessionOverlayBaseShas.get(userId)?.has(repoPath)) {
+      this.recordOverlayBaseShaOnce(userId, repoPath, await this.resolveLiveBaseSha(repoPath, ref));
+    }
     let overlay = this.sessionOverlays.get(userId);
     if (!overlay) {
       overlay = new Map();
@@ -1987,6 +3213,8 @@ export class GitHubAPIBackend implements StorageBackend {
 
   clearSessionOverlay(userId: string): void {
     this.sessionOverlays.delete(userId);
+    this.sessionOverlayBaseShas.delete(userId); // t/4312 condition 3
+    this.sessionOverlayConflicts.delete(userId); // t/4312 condition 3 (SO F1 state)
     this.recordEvent({
       type: 'branch.delete',
       component: 'session',
@@ -1994,6 +3222,215 @@ export class GitHubAPIBackend implements StorageBackend {
       message: `Session overlay cleared for ${userId}`,
       data: { userId },
     });
+  }
+
+  /** t/4312 SO F1 ("Use theirs"), whole-batch per TL's correction (p/538#97):
+   *  a per-path discard could leave the same cross-file inconsistency F2
+   *  exists to prevent. **Operates on the WHOLE staged overlay, not just
+   *  the conflicted subset** (Rosetta Stone's catch, p/641#10/#11): a kept
+   *  `edges.json` that references a node only the discarded `skeptic.json`
+   *  defined would dangle just as badly as a partial commit would have.
+   *  Discards every staged path and its recorded base together — they all
+   *  read live from the committed branch again. Idempotent: a no-op (empty
+   *  result) when nothing is staged, so a double-call is safe. Returns the
+   *  paths actually discarded. */
+  discardConflictedOverlayEntries(userId: string): string[] {
+    const overlay = this.sessionOverlays.get(userId);
+    if (!overlay || overlay.size === 0) return [];
+    const targets = [...overlay.keys()];
+    this.sessionOverlays.delete(userId);
+    this.sessionOverlayBaseShas.delete(userId);
+    this.sessionOverlayConflicts.delete(userId);
+    return targets;
+  }
+
+  /** t/4312 SO F1 ("Keep mine"), whole-batch per TL's correction (p/538#97)
+   *  and Rosetta Stone's catch (p/641#10/#11) — same cross-file-consistency
+   *  reasoning as discard above. Re-bases EVERY staged path (not just the
+   *  conflicted subset) to the branch's CURRENT head together, then
+   *  attempts one commit — the staged content now looks fresh against the
+   *  new base and intentionally overwrites the other actor's changes (an
+   *  explicit, user-confirmed overwrite, never a silent one). `stillConflicted`
+   *  is normally empty; non-empty only if another conflict lands in the brief
+   *  window between the rebase and the commit — the caller should re-enter
+   *  resolution for those, never auto-retry this call. */
+  async rebaseAndRecommitConflictedOverlayEntries(
+    userId: string, branchName: string,
+  ): Promise<{ committed: boolean; commitSha?: string; filesCommitted?: number; stillConflicted: string[] }> {
+    const overlay = this.sessionOverlays.get(userId);
+    if (!overlay || overlay.size === 0) return { committed: false, stillConflicted: [] };
+    let bases = this.sessionOverlayBaseShas.get(userId);
+    if (!bases) { bases = new Map(); this.sessionOverlayBaseShas.set(userId, bases); }
+    for (const path of overlay.keys()) bases.set(path, await this.resolveLiveBaseSha(path, branchName));
+    this.sessionOverlayConflicts.delete(userId);
+
+    const result = await this.commitOverlay(userId, undefined, { branchName });
+    if (!result) return { committed: false, stillConflicted: [] };
+    return {
+      committed: (result.conflictedPaths?.length ?? 0) === 0 && result.filesCommitted > 0,
+      commitSha: result.commitSha,
+      filesCommitted: result.filesCommitted,
+      stillConflicted: result.conflictedPaths ?? [],
+    };
+  }
+
+  /**
+   * t/4258/t/4277 (C1): remove only the overlay entries a commit actually
+   * committed, and only if they're unchanged since the pre-commit snapshot.
+   * A write (or delete) that landed on a path while the commit's GitHub
+   * calls were in flight must survive — it wasn't part of what got
+   * committed, so clearing it would silently drop it. Unlike
+   * clearSessionOverlay() (full wipe, used for session teardown), this is
+   * commitOverlayImpl's post-commit cleanup only.
+   *
+   * t/4312 (condition 2/3): a path that stays staged (content moved mid-flight)
+   * gets its recorded base REFRESHED to what we just committed — otherwise
+   * the user's own next commit attempt would compare against the old
+   * pre-commit base and conflict with itself. A path that does get cleared
+   * has its base removed entirely (nothing left to track).
+   */
+  private clearCommittedOverlayEntries(
+    userId: string,
+    committed: { writes: { path: string; content: string }[]; deletes: string[] },
+  ): void {
+    const overlay = this.sessionOverlays.get(userId);
+    const bases = this.sessionOverlayBaseShas.get(userId);
+    if (overlay) {
+      for (const w of committed.writes) {
+        if (overlay.get(w.path) === w.content) { overlay.delete(w.path); bases?.delete(w.path); }
+        else bases?.set(w.path, gitBlobSha(w.content));
+      }
+      for (const path of committed.deletes) {
+        if (overlay.get(path) === GitHubAPIBackend.TOMBSTONE) { overlay.delete(path); bases?.delete(path); }
+        else bases?.set(path, null);
+      }
+      if (overlay.size === 0) this.sessionOverlays.delete(userId);
+    }
+    if (bases && bases.size === 0) this.sessionOverlayBaseShas.delete(userId);
+  }
+
+  /** t/4312: find which overlay entries' recorded base no longer matches the
+   *  current tree (someone else's commit, or our own since-committed
+   *  content, moved it). A base-tree lookup failure or a truncated tree
+   *  fails CLOSED: every entry conflicts rather than risking a silent
+   *  overwrite. SO condition F2 (e/333#2): any conflict means the caller
+   *  commits NOTHING this round, so this only needs to report which paths
+   *  conflict, not split entries into a safe/conflicted pair. */
+  private async partitionOverlayEntriesByBase(
+    creds: SyncCredentials, userId: string,
+    entries: { writes: { path: string; content: string }[]; deletes: string[] },
+    currentSha: string, callId: string,
+  ): Promise<{ conflictedPaths: string[] }> {
+    const treeResp = await this.rest.request(creds, 'GET',
+      `/repos/${creds.repo}/git/trees/${currentSha}?recursive=1`, undefined, callId);
+    const failClosed = !treeResp.ok || (treeResp.data as { truncated?: boolean } | null)?.truncated === true;
+    const shaByPath: Map<string, string> = failClosed
+      ? new Map()
+      : new Map((treeResp.data as { tree: { path: string; sha: string; type: string }[] }).tree
+          .filter(t => t.type === 'blob').map(t => [t.path, t.sha]));
+
+    const bases = this.sessionOverlayBaseShas.get(userId);
+    // t/4312: 'unknown' means a live lookup was attempted and FAILED — fails
+    // closed (always conflicts), never trusted. `undefined` (no base ever
+    // recorded — a raw writeToOverlay() call, or an entry that predates this
+    // feature) is a DIFFERENT case: there's no evidence anything moved, so it
+    // keeps today's behavior rather than treating a bookkeeping gap as proof
+    // of a real conflict.
+    const isSafe = (path: string): boolean => {
+      if (failClosed) return false;
+      const base = bases?.get(path);
+      if (base === 'unknown') return false;
+      if (base === undefined) return true;
+      return base === (shaByPath.get(path) ?? null);
+    };
+
+    const conflictedPaths = [
+      ...entries.writes.map(w => w.path).filter(p => !isSafe(p)),
+      ...entries.deletes.filter(p => !isSafe(p)),
+    ];
+
+    if (failClosed && conflictedPaths.length > 0) {
+      this.recordEvent({
+        type: 'github.api.error', component: 'github-api', level: 'warn',
+        message: `commitOverlay: base-tree lookup failed or truncated for ${currentSha} — failing closed, ${conflictedPaths.length} path(s) treated as conflicted`,
+        data: { currentSha, paths: conflictedPaths },
+      });
+    }
+
+    return { conflictedPaths };
+  }
+
+  private buildOverlayTreeEntries(safe: { writes: { path: string; content: string }[]; deletes: string[] }): Record<string, unknown>[] {
+    return [
+      ...safe.writes.map(f => ({ path: f.path, mode: '100644', type: 'blob', content: f.content })),
+      ...safe.deletes.map(path => ({ path, mode: '100644', type: 'blob', sha: null })), // null SHA = delete from tree
+    ];
+  }
+
+  private buildOverlayCommitMessage(safe: { writes: { path: string; content: string }[]; deletes: string[] }): string {
+    const deleteSuffix = safe.deletes.length > 0 ? `, delete ${safe.deletes.length}` : '';
+    return `Update ${safe.writes.length} file(s)${deleteSuffix}`;
+  }
+
+  /** Steps 2-4 of commitOverlayImpl (create tree, create commit, update ref) —
+   *  extracted to keep commitOverlayImpl's own complexity down after t/4312's
+   *  base-fence partitioning. Behavior unchanged from before that change. */
+  private async createTreeCommitAndUpdateRef(
+    creds: SyncCredentials, branch: string, currentSha: string,
+    treeEntries: Record<string, unknown>[], commitMsg: string, callId: string,
+  ): Promise<string> {
+    const treeResp = await this.rest.request(creds, 'POST',
+      `/repos/${creds.repo}/git/trees`, { base_tree: currentSha, tree: treeEntries }, callId);
+    if (!treeResp.ok) {
+      throw new ActionableError({
+        goal: `Commit overlay to ${branch}`,
+        problem: `Failed to create tree: ${treeResp.status} ${treeResp.error}`,
+        location: 'GitHubAPIBackend.commitOverlay step 2',
+        nextSteps: ['Check file paths and content', 'Verify GitHub App permissions'],
+      });
+    }
+    const newTreeSha = (treeResp.data as { sha: string }).sha;
+
+    const commitResp = await this.rest.request(creds, 'POST',
+      `/repos/${creds.repo}/git/commits`, { message: commitMsg, tree: newTreeSha, parents: [currentSha] }, callId);
+    if (!commitResp.ok) {
+      throw new ActionableError({
+        goal: `Commit overlay to ${branch}`,
+        problem: `Failed to create commit: ${commitResp.status} ${commitResp.error}`,
+        location: 'GitHubAPIBackend.commitOverlay step 3',
+        nextSteps: ['Retry — dangling tree is harmless'],
+      });
+    }
+    const commitSha = (commitResp.data as { sha: string }).sha;
+
+    const updateResp = await this.rest.request(creds, 'PATCH',
+      `/repos/${creds.repo}/git/refs/heads/${branch}`, { sha: commitSha, force: false }, callId);
+    if (!updateResp.ok) {
+      throw new ActionableError({
+        goal: `Commit overlay to ${branch}`,
+        problem: `Failed to update branch ref: ${updateResp.status} ${updateResp.error}`,
+        location: 'GitHubAPIBackend.commitOverlay step 4',
+        nextSteps: ['Retry — tree and commit are already created'],
+      });
+    }
+    return commitSha;
+  }
+
+  /** t/4312: one WARN + flight-recorder event naming paths kept staged rather
+   *  than silently overwritten. */
+  private recordOverlayConflicts(userId: string, branch: string, conflictedPaths: string[]): void {
+    const warnMsg = `commitOverlay: ${conflictedPaths.length} path(s) conflicted on ${branch} for ${userId} — kept staged, not overwritten (t/4312)`;
+    log.storage.warn({ userId, branch, conflictedPaths }, warnMsg);
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'storage', level: 'warn', message: warnMsg, data: { userId, branch, conflictedPaths },
+    });
+  }
+
+  /** t/4215: wipe the plain-readFile session cache at true session end. */
+  clearSessionReadCache(userId: string): void {
+    this.sessionReadCache.delete(userId);
+    this.sessionReadCacheHeadSha.delete(userId);
+    this.sessionWriteActivitySeq.delete(userId);
   }
 }
 

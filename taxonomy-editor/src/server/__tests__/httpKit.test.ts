@@ -8,10 +8,11 @@
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import type { ServerResponse } from 'http';
-import { error, json, withEndpointTimeout } from '../httpKit.js';
+import { error, json, withEndpointTimeout, statusForError, codeForError, concatChunked, jsonStringifyChunked, type SerializeStats } from '../httpKit.js';
 import { log } from '../logger.js';
 import { setGlobalRecorder } from '../../../../lib/flight-recorder/index.js';
 import type { FlightRecorder, RecordInput } from '../../../../lib/flight-recorder/flightRecorder.js';
+import { ActionableError } from '../../../../lib/debate/errors.js';
 
 function fakeRes(method = 'GET', routePath = '/api/test'): ServerResponse {
   return {
@@ -99,6 +100,80 @@ describe('httpKit idempotent writes (t/1515)', () => {
   });
 });
 
+// ── t/4185: write-conflict ActionableError → HTTP 409 + machine-readable code ──
+function bodyOf(res: ServerResponse): Record<string, unknown> {
+  const call = (res.end as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+  return JSON.parse(call[0] as string) as Record<string, unknown>;
+}
+
+describe('statusForError (t/4185)', () => {
+  it('ActionableError with httpStatus set → that status', () => {
+    const err = new ActionableError({ goal: 'g', problem: 'p', location: 'l', nextSteps: [] });
+    err.httpStatus = 409;
+    expect(statusForError(err)).toBe(409);
+  });
+
+  it('ActionableError without httpStatus → the fallback (default 500)', () => {
+    const err = new ActionableError({ goal: 'g', problem: 'p', location: 'l', nextSteps: [] });
+    expect(statusForError(err)).toBe(500);
+  });
+
+  it('a plain Error (not ActionableError) → the fallback, never guesses a status from message text', () => {
+    expect(statusForError(new Error('conflict'))).toBe(500);
+  });
+
+  it('a custom fallback is honored when no httpStatus is set', () => {
+    expect(statusForError(new Error('x'), 400)).toBe(400);
+  });
+});
+
+describe('codeForError (t/4185)', () => {
+  it('ActionableError with code set → { code }', () => {
+    const err = new ActionableError({ goal: 'g', problem: 'p', location: 'l', nextSteps: [], code: 'WRITE_CONFLICT' });
+    expect(codeForError(err)).toEqual({ code: 'WRITE_CONFLICT' });
+  });
+
+  it('ActionableError without code → undefined (no stray code:undefined key)', () => {
+    const err = new ActionableError({ goal: 'g', problem: 'p', location: 'l', nextSteps: [] });
+    expect(codeForError(err)).toBeUndefined();
+  });
+
+  it('a plain Error → undefined', () => {
+    expect(codeForError(new Error('x'))).toBeUndefined();
+  });
+});
+
+describe('error() end-to-end: write-conflict maps to 409 + code, including in production (t/4185)', () => {
+  const ORIG_ENV = process.env.NODE_ENV;
+  afterEach(() => { vi.restoreAllMocks(); process.env.NODE_ENV = ORIG_ENV; });
+
+  it('409 + code survive the <500 branch in development', () => {
+    process.env.NODE_ENV = 'development';
+    const res = fakeRes('PUT', '/api/taxonomy/:pov');
+    const err = new ActionableError({ goal: 'Save the taxonomy write', problem: 'SHA conflict', location: 'x', nextSteps: ['retry'], httpStatus: 409, code: 'WRITE_CONFLICT' });
+    error(res, String(err), statusForError(err), err, codeForError(err));
+    expect(wroteStatus(res, 409)).toBe(true);
+    expect(bodyOf(res).code).toBe('WRITE_CONFLICT');
+  });
+
+  it('409 + code survive the <500 branch in production too (t/853 only strips internals, not code)', () => {
+    process.env.NODE_ENV = 'production';
+    const res = fakeRes('PUT', '/api/taxonomy/:pov');
+    const err = new ActionableError({ goal: 'Save the taxonomy write', problem: 'SHA conflict', location: 'x', nextSteps: ['retry'], httpStatus: 409, code: 'WRITE_CONFLICT' });
+    error(res, String(err), statusForError(err), err, codeForError(err));
+    expect(wroteStatus(res, 409)).toBe(true);
+    expect(bodyOf(res).code).toBe('WRITE_CONFLICT');
+  });
+
+  it('an ordinary unexpected error (no httpStatus) still gets 500 — no regression', () => {
+    const res = fakeRes('PUT', '/api/taxonomy/:pov');
+    const err = new Error('disk full');
+    error(res, String(err), statusForError(err), err, codeForError(err));
+    expect(wroteStatus(res, 500)).toBe(true);
+    expect(bodyOf(res).code).toBeUndefined();
+  });
+});
+
 describe('withEndpointTimeout (t/1515/t/1516)', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
@@ -130,5 +205,63 @@ describe('withEndpointTimeout (t/1515/t/1516)', () => {
     vi.advanceTimersByTime(1000);
     expect(res.writeHead).not.toHaveBeenCalled();
     release(); await p;
+  });
+});
+
+describe('concatChunked — yields during assembly, not just during stringify (t/4286 canary re-run)', () => {
+  it('byte-identical to Buffer.concat for arbitrary chunk sets', async () => {
+    const chunks = [Buffer.from('ab'), Buffer.from(''), Buffer.from('cde'), Buffer.from('f')];
+    const result = await concatChunked(chunks, 2);
+    expect(result.equals(Buffer.concat(chunks))).toBe(true);
+    expect(result.toString('utf-8')).toBe('abcdef');
+  });
+
+  it('empty chunk list → empty buffer', async () => {
+    expect((await concatChunked([], 4)).length).toBe(0);
+  });
+
+  it('actually yields to the event loop between copies, not just between stringify calls', async () => {
+    // yieldEvery=1 forces a yield after EVERY chunk. A setImmediate scheduled right after
+    // calling concatChunked (unawaited) must fire BEFORE concatChunked resolves, proving the
+    // copy loop really hands control back — not just a correctness-preserving refactor that
+    // still runs the whole copy synchronously in one go (the exact bug this test guards against;
+    // the old `Buffer.concat(chunks)` call would let concatChunked "finish" before this marker
+    // ever got a chance to run).
+    const chunks = Array.from({ length: 5 }, (_, i) => Buffer.from(`chunk-${i}`));
+    const order: string[] = [];
+    const resultPromise = concatChunked(chunks, 1).then((b) => { order.push('concatChunked'); return b; });
+    const markerPromise = new Promise<void>((r) => setImmediate(() => { order.push('marker'); r(); }));
+    await Promise.all([resultPromise, markerPromise]);
+    expect(order[0]).toBe('marker');
+  });
+
+  it('jsonStringifyChunked on a large array still round-trips through the new concatChunked path', async () => {
+    const big = Array.from({ length: 300 }, (_, i) => ({ id: `node-${i}`, vectors: [[i, i + 0.5]] }));
+    const buf = await jsonStringifyChunked(big, 16);
+    expect(JSON.parse(buf.toString('utf-8'))).toEqual(big);
+  });
+
+  it('yields on a BYTE threshold even when far under the item-count threshold (t/4286#35: uneven item sizes)', async () => {
+    // One huge item (well past YIELD_BYTES_THRESHOLD's 2MB on its own) followed by many tiny
+    // ones. yieldEvery=1000 (never hit by count here) — only the byte threshold can trigger a yield.
+    const hugeArray = new Array(2_000_000).fill(12); // ~2 bytes/entry + comma ≈ 6MB stringified
+    const value = { huge: hugeArray, a: 1, b: 2, c: 3 };
+    const stats: SerializeStats = { slices: 0, maxSliceMs: 0 };
+    const buf = await jsonStringifyChunked(value, 1000, stats);
+    expect(JSON.parse(buf.toString('utf-8'))).toEqual(value);
+    expect(stats.slices).toBeGreaterThan(1); // the byte threshold forced at least one yield
+  });
+
+  it('reports slice stats byte-identical in shape to ExtractStats (slices, maxSliceMs)', async () => {
+    const stats: SerializeStats = { slices: 0, maxSliceMs: 0 };
+    await jsonStringifyChunked([1, 2, 3], 2, stats);
+    expect(stats.slices).toBeGreaterThanOrEqual(1);
+    expect(stats.maxSliceMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('a single never-yielded call (small payload) still reports exactly 1 slice', async () => {
+    const stats: SerializeStats = { slices: 0, maxSliceMs: 0 };
+    await jsonStringifyChunked({ a: 1 }, 256, stats);
+    expect(stats.slices).toBe(1);
   });
 });

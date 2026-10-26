@@ -15,11 +15,13 @@ declare const __APP_VERSION__: string;
 declare const __BUILD_DATE__: string;
 declare const __CHANGELOG_MD__: string;
 
-const REPO_URL = 'https://github.com/jpsnover/ai-triad-research';
+const REPO_URL = 'https://github.com/AI-Rosetta-Stone/ai-triad-research';
 
 const DOCS = [
   { title: 'Architecture Overview', path: 'docs/architecture-overview.md',
     desc: 'Two-repo split, Electron apps, AI backends, and data model' },
+  { title: 'API Key Protection', path: 'docs/security/api-key-protection.md',
+    desc: 'How your AI provider API key is stored, transmitted, and protected' },
   { title: 'Debate Engine Design', path: 'docs/debate-engine-design.md',
     desc: 'Three-agent BDI debate system, QBAF scoring, and moderator' },
   { title: 'Debate System Overview', path: 'docs/debate-system-overview.md',

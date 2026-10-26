@@ -3330,7 +3330,7 @@ Institutional memory for failure patterns across the AI Triad Research project.
 **Root Cause:** The pre-implementation state check ("has this already landed?") is skipped. For Trigger A, context loss is the proximate cause; for Trigger B, the urgency of a direct delegation bypasses the check. In both cases, the gap is the same: the agent starts implementing from the task description rather than the current main state.
 
 **Prevention:**
-1. **Before opening a PR, search open AND merged PRs for the ticket key:** `gh pr list --state all --search "t/XXXX" -R jpsnover/ai-triad-research`. If a merged PR exists, read its diff before writing any code.
+1. **Before opening a PR, search open AND merged PRs for the ticket key:** `gh pr list --state all --search "t/XXXX" -R AI-Rosetta-Stone/ai-triad-research`. If a merged PR exists, read its diff before writing any code.
 2. **For delegated pings, run `git log --oneline origin/main -- <files>` before acting** — if the delegated change is already in the log, reply "already landed" rather than re-implementing.
 3. After a context boundary (session restart, long gap, context compression), re-read the ticket's latest comments before starting implementation — the ticket anchor is where completed work is recorded.
 4. If a merged PR is found for the ticket, close any draft/stale work and redirect to a follow-up ticket rather than overwriting the landed implementation.
@@ -3999,3 +3999,402 @@ Institutional memory for failure patterns across the AI Triad Research project.
 **Status:** Active — 1 instance (p/228#22, t/3307). Recurrence of t/2514 duplicate-implementation class. The concrete `gh pr list --search` mechanic is the prevention gap vs. the existing q/42 rule.
 
 **Applies To:** All agents in multi-instance roles (PowerShell, CL, ServerAPI, etc.) and any agent taking over a ticket from an asleep peer. Especially relevant when the ticket is already assigned.
+
+---
+
+## #195 [Deploy/ACA] ACA Revision `runningState` Exact-Match `'Running'` Misses Healthy Revisions
+
+**Pattern:** A poll loop waiting for an ACA revision to become healthy matched only `runningState == 'Running'` exactly. ACA reports healthy revisions as `'RunningAtMaxScale'` or `'RunningAtMinScale'` depending on traffic. The loop timed out (exit 143) even though the revision was healthy throughout.
+
+**Instances:**
+- 2026-09-05 — DevOps (p/26#100): revision-health poll loop matched `runningState == 'Running'` exactly. ACA returned `'RunningAtMaxScale'` for the healthy revision; the loop never matched and timed out. Fix: changed match to `/^Running/` prefix regex.
+
+**Root Cause:** ACA's `runningState` enum includes `'Running'`, `'RunningAtMaxScale'`, and `'RunningAtMinScale'` — all indicating a healthy revision. Exact-matching only `'Running'` treats the scale-qualified variants as "not ready."
+
+**Prevention:**
+1. **Match `/^Running/` prefix when polling ACA revision `runningState` for health** — accepts all three healthy variants.
+2. **Unhealthy states** to watch for: `'Provisioning'`, `'Deprovisioning'`, `'Failed'`, `'Degraded'`.
+3. **Test the poll condition under real traffic** — scale-qualified states only appear under real or simulated load and may not surface in synthetic tests.
+
+**Status:** Active — 1 instance (p/26#100). ACA API behavior; prefix-match is the canonical fix.
+
+**Applies To:** All agents or scripts polling ACA revision health (deploy pipelines, readiness gates, blue-green flip scripts).
+
+---
+
+## #196 [Process/PR] Co-Merge / Joint-GV PRs Must Never Use `--auto` — Label `joint-gv` and Merge Manually
+
+**Pattern:** Two or more PRs must land together (locked cross-role contract) or one PR is gated on a joint TL Gate Verification. Auto-merge is enabled on one of them. When CI goes green, auto-merge fires and merges that PR alone — without its pair — briefly breaking main or stranding reviewed work.
+
+**Instances:**
+- 2026-09-04 — t/3307 / PR #1947 (AGENTS.md, t/3318): PR #1947 had auto-merge enabled as part of a co-merge pair. When checks went green, it merged alone without its ElectronMain pair, briefly breaking main. Fix: `joint-gv` label + `auto-merge-jointgv-guard` blocks `gh pr merge --auto` on labeled PRs; manual `--match-head-commit` merge required after GV clears.
+
+**Root Cause:** Auto-merge is unconditional on CI green — it has no awareness of PR-pairing or joint GV status. It races any coordination and fires on whichever PR's CI finishes first.
+
+**Prevention:**
+1. **Label co-merge and joint-GV PRs with `joint-gv`** — activates `auto-merge-jointgv-guard` which blocks `gh pr merge --auto` on the labeled PR.
+2. **Never enable auto-merge on a `joint-gv`-labeled PR** — merge manually with `--match-head-commit` after the joint GV clears.
+3. **`blocks` relations and ticket comments do NOT prevent auto-merge** — only the `joint-gv` label + guard enforces this.
+
+**Status:** Active — 1 instance (t/3307, t/3318). Codified in root AGENTS.md PR-Flow Practice Rules.
+
+**Applies To:** All agents landing cross-role paired PRs or PRs gated on joint TL Gate Verification.
+
+---
+
+## #197 [Process/Git] `gh pr close --delete-branch` Fails in Worktree Context When Branch Is Checked Out Elsewhere
+
+**Pattern:** `gh pr close <N> --delete-branch` fails with "fatal: '<branch>' is already used by worktree '<path>'" when the flag attempts to delete the local branch and that branch is currently checked out in the shared tree or another worktree.
+
+**Instances:**
+- 2026-09-05 — DevOps 2 (p/340#7): `gh pr close 1979 --delete-branch` failed because it attempted to delete local `main` (checked out by the shared tree). Fix: `git push origin --delete <branch>` to delete only the remote ref; local cleanup handled explicitly.
+
+**Root Cause:** `gh pr close --delete-branch` deletes both the remote and local branch. In a worktree context, deleting the local branch fails if it is currently checked out anywhere. The error surfaces as a git fatal, not a gh error.
+
+**Prevention:**
+1. **In worktree contexts, avoid `gh pr close --delete-branch`** — use `git push origin --delete <branch>` for the remote ref instead.
+2. **For local branch cleanup:** `git branch -D <branch>` only after confirming no worktree holds it via `git worktree list` (see also Pattern #187).
+3. **Close the PR and delete branches as separate steps** when in a worktree: `gh pr close <N>` then `git push origin --delete <branch>`.
+
+**Status:** Active — 1 instance (p/340#7). Worktree-context branch-delete constraint; separate remote + local delete is the canonical approach.
+
+**Applies To:** All agents closing PRs and cleaning up branches in a worktree context. Especially relevant when consolidating duplicate PRs (per Pattern #194).
+
+---
+
+## #198 [Build/PS] Standalone `.ps1` Cannot Call Module-Private Helpers — Unit Stubs Hide This Until Real Run
+
+**Pattern:** A standalone `.ps1` script calls `Import-Module AITriad` and then invokes a private helper function (e.g. `Get-Prompt`). The import only exports public functions; private helpers are not in the caller's scope and throw "not recognized as the name of a cmdlet" at runtime. Unit tests that stub the private helper mask the error — it only surfaces when the script is actually run against the real module.
+
+**Instances:**
+- 2026-09-05 — PowerShell (p/20#40, t/3302 fork-B): standalone `.ps1` called `Get-Prompt` after `Import-Module AITriad`. `Get-Prompt` is a private helper — not exported, not in scope. Unit tests had stubbed it; first real run threw "not recognized." Fix: dot-sourced the private file and set `$script:ModuleRoot` before calling it.
+
+**Root Cause:** PowerShell module scoping is strict — `Import-Module` only surfaces `Export-ModuleMember`-listed functions. Private helpers live in `$script:` scope inside the module and are invisible to outside callers. Stub-based unit tests bypass this scoping entirely, providing false confidence.
+
+**Prevention:**
+1. **Do not call private module helpers directly from a standalone `.ps1`** — either export the helper, dot-source its file (setting any required `$script:` vars like `$script:ModuleRoot` first), or invoke it via `& (Get-Module AITriad) { Get-Prompt @args } @actualArgs`.
+2. **Add an integration test that calls the script end-to-end with the real (unstubbed) module** — this will catch "not recognized" errors that unit stubs hide.
+3. **When dot-sourcing a private file, initialize its `$script:` dependencies first** — private helpers often read `$script:ModuleRoot` or similar vars set during module load; dot-sourcing skips that initialization.
+
+**Status:** Active — 1 instance (p/20#40, t/3302). PS module scoping trap; dot-source + integration test is the canonical fix.
+
+**Applies To:** All agents writing standalone `.ps1` scripts that reuse AITriad module internals. Especially relevant for harvest/analysis scripts that call `Get-Prompt`, `Invoke-AIEnrich`, or other private helpers.
+
+---
+
+## #199 [Build/PS] Bare Relative `-OutPath` Resolves to .NET Process Cwd, Not PowerShell `Set-Location` Cwd
+
+**Pattern:** A PowerShell script passes a bare relative path to a `-OutPath` (or similar) parameter expecting output to land in the current PS working directory. The path resolves to the .NET process working directory instead — which is typically the repo root or the shell's launch directory, not the directory set by `Set-Location` or `cd`. The output file lands silently out of sight.
+
+**Instances:**
+- 2026-09-05 — PowerShell (p/20#40, t/3302): `-OutPath "results.json"` resolved to the .NET process cwd (repo root), not the subtree the script `cd`'d into. File landed in the wrong directory; subsequent steps failed to find it. Fix: `-OutPath (Join-Path (Get-Location).Path "results.json")`.
+
+**Root Cause:** PowerShell's `Set-Location` / `cd` changes the PS provider's current location but NOT the underlying .NET `System.IO.Directory.GetCurrentDirectory()`. Parameters passed to .NET APIs or cmdlets that call into .NET for path resolution use the .NET cwd, not the PS one. These can silently diverge, especially in scripts that `cd` partway through.
+
+**Prevention:**
+1. **Always anchor relative output paths to `(Get-Location).Path`:** `Join-Path (Get-Location).Path "relative/path"` — this explicitly uses the PS current location, not the .NET process cwd.
+2. **Prefer absolute paths for output files in scripts** — resolve at the top of the script (`$outDir = (Get-Location).Path`) before any `cd` calls, then use the resolved absolute path throughout.
+3. **If a file silently "disappears" after writing**, check the repo root and the shell's launch directory — bare relative paths often land there.
+
+**Status:** Active — 1 instance (p/20#40, t/3302). PS/.NET cwd split; anchor to `(Get-Location).Path` is the canonical fix.
+
+**Applies To:** All agents writing PowerShell scripts that produce output files, especially scripts that `cd` mid-execution or call cmdlets with `-OutPath`/`-Path` parameters.
+
+---
+
+## #200 [Process/Overlay] New Nested `AGENTS.md` Requires `ogit add -f` — Whitelist Alone Does Not Stage New Files
+
+**Pattern:** A new nested `AGENTS.md` (created for a new role or instance) is not tracked by either the main repo or the overlay repo until explicitly staged. `ogit add <path>` (without `-f`) fails with exit 1 because the overlay whitelist allows the file pattern but does not automatically stage new untracked files — `-f` is required to force-add files that are not already in the index.
+
+**Instances:**
+- 2026-09-05 — Orca Support (p/13#35, commit b0fdd1a): `ogit add` of a new nested devops `AGENTS.md` hit the whitelist ignore (exit 1). Resolved with `ogit add -f <path>`; audit clean. Recurrence of t/1971 pattern.
+
+**Root Cause:** Git's `.gitignore` / `.orca-gitignore` whitelist allows specific `AGENTS.md` paths but does not stage them — a new file must be explicitly force-added with `-f` to override the default ignore. Without `-f`, `git add` silently skips or errors on files that match an ignore pattern, even if a whitelist `!` exception exists.
+
+**Prevention:**
+1. **Always use `ogit add -f <new-role>/AGENTS.md`** when adding a new nested `AGENTS.md` to the overlay — never plain `ogit add` without `-f`.
+2. **Follow the three-step sequence from root AGENTS.md:** `ogit add -f <path>` → `sh .githooks/agent-file-owner.sh --audit` (expect clean) → commit. Do not skip the audit.
+3. **Never use `--no-verify` past the audit** — a new `AGENTS.md` that bypasses the audit is an unbacked orphan (Pattern #146).
+
+**Status:** Active — recurrence of t/1971. Codified in root AGENTS.md "Creating a role/instance?" section. Each new role/instance creation is a new exposure.
+
+**Applies To:** All agents creating new roles or instances. Especially relevant for TL and Orca Support who provision new agent scopes.
+
+---
+
+## #201 [Process/Overlay] `/land-from-worktree` Is Main-Repo-Only — Overlay-Owned Files Need `ogit` Flow; `--path` Check Unreliable for Non-AGENTS.md Files
+
+**Pattern:** An agent uses `/land-from-worktree` (or the standard `git add` / `git commit` / `gh pr create` flow) to land a file that is overlay-owned (e.g., a docs file in an overlay-scoped directory). The main repo's `.gitignore` silently rejects the file — `git add` reports it as ignored or simply refuses — and the file never lands. A secondary trap: `agent-file-owner.sh --path` reports `NEITHER` for non-`AGENTS.md` overlay-tracked files, giving a false "untracked by both" result.
+
+**Instances:**
+- 2026-09-05 — Orca Support (p/13#38): attempted to land `orca-support/docs/review-architecture-audit.md` via the main-repo `/land-from-worktree` flow. `git add` refused — `orca-support/` is main-gitignored (overlay-owned). `--path` check also reported `NEITHER` (non-AGENTS.md file). Resolved: `ogit add -f` + overlay commit f297eee; audit clean.
+
+**Root Cause:** The main repo's `.gitignore` excludes overlay-owned directories (e.g., `orca-support/`, `.orca/`). Files inside those directories are invisible to `git add`. `agent-file-owner.sh --path` was designed for `AGENTS.md` files only — it does not track arbitrary overlay files and correctly reports `NEITHER` for them, which is misleading when the file IS overlay-tracked.
+
+**Prevention:**
+1. **Before running `/land-from-worktree`, check whether the target file's directory is main-gitignored** — if so, it's overlay-owned and needs `ogit add -f <path>` + `ogit commit` + `ogit push`, not the main-repo flow.
+2. **`agent-file-owner.sh --path` is only authoritative for `AGENTS.md` files** — for other files, use `ogit status` or `ogit log -- <path>` to confirm overlay tracking. `--audit` (no `--path`) is the authoritative check for the full file set.
+3. **When in doubt about repo ownership for a non-AGENTS.md file**, run `git check-ignore -v <path>` — a hit means main-gitignored → overlay territory.
+
+**Status:** Active — 1 instance (p/13#38). Overlay/main routing gap; ogit flow is the canonical path for overlay-owned non-AGENTS.md files.
+
+**Applies To:** All agents landing docs, configs, or other files in overlay-owned scopes. Especially relevant for Orca Support, TL, and any role whose scope is partially or fully overlay-owned.
+
+---
+
+## #202 [Process/Platform] Switching a Gate-Critical Role's `agent_type` Without Canary — Keyed-but-MCP-Less Session Blocks Gate
+
+**Pattern:** An agent updates a gate-critical role's runtime via `update_instance agent_type <provider>` without a canary step. The target provider's config (e.g., `.gemini/settings.json`) was never provisioned by Orca. The new session launches with the API key but without MCP connections ("never connected"). Pings queue but are never received; any gate the role owns blocks indefinitely.
+
+**Instances:**
+- 2026-09-05 — Orca Support (p/13#40, t/3358): switched Second Opinion role from `claude` to `gemini` via `update_instance`. Orca had not generated `.gemini/settings.json`; the Gemini session launched keyed-but-MCP-less. Pings queued; t/3358 merge gate blocked ~3h. Resolved: reverted to `claude`/`fable-5`, human restarted session, connection registered, consult delivered.
+
+**Root Cause:** `update_instance agent_type` changes the runtime label but does not provision the target provider's config files. There is no warning when the target config is absent. The operator assumed the switch was complete and activated when it was not.
+
+**Prevention:**
+1. **Canary-first for any `agent_type` switch on a gate-critical role** — switch a non-critical instance first (or a test instance), verify MCP connection registers, then switch the gate-critical role. Never switch gate-critical roles cold.
+2. **After switching, verify the session is MCP-connected before considering the migration complete** — check `get_agent_status` or wait for a test ping to be received. A keyed-but-unconnected session appears "running" but is functionally absent.
+3. **Platform gap: `update_instance agent_type` should warn when the target provider's config is absent** — file as a platform improvement ticket with Orca Support if encountered.
+4. **Have a revert path ready** — know the previous `agent_type` value before switching; reverting is fast if the prior config is still intact.
+
+**Status:** Active — 1 instance (p/13#40, t/3358). Runtime-switch safety gap; canary-first + verify-connection is the canonical prevention.
+
+**Applies To:** All agents or operators switching `agent_type` on any role, especially gate-critical roles (Second Opinion, TL, DevOps). Especially relevant for Orca Support who performs runtime migrations.
+
+---
+
+## #203 [Build/Worktree] Windows Dir-Symlinks Require Elevation or Dev Mode — Use `pnpm install` Instead for `node_modules` in Worktrees
+
+**Pattern:** On Windows, creating a directory symlink for `node_modules` in a worktree via `bash ln -s` or `New-Item -ItemType SymbolicLink` fails with "File name too long" (misleading — actual cause: existing-target-dir collision or privilege) or "requires admin rights / developer mode not enabled." Neither shell had the required elevation. Attempting to work around with `mklink /J` (junction) avoids the privilege issue but introduces teardown complexity (Pattern #192).
+
+**Instances:**
+- 2026-09-07 — Rosetta Stone (p/6#56): `bash ln -s` and `New-Item -ItemType SymbolicLink` both failed repeatedly when trying to link `taxonomy-editor/node_modules` into a fresh worktree. "File name too long" from `ln` was a misleading error masking an existing-target-dir collision. Resolved: skipped symlinking entirely; ran `CI=true pnpm install --frozen-lockfile --prefer-offline` in the worktree. Completed in 42s (pnpm content-store already warm).
+
+**Root Cause:** Windows directory symlinks require either Administrator elevation or Developer Mode enabled. Most agent shell contexts have neither. `ln -s` on Windows (MSYS/Git Bash) additionally produces misleading errors when the target already exists as a directory. `mklink /J` (junction) avoids privilege requirements but creates teardown risk (Pattern #192).
+
+**Prevention:**
+1. **Prefer `CI=true pnpm install --frozen-lockfile --prefer-offline` over symlinking for `node_modules` in worktrees** — with a warm pnpm content-store, this completes in ~40s and avoids all privilege and teardown complexity.
+2. **Do not attempt `ln -s` or `New-Item -ItemType SymbolicLink` for directories on Windows** — elevation/Dev Mode are required and rarely available in agent contexts.
+3. **If a junction (`mklink /J` or `New-Item -ItemType Junction`) is used instead**, follow the teardown sequence from Pattern #192 (remove junction with `cmd //c rmdir` before `git worktree remove`).
+4. **"File name too long" from `ln -s` on Windows is often a misleading error** — check for an existing-target-dir collision first before interpreting it as a path-length issue.
+
+**Status:** Active — 1 instance (p/6#56). Extension of Patterns #189 and #192; `pnpm install --frozen-lockfile --prefer-offline` is the canonical Windows-safe alternative to node_modules symlinking.
+
+**Applies To:** All agents creating worktrees for npm/pnpm-based subtrees on Windows. Especially relevant when the worktree is short-lived (test run, single-PR fix) and a full `npm install` would be wasteful.
+
+---
+
+## #191 [Process/Git] (Second Instance) — Stash-Preserve Foreign WIP Before Working in Another Role's Live Worktree
+
+*(See first instance above for the base pattern: check `git worktree list` before touching another role's PR branch.)*
+
+**Additional Instance:**
+- 2026-09-07 — Tech Lead (p/335#64, PR #2053): `git worktree add` on PR #2053's branch refused "already used by worktree" — Rosetta Stone held a live checkout. Resolution variant: instead of routing a patch to the owner (first-instance approach), TL worked in the existing worktree directly, first stash-preserving Rosetta's foreign staged WIP (`git stash --include-untracked`) before applying the fix, then unstashing after. Owner completed the final push themselves.
+
+**Additional Prevention (complement to #191's base rule):**
+- **If the owner is unreachable and you must work in their live worktree**, `git stash --include-untracked` first to preserve their staged/unstaged WIP, apply only the minimal fix, then `git stash pop` and leave the final push to the owner. Never commit over someone else's uncommitted work.
+
+---
+
+## #204 [Process/Methodology] Pre-Commit the Acceptance Rule Before the Measurement Exists — Prevents Re-Litigation on a Low Score
+
+**Pattern:** A team needs to evaluate a new component against a threshold. Instead of measuring first and then deciding whether the score is "good enough," the acceptance rule and fallback are locked in (with human approval) *before* the golden measurement is taken. When the blind score comes in below the floor, there is no room for special-pleading — the pre-committed rule executes without re-litigation.
+
+**Instances:**
+- 2026-09-07 — Computational Linguist (p/7#78, e/145, t/3381, t/3379): SO/TL/CL locked the `about[]`-component acceptance threshold (≥0.80) and fallback (A→C relabel) before the golden harness ran. Blind measurement: 0.636 — well below floor. Robustness check: most-generous relabel still yielded 0.799 < 0.80. Fallback executed cleanly with no re-litigation. First live firing of a pre-committed fallback rule in this project.
+
+**Root Cause:** When thresholds are set after measurement, the score anchors the discussion — teams argue about whether 0.636 is "really" below the bar, or whether the bar was set correctly, or whether a generous interpretation would pass. Pre-commitment removes the anchor. The rule is a contract, not a negotiation.
+
+**Prevention:**
+1. **Lock the acceptance rule and fallback before the measurement runs** — get human approval (or multi-stakeholder sign-off via SO/TL/CL) on the threshold AND the fallback action while the score is still unknown. Record it as a durable commitment (ticket comment, email thread, SO decision).
+2. **Include a robustness check in the rule** — e.g., "most-generous relabeling still fails" prevents special-pleading after the fact. A fallback that fires even under the most favorable interpretation is unambiguously correct.
+3. **The fallback is not a punishment** — frame it as a planned engineering response to a measurement outcome, not a failure. Teams that see the fallback as punitive will fight the threshold; teams that see it as a pre-planned path will execute it calmly.
+
+**Status:** Active — 1 instance (p/7#78, e/145, t/3381, t/3379). Reference example for pre-committed acceptance rules. Methodology pattern; applicable to any evaluation-gated component or data-quality decision.
+
+**Applies To:** All agents and humans setting acceptance thresholds for evaluated components, classifiers, or data-quality gates. Especially relevant for measurement-gated decisions where post-hoc score anchoring is a known risk.
+
+---
+
+## #205 [Platform/Observability] Orca Feedback-Rule Telemetry Writer Dead Since May 2026 — Never Cite `fire_count` / `last_fired_at` as Evidence
+
+**Pattern:** Orca's feedback-rule execution-telemetry writer stopped recording data after a late-May 2026 platform update. Fields `fire_count_24h`, `recent_executions`, and `last_fired_at` are unfed for all rules; the on-disk execution log stalled 2026-05-29. Rules still FIRE normally — only the telemetry recording is broken. Citing these fields as evidence of rule activity (or inactivity) in Gate Verifications, closures, or audits produces a false record.
+
+**Instances:**
+- 2026-09-07 — DevOps Lead (p/26#103, t/3394#1/#2, e/147#5): confirmed platform regression — telemetry writer dead since late May. `fire_count_24h` = 0 and `last_fired_at` = null for ALL rules, including rules with known recent firings. Absence of telemetry proves nothing about rule activity. Real fix is upstream (Orca Support reporting it).
+
+**Root Cause:** A platform regression in the late-May Orca update silently stopped writing execution telemetry. The regression was not flagged at release; it was discovered months later during a GV audit when expected telemetry was absent. The only durable evidence of rule firing is a rule-specific durable sink (e.g., t/2070-style log entry) outside the Orca telemetry system.
+
+**Prevention:**
+1. **Never cite `fire_count_24h`, `recent_executions`, or `last_fired_at` as evidence** in Gate Verifications, closures, or audits until Orca Support confirms the telemetry writer is restored.
+2. **For gate verification, rely on durable sinks** — a rule that writes to a GitHub issue, a ticket comment, or an external log (t/2070 pattern) provides tamper-evident evidence independent of the broken telemetry.
+3. **When a rule's GV requires fire evidence**, force-trigger the fire arm in a controlled test and observe the durable output — don't infer activity from the Orca telemetry dashboard.
+4. **Track the fix via Orca Support** (t/3394) — re-enable telemetry-based GV evidence only after the writer is confirmed restored and backfill-verified.
+
+**Status:** Active — platform regression (late-May 2026, t/3394). Affects ALL feedback rules. Resolution pending Orca Support upstream fix. Until resolved, durable sinks are the only admissible fire evidence.
+
+**Applies To:** All agents performing Gate Verifications, incident closures, or audits that reference feedback-rule firing evidence. Especially relevant for TL, DevOps, and any role that authors or reviews gate-verification documentation.
+
+---
+
+## #206 [Platform/Safety] ALL Orca `run:` Shell-Out Feedback Rules Silently Inert Since Late-May 2026 — Block Gates Cannot Be Trusted
+
+**Pattern:** A late-May 2026 Orca platform regression made all `run:` shell-out feedback rules fail to execute. The rules are defined, the rule engine partially operates (static/template rules still fire), but `run:` predicates produce no output and no block. Every blocking gate in the fleet — `pre-self-merge-verify`, `joint-gv-automerge-guard`, `done-evidence` — has been silently inert since ~2026-05-29. No errors are surfaced; the rules appear active.
+
+**Instances:**
+- 2026-09-07 — Orca Support (p/13#43, t/3394#6): probe `gh pr merge 99999` (exit 1 = PR not found) was not intercepted by `pre-self-merge-verify` (type:block). Template rules fired on the same call, confirming partial rule-engine operation. Documented at t/3394#6.
+- 2026-09-07 — DevOps Lead (p/26#106, t/3394, t/3396): fleet-wide confirmation — ALL `run:` shell-out feedback rules inert. `pre-self-merge-verify` (t/3270), `joint-gv-automerge-guard` (t/3318), and `done-evidence` (t/3360) all dead. Manual disciplines are the only protection until the platform fix lands.
+
+**Root Cause:** The late-May Orca update broke the `run:` shell-out execution path. The regression is silent — no error is reported when a `run:` rule fails to execute, and the dashboard shows rules as "active." This is a platform bug, not a configuration error.
+
+**Prevention:**
+1. **Never cite a `run:` feedback rule as enforcement in a Gate Verification, incident closure, or audit** until Orca Support confirms the execution path is restored and an execution probe passes.
+2. **Fall back to manual disciplines** for all protections that were backed by `run:` rules: manually verify `--match-head-commit` on every merge, manually enforce draft on gated PRs, manually confirm done evidence before closing incidents.
+3. **Verify execution before citing a rule as a safety layer** — run an execution probe (deliberate trigger with observable output) rather than assuming a rule fires because it is defined and enabled.
+4. **Static/template rules (no `run:` block) still fire** — these are unaffected and can be cited as active.
+
+**Status:** Active — platform regression (~2026-05-29, t/3394, t/3396). Affects ALL `run:` feedback rules fleet-wide. Resolution pending Orca Support upstream fix. Note: this is a broader finding than #205 (telemetry dead) — that covers telemetry recording; this covers gate execution itself.
+
+**Applies To:** All agents relying on feedback-rule enforcement for safety-critical workflows. Especially relevant for TL (merge guard), DevOps (done-evidence, joint-gv guard), and any agent citing rule activation as a GV artifact.
+
+---
+
+## #207 [Test/React] `getByText()` Throws Multi-Match When the Value Renders in Multiple DOM Rows
+
+**Pattern:** A React Testing Library test uses `getByText('some-value')` to assert a value is displayed. The value appears in more than one DOM node (e.g., an args row AND an `about[]` chip both show the same string). `getByText` throws "found multiple elements with text" — a test error, not a product bug.
+
+**Instances:**
+- 2026-09-07 — Analysis (p/629#1): `BdiGroundingPanel.test.tsx` used `getByText('ent-034')` where `ent-034` appeared in both the args row and an `about[]` chip. Multi-match error. Fixed with `getAllByText('ent-034').length` check.
+
+**Root Cause:** `getByText` is a strict single-match query — it throws if more than one element matches, which is correct behavior. When a test value can legitimately appear in multiple places in the rendered output (repeated in different panels, rows, or chips), `getByText` is the wrong query.
+
+**Prevention:**
+1. **Use `getAllByText(...).length` when asserting a value appears at least once** but it may legitimately render multiple times.
+2. **Use scoped queries with `within(container).getByText(...)` when asserting a specific occurrence** — e.g., `within(screen.getByTestId('args-row')).getByText('ent-034')` to assert the value appears specifically in the args row.
+3. **When writing a new test for a component that renders shared IDs or labels in multiple places**, audit the rendered DOM for duplicate text before choosing `getByText` — `screen.getAllByText(...)` in a debug run reveals all occurrences.
+
+**Status:** Active — 1 instance (p/629#1). Test-authoring pattern; no product bug involved.
+
+**Applies To:** All agents writing React Testing Library tests for components that display entity IDs, labels, or values in multiple panels or rows (e.g., `BdiGroundingPanel`, `about[]`-component tests, node-detail views).
+
+---
+
+## #208 [Build/Shell] Shell Quoting Rule Applies to Inline jq Programs in `gh api --jq` — Shell-Hostile Chars Cause Syntax Errors
+
+**Pattern:** A `gh api` one-liner uses `--jq` with an inline jq expression containing shell-hostile characters (quotes, curly braces, `$` vars). The shell misinterprets the jq string before `gh` sees it, producing "unexpected EOF while looking for matching quote" or similar syntax errors. This is the same class as the Shell Quoting Rule for heredocs and inline Python, but less obviously so since jq programs are often short.
+
+**Instances:**
+- 2026-09-08 — Tech Lead (p/335#69): `gh api ... --jq '"head=\(.headRefOid)"'` with a jq expression containing nested quotes failed with "unexpected EOF while looking for matching quote." Fix: dumped the JSON response to a temp file (`gh api ... > tmp.json`) and parsed with Python (`python -c "import json; ..."` or via a temp script file).
+
+**Root Cause:** The shell processes `--jq "<expr>"` before passing it to `gh`. jq programs that contain nested quotes, `$`, `{}`, or `;` require careful escaping — exactly the shell escaping problem the Shell Quoting Rule exists to prevent.
+
+**Prevention:**
+1. **For jq programs with any shell-hostile chars (quotes, `$`, `{}`, `;`)**, dump the JSON to a temp file first and parse with Python: `gh api <endpoint> > tmp.json && python <script>`.
+2. **Simple jq programs with only safe chars** (`.field`, `.field[]`) can be used inline safely: `gh api ... --jq '.headRefOid'`.
+3. **The Shell Quoting Rule (root AGENTS.md) applies to `--jq` strings** — when in doubt, write the jq/python to a temp file via Write, then execute.
+
+**Status:** Active — 1 instance (p/335#69). Extension of the Shell Quoting Rule to jq programs; dump-and-parse is the canonical safe path.
+
+**Applies To:** All agents using `gh api --jq` with complex expressions. Especially relevant when jq output needs string interpolation, conditionals, or multiple fields.
+
+---
+
+## #209 [Process/Shell] `||`-Fallback Write Split: Write Goes to `$TMPDIR`, Next Step Reads Scratchpad Path — Silent Mismatch
+
+**Pattern:** A command writes a file with a `||`-fallback: `> "$TMPDIR/file" || > scratchpad/file`. When `$TMPDIR` is set (which it often is), the write succeeds to `$TMPDIR/file` and the fallback never runs. The next step reads `scratchpad/file` (hardcoded) — which is empty or doesn't exist. The mismatch is silent: no error from the write, no error from the read until the downstream step fails on the missing data.
+
+**Instances:**
+- 2026-09-08 — Tech Lead (p/335#69): a Bash pipeline wrote to `"$TMPDIR/file"` successfully (TMPDIR was set); the fallback `scratchpad/file` write never fired. The next step read `scratchpad/file` — empty. Fix: replaced with a single explicit scratchpad path: `> scratchpad/file`.
+
+**Root Cause:** The `||`-fallback pattern assumes the primary write will fail when the env var is unset. But when `$TMPDIR` IS set (the common case on most systems), the fallback never runs and the two branches silently diverge from the next step's expectation.
+
+**Prevention:**
+1. **Use a single explicit path for file writes** — don't split write paths across a `||`-fallback unless both branches are explicitly handled by all downstream readers.
+2. **If you need a fallback, resolve the path to a variable first** and use it consistently: `OUT="${TMPDIR:-scratchpad}/file"; > "$OUT"` — then pass `$OUT` to downstream steps rather than hardcoding either branch.
+3. **Treat `||`-fallback writes as a code smell** in scripts where a later step reads a hardcoded path — the two branches will silently diverge whenever the primary path's precondition is met.
+
+**Status:** Active — 1 instance (p/335#69). Shell path-split trap; single explicit path is the canonical fix.
+
+**Applies To:** All agents writing Bash scripts with conditional write paths. Especially relevant for scripts that write temp files and pass paths to subsequent steps.
+
+---
+
+## #210 [Build/Shell] jq Uses `,` Not `;` to Sequence Multiple Outputs — `;` Is a Syntax Error
+
+**Pattern:** A `gh ... --jq` expression uses `;` to sequence two output expressions (treating jq like a shell). jq uses `,` for sequencing multiple outputs and `;` as a function-argument separator — using `;` between top-level expressions produces a syntax error.
+
+**Instances:**
+- 2026-09-08 — Tech Lead (p/335#71): `gh pr view --jq '"head=\(.headRefOid)"; .files[].path'` — the `;` was intended as a statement separator but is not valid jq between top-level expressions. Fix: `.headRefOid, (.files[].path)` — comma sequences outputs.
+
+**Root Cause:** jq is not a shell and not a general scripting language. Its operator precedence and separators are distinct: `,` produces multiple outputs from one expression, `;` separates arguments to a multi-arg function (e.g., `if . then . else . end`). Shell muscle memory often substitutes `;` (shell statement separator) for `,` (jq output separator).
+
+**Prevention:**
+1. **Sequence multiple jq outputs with `,` not `;`**: `gh pr view --jq '.headRefOid, (.files[].path)'`
+2. **`;` in jq is only valid as a function argument separator** (e.g., `reduce`, `label-break`, `path(expr;expr)`) — if you see `;` in a top-level position, it's a bug.
+3. **For complex jq programs, test with `echo '{}' | jq '<expr>'` in the shell before embedding** — syntax errors surface immediately.
+
+**Status:** Active — 1 instance (p/335#71). jq language-syntax trap; `,` is the canonical output sequencer.
+
+**Applies To:** All agents using `gh ... --jq` or shell `jq` pipelines with multiple output fields. Especially relevant when constructing composite output strings from PR/issue metadata.
+
+---
+
+## #211 [Process/Data] AI Batch Work Fully Generated but Persisted Zero — End-Batched Write + Session Killed Before Write
+
+**Pattern:** A long AI-batch pipeline (e.g., 916 AI calls to enrich nodes) generates all results in memory, then writes them all at the very end. The task session is killed (timeout, OOM, manual stop) before the write executes. Net result: full AI spend, zero data saved, results unrecoverable.
+
+**Instances:**
+- 2026-09-08 — Computational Linguist (p/7#81, t/3366): 916-node `debate_grounding` backfill authorized and run inside a task session. All 916 statements generated (~916 AI calls). The cmdlet batches all writes at the end; the session was killed after generation, before the write. 0 entries persisted. Full AI spend wasted. Fix tracked as t/3457 (incremental/checkpoint writes).
+
+**Root Cause:** Batch writes at the end of a long pipeline create an all-or-nothing commit boundary. Any session interruption (timeout, kill, OOM, network drop) after generation but before the write loses everything. Task-session runs are especially vulnerable — they have a finite lifetime and die at their boundary regardless of progress.
+
+**Prevention:**
+1. **Checkpoint-write incrementally** — for AI-batch pipelines over ~50 nodes, write each result (or small batches of N) immediately after generation. This limits the blast radius of any session interruption to at most N nodes.
+2. **Run long AI batches in environments that survive to completion** — prefer terminal/PS runs or background jobs over task-session runs for operations that take >5 minutes. Task sessions die at their boundary; terminal runs survive until the command exits.
+3. **Track progress with a durable counter** — write a progress marker to disk after each checkpoint batch. A re-run can resume from the last checkpoint rather than restarting from zero.
+4. **Design for idempotent re-run** — a batch that can be safely re-run from any checkpoint (skipping already-written nodes) is resilient to session interruption. Backfills that re-check before writing satisfy this.
+
+**Status:** Active — 1 instance (p/7#81, t/3366). High-cost failure class; checkpoint writes + terminal-mode execution are the canonical prevention. t/3457 tracks the PS resilience fix.
+
+**Applies To:** All agents authoring or running long AI-batch enrichment pipelines (debate_grounding, reflections, embeddings, logical_form). Especially relevant for backfill operations on large node sets (>50 entries).
+
+---
+
+## #212 [Deploy/Azure] `az role assignment list --scope <sub-resource>` Fails with `MissingSubscription` (exit 3) Even with `--subscription`
+
+**Pattern:** `az role assignment list --scope <resource-id>` fails with `(MissingSubscription) The request did not have a subscription or a valid tenant level resource provider` (exit 3), even after `az account set --subscription <id>` and/or passing `--subscription` inline. This is a known az CLI quirk when reading RBAC role assignments at a sub-resource scope (below the subscription level).
+
+**Instances:**
+- 2026-09-08 — DevOps Lead (p/26#109): repeated `az role assignment list --scope <ACA-resource-id>` failures with exit 3 / MissingSubscription despite correct subscription context. Bypassed with a direct ARM REST call: `az rest --method get --url "https://management.azure.com/<scope>/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&$filter=atScope()"`.
+
+**Root Cause:** The az CLI `role assignment list` command has a known issue resolving subscription context when scoped below the subscription level (resource group, resource, sub-resource). The standard `--subscription` and `az account set` flags do not reliably fix this. The ARM REST API resolves the subscription from the resource ID in the URL and does not have this issue.
+
+**Prevention:**
+1. **For RBAC role assignment queries at sub-resource scopes, use `az rest` with the ARM REST API** instead of `az role assignment list`: `az rest --method get --url "https://management.azure.com/<scope>/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&$filter=atScope()"`.
+2. **exit 3 + `MissingSubscription` from `az role assignment list`** is a CLI bug signal, not a permissions issue — don't retry with `--subscription`, switch to `az rest`.
+3. **Subscription-level RBAC queries** (`--scope /subscriptions/<id>`) are unaffected; the workaround is only needed for resource/sub-resource scopes.
+
+**Status:** Active — 1 instance (p/26#109). Known az CLI quirk; `az rest` ARM call is the canonical workaround.
+
+**Applies To:** All agents querying RBAC role assignments on Azure resources (ACA, storage accounts, key vaults, etc.) below the subscription scope. Especially relevant for DevOps agents performing RBAC audits.
+
+---
+
+## #213 [Test/Integration] Component Ships Green Across Multiple Merges But Is Never Wired Into the Registry — Feature Unreachable in UI
+
+**Pattern:** A UI component (panel, tab, view) is built, tested with passing unit tests, and merged across multiple tickets. However, it is never registered in the application's panel/tab registry (the routing layer that determines which components are mountable from the toolbar or navigation). The component is present in the codebase but unreachable in the running UI. Unit tests pass because they mount the component directly; no test exercises the registry wiring. The gap goes undetected across multiple merges.
+
+**Instances:**
+- 2026-09-08 — Computational Linguist (p/7#83, t/3470, p/640#2): `BdiGroundingPanel` was built and shipped across 3 tickets (t/3292 concepts/entities, t/3397 logical_form, t/3466 debate_grounding) with green unit tests and green CI. It was never added to the toolbar-panel registry. The panel was completely unreachable in the running UI across all 3 merges. Surfaced during a CL trace of a PI question; confirmed by Analysis (p/640#2). Fix tracked t/3470.
+
+**Root Cause:** Unit tests mount components directly (e.g., `render(<BdiGroundingPanel ... />)`) — they bypass the registry entirely. The registry is the integration point between the component and the application shell; it is not covered by component unit tests. No gate checked for "exported panel component with no registry entry."
+
+**Prevention:**
+1. **When shipping a new panel/tab/view component, verify it is wired into the registry in the same PR** — include a registry import/entry as part of the component's definition of "done."
+2. **Add a smoke test that mounts the panel via the registry path** (i.e., select the panel from the toolbar and assert it renders), not just via direct `render()`. See also the `/smoke-ui` skill.
+3. **Consider a lint/import check for exported panel components with no consumer** — a panel exported from its file but not imported by the registry is a dead export. A no-importer lint rule or a registry-completeness test can catch this at CI time.
+4. **For multi-ticket component builds**, include a "registry wiring" acceptance criterion on the first ticket, not the last — it is easy to defer across tickets and never complete.
+
+**Status:** Active — 1 instance (p/7#83, t/3470). Test-coverage failure class: unit-green masked feature-unreachable across 3 merges. Fix tracked t/3470; prevention candidate for a registry-completeness gate.
+
+**Applies To:** All agents building new panel, tab, or view components for the taxonomy-editor or other Electron apps. Especially relevant when a component is built incrementally across multiple tickets (e.g., adding data sources one ticket at a time).

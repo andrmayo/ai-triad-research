@@ -17,7 +17,9 @@ import type {
   ArgumentNetworkEdge,
   TranscriptEntry,
   DialecticalStyle,
+  DebateSession,
 } from './types.js';
+import { getGlobalRecorder } from '../flight-recorder/index.js';
 import { computePragmaticConvergence, computeConcludingPragmaticSignal } from './pragmaticSignals.js';
 import { computeSchemeStagnationCombined, computeSchemeCoverageFactor } from './schemeStagnation.js';
 import {
@@ -33,9 +35,9 @@ import {
 } from './signalConfidence.js';
 import { needsGc, needsHardCap } from './networkGc.js';
 import { computeUncertaintyMetric } from './convergenceSignals.js';
+import { effectiveCamp } from './argumentNetwork/utils.js';
+import calibrationConfigJson from './calibration-config.json' with { type: 'json' };
 // ── Weight Loading ──────────────────────────────────────────
-// Node.js fs/path/url are only available in the main process. In the renderer
-// (Vite browser bundle) we fall through to the hardcoded defaults below.
 
 interface ProvisionalWeights {
   [key: string]: unknown;
@@ -55,72 +57,10 @@ interface ProvisionalWeights {
 
 let _cachedWeights: ProvisionalWeights | null = null;
 
-export function loadProvisionalWeights(debateDir?: string): ProvisionalWeights {
-  if (_cachedWeights) {
-    return _cachedWeights;
+export function loadProvisionalWeights(): ProvisionalWeights {
+  if (!_cachedWeights) {
+    _cachedWeights = { ...calibrationConfigJson } as ProvisionalWeights;
   }
-
-  // Only attempt filesystem reads in Node.js (main process / server)
-  if (typeof process !== 'undefined' && process.versions?.node) {
-    try {
-      // Dynamic imports avoid Vite externalization errors in the renderer
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const fs = require('fs') as typeof import('fs');
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const path = require('path') as typeof import('path');
-
-      const candidates = [
-        debateDir ? path.join(debateDir, 'calibration-config.json') : null,
-        path.resolve(__dirname, 'calibration-config.json'),
-      ].filter(Boolean) as string[];
-
-      for (const p of candidates) {
-        try {
-          const raw = fs.readFileSync(p, 'utf-8');
-          const parsed = JSON.parse(raw) as ProvisionalWeights;
-          if (parsed.schema_version === 1) {
-            _cachedWeights = parsed;
-            return parsed;
-          }
-        } catch { /* try next candidate */ }
-      }
-    } catch { /* not in Node.js environment — fall through to defaults */ }
-  }
-
-  // Hardcoded fallback — must stay byte-for-byte equal to calibration-config.json so the
-  // browser (which cannot read files) uses the same values as the server. Drift is gated by
-  // the parity test in phaseTransitions.test.ts (t/2186).
-  _cachedWeights = {
-    schema_version: 1,
-    argumentative_saturation: {
-      recycling_pressure: 0.01, crux_maturity: 0.28, concession_plateau: 0.01,
-      engagement_fatigue: 0.01, pragmatic_convergence: 0.33, scheme_stagnation: 0.36,
-    },
-    convergence: {
-      qbaf_agreement_density: 0.35, position_stability: 0.25,
-      irreducible_disagreement_ratio: 0.25, concluding_pragmatic_signal: 0.15,
-    },
-    thresholds: { argumentation_exit: 0.72, concluding_exit: 0.70, confidence_floor: 0.40, crux_semantic_novelty: 0.70 },
-    phase_bounds: {
-      min_confrontation_rounds: 1, max_confrontation_rounds: 2,
-      min_argumentation_rounds: 2, max_argumentation_rounds: 2,
-      min_concluding_rounds: 1, max_concluding_rounds: 1,
-      max_total_rounds_default: 10, max_regressions: 2, regression_ratchet: 0.10,
-    },
-    pacing_presets: {
-      tight: { maxTotalRounds: 4, argumentationExit: 0.62, concludingExit: 0.60 },
-      moderate: { maxTotalRounds: 10, argumentationExit: 0.72, concludingExit: 0.70 },
-      thorough: { maxTotalRounds: 8, argumentationExit: 0.80, concludingExit: 0.80 },
-    },
-    network: { gc_trigger: 175, gc_target: 150, hard_cap: 200 },
-    budget: { soft_multiplier: 8, hard_multiplier: 15, max_soft_multiplier: 10 },
-    relevance: {
-      embedding_threshold: 0.48, lexical_threshold: 0.22, min_per_category: 3,
-      max_pov_nodes: 35, max_desires: 5, max_situations: 8,
-      adaptation_enabled: true, adaptation_history: [],
-    },
-    evaluator: { model: 'gemini-3.5-flash-lite', version: 1 },
-  };
   return _cachedWeights;
 }
 
@@ -170,9 +110,55 @@ export function validatePhaseState(state: PhaseState): { valid: boolean; errors:
   return { valid: errors.length === 0, errors };
 }
 
+// ── Cap Helpers ──────────────────────────────────────────────
+
+/**
+ * Effective round cap in turns for a debate session.
+ * When phaseBoundsOverride is active: max(maxTotalRounds, Σ scaled max bounds).
+ * When no override: maxTotalRounds. Units: turns.
+ * Pass the real speaker count for accurate results.
+ */
+export function effectiveRoundCap(config: PhaseTransitionConfig, speakers: number): number {
+  const w = loadProvisionalWeights();
+  const rawPb = { ...w.phase_bounds };
+  const ov = config.phaseBoundsOverride;
+  if (ov == null) return config.maxTotalRounds;
+  if (ov.maxConfrontationRounds != null) rawPb.max_confrontation_rounds = ov.maxConfrontationRounds;
+  if (ov.maxArgumentationRounds != null) rawPb.max_argumentation_rounds = ov.maxArgumentationRounds;
+  if (ov.maxConcludingRounds != null) rawPb.max_concluding_rounds = ov.maxConcludingRounds;
+  const s = Math.max(1, speakers);
+  return Math.max(
+    config.maxTotalRounds,
+    (rawPb.max_confrontation_rounds + rawPb.max_argumentation_rounds + rawPb.max_concluding_rounds) * s,
+  );
+}
+
+/**
+ * The renderer loop's iteration cap; normal endings come from `phase_terminated`,
+ * this is the safety net. Adds scaled min_concluding to effectiveRoundCap so a
+ * debate force-transitioned into concluding at the cap can finish its minimum.
+ * Units: turns. Pass the real speaker count for accurate results.
+ */
+export function maxTurnCeiling(config: PhaseTransitionConfig, speakers: number): number {
+  const w = loadProvisionalWeights();
+  const rawPb = { ...w.phase_bounds };
+  const ov = config.phaseBoundsOverride;
+  if (ov?.maxConcludingRounds != null) rawPb.max_concluding_rounds = ov.maxConcludingRounds;
+  const s = Math.max(1, speakers);
+  const scaledMinConcluding = Math.min(rawPb.min_concluding_rounds, rawPb.max_concluding_rounds) * s;
+  return effectiveRoundCap(config, speakers) + scaledMinConcluding;
+}
+
 // ── Config Validation ───────────────────────────────────────
 
-export function validateAdaptiveConfig(config: PhaseTransitionConfig): { valid: boolean; errors: string[]; warnings: string[] } {
+/**
+ * Validate a PhaseTransitionConfig. Pass the real speaker count for accurate
+ * floor checking; defaults to 1 (conservative, always safe to validate).
+ */
+export function validateAdaptiveConfig(
+  config: PhaseTransitionConfig,
+  speakers = 1,
+): { valid: boolean; errors: string[]; warnings: string[] } {
   const errors: string[] = [];
   const warnings: string[] = [];
 
@@ -182,8 +168,23 @@ export function validateAdaptiveConfig(config: PhaseTransitionConfig): { valid: 
   if (config.concludingExitThreshold < 0.30 && config.dialecticalStyle !== 'socratic') {
     errors.push('concludingExitThreshold < 0.30: synthesis will exit before meaningful convergence');
   }
-  if (config.maxTotalRounds < 6) {
-    errors.push('maxTotalRounds < 6: below the minimum sum of per-phase minimums');
+  // Floor: Σ min(min,max) per phase × speakers — same scaling as engine (t/3936 fix).
+  // Compare against effectiveRoundCap so override-extended bounds are in scope.
+  const _wv = loadProvisionalWeights();
+  const _rawPb = { ..._wv.phase_bounds };
+  const _ov = config.phaseBoundsOverride;
+  if (_ov?.maxConfrontationRounds != null) _rawPb.max_confrontation_rounds = _ov.maxConfrontationRounds;
+  if (_ov?.maxArgumentationRounds != null) _rawPb.max_argumentation_rounds = _ov.maxArgumentationRounds;
+  if (_ov?.maxConcludingRounds != null) _rawPb.max_concluding_rounds = _ov.maxConcludingRounds;
+  const _s = Math.max(1, speakers);
+  const _scaledFloor = (
+    Math.min(_rawPb.min_confrontation_rounds, _rawPb.max_confrontation_rounds) +
+    Math.min(_rawPb.min_argumentation_rounds, _rawPb.max_argumentation_rounds) +
+    Math.min(_rawPb.min_concluding_rounds, _rawPb.max_concluding_rounds)
+  ) * _s;
+  const _cap = effectiveRoundCap(config, speakers);
+  if (_cap < _scaledFloor) {
+    errors.push(`effectiveRoundCap ${_cap} < ${_scaledFloor}: below minimum phase sequence (Σ scaled phase minimums)`);
   }
   if (config.maxTotalRounds > 20) {
     warnings.push('maxTotalRounds > 20: unusually long debate');
@@ -431,7 +432,7 @@ export function computeConvergenceScore(ctx: SignalContext, coldStart: boolean):
     const targetNode = ctx.network.nodes.find(n => n.id === e.target);
     if (!sourceNode || !targetNode) return false;
     return e.type === 'supports'
-      && sourceNode.speaker !== targetNode.speaker
+      && effectiveCamp(sourceNode) !== effectiveCamp(targetNode)
       && (recentTurnNumbers.has(sourceNode.turn_number) || recentTurnNumbers.has(targetNode.turn_number));
   });
 
@@ -452,7 +453,7 @@ export function computeConvergenceScore(ctx: SignalContext, coldStart: boolean):
   const recentCrossPovEdges = ctx.network.edges.filter(e => {
     const sn = ctx.network.nodes.find(n => n.id === e.source);
     const tn = ctx.network.nodes.find(n => n.id === e.target);
-    return sn && tn && sn.speaker !== tn.speaker
+    return sn && tn && effectiveCamp(sn) !== effectiveCamp(tn)
       && (recentTurnNumbers.has(sn.turn_number) || recentTurnNumbers.has(tn.turn_number));
   });
   const strongAttackEdges = recentCrossPovEdges.filter(e => {
@@ -594,17 +595,23 @@ export function evaluatePhaseTransition(
     return { action: 'force_transition', new_phase: 'concluding', reason: `Network hard cap (${ctx.network.nodeCount} >= ${w.network.hard_cap})`, veto_active: false, force_active: true, confidence_deferred: false, components: { network_size: ctx.network.nodeCount } };
   }
 
-  // Global: maxTotalRounds hard cap — safety net when per-phase signals don't converge
-  if (state.total_rounds_elapsed >= config.maxTotalRounds) {
+  // Global: maxTotalRounds hard cap — safety net when per-phase signals don't converge.
+  // When phaseBoundsOverride is active, effectiveRoundCap scales up so the cap is never
+  // hit during normal bounded progression (t/3882). maxTurnCeiling adds min_concluding
+  // headroom so a forced concluding phase can always finish its minimum (t/3936).
+  const activeCap = effectiveRoundCap(config, s);
+  const ceiling = maxTurnCeiling(config, s);
+  if (state.total_rounds_elapsed >= activeCap) {
     if (state.current_phase === 'concluding') {
       if (state.rounds_in_phase >= pb.min_concluding_rounds ||
-          state.total_rounds_elapsed >= config.maxTotalRounds + pb.min_concluding_rounds) {
-        return { action: 'terminate', reason: `Max total rounds (${state.total_rounds_elapsed} >= ${config.maxTotalRounds})`, veto_active: false, force_active: true, confidence_deferred: false, components: { total_rounds: state.total_rounds_elapsed, max: config.maxTotalRounds } };
+          state.total_rounds_elapsed >= ceiling) {
+        return { action: 'terminate', reason: `Max total rounds (${state.total_rounds_elapsed} >= ${activeCap})`, veto_active: false, force_active: true, confidence_deferred: false, components: { total_rounds: state.total_rounds_elapsed, max: activeCap } };
       }
       // Already concluding — do NOT force_transition (resets rounds_in_phase → infinite loop).
       // Fall through to normal concluding evaluation below.
     } else {
-      return { action: 'force_transition', new_phase: 'concluding', reason: `Max total rounds (${state.total_rounds_elapsed} >= ${config.maxTotalRounds})`, veto_active: false, force_active: true, confidence_deferred: false, components: { total_rounds: state.total_rounds_elapsed, max: config.maxTotalRounds } };
+      // Cap reached before concluding — force transition rather than terminate (t/3882 regression fix).
+      return { action: 'force_transition', new_phase: 'concluding', reason: `Max total rounds (${state.total_rounds_elapsed} >= ${activeCap}) — forcing concluding phase`, veto_active: false, force_active: true, confidence_deferred: false, components: { total_rounds: state.total_rounds_elapsed, max: activeCap } };
     }
   }
 
@@ -1060,4 +1067,30 @@ export function initAdaptiveDiagnostics(): AdaptiveStagingDiagnostics {
     gc_events: [],
     signal_telemetry: [],
   };
+}
+
+// ── Session Selectors ────────────────────────────────────────
+
+/**
+ * Read the current debate phase from a session.
+ * Authoritative source is adaptive_staging.phase_state.current_phase (t/3761).
+ * Falls back to the legacy sibling field written by the renderer for old sessions,
+ * emitting a WARN so the fallback path is never silent.
+ */
+export function getCurrentPhase(session: DebateSession): DebatePhase | null {
+  if (session.adaptive_staging?.phase_state?.current_phase) {
+    return session.adaptive_staging.phase_state.current_phase;
+  }
+  const legacySibling = (session.adaptive_staging as Record<string, unknown> | undefined)?.['current_phase'] as DebatePhase | undefined;
+  if (legacySibling) {
+    getGlobalRecorder()?.record({
+      type: 'system.error',
+      component: 'debate-engine',
+      level: 'warn',
+      message: 'getCurrentPhase: phase_state absent — falling back to legacy sibling current_phase (legacy session)',
+      data: { current_phase: legacySibling },
+    });
+    return legacySibling;
+  }
+  return null;
 }

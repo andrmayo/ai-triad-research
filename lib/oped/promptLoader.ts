@@ -4,7 +4,9 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import type { OpEdParams } from './types.js';
+import { loadOutletsData } from './loadOutlets.js';
 import type { PovKey } from '../debate/types.js';
+import type { OutletBandStyle } from './outletBands.js';
 
 export interface SourceBrief {
   author?: string;
@@ -28,6 +30,7 @@ export interface PromptContext {
   sourceBrief?: SourceBrief;
   outletGuidance: string;
   targetWords: number;
+  style?: OutletBandStyle;
 }
 
 export interface AssembledPrompt {
@@ -58,11 +61,25 @@ export function loadAndAssemblePrompt(promptsDir: string, ctx: PromptContext): A
     ? ctx.params.authorBio
     : '(none supplied — write a generic authority line the author can replace, e.g. "[Author], [affiliation]")';
 
+  const sd = loadOutletsData().styleDefaults;
+  const s = ctx.style;
+  const styleAudience = s?.audience ?? sd.audience;
+  const styleReadingLevel = s?.readingLevel ?? sd.readingLevel;
+  const styleSentence = s?.sentenceMechanics ?? sd.sentenceMechanics;
+  const styleParagraph = s?.paragraphMechanics ?? sd.paragraphMechanics;
+  const styleJargon = s?.jargonGuidance ?? sd.jargonGuidance;
+  const styleBodyFormat = s?.bodyFormat ?? sd.bodyFormat;
+
   const system = interpolate(loadPromptTemplate(promptsDir, 'op-ed-generation-system'), {
     POV_LABEL: ctx.povLabel,
     VOICE_BLOCK: ctx.voiceBlock,
     WORD_COUNT: String(ctx.targetWords),
     OUTLET_GUIDANCE: ctx.outletGuidance,
+    STYLE_AUDIENCE: styleAudience,
+    STYLE_READING_LEVEL: styleReadingLevel,
+    STYLE_SENTENCE: styleSentence,
+    STYLE_PARAGRAPH: styleParagraph,
+    STYLE_JARGON: styleJargon,
   });
 
   const user = interpolate(loadPromptTemplate(promptsDir, 'op-ed-generation-user'), {
@@ -80,6 +97,7 @@ export function loadAndAssemblePrompt(promptsDir: string, ctx: PromptContext): A
     SOURCE_THESIS: ctx.sourceBrief?.thesis ?? '',
     SOURCE_STANCE: ctx.sourceBrief?.stance ?? '',
     SOURCE_RECOMMENDATIONS: ctx.sourceBrief?.primary_recommendations?.join('; ') ?? '',
+    STYLE_BODY_FORMAT: styleBodyFormat,
     SOURCE_KEY_CLAIMS: ctx.sourceBrief?.key_claims?.length
       ? ctx.sourceBrief.key_claims.map((c, i) => `  ${i + 1}. ${c}`).join('\n')
       : '(none extracted)',
@@ -104,5 +122,40 @@ export function assembleReflectionPrompt(
     OPED_BODY: opedBody,
     GROUNDING_LIST: groundingList,
     SOURCE_CLAIMS: sourceClaims,
+  });
+}
+
+export function assembleReadabilityEditPrompt(
+  promptsDir: string,
+  body: string,
+  violations: string,
+): string {
+  return interpolate(loadPromptTemplate(promptsDir, 'op-ed-readability-edit'), {
+    BODY: body,
+    VIOLATIONS: violations,
+  });
+}
+
+export function assembleCoherenceJudgePrompt(
+  promptsDir: string,
+  body: string,
+  thesis: string,
+  valueHierarchy: string,
+): string {
+  return interpolate(loadPromptTemplate(promptsDir, 'op-ed-coherence-judge'), {
+    BODY: body,
+    THESIS: thesis,
+    VALUE_HIERARCHY: valueHierarchy,
+  });
+}
+
+export function assembleCoherenceRewritePrompt(
+  promptsDir: string,
+  body: string,
+  flaggedContradictions: string,
+): string {
+  return interpolate(loadPromptTemplate(promptsDir, 'op-ed-coherence-rewrite'), {
+    BODY: body,
+    FLAGGED_CONTRADICTIONS: flaggedContradictions,
   });
 }

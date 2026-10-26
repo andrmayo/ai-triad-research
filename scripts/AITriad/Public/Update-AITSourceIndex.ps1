@@ -67,7 +67,11 @@ function Update-AITSourceIndex {
 
         # Load summary statistics — prefer cached values in metadata
         $TotalClaims      = 0
-        $ClaimsByPov      = @{ accelerationist = 0; safetyist = 0; skeptic = 0; situations = 0 }
+        # t/3944: MUST be [ordered] -- a plain @{} serializes via ConvertTo-Json in
+        # .NET hash-bucket order, which is randomized per PROCESS (not just different
+        # from the committed Python-authored format once), so every rebuild could
+        # reorder these keys regardless of whether any data changed ("serializer churn").
+        $ClaimsByPov      = [ordered]@{ accelerationist = 0; safetyist = 0; skeptic = 0; situations = 0 }
         $TotalFacts       = 0
         $UnmappedConcepts = 0
 
@@ -90,10 +94,14 @@ function Update-AITSourceIndex {
             if (Test-Path $SummaryPath) {
                 try {
                     $Summary = Get-Content -Raw -Path $SummaryPath | ConvertFrom-Json
-                    if ($Summary.factual_claims) {
-                        $TotalClaims = @($Summary.factual_claims).Count
-                    }
-                    foreach ($Claim in @($Summary.factual_claims)) {
+                    # Every summary key guarded (t/4010). Unguarded, a summary that PARSED fine but
+                    # lacked factual_claims threw here, fell into the catch below ("Could not parse"),
+                    # and silently skipped pov_summaries/unmapped_concepts too -> wrong zeros in the index.
+                    # @() wraps the whole `if`: `$x = if (..) { @(..) } else { @() }` collapses @() to $null.
+                    $SummaryProps  = $Summary.PSObject.Properties
+                    $FactualClaims = @(if ($SummaryProps['factual_claims'] -and $Summary.factual_claims) { $Summary.factual_claims })
+                    $TotalClaims   = $FactualClaims.Count
+                    foreach ($Claim in $FactualClaims) {
                         if (-not $Claim.PSObject.Properties['linked_taxonomy_nodes']) { continue }
                         foreach ($NodeId in @($Claim.linked_taxonomy_nodes)) {
                             if     ($NodeId -like 'acc-*') { $ClaimsByPov['accelerationist']++ }
@@ -102,13 +110,14 @@ function Update-AITSourceIndex {
                             elseif ($NodeId -like 'sit-*') { $ClaimsByPov['situations']++ }
                         }
                     }
+                    $PovSummaries = if ($SummaryProps['pov_summaries']) { $Summary.pov_summaries } else { $null }
                     foreach ($PovName in @('accelerationist', 'safetyist', 'skeptic')) {
-                        $PovData = $Summary.pov_summaries.$PovName
+                        $PovData = if ($PovSummaries -and $PovSummaries.PSObject.Properties[$PovName]) { $PovSummaries.$PovName } else { $null }
                         if ($PovData -and $PovData.PSObject.Properties['key_points'] -and $PovData.key_points) {
                             $TotalFacts += @($PovData.key_points).Count
                         }
                     }
-                    if ($Summary.unmapped_concepts) {
+                    if ($SummaryProps['unmapped_concepts'] -and $Summary.unmapped_concepts) {
                         $UnmappedConcepts = @($Summary.unmapped_concepts).Count
                     }
                 } catch {
@@ -131,6 +140,9 @@ function Update-AITSourceIndex {
             total_facts      = $TotalFacts
             unmapped_concepts = $UnmappedConcepts
             one_liner        = if ($Props['one_liner'])      { $Meta.one_liner }      else { $null }
+            # The raw mark, for readers of _index.json (t/4337). Additive; no reader branches on it in
+            # PS: Get-AITSource filters with Get-SourceResolution, which also validates the mark.
+            duplicate_of     = if ($Props['duplicate_of'] -and $Meta.duplicate_of) { [string]$Meta.duplicate_of } else { $null }
         }
 
         $Entries.Add($Entry)

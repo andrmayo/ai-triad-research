@@ -9,6 +9,7 @@ import { parseAIJson } from '@lib/debate/helpers';
 import { entrySummarizationPrompt } from '../../../prompts/debate';
 import { findNodeMetaInStore } from './taxonomyContext';
 import { _abortController, isCancellationError } from './guards';
+import { ActionableError } from '@lib/debate/errors';
 // getDocTitles lives in a store-free module to avoid a load-order cycle (t/1779);
 // re-exported here so existing importers (debate*Slice) stay unchanged.
 export { getDocTitles } from './docTitles';
@@ -65,7 +66,7 @@ export async function generateTextWithProgress(
     // Thread the live debate abort signal (t/2508) so cancelAndResetAbort() physically
     // kills the in-flight request instead of merely gating late results. Read inline:
     // the currently-active controller is the one owning this call at await time.
-    const result = await api.generateText(prompt, model, timeoutMs, undefined, { signal: _abortController?.signal });
+    const result = await api.generateText(prompt, model, timeoutMs, undefined, { signal: _abortController?.signal, purpose: activity });
     return result;
   } catch (err) {
     if (isCancellationError(err)) {
@@ -212,10 +213,15 @@ export async function getSourceEvidenceIndex(): Promise<Record<string, unknown> 
 
 // ── Stage generate factory (shared by opening + cross-respond) ──
 
+// t/4044: the onServed recorder for a speaker's stage-generate lives with the factory it feeds.
+export { servedTurnRecorder } from './failoverTracking';
+
 export function makeStageGenerate(
   set: (partial: Record<string, unknown>) => void,
   model: string,
-): (prompt: string, callModel: string, options: { temperature?: number; timeoutMs?: number }, label: string) => Promise<string> {
+  // t/4044: told the requested and served model after each successful call (shared/failoverTracking.ts).
+  onServed?: (requested: string, served: string | undefined) => void,
+): (prompt: string, callModel: string, options: { temperature?: number; timeoutMs?: number; maxTokens?: number }, label: string) => Promise<string> {
   return async (prompt, callModel, options, label) => {
     set({ debateGeneratingStartedAt: Date.now(), debateActivity: label, debateProgress: null });
     const unsubscribe = api.onGenerateTextProgress((progress: Record<string, unknown>) => {
@@ -223,7 +229,27 @@ export function makeStageGenerate(
     });
     try {
       // Thread the live debate abort signal (t/2508) — see generateTextWithProgress.
-      const result = await api.generateText(prompt, callModel || model, options.timeoutMs, options.temperature, { signal: _abortController?.signal });
+      const result = await api.generateText(prompt, callModel || model, options.timeoutMs, options.temperature, { signal: _abortController?.signal, purpose: label, maxTokens: options.maxTokens });
+      // t/3525: the live app's stage pipeline (this function) never routes through
+      // lib/debate/aiAdapter.ts's equivalent check — mirror it here so a truncated/blocked
+      // response fails loudly instead of reaching parseAIJson as corrupt partial JSON.
+      if (result.stopReason === 'max_tokens') {
+        throw new ActionableError({
+          goal: 'Generate AI response',
+          problem: `Response truncated at provider output limit for "${label}" — JSON parse would fail on partial output`,
+          location: 'generation.makeStageGenerate',
+          nextSteps: ['Raise maxTokens for this stage', 'Shorten the prompt'],
+        });
+      }
+      if (result.stopReason === 'content_filter') {
+        throw new ActionableError({
+          goal: 'Generate AI response',
+          problem: `Response blocked by provider content policy for "${label}"`,
+          location: 'generation.makeStageGenerate',
+          nextSteps: ['Review the prompt for policy-violating content', 'Try a different model or backend'],
+        });
+      }
+      onServed?.(callModel || model, result.servedModel);
       return result.text;
     } catch (err) {
       if (isCancellationError(err)) {

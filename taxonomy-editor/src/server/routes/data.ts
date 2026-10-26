@@ -16,13 +16,15 @@ import type { Router } from '../httpKit.js';
 import type { ServerCtx } from './context.js';
 import { json, error } from '../httpKit.js';
 import { getGlobalRecorder } from '../../../../lib/flight-recorder/index.js';
-import { getDataRoot, STORAGE_MODE, isStagingIdentity } from '../config.js';
+import { ActionableError } from '../../../../lib/debate/errors.js';
+import { getDataRoot, STORAGE_MODE, isStagingIdentity, isLocalDeployment } from '../config.js';
 import { getConfig } from '../runtimeConfig.js';
 import { isPathWithinDir } from '../security/accessControl.js';
 import { requireAdmin } from '../community/admin/reviewRegistry.js';
 import { log } from '../logger.js';
 import * as fileIO from '../storage/fileIO.js';
 import * as ai from '../ai/aiBackends.js';
+import { refreshModelsRequestSchema } from '../ai/refreshModelsRequestSchema.js';
 
 /** Converts a git SSH remote URL to HTTPS. Non-SSH URLs are returned unchanged. */
 export function convertSshToHttps(remoteUrl: string): string {
@@ -39,8 +41,25 @@ export function registerDataRoutes(r: Router, ctx: ServerCtx): void {
     json(res, fileIO.getDataRootPath());
   });
 
+  // t/4372 (t/4264#2, TL): a desktop/local-server-only feature — refuse on hosted before ever
+  // touching process.env. Keyed on isLocalDeployment() (STORAGE_MODE==='filesystem' &&
+  // NODE_ENV!=='production'), not STORAGE_MODE alone, because the prod rollback runbook can set
+  // STORAGE_MODE=filesystem on hosted prod (t/4229's exact trap) — same predicate as
+  // /api/models/refresh's `accept` gate and taxonomy.ts's isPovTagsGateExempt().
   post('/api/data/set-root', (_req, res, body) => {
     if (!requireAdmin(res)) return; // L2 (t/720): mutating the data root is admin-only
+    if (!isLocalDeployment()) {
+      const notLocal = new ActionableError({
+        goal: 'Re-point this process\'s data root to a different local directory',
+        problem: 'Hosted deployments read taxonomy data through a fixed, provisioned root (github-api or a managed share) — re-pointing it is a desktop/local-server-only feature.',
+        location: 'server/routes/data.ts → POST /api/data/set-root',
+        nextSteps: ['Apply this change from the desktop app instead.'],
+      });
+      log.server.warn({ component: 'data-set-root' }, 'set-root refused on hosted (t/4372)');
+      getGlobalRecorder()?.record({ type: 'system.error', component: 'data-set-root', level: 'warn', message: notLocal.message, error: { name: notLocal.name, message: notLocal.message, stack: notLocal.stack } });
+      error(res, String(notLocal), 409, notLocal, { code: 'SET_ROOT_NOT_SUPPORTED_ON_HOSTED' });
+      return;
+    }
     const { newRoot } = body as { newRoot: string };
     try {
       if (!fs.existsSync(newRoot)) {
@@ -76,14 +95,14 @@ export function registerDataRoutes(r: Router, ctx: ServerCtx): void {
       // when targetPath is root-owned (e.g. /data in Azure containers).
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'data-clone-'));
       await new Promise<void>((resolve, reject) => {
-        execFile('git', ['clone', 'https://github.com/jpsnover/ai-triad-data.git', tmpDir], { timeout: getConfig().server.gitCloneTimeoutMs }, (err) => {
+        execFile('git', ['clone', 'https://github.com/AI-Rosetta-Stone/ai-triad-data.git', tmpDir], { timeout: getConfig().server.gitCloneTimeoutMs, windowsHide: true }, (err) => {
           if (err) reject(err); else resolve();
         });
       });
       const entries = fs.readdirSync(tmpDir).filter(f => f !== '.git');
       fs.mkdirSync(targetPath, { recursive: true });
       await new Promise<void>((resolve, reject) => {
-        execFile('cp', ['-a', ...entries.map(f => path.join(tmpDir, f)), targetPath], (err) => {
+        execFile('cp', ['-a', ...entries.map(f => path.join(tmpDir, f)), targetPath], { windowsHide: true }, (err) => {
           if (err) reject(err); else resolve();
         });
       });
@@ -116,7 +135,7 @@ export function registerDataRoutes(r: Router, ctx: ServerCtx): void {
       if (!fs.existsSync(gitDir)) { json(res, { available: false, error: 'Not a git repo' }); return; }
 
       const runGit = (args: string[]): Promise<string> => new Promise((resolve, reject) => {
-        execFile('git', args, { cwd: dataRoot, timeout: 15_000 }, (err, stdout) => {
+        execFile('git', args, { cwd: dataRoot, timeout: 15_000, windowsHide: true }, (err, stdout) => {
           if (err) reject(err); else resolve(stdout.trim());
         });
       });
@@ -190,7 +209,7 @@ export function registerDataRoutes(r: Router, ctx: ServerCtx): void {
     try {
       const dataRoot = getDataRoot();
       const runGit = (args: string[], timeoutMs = getConfig().server.gitDefaultTimeoutMs): Promise<string> => new Promise((resolve, reject) => {
-        execFile('git', args, { cwd: dataRoot, timeout: timeoutMs, maxBuffer: getConfig().server.gitBufferLimitBytes }, (err, stdout, stderr) => {
+        execFile('git', args, { cwd: dataRoot, timeout: timeoutMs, maxBuffer: getConfig().server.gitBufferLimitBytes, windowsHide: true }, (err, stdout, stderr) => {
           if (err) {
             log.dataPull.error({ cmd: `git ${args.join(' ')}`, stderr: stderr?.trim() }, err.message);
             reject(new Error(`git ${args[0]}: ${err.message}${stderr ? ' — ' + stderr.trim() : ''}`));
@@ -276,9 +295,41 @@ export function registerDataRoutes(r: Router, ctx: ServerCtx): void {
     json(res, await fileIO.loadAIModels());
   });
 
-  post('/api/models/refresh', async (_req, res) => {
+  // t/4162 Part 1 (T1; TL p/522#398): anon-blocked globally (accessControl.ts `isAnonBlockedRoute`).
+  // A plain/dryRun call runs for any signed-in caller (read-only — ai.refreshAIModels coerces a
+  // non-dryRun call without `accept` to dryRun for every principal, same shape as #3329).
+  // Part 2 (T2/SO, this ticket): `accept` (the actual write path) requires admin. `principal` is
+  // always host-set from getCurrentUserId() inside ai.refreshAIModels (t/4162#1/#3 C3) — never
+  // client text — so gating here is sufficient; nothing downstream trusts a client-supplied identity.
+  //
+  // SO finding (e/334#2), TL ruling (A1, p/522#430): on hosted, `refreshAIModels` writes
+  // `getProjectRoot()`'s container-local `ai-models.json` — that copy and its t/4160 sign-off
+  // vanish on the next restart/deploy/scale-to-zero, and the repo's actual source of truth
+  // (read by PowerShell, Electron, gated by `verify:config`) never changes. Refuse `accept` on
+  // hosted before it ever reaches ai.refreshAIModels; dry-run/proposal viewing stays unaffected.
+  // SO follow-up (e/334#4): STORAGE_MODE alone fails OPEN during the prod rollback runbook
+  // (STORAGE_MODE=filesystem on hosted prod, t/4229's exact trap) — isLocalDeployment() pins
+  // "accept allowed" to genuine desktop/local-server use via NODE_ENV, not just the mode.
+  post('/api/models/refresh', async (_req, res, body) => {
+    const parsed = refreshModelsRequestSchema.safeParse(body ?? {});
+    if (!parsed.success) { error(res, 'Invalid refresh request: ' + parsed.error.message, 400); return; }
+    if (parsed.data.accept) {
+      if (!requireAdmin(res)) return;
+      if (!isLocalDeployment()) {
+        const notDurable = new ActionableError({
+          goal: 'Apply a reviewed AI model-catalog change',
+          problem: 'Hosted accept would write a container-local copy of ai-models.json — the change and its sign-off vanish on the next restart, deploy or scale-to-zero, and the repo\'s source of truth (PowerShell, Electron, verify:config) never changes.',
+          location: 'server/routes/data.ts → POST /api/models/refresh (accept)',
+          nextSteps: ['Apply this change from the desktop app instead', 'Or open a PR updating ai-models.json directly'],
+        });
+        log.server.warn({ component: 'models-refresh' }, 'accept refused on hosted — not durable (t/4234 A1)');
+        getGlobalRecorder()?.record({ type: 'system.error', component: 'models-refresh', level: 'warn', message: notDurable.message, error: { name: notDurable.name, message: notDurable.message, stack: notDurable.stack } });
+        error(res, String(notDurable), 409, notDurable, { code: 'ACCEPT_NOT_DURABLE_ON_HOSTED' });
+        return;
+      }
+    }
     try {
-      json(res, await ai.refreshAIModels());
+      json(res, await ai.refreshAIModels(parsed.data));
     } catch (err) { getGlobalRecorder()?.record({ type: 'system.error', component: 'server', level: 'error', message: 'Failed to refresh AI models', error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } }); error(res, String(err), 500, err); }
   });
 }

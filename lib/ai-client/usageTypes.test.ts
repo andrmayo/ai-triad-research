@@ -187,6 +187,21 @@ describe('validateUsageConfig', () => {
     expect(validateUsageConfig(registry, TEST_MODEL_REGISTRY)).toEqual([]);
   });
 
+  it('rejects a *-latest alias — exact-match predicate mirrors production resolveModel (t/3518/t/3664 fold)', () => {
+    // After the fold repoint (t/3664#13), validateUsageConfig uses an exact models[].id Set —
+    // matching production's resolveModel exact-find branch. *-latest aliases are NOT in models[].id
+    // and must be rejected at authoring time, not silently shipped as a floating alias. The six
+    // ai-usages.json entries that previously used `gemini-flash-lite-latest` were repointed to
+    // the concrete `gemini-3.5-flash-lite` id in the same PR; any future recruit is caught here.
+    const registry = {
+      'server.latest-alias': { description: 'Uses a *-latest alias', model: 'gemini-flash-lite-latest' },
+    };
+    const errors = validateUsageConfig(registry, TEST_MODEL_REGISTRY).filter((e) => e.field === 'model');
+    expect(errors).toHaveLength(1);
+    expect(errors[0].usageId).toBe('server.latest-alias');
+    expect(errors[0].message).toContain('gemini-flash-lite-latest');
+  });
+
   it('reports unknown model', () => {
     const registry = {
       'test.usage': {

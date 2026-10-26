@@ -73,7 +73,7 @@ function Invoke-EdgeRationaleBackfill {
 
         [Parameter()]
         [ValidateScript({ Test-AIModelId $_ })]
-        [string]$Model = 'gemini-3.5-flash-lite',
+        [string]$Model = (Get-AITierModel -Tier basic),
 
         [Parameter()]
         [string]$ApiKey = '',
@@ -100,22 +100,16 @@ function Invoke-EdgeRationaleBackfill {
     $ErrorActionPreference = 'Stop'
 
     # ── Resolve backend + key (fail fast with a clear message) ────────────
-    $Backend = if ($Model -match '^gemini') { 'gemini' }
-        elseif ($Model -match '^claude') { 'claude' }
-        elseif ($Model -match '^groq')   { 'groq' }
-        elseif ($Model -match '^openai') { 'openai' }
-        else                             { 'gemini' }
-    if (-not $DryRun) {
-        $ResolvedKey = Resolve-AIApiKey -ExplicitKey $ApiKey -Backend $Backend
-    } else {
-        $ResolvedKey = ''
-    }
+    # The backend comes from ai-models.json and an unknown model fails here, before any call (t/4087).
+    # Only the user's own -ApiKey is forwarded; Invoke-AIApi resolves the key for the registry backend.
+    $null = Get-AIModelBackend -Model $Model
+    $ResolvedKey = $ApiKey
 
     # ── Load edges.json ───────────────────────────────────────────────────
     $TaxDir    = if ($RepoRoot) { Join-Path $RepoRoot 'taxonomy/Origin' } else { Get-TaxonomyDir }
     $EdgesPath = Join-Path $TaxDir 'edges.json'
     if (-not (Test-Path -LiteralPath $EdgesPath)) {
-        throw (New-ActionableError `
+        throw (New-ActionableError -AsErrorRecord `
             -Goal 'Backfill edge rationales' `
             -Problem "edges.json not found at $EdgesPath" `
             -Location 'Invoke-EdgeRationaleBackfill' `
@@ -154,7 +148,9 @@ function Invoke-EdgeRationaleBackfill {
     # ── Select target edges ───────────────────────────────────────────────
     $Targets   = [System.Collections.Generic.List[object]]::new()
     $SelfLoops = [System.Collections.Generic.List[string]]::new()
+    $Superseded = Get-SupersededNodeIdSet   # no AI call for an edge with a retired endpoint; the file keeps it (t/4356)
     foreach ($E in @($EdgesData.edges)) {
+        if ($Superseded.Contains([string]$E.source) -or $Superseded.Contains([string]$E.target)) { continue }
         $HasRationale = $E.PSObject.Properties['rationale'] -and -not [string]::IsNullOrWhiteSpace($E.rationale)
         if ($HasRationale -and -not $Force) { continue }
         # Never rationalize a malformed self-loop (source == target). Collect for a cleanup list.

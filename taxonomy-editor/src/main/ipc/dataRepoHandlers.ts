@@ -38,13 +38,13 @@ export function registerDataRepoHandlers(): void {
     if (!resolved.startsWith(home + path.sep) && resolved !== home) {
       return { success: false, message: `Target path must be within ${home}` };
     }
-    const repoUrl = 'https://github.com/jpsnover/ai-triad-data.git';
+    const repoUrl = 'https://github.com/AI-Rosetta-Stone/ai-triad-data.git';
     return new Promise<{ success: boolean; message: string }>((resolve) => {
       const parentDir = path.dirname(resolved);
       if (!fs.existsSync(parentDir)) {
         fs.mkdirSync(parentDir, { recursive: true });
       }
-      execFile('git', ['clone', repoUrl, resolved], { timeout: 300000 }, (err, stdout, stderr) => {
+      execFile('git', ['clone', repoUrl, resolved], { timeout: 300000, windowsHide: true }, (err, stdout, stderr) => {
         if (err) {
           resolve({ success: false, message: stderr || err.message });
         } else {

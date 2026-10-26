@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
+# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 # Licensed under the MIT License. See LICENSE file in the project root.
 
 function Invoke-PolicyRefinement {
@@ -17,7 +17,7 @@ function Invoke-PolicyRefinement {
     .PARAMETER Model
         AI model to use. Defaults to AI_MODEL env var, then "gemini-3.5-flash-lite".
     .PARAMETER ApiKey
-        AI API key. If omitted, resolved via backend-specific env var or AI_API_KEY.
+        AI API key. If omitted, resolved via the backend-specific env var (AI_API_KEY is a fallback for gemini models only).
     .PARAMETER DryRun
         Show prompts and current text without calling the API.
     .PARAMETER PassThru
@@ -25,7 +25,7 @@ function Invoke-PolicyRefinement {
     .EXAMPLE
         Invoke-PolicyRefinement -DryRun
     .EXAMPLE
-        Invoke-PolicyRefinement -Model 'claude-sonnet-4-20250514'
+        Invoke-PolicyRefinement -Model 'claude-sonnet-4-6'
     .EXAMPLE
         Invoke-PolicyRefinement -PassThru
     .LINK
@@ -56,7 +56,7 @@ function Invoke-PolicyRefinement {
     $ErrorActionPreference = 'Stop'
 
     if (-not $Model) {
-        if ($env:AI_MODEL) { $Model = $env:AI_MODEL } else { $Model = 'gemini-3.5-flash-lite' }
+        if ($env:AI_MODEL) { $Model = $env:AI_MODEL } else { $Model = (Get-AITierModel -Tier basic) }
     }
 
     # -- Validate environment --------------------------------------------------
@@ -71,14 +71,10 @@ function Invoke-PolicyRefinement {
     }
 
     if (-not $DryRun) {
-        if     ($Model -match '^gemini') { $Backend = 'gemini' }
-        elseif ($Model -match '^claude') { $Backend = 'claude' }
-        elseif ($Model -match '^groq')   { $Backend = 'groq'   }
-        elseif ($Model -match '^openai') { $Backend = 'openai' }
-        else                             { $Backend = 'gemini'  }
-        $ResolvedKey = Resolve-AIApiKey -ExplicitKey $ApiKey -Backend $Backend
-        if ([string]::IsNullOrWhiteSpace($ResolvedKey)) {
-            Write-Fail 'No API key found. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or AI_API_KEY.'
+        # Backend from ai-models.json, never guessed; only the user's -ApiKey is forwarded (t/4087).
+        $KeyStatus = Get-AIModelKeyStatus -Model $Model -ApiKey $ApiKey
+        if (-not $KeyStatus.HasKey) {
+            Write-Fail "No API key found for the $($KeyStatus.Backend) backend. Set $($KeyStatus.EnvHint), or pass -ApiKey."
             throw 'No API key configured'
         }
     }
@@ -86,7 +82,7 @@ function Invoke-PolicyRefinement {
     # -- Load registry and taxonomy files --------------------------------------
     Write-Step 'Loading policy registry and taxonomy'
 
-    $Registry = Get-Content -Raw -Path $RegistryPath | ConvertFrom-Json
+    $Registry = ConvertFrom-JsonPreserveShape -Json (Get-Content -Raw -Path $RegistryPath)   # whole-file rewrite: keep timestamps as written (t/4425)
     Write-OK "Registry loaded: $($Registry.policies.Count) policies"
 
     $PovFiles = @('accelerationist', 'safetyist', 'skeptic', 'situations')
@@ -94,7 +90,7 @@ function Invoke-PolicyRefinement {
     foreach ($PovKey in $PovFiles) {
         $FilePath = Join-Path $TaxDir "$PovKey.json"
         if (Test-Path $FilePath) {
-            $TaxData[$PovKey] = Get-Content -Raw -Path $FilePath | ConvertFrom-Json
+            $TaxData[$PovKey] = Read-PovTaxonomyFile -Path $FilePath   # shape-preserving read (t/4356)
         }
     }
 
@@ -138,13 +134,13 @@ function Invoke-PolicyRefinement {
             if (-not $Node.graph_attributes.PSObject.Properties['policy_actions']) { continue }
 
             foreach ($PA in $Node.graph_attributes.policy_actions) {
-                if ($PA.PSObject.Properties['policy_id']) { $Pid = $PA.policy_id } else { $Pid = $null }
-                if (-not $Pid) { continue }
+                if ($PA.PSObject.Properties['policy_id']) { $PolicyId = $PA.policy_id } else { $PolicyId = $null }
+                if (-not $PolicyId) { continue }
 
-                if (-not $PolicyFramings.ContainsKey($Pid)) {
-                    $PolicyFramings[$Pid] = [System.Collections.Generic.List[object]]::new()
+                if (-not $PolicyFramings.ContainsKey($PolicyId)) {
+                    $PolicyFramings[$PolicyId] = [System.Collections.Generic.List[object]]::new()
                 }
-                $PolicyFramings[$Pid].Add([PSCustomObject]@{
+                $PolicyFramings[$PolicyId].Add([PSCustomObject]@{
                     NodeId  = $Node.id
                     POV     = $PovKey
                     Action  = $PA.action
@@ -160,18 +156,18 @@ function Invoke-PolicyRefinement {
     $Results = [System.Collections.Generic.List[object]]::new()
 
     foreach ($Policy in $MultiPolicies) {
-        $Pid = $Policy.id
+        $PolicyId = $Policy.id
         $CurrentAction = $Policy.action
 
-        if (-not $PolicyFramings.ContainsKey($Pid)) {
-            Write-Warn "$Pid`: no framings found in taxonomy files"
+        if (-not $PolicyFramings.ContainsKey($PolicyId)) {
+            Write-Warn "$PolicyId`: no framings found in taxonomy files"
             $Failed++
             continue
         }
 
-        $Framings = $PolicyFramings[$Pid]
+        $Framings = $PolicyFramings[$PolicyId]
 
-        Write-Step "$Pid`: $CurrentAction ($($Framings.Count) framings)"
+        Write-Step "$PolicyId`: $CurrentAction ($($Framings.Count) framings)"
 
         # Build the refinement prompt
         $FramingBlock = ($Framings | ForEach-Object {
@@ -185,7 +181,7 @@ accelerationist, safetyist, or skeptic).
 
 CURRENT canonical action: "$CurrentAction"
 
-This policy ($Pid) is referenced by $($Framings.Count) nodes across different POVs.
+This policy ($PolicyId) is referenced by $($Framings.Count) nodes across different POVs.
 Here are all the framings:
 
 $FramingBlock
@@ -201,7 +197,7 @@ INSTRUCTIONS:
         # -- DryRun: show prompt and skip API call --
         if ($DryRun) {
             Write-Host ''
-            Write-Host "--- $Pid ---" -ForegroundColor Cyan
+            Write-Host "--- $PolicyId ---" -ForegroundColor Cyan
             Write-Host "  Current : $CurrentAction" -ForegroundColor Yellow
             Write-Host "  Framings:" -ForegroundColor Gray
             foreach ($F in $Framings) {
@@ -226,14 +222,14 @@ INSTRUCTIONS:
             $AIResult = Invoke-AIApi `
                 -Prompt    $Prompt `
                 -Model     $Model `
-                -ApiKey    $ResolvedKey `
+                -ApiKey    $ApiKey `
                 -Temperature 0.1 `
                 -MaxTokens 2048 `
                 -ResponseSchema $RefinementSchema
 
             $ResponseText = $AIResult.Text
             if (-not $ResponseText) {
-                Write-Warn "$Pid`: empty API response"
+                Write-Warn "$PolicyId`: empty API response"
                 $Failed++
                 continue
             }
@@ -247,7 +243,7 @@ INSTRUCTIONS:
                 $JsonMatch = [regex]::Match($ResponseText, '(?s)\{.*?\}')
             }
             if (-not $JsonMatch.Success) {
-                Write-Warn "$Pid`: no JSON object found in response: $($ResponseText.Substring(0, [Math]::Min(100, $ResponseText.Length)))"
+                Write-Warn "$PolicyId`: no JSON object found in response: $($ResponseText.Substring(0, [Math]::Min(100, $ResponseText.Length)))"
                 $Failed++
                 continue
             }
@@ -255,7 +251,7 @@ INSTRUCTIONS:
             $Parsed = $JsonMatch.Value | ConvertFrom-Json
 
             if (-not $Parsed.PSObject.Properties['refined_action'] -or [string]::IsNullOrWhiteSpace($Parsed.refined_action)) {
-                Write-Warn "$Pid`: LLM returned empty or missing refined_action"
+                Write-Warn "$PolicyId`: LLM returned empty or missing refined_action"
                 $Failed++
                 continue
             }
@@ -263,15 +259,15 @@ INSTRUCTIONS:
             $RefinedAction = $Parsed.refined_action.Trim()
         }
         catch {
-            Write-Fail "$Pid`: API call or parse failed -- $_"
+            Write-Fail "$PolicyId`: API call or parse failed -- $_"
             $Failed++
             continue
         }
 
-        Write-Info "$Pid`: `"$CurrentAction`" -> `"$RefinedAction`""
+        Write-Info "$PolicyId`: `"$CurrentAction`" -> `"$RefinedAction`""
 
         # -- Update policy_actions.json --
-        if ($PSCmdlet.ShouldProcess("$Pid in policy_actions.json", "Update action to '$RefinedAction'")) {
+        if ($PSCmdlet.ShouldProcess("$PolicyId in policy_actions.json", "Update action to '$RefinedAction'")) {
             $Policy.action = $RefinedAction
             # Track refinement timestamp and framing count for incremental refinement
             if ($Policy.PSObject.Properties['last_refined_at']) {
@@ -296,8 +292,8 @@ INSTRUCTIONS:
                 if (-not $Node.graph_attributes.PSObject.Properties['policy_actions']) { continue }
 
                 foreach ($PA in $Node.graph_attributes.policy_actions) {
-                    if ($PA.PSObject.Properties['policy_id'] -and $PA.policy_id -eq $Pid) {
-                        if ($PSCmdlet.ShouldProcess("$($Node.id) [$PovKey]", "Update action text for $Pid")) {
+                    if ($PA.PSObject.Properties['policy_id'] -and $PA.policy_id -eq $PolicyId) {
+                        if ($PSCmdlet.ShouldProcess("$($Node.id) [$PovKey]", "Update action text for $PolicyId")) {
                             $PA.action = $RefinedAction
                         }
                     }
@@ -307,7 +303,7 @@ INSTRUCTIONS:
 
         $Refined++
         $Results.Add([PSCustomObject]@{
-            PolicyId       = $Pid
+            PolicyId       = $PolicyId
             OriginalAction = $CurrentAction
             RefinedAction  = $RefinedAction
             FramingCount   = $Framings.Count
@@ -329,7 +325,7 @@ INSTRUCTIONS:
             if (-not $TaxData.ContainsKey($PovKey)) { continue }
             $FilePath = Join-Path $TaxDir "$PovKey.json"
             if ($PSCmdlet.ShouldProcess($FilePath, 'Write updated taxonomy file')) {
-                $TaxData[$PovKey] | ConvertTo-Json -Depth 20 | Write-Utf8NoBom -Path $FilePath 
+                Write-PovTaxonomyFile -Path $FilePath -Data $TaxData[$PovKey]   # canonical TS format (t/4356)
                 Write-OK "Saved $PovKey"
             }
         }

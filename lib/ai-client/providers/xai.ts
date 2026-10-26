@@ -6,9 +6,11 @@
 // matches Groq/z.ai/Moonshot exactly; the model id (grok-4.6) flows from
 // ai-models.json via apiModelId.
 import { ActionableError } from '../../debate/errors.js';
-import { withTimeout, makeFetchSignal } from '../retry.js';
+import { makeFetchSignal } from '../retry.js';
+import { fetchWithDiagnostics } from '../instrumentation.js';
 import type { FetchFn, GenerateOptions, ProviderResult } from '../types.js';
 import { DEFAULT_TEMPERATURE } from '../defaults.js';
+import { normalizeStopReason } from './stopReason.js';
 
 const XAI_BASE = 'https://api.x.ai/v1';
 
@@ -25,7 +27,7 @@ export async function generateViaXai(
   if (opts.systemMessage) messages.push({ role: 'system', content: opts.systemMessage });
   messages.push({ role: 'user', content: prompt });
 
-  const response = await fetchFn(`${XAI_BASE}/chat/completions`, {
+  const { response, bodyText, diagnostics } = await fetchWithDiagnostics(fetchFn, `${XAI_BASE}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -41,9 +43,7 @@ export async function generateViaXai(
       } : {}),
     }),
     signal: makeFetchSignal(timeoutMs, opts.signal),
-  });
-
-  const bodyText = await withTimeout(response.text(), 60_000, 'Reading xAI response');
+  }, 60_000, 'Reading xAI response');
 
   if (response.status === 429 || response.status === 503) {
     throw new ActionableError({
@@ -69,7 +69,8 @@ export async function generateViaXai(
   }
 
   let json: {
-    choices?: { message: { content: string } }[];
+    model?: string; // provider-reported served identity (t/3677)
+    choices?: { message: { content: string }; finish_reason?: string }[];
     usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; prompt_cache_hit_tokens?: number };
   };
   try {
@@ -98,5 +99,6 @@ export async function generateViaXai(
     cachedTokens: u.prompt_cache_hit_tokens,
     totalTokens: u.total_tokens,
   } : undefined;
-  return { text, usage, rawResponsePreview: text ? undefined : bodyText.slice(0, 200) };
+  const rawStopReason = json.choices[0].finish_reason ?? undefined;
+  return { text, usage, rawResponsePreview: text ? undefined : bodyText.slice(0, 200), stopReason: normalizeStopReason(rawStopReason), rawStopReason, diagnostics, providerReportedModel: json.model };
 }

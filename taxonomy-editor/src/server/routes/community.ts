@@ -14,12 +14,14 @@ import type { Router } from '../httpKit.js';
 import type { ServerCtx } from './context.js';
 import { json, error, param } from '../httpKit.js';
 import { getGlobalRecorder } from '../../../../lib/flight-recorder/index.js';
+import { log } from '../logger.js';
+import { getUserContentBackend } from '../storage/fileIO.js';
 import { rateLimitResponseBody } from '../security/rateLimitResponse.js';
 import * as rateLimiter from '../security/rateLimiter.js';
 import { getStorageUserId } from '../security/userContext.js';
 import * as community from '../community/community.js';
-import { mintCommunityOpedShare, revokeCommunityOpedShare, getCommunityOpedShareEntry } from '../community/communityOpedShares.js';
-import { writePublicCommunityOpEd, deletePublicCommunityOpEd, type CommunityOpEdItem } from '../storage/communityOpedShareStore.js';
+import { revokeCommunityOpedShare, getCommunityOpedShareEntry } from '../community/communityOpedShares.js';
+import { deletePublicCommunityOpEd } from '../storage/communityOpedShareStore.js';
 
 export function registerCommunityRoutes(r: Router, ctx: ServerCtx): void {
   const { get, post, del } = r;
@@ -42,10 +44,10 @@ export function registerCommunityRoutes(r: Router, ctx: ServerCtx): void {
     if (!community.isAdmin()) { json(res, { error: 'Forbidden' }, 403); return; }
     try {
       const type = param(req, 'type', '/api/community/:type/:id');
-      if (type !== 'chats' && type !== 'debates' && type !== 'opeds') { error(res, 'type must be "chats", "debates", or "opeds"', 400); return; }
+      if (type !== 'chats' && type !== 'debates' && type !== 'opeds' && type !== 'inquiries') { error(res, 'type must be "chats", "debates", "opeds", or "inquiries"', 400); return; }
       const id = param(req, 'id', '/api/community/:type/:id');
       const reason = (body as { reason?: string } | undefined)?.reason;
-      await community.removeCommunityItem(type as 'chats' | 'debates' | 'opeds', id, typeof reason === 'string' ? reason : undefined);
+      await community.removeCommunityItem(type as 'chats' | 'debates' | 'opeds' | 'inquiries', id, typeof reason === 'string' ? reason : undefined);
       json(res, { ok: true });
     } catch (err) {
       getGlobalRecorder()?.record({
@@ -164,6 +166,44 @@ export function registerCommunityRoutes(r: Router, ctx: ServerCtx): void {
     }
   });
 
+  // t/3621: community inquiry reader surface (the module funcs landed with t/3621).
+  // Mirrors the opeds listing/detail handlers verbatim; `source: 'community'`
+  // tags rows the same way the oped/debate listings do.
+  get('/api/community/inquiries', async (_req, res) => {
+    try {
+      const entries = await community.listCommunityInquiries() as Record<string, unknown>[];
+      json(res, entries.map(e => ({ ...e, source: 'community' })));
+    }
+    catch (err) {
+      getGlobalRecorder()?.record({
+        type: 'system.error',
+        component: 'server',
+        level: 'error',
+        message: 'Failed to list community inquiries',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+      error(res, String(err), (err as { statusCode?: number }).statusCode ?? 500);
+    }
+  });
+
+  get('/api/community/inquiries/:id', async (req, res) => {
+    try {
+      const id = param(req, 'id', '/api/community/inquiries/:id');
+      const item = await community.loadCommunityItem('inquiries', id);
+      if (!item) { json(res, { found: false }, 200); return; }
+      json(res, item);
+    } catch (err) {
+      getGlobalRecorder()?.record({
+        type: 'system.error',
+        component: 'server',
+        level: 'error',
+        message: 'Failed to load community inquiry item',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+      error(res, String(err), 404);
+    }
+  });
+
   // ── t/3315: public no-login share link for a COMMUNITY op-ed (Pattern-A publish-on-share). ──
   // Any authed user may mint (rate-limited); a community-scoped registry returns ONE stable shareId
   // per item to all callers. The public copy is the anonymous positive-allowlist projection served by
@@ -183,24 +223,42 @@ export function registerCommunityRoutes(r: Router, ctx: ServerCtx): void {
         return;
       }
 
-      const item = await community.getCommunityOpEd(id);
-      if (!item) { error(res, 'not_found', 404); return; }
+      // t/3484: source submittedBy (the item's ORIGINAL submitter — tracked server-side ONLY for the
+      // revoke-auth check; the PUBLIC copy stays anonymous, community_metadata stripped). This pre-read
+      // is ONLY for submittedBy — the same pattern backfillCommunityOpedShares uses (it sources it from
+      // the listing summary). mintAndProjectCommunityOpEd below re-validates + is the SINGLE mint+project
+      // path (t/3483#2 — no dual mint paths; the manual mint+project that used to live here is gone).
+      const pre = await community.getCommunityOpEd(id);
+      const submittedBy = pre.found
+        ? ((pre.item as { community_metadata?: { submitted_by_display?: string } }).community_metadata?.submitted_by_display ?? '')
+        : '';
 
-      // Condition 4: assert PRESENCE before minting — never register a shareId for an empty/partial
-      // read (ADR-001 silent-empty guard on the hosted github-api path). writePublicCommunityOpEd re-checks.
-      const it = item as { topic?: unknown; opeds?: unknown; community_metadata?: { submitted_by_display?: string } };
-      if (!it.topic || !Array.isArray(it.opeds) || it.opeds.length === 0) {
-        error(res, 'Community op-ed is empty or malformed — cannot mint a public copy', 422);
+      const result = await community.mintAndProjectCommunityOpEd(id, submittedBy);
+      if (result.outcome === 'skipped') {
+        // Preserve the t/3334/t/3430 discrimination via the helper's `reason`:
+        if (result.reason === 'malformed') {
+          // found item but missing topic (opeds non-empty) = unambiguous corruption → always WARN→Log_s → 422.
+          log.server.warn(
+            { id, backend: getUserContentBackend().constructor.name, reason: 'malformed' },
+            'Community op-ed share mint: item malformed (missing topic / empty opeds) — refusing to mint (corruption)',
+          );
+          error(res, 'Community op-ed is empty or malformed — cannot mint a public copy', 422);
+          return;
+        }
+        if (result.reason === 'empty') {
+          // ADR-001 silent-empty (blob present, zero voices) — GitHub-API silent-empty / corruption → WARN + 404.
+          log.server.warn(
+            { id, backend: getUserContentBackend().constructor.name, path: 'mint', reason: 'empty' },
+            'Community op-ed share mint: getCommunityOpEd SILENT-EMPTY (blob present, zero voices) — possible corruption; refusing to mint',
+          );
+        }
+        // 'absent' = wrong/missing id — ordinary, expected, never corruption → routine 404, NO operator WARN.
+        error(res, 'not_found', 404);
         return;
       }
 
-      // submittedBy is tracked server-side ONLY for the revoke-auth check; the PUBLIC copy stays anonymous
-      // (projectPublicOpEd strips all community_metadata — condition 1).
-      const submittedBy = it.community_metadata?.submitted_by_display ?? '';
-      const shareId = await mintCommunityOpedShare(id, submittedBy);
-      await writePublicCommunityOpEd(item as unknown as CommunityOpEdItem, shareId);
-
-      json(res, { shareId, url: `/share/oped/${shareId}` });
+      // minted | already-shared → the stable community-scoped public shareId.
+      json(res, { shareId: result.shareId, url: `/share/oped/${result.shareId}` });
     } catch (err) {
       getGlobalRecorder()?.record({
         type: 'system.error', component: 'server', level: 'error',
@@ -237,7 +295,7 @@ export function registerCommunityRoutes(r: Router, ctx: ServerCtx): void {
 
   post('/api/community/submit', async (_req, res, body) => {
     try {
-      const { type, data, note } = body as { type: 'chat' | 'debate' | 'oped'; data: unknown; note?: string };
+      const { type, data, note } = body as { type: 'chat' | 'debate' | 'oped' | 'inquiry'; data: unknown; note?: string };
       if (!type || !data) { json(res, { error: 'type and data required' }, 400); return; }
 
       // Pre-flight: a community submission must reach GitHub (it's shared data on
@@ -281,7 +339,7 @@ export function registerCommunityRoutes(r: Router, ctx: ServerCtx): void {
 
   post('/api/community/copy', async (_req, res, body) => {
     try {
-      const { type, communityId } = body as { type: 'chats' | 'debates' | 'opeds'; communityId: string };
+      const { type, communityId } = body as { type: 'chats' | 'debates' | 'opeds' | 'inquiries'; communityId: string };
       if (!type || !communityId) { json(res, { error: 'type and communityId required' }, 400); return; }
       json(res, await community.copyFromCommunity(type, communityId));
     } catch (err) {

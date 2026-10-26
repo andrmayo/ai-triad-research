@@ -19,10 +19,12 @@ import { parseJsonRobust, formatRecentTranscript, getMoveName } from '../../help
 import { checkDraftScopeBoundary, SCOPE_BOUNDARY_THRESHOLD } from '../../exclusionGuard.js';
 import { computeCampInsularityRate, isInsularityCritical, selectCrossCampNode } from '../../schemeStagnation.js';
 import { nodePovFromId } from '../../nodeIdUtils.js';
+import { effectiveCamp } from '../../argumentNetwork/utils.js';
 import { resolveTurnValidationConfig } from '../../turnValidator.js';
 import { updateModeratorState, computeDebateHealthScore, buildInterventionBriefInjection, MOVE_RESPONSE_CONFIG, DIRECT_RESPONSE_PATTERNS, updateCruxEngagement } from '../../moderator.js';
 import { runModeratorSelection, executeTurnWithRetry, type ModeratorSelectionCallbacks, type ModeratorSelectionInput, type TurnRetryCallbacks, type TurnRetryInput } from '../../orchestration.js';
 import { pruneSessionData, pruneModeratorState } from '../../sessionPruning.js';
+import type { DriftTelemetryEntry } from '../../calibrationLogger/schema.js';
 import { getGlobalRecorder } from '../../../flight-recorder/index.js';
 import { runTurnPipeline, assemblePipelineResult, type TurnPipelineInput } from '../../turnPipeline.js';
 import { DEFAULT_TEMPERATURE } from '../../../ai-client/defaults.js';
@@ -47,6 +49,7 @@ import {
 import { injectPerturbation } from '../perturbation.js';
 import { shouldTriggerDiversityRound, runDiversityRound } from './diversityInjection.js';
 import { runProbingQuestions } from './probingQuestions.js';
+import { updateNarrativeSimilarity } from './narrativeVoicing.js';
 import { retrieveTalmudicReference, formatTalmudicSourceDirective, validateTalmudicReferenceResponse } from '../../talmudicReferences.js';
 import type { TalmudicReferenceSelection } from '../../types.js';
 
@@ -231,6 +234,11 @@ export async function runAdaptiveCrossRespond(engine: DebateEngineInternals): Pr
     state = applyTransition(state, result);
     state.api_calls_used = engine.apiCallCount;
     engine._phaseState = state;
+    // Persist after each round so single-step GUI can hydrate on next invocation (t/3761).
+    // adaptive_staging is guaranteed present by hydratePhaseState (debateEngine/hydrateState.ts).
+    if (engine.session.adaptive_staging) {
+      engine.session.adaptive_staging.phase_state = state;
+    }
 
     if (result.action === 'transition' || result.action === 'force_transition') {
       diag.phases.push({
@@ -423,6 +431,7 @@ export async function runCrossRespondRound(engine: DebateEngineInternals, round:
         drift_detected: selectionResult.drift_detected ?? false,
         drift_reasoning: selectionResult.trigger_reasoning ?? null,
         intervention_recommended: selectionResult.intervene ?? false,
+        intervention_source: selectionResult.intervene ? (selectionResult.trigger_source ?? 'moderator') : null,
         intervention_move: activeIntervention?.move ?? modResult.engineValidation?.validated_move ?? null,
         intervention_validated: !!activeIntervention,
         suppressed_reason: modResult.engineValidation?.suppressed_reason ?? null,
@@ -473,7 +482,7 @@ export async function runCrossRespondRound(engine: DebateEngineInternals, round:
   }
 
   // Generate response
-  const info = POVER_INFO[responder];
+  const info = engine.getSoulForSpeaker(responder);
   engine.progress('debate', responder, `${info.label} responding (round ${round})`);
 
   // priorRefs is also fed to the prompt below; computing it here lets
@@ -498,7 +507,7 @@ export async function runCrossRespondRound(engine: DebateEngineInternals, round:
     : '';
   const concessionCandidateIds = concessionHint
     ? (concessionAN!.nodes
-        .filter(n => n.speaker !== responder)
+        .filter(n => effectiveCamp(n) !== responder)
         .filter(n => (n.computed_strength ?? n.base_strength ?? 0) >= CONCESSION_CANDIDATE_MIN_QBAF_STRENGTH)
         .filter(n => !concessionAN!.edges.some(e => e.type === 'attacks' && e.source && concessionAN!.nodes.find(x => x.id === e.source)?.speaker === responder && e.target === n.id))
         .filter(n => !priorConceded.includes(n.id) && !priorConceded.includes(n.text))
@@ -655,7 +664,13 @@ export async function runCrossRespondRound(engine: DebateEngineInternals, round:
   const pipelineInput: TurnPipelineInput = {
     label: info.label,
     pov: info.pov,
+    soul: info,
     personality: info.personality,
+    opponentSouls: Object.fromEntries(
+      engine.config.activePovers
+        .filter(id => id !== responder && (id as string) !== 'user')
+        .map(id => [id, engine.getSoulForSpeaker(id)]),
+    ),
     topic: engine.session.topic.final,
     background: engine.session.topic.background || undefined,
     taxonomyContext: taxonomyContext + turnVocabContext + interventionInjection + insularityInjection,
@@ -873,7 +888,7 @@ export async function runCrossRespondRound(engine: DebateEngineInternals, round:
         const rewriteGenerateFn = async (prompt: string) =>
           engine.stageGenerate(prompt, draftModel, { temperature: draftTemp }, `${responder} overgen-rewrite`);
 
-        const poverInfo = POVER_INFO[responder];
+        const poverInfo = engine.getSoulForSpeaker(responder);
         const overgenResult = await runOvergenPipeline(
           draftFn, rewriteGenerateFn, embedFn,
           {
@@ -979,6 +994,7 @@ export async function runCrossRespondRound(engine: DebateEngineInternals, round:
     addressing: addressing as SpeakerId | 'all',
     caveats: caveats.length > 0 ? caveats : undefined,
     model: engine.config.speakerModels ? resolveModelForSpeaker(engine, responder) : undefined,
+    provider_model: engine.adapter.lastProviderModel,
     metadata: {
       cross_respond: true,
       round,
@@ -1066,6 +1082,9 @@ export async function runCrossRespondRound(engine: DebateEngineInternals, round:
     }
   }
 
+  // h3: similarity of this turn to the speaker's own camp narrative (drift from the opening baseline)
+  await updateNarrativeSimilarity(engine, entry);
+
   // Accumulate context manifest for taxonomy gap analysis
   accumulateContextManifest(engine, round, responder, info.pov, taxonomyRefs.map(r => r.node_id));
 
@@ -1099,6 +1118,53 @@ export async function runCrossRespondRound(engine: DebateEngineInternals, round:
     scope_drift_check: scopeDriftCheck,
     overgen: overgenDiagnostics,
   });
+
+  // Drift telemetry shadow log (t/3603) — observations only, no behaviour change
+  {
+    const qr = pipelineResult.qualityGateResult;
+    let quality_action: DriftTelemetryEntry['quality_action'];
+    if (!qr) {
+      quality_action = 'no_gate';
+    } else if (!qr.post_repair) {
+      quality_action = 'accepted';
+    } else {
+      quality_action =
+        qr.repair_outcome === 'fixed' ? 'repair_fixed' :
+        qr.repair_outcome === 'partial' ? 'repair_partial' :
+        'repair_unchanged';
+    }
+
+    // Token sum: add input+output per stage; null only when zero stages have usage data
+    let tokenSum = 0;
+    let stagesWithUsage = 0;
+    for (const d of pipelineResult.stage_diagnostics) {
+      const diag = d as Record<string, unknown>;
+      const inp = typeof diag.input_tokens === 'number' ? diag.input_tokens : 0;
+      const out = typeof diag.output_tokens === 'number' ? diag.output_tokens : 0;
+      if (typeof diag.input_tokens === 'number' || typeof diag.output_tokens === 'number') {
+        stagesWithUsage++;
+      }
+      tokenSum += inp + out;
+    }
+
+    // crux_engaged: last convergence signal for this speaker (pushed by claimExtractionPipeline)
+    const lastConvSig = engine.session.convergence_signals?.slice(-1)[0];
+    const crux_engaged = lastConvSig?.crux_engagement_rate.used_this_turn ?? null;
+
+    const entry: DriftTelemetryEntry = {
+      round,
+      speaker: responder,
+      quality_action,
+      topic_aligned: pipelineResult.topicAlignmentResult?.topic_aligned ?? null,
+      alignment_repair_triggered: pipelineResult.topicAlignmentResult?.repaired ?? false,
+      crux_engaged,
+      tokens_total: stagesWithUsage > 0 ? tokenSum : null,
+      latency_ms_total: pipelineResult.total_time_ms,
+      topical_state: null,   // populated by CL's t/3630 estimator when it ships
+      topical_drift_score: null,
+    };
+    (engine.session.drift_telemetry ??= []).push(entry);
+  }
 
   // Track move types and disagreement types
   if (meta.move_types) {

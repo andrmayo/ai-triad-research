@@ -60,7 +60,7 @@ function Set-TaxonomyHierarchy {
         if (Test-Path $FilePath) {
             $TaxFiles[$PovKey] = @{
                 Path = $FilePath
-                Data = Get-Content -Raw -Path $FilePath | ConvertFrom-Json
+                Data = Read-PovTaxonomyFile -Path $FilePath   # shape-preserving read (t/4356)
                 Modified = $false
             }
         }
@@ -160,52 +160,34 @@ function Set-TaxonomyHierarchy {
             }
             else {
                 # ── Create new parent node ───────────────────────────────
-                if ($IsCrossCutting) {
-                    $ParentId = "sit-$($NextSeq.ToString('D3'))"
-                    $NextSeq++
+                # t/3887: resolve the FINAL id (incl. any collision bump) BEFORE
+                # minting, so the cross-cutting branch's BDI gate call (inside
+                # New-SituationNode) sees the real id, not a provisional one.
+                # One prefix, computed once, so collision-bump doesn't repeat
+                # the IsCrossCutting branch (complexity-ratchet, t/3829).
+                if ($IsCrossCutting) { $IdPrefix = 'sit' } else { $IdPrefix = "$PovPrefix-$CatPrefix" }
+                $ParentId = "$IdPrefix-$($NextSeq.ToString('D3'))"
+                $NextSeq++
 
-                    $NewNode = [ordered]@{
-                        id              = $ParentId
-                        label           = $Parent.label
-                        description     = $Parent.description
-                        interpretations = [ordered]@{
-                            accelerationist = ''
-                            safetyist       = ''
-                            skeptic         = ''
-                        }
-                        linked_nodes    = @()
-                        conflict_ids    = @()
-                    }
-                }
-                else {
-                    $ParentId = "$PovPrefix-$CatPrefix-$($NextSeq.ToString('D3'))"
-                    $NextSeq++
-
-                    $NewNode = [ordered]@{
-                        id                 = $ParentId
-                        category           = $Bucket.category
-                        label              = $Parent.label
-                        description        = $Parent.description
-                        parent_id          = $null
-                        children           = @()
-                        situation_refs = @()
-                    }
-                }
-
-                # Check for ID collision
                 if ($ExistingIds.Contains($ParentId)) {
                     Write-Warn "ID collision: $ParentId — incrementing"
-                    $NextSeq++
-                    if ($IsCrossCutting) {
-                        $ParentId = "sit-$($NextSeq.ToString('D3'))"
-                    } else {
-                        $ParentId = "$PovPrefix-$CatPrefix-$($NextSeq.ToString('D3'))"
-                    }
-                    $NewNode.id = $ParentId
+                    $ParentId = "$IdPrefix-$($NextSeq.ToString('D3'))"
                     $NextSeq++
                 }
 
-                $NewObj = [PSCustomObject]$NewNode
+                # t/2332 gate + t/3887 shared creator — FAIL-CLOSED: on gate
+                # failure, skip this single parent (and, critically, its
+                # children too — this `continue` is at the parent-loop level,
+                # so no child is assigned an unminted parent_id). The gate's own
+                # try/catch lives inside New-TaxonomyParentNode, not here, so it
+                # doesn't add a second decision point to this already-baselined
+                # function (complexity-ratchet, t/3829).
+                $NewObj = New-TaxonomyParentNode -IsCrossCutting $IsCrossCutting -Id $ParentId -Label $Parent.label -Description $Parent.description -Category $Bucket.category
+                if (-not $NewObj) {
+                    $Stats.Errors++
+                    continue
+                }
+
                 Add-TextHistoryEntry -Node $NewObj -Field 'label' -Value $Parent.label -Source 'initial'
                 if ($Parent.description) {
                     Add-TextHistoryEntry -Node $NewObj -Field 'description' -Value $Parent.description -Source 'initial'
@@ -395,15 +377,11 @@ function Set-TaxonomyHierarchy {
 
         $FileEntry.Data.last_modified = $Today
 
-        $Json = $FileEntry.Data | ConvertTo-Json -Depth 20
-        if ($Json.Length -gt 10MB) {
-            Write-Fail "BLOCKED write to $PovKey — JSON is $([math]::Round($Json.Length / 1MB, 1)) MB (likely corrupted encoding). Skipping to prevent data loss."
-            continue
-        }
         if ($PSCmdlet.ShouldProcess($FileEntry.Path, 'Write updated taxonomy file')) {
             try {
-                Assert-DataWriteAllowed -Path $FileEntry.Path  # t/2902
-                Set-Content -Path $FileEntry.Path -Value ($Json -replace "`r`n", "`n") -Encoding utf8NoBOM -NoNewline
+                # Canonical TS format (t/4356). The funnel carries the t/2902 guard and the 10 MB
+                # corrupted-content block; either throws into the catch below, so the file is skipped.
+                Write-PovTaxonomyFile -Path $FileEntry.Path -Data $FileEntry.Data
                 Write-OK "Saved $PovKey ($($FileEntry.Path))"
             }
             catch {

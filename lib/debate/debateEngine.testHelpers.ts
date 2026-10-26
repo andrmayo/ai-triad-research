@@ -16,6 +16,8 @@ export function createMockAdapter(responses: string[] = []): ExtendedAIAdapter {
     async generateText(_prompt: string, _model: string, _options?: GenerateOptions) {
       return responses[callIndex++] || '{"response": "mock"}';
     },
+    // t/3614: required AIAdapter member — mock never runs floor logic, so an empty registry is correct.
+    registry: { backends: [], models: [] },
   };
 }
 
@@ -24,6 +26,8 @@ export function createThrowingAdapter(error: Error): ExtendedAIAdapter {
     async generateText() {
       throw error;
     },
+    // t/3614: required AIAdapter member — mock never runs floor logic, so an empty registry is correct.
+    registry: { backends: [], models: [] },
   };
 }
 
@@ -52,6 +56,9 @@ export function createMinimalTaxonomy(): LoadedTaxonomy {
     edges: null,
     embeddings: {},
     policyRegistry: [],
+    allNodesById: new Map(),
+    resolveNode: (id: string) => undefined,
+    allEdges: null,
   };
 }
 

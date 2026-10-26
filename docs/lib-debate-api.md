@@ -82,7 +82,7 @@ type PoverId = 'Accelerationist' | 'Safetyist' | 'Skeptic' | 'user';
 |----|-------|-----|-------------|
 | `Accelerationist` | Accelerationist | accelerationist | Confident, forward-looking, frames risk as cost-of-inaction |
 | `Safetyist` | Safetyist | safetyist | Methodical, evidence-driven, frames progress as conditional-on-safeguards |
-| `Skeptic` | Skeptic | skeptic | Wry, pragmatic, challenges assumptions from both sides |
+| `Skeptic` | Skeptic | skeptic | Grounded, dry, unmoved by both utopia and apocalypse; asks what is actually happening and who answers for it |
 | `user` | (human) | — | Human participant in user-is-pover mode |
 
 ### Transcript Entry
@@ -390,7 +390,7 @@ interface GenerateOptions {
 function createCLIAdapter(repoRoot: string, explicitKey?: string): AIAdapter;
 ```
 
-Creates an adapter that resolves models from `ai-models.json` and API keys from environment variables (backend-specific → `AI_API_KEY` fallback).
+Creates an adapter that resolves models from `ai-models.json` and API keys from environment variables (backend-specific; `AI_API_KEY` is a fallback for gemini models only, and a non-gemini backend with only `AI_API_KEY` set is refused with an error naming its own variable).
 
 ---
 

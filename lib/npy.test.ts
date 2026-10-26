@@ -1,9 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { parseNpy, extractNodeVectors } from './npy.js';
+import { parseNpy, extractNodeVectors, extractNodeVectorsAsync } from './npy.js';
 
 function buildNpyBuffer(rows: number, cols: number, values: number[]): Buffer {
   const header = `{'descr': '<f4', 'fortran_order': False, 'shape': (${rows}, ${cols}), }`;
-  const padded = header.padEnd(Math.ceil((header.length + 10) / 64) * 64 - 10, ' ') + '\n';
+  // NumPy's layout: the 10-byte prefix + header + '\n' is a multiple of 64, so the data block is aligned (the real
+  // corpus files start their data at byte 128). The '\n' counts towards the padding.
+  const padded = header.padEnd(Math.ceil((header.length + 11) / 64) * 64 - 11, ' ') + '\n';
   const headerLen = padded.length;
 
   const buf = Buffer.alloc(10 + headerLen + rows * cols * 4);
@@ -68,5 +70,72 @@ describe('extractNodeVectors', () => {
     expect(result['acc-B-001'].vectors[1]).toEqual([expect.closeTo(0.3), expect.closeTo(0.4)]);
     expect(result['acc-B-002'].vectors[0]).toEqual([expect.closeTo(0.5), expect.closeTo(0.6)]);
     expect(result['acc-B-002'].vectors[1]).toEqual([expect.closeTo(0.7), expect.closeTo(0.8)]);
+  });
+});
+
+describe('extractNodeVectorsAsync', () => {
+  const values = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+  const index = {
+    'acc-B-001': { start: 0, count: 2 },
+    'acc-B-002': { start: 2, count: 1 },
+    'acc-B-003': { start: 3, count: 1 },
+  };
+
+  it('produces the same output as the sync extractor', async () => {
+    const parsed = parseNpy(buildNpyBuffer(4, 2, values));
+    const result = await extractNodeVectorsAsync(parsed, index, 'acc', 1);
+    expect(result).toEqual(extractNodeVectors(parsed, index, 'acc'));
+    expect(Array.isArray(result['acc-B-001'].vectors[0])).toBe(true);
+  });
+
+  it('yields to the event loop between node chunks (t/4286)', async () => {
+    const parsed = parseNpy(buildNpyBuffer(4, 2, values));
+    let ticks = 0;
+    let stop = false;
+    const spin = (): void => { if (!stop) { ticks++; setImmediate(spin); } };
+    setImmediate(spin);
+    await extractNodeVectorsAsync(parsed, index, 'acc', 1);
+    stop = true;
+    expect(ticks).toBeGreaterThanOrEqual(2);
+  });
+
+  // t/4286#20: the work is per float. A node-count budget the corpus never reaches must not leave a file unyielded.
+  it('yields on the float budget even when the node budget is never reached', async () => {
+    const parsed = parseNpy(buildNpyBuffer(4, 2, values));
+    const stats = { slices: 0, maxSliceMs: 0, floats: 0 };
+    // 4 nodes' worth of rows (2+1+1 rows x 2 cols = 8 floats); node budget 1e9, float budget 2.
+    const result = await extractNodeVectorsAsync(parsed, index, 'acc', 1e9, stats, 2);
+    expect(result).toEqual(extractNodeVectors(parsed, index, 'acc'));
+    expect(stats.floats).toBe(8);
+    expect(stats.slices).toBe(4); // a yield after each of the 3 nodes (each copies >= 2 floats), plus the first slice
+    expect(stats.maxSliceMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('with the default budgets, a small file runs as one slice and reports its floats', async () => {
+    const parsed = parseNpy(buildNpyBuffer(4, 2, values));
+    const stats = { slices: 0, maxSliceMs: 0, floats: 0 };
+    await extractNodeVectorsAsync(parsed, index, 'acc', undefined, stats);
+    expect(stats).toMatchObject({ slices: 1, floats: 8 });
+  });
+});
+
+describe('parseNpy data placement (t/4286#20)', () => {
+  const values = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+
+  it('an aligned data block is viewed in place, not copied', () => {
+    const buf = buildNpyBuffer(3, 2, values);
+    const parsed = parseNpy(buf);
+    expect(parsed.data.buffer).toBe(buf.buffer); // shares the input's memory
+    expect(Array.from(parsed.data)).toEqual(values.map((v) => expect.closeTo(v)));
+  });
+
+  it('an unaligned data block is copied into an aligned buffer and still decodes correctly', () => {
+    const src = buildNpyBuffer(3, 2, values);
+    const shifted = Buffer.alloc(src.length + 1);
+    src.copy(shifted, 1);
+    const unaligned = shifted.subarray(1); // byteOffset 1: the data block is no longer 4-byte aligned
+    const parsed = parseNpy(unaligned);
+    expect(parsed.data.buffer).not.toBe(shifted.buffer);
+    expect(Array.from(parsed.data)).toEqual(values.map((v) => expect.closeTo(v)));
   });
 });

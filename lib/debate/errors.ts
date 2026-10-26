@@ -22,6 +22,8 @@ export class ActionableError extends Error {
   public readonly location: string;
   public readonly nextSteps: string[];
   public readonly innerError?: Error;
+  public httpStatus?: number;
+  public readonly code?: string;
 
   constructor(opts: {
     goal: string;
@@ -29,6 +31,8 @@ export class ActionableError extends Error {
     location: string;
     nextSteps: string[];
     innerError?: unknown;
+    httpStatus?: number;
+    code?: string;
   }) {
     const inner = opts.innerError instanceof Error ? opts.innerError : undefined;
     const innerMsg = inner ? `\n  Inner error: ${inner.message}` : '';
@@ -50,6 +54,8 @@ export class ActionableError extends Error {
     this.location = opts.location;
     this.nextSteps = opts.nextSteps;
     this.innerError = inner;
+    this.httpStatus = opts.httpStatus;
+    this.code = opts.code;
 
     // Maintain prototype chain for instanceof checks
     Object.setPrototypeOf(this, ActionableError.prototype);

@@ -157,6 +157,294 @@ def test_testedness_adversarial_when_attack_present():
     assert tm["stance_hist"] == {"supports": 1, "disputes": 1}
 
 
+# _detect_numeric_temporal_conflict — deterministic complement (t/3302 fork-B, TL's mandatory
+# high-precision detector). Conservative: subject overlap + same-kind disjoint quantities.
+
+def _bow_embedder(texts):
+    # Deterministic bag-of-words vectors (test-only proxy for MiniLM): masked-identical text -> cosine
+    # 1.0; different-subject masked text -> < 0.93. Exercises the same-subject gate without a model.
+    # The detector masks BEFORE calling the embedder, so these receive already-masked strings.
+    toks = [set(str(t).lower().split()) for t in texts]
+    vocab = sorted(set().union(*toks)) if toks else []
+    return [[1.0 if v in tk else 0.0 for v in vocab] for tk in toks]
+
+
+def test_numeric_conflicting_percentages_same_subject():
+    assert eq._detect_numeric_temporal_conflict(
+        "Compute among safety labs grew 30 percent last year",
+        "Compute among safety labs grew 10 percent last year", embedder=_bow_embedder) is True
+
+
+def test_numeric_same_percentage_no_conflict():
+    assert eq._detect_numeric_temporal_conflict(
+        "Compute among safety labs grew 30 percent last year",
+        "Compute among safety labs grew 30 percent last year") is False
+
+
+def test_numeric_different_subject_no_conflict():
+    # Different percentages but the subjects don't overlap (<3 shared content words) -> no fire.
+    assert eq._detect_numeric_temporal_conflict(
+        "GDP rose 30 percent", "unemployment fell 10 percent") is False
+
+
+def test_temporal_conflicting_years_same_subject():
+    assert eq._detect_numeric_temporal_conflict(
+        "The superintelligence ban takes effect by 2027 under this act",
+        "The superintelligence ban takes effect by 2030 under this act", embedder=_bow_embedder) is True
+
+
+def test_bare_numbers_conflict_requires_strong_overlap():
+    # 4+ shared content words + disjoint bare numbers -> conflict.
+    assert eq._detect_numeric_temporal_conflict(
+        "The frontier training run used 3 data centers in the cluster",
+        "The frontier training run used 7 data centers in the cluster", embedder=_bow_embedder) is True
+
+
+def test_bare_numbers_weak_overlap_no_conflict():
+    # Disjoint numbers but too few shared words -> no fire (subject gate not met).
+    assert eq._detect_numeric_temporal_conflict(
+        "labs used 3 chips", "labs used 7 servers") is False
+
+
+# same-subject masked-cosine hard-gate (t/3337#5) — the fix for the 0/54 same-doc precision failure
+
+def test_mask_numbers_replaces_values_keeps_metric():
+    m = eq._mask_numbers("17% of firms cut 5,000 jobs by 2024 worth $3 billion")
+    assert "17" not in m and "5,000" not in m and "2024" not in m and "$" not in m and "billion" not in m
+    assert "firms" in m and "jobs" in m and "worth" in m   # metric/subject words survive
+
+def test_same_subject_gate_blocks_different_subject_that_old_detector_fired():
+    # The regression the census exposed: disjoint % + >=3 shared words but DIFFERENT metric (postings vs
+    # skills). Old detector fired (0/54 precision); the masked-cosine gate must SKIP it.
+    a = "job postings dropped 17 percent this year across the market"
+    b = "required skills dropped 24 percent this year across the market"
+    assert eq._detect_numeric_temporal_conflict(a, b, embedder=_bow_embedder) is False
+
+def test_same_subject_gate_still_fires_same_metric():
+    # Same metric, different value -> masked-identical -> cosine 1.0 -> fires (recall preserved).
+    a = "unemployment rose 17 percent this year across the market"
+    b = "unemployment rose 24 percent this year across the market"
+    assert eq._detect_numeric_temporal_conflict(a, b, embedder=_bow_embedder) is True
+
+def test_same_subject_gate_no_candidate_skips_embed():
+    # Same numbers (not disjoint) -> no candidate -> returns False WITHOUT calling the embedder.
+    called = {"n": 0}
+    def spy(texts):
+        called["n"] += 1
+        return _bow_embedder(texts)
+    assert eq._detect_numeric_temporal_conflict(
+        "labs grew compute 30 percent last year", "labs grew compute 30 percent last year",
+        embedder=spy) is False
+    assert called["n"] == 0   # no embed when there's no disjoint-number candidate (cheap fast-path)
+
+
+# detect_semantic_edges + enrich_conflict extra_edges — fork-B wiring (t/3302, AI mocked)
+
+def _si(stance, doc, text):
+    return {"stance": stance, "doc_id": doc, "assertion": text}
+
+
+def test_detect_semantic_edges_numeric_and_llm():
+    to_process = [
+        (None, {"claim_id": "c0", "instances": [
+            _si("neutral", "d1", "compute among safety labs grew 30 percent last year"),
+            _si("neutral", "d2", "compute among safety labs grew 10 percent last year")]}),
+        (None, {"claim_id": "c1", "instances": [
+            _si("neutral", "d1", "cats are calm household pets"),
+            _si("neutral", "d2", "dogs are loud household pets")]}),
+    ]
+    # Only c1's pair (id "1:0:1") reaches the LLM (c0 is caught by the numeric detector first).
+    def runner(batch, mode, temp):
+        ids = {p["id"] for c in batch for p in c["pairs"]}
+        assert ids == {"1:0:1"}, f"numeric pair must not reach the LLM; got {ids}"
+        return {"1:0:1": {"label": "contradict", "confidence": 0.9}}
+    by_ci = eq.detect_semantic_edges(to_process, min_confidence=0.5, mode="per-conflict", cc_runner=runner,
+                                     embedder=_bow_embedder)
+    # Symmetric contradictions: TWO attack edges each (i->j and j->i), t/3336#4.
+    assert len(by_ci[0]) == 2 and all(e["detector"] == "numeric" and e["type"] == "attacks" for e in by_ci[0])
+    assert {(e["source"], e["target"]) for e in by_ci[0]} == {("inst-0", "inst-1"), ("inst-1", "inst-0")}
+    assert len(by_ci[1]) == 2 and all(e["detector"] == "llm" and e["type"] == "attacks" for e in by_ci[1])
+    assert {(e["source"], e["target"]) for e in by_ci[1]} == {("inst-0", "inst-1"), ("inst-1", "inst-0")}
+    assert all(e["confidence"] == 0.9 for e in by_ci[1])
+
+
+def test_detect_semantic_edges_entail_is_support():
+    to_process = [(None, {"claim_id": "c0", "instances": [
+        _si("neutral", "d1", "the model reduces latency"),
+        _si("neutral", "d2", "the model cuts latency")]})]
+    runner = lambda batch, mode, temp: {"0:0:1": {"label": "entail", "confidence": 0.8}}
+    by_ci = eq.detect_semantic_edges(to_process, min_confidence=0.5, cc_runner=runner)
+    # Entailment is directional — a SINGLE support edge (not symmetric), t/3336#4.
+    assert len(by_ci[0]) == 1
+    assert by_ci[0][0]["type"] == "supports"
+    assert by_ci[0][0]["detector"] == "llm"
+
+
+def test_detect_semantic_edges_low_confidence_dropped():
+    to_process = [(None, {"claim_id": "c0", "instances": [
+        _si("neutral", "d1", "alpha beta gamma"),
+        _si("neutral", "d2", "delta epsilon zeta")]})]
+    runner = lambda batch, mode, temp: {"0:0:1": {"label": "contradict", "confidence": 0.2}}
+    by_ci = eq.detect_semantic_edges(to_process, min_confidence=0.5, cc_runner=runner)
+    assert by_ci == {}  # below threshold -> no edge
+
+
+def test_enrich_conflict_merges_extra_edges_with_provenance():
+    conflict = {"instances": [_si("neutral", "d1", "aaa"), _si("neutral", "d2", "bbb")]}
+    extra = [{"source": "inst-0", "target": "inst-1", "type": "attacks", "weight": 0.6,
+              "attack_type": "rebut", "detector": "llm", "edge_origin": "semantic", "confidence": 0.77}]
+    pre = eq.enrich_conflict(conflict, {}, extra_edges=extra)
+    assert pre.get("_needs_bridge") is True   # extra edge -> needs propagation
+    eo = pre["edge_output"][0]
+    assert eo["detector"] == "llm" and eo["edge_origin"] == "semantic" and eo["confidence"] == 0.77
+
+
+# Provenance + benefit-arm predictions sink — fork-B corpus-write conditions (t/3302#24, t/3336)
+
+def test_semantic_edge_provenance_classifier_and_tau():
+    to_process = [
+        (None, {"claim_id": "c0", "instances": [
+            _si("neutral", "d1", "compute among safety labs grew 30 percent last year"),
+            _si("neutral", "d2", "compute among safety labs grew 10 percent last year")]}),
+        (None, {"claim_id": "c1", "instances": [
+            _si("neutral", "d1", "cats are calm household pets"),
+            _si("neutral", "d2", "dogs are loud household pets")]}),
+    ]
+    runner = lambda batch, mode, temp: {"1:0:1": {"label": "contradict", "confidence": 0.9}}
+    by_ci = eq.detect_semantic_edges(to_process, min_confidence=0.9, mode="per-conflict", cc_runner=runner,
+                                     embedder=_bow_embedder)
+    # LLM edge carries classifier id + τ (TL GV cond 1)
+    llm_edge = by_ci[1][0]
+    assert llm_edge["classifier"] == eq._CC_USAGE_ID
+    assert llm_edge["tau"] == 0.9
+    # numeric edge carries τ but NO classifier (deterministic detector)
+    num_edge = by_ci[0][0]
+    assert num_edge["detector"] == "numeric"
+    assert num_edge["tau"] == 0.9
+    assert "classifier" not in num_edge
+
+
+def test_predictions_sink_captures_numeric_and_llm():
+    to_process = [
+        (None, {"claim_id": "c0", "instances": [
+            _si("neutral", "d1", "compute among safety labs grew 30 percent last year"),
+            _si("neutral", "d2", "compute among safety labs grew 10 percent last year")]}),
+        (None, {"claim_id": "c1", "instances": [
+            _si("neutral", "d1", "cats are calm household pets"),
+            _si("neutral", "d2", "dogs are loud household pets")]}),
+    ]
+    runner = lambda batch, mode, temp: {"1:0:1": {"label": "contradict", "confidence": 0.9, "method": "llm-batch"}}
+    sink = []
+    eq.detect_semantic_edges(to_process, min_confidence=0.9, mode="per-conflict",
+                             cc_runner=runner, predictions_sink=sink, embedder=_bow_embedder)
+    assert len(sink) == 2  # one numeric candidate + one llm candidate, none dropped
+    by_conf = {p["conflict_id"]: p for p in sink}
+    num = by_conf["c0"]
+    assert num["predicted"] == "contradict" and num["confidence"] == 1.0 and num["method"] == "numeric"
+    assert num["source"] == "inst-0" and num["target"] == "inst-1"
+    llm = by_conf["c1"]
+    assert llm["predicted"] == "contradict" and llm["confidence"] == 0.9 and llm["method"] == "llm-batch"
+
+
+def test_predictions_sink_records_raw_pre_tau():
+    # A below-threshold contradict produces NO edge but is still recorded raw in the sink (CL applies τ).
+    to_process = [(None, {"claim_id": "c0", "instances": [
+        _si("neutral", "d1", "alpha beta gamma"),
+        _si("neutral", "d2", "delta epsilon zeta")]})]
+    runner = lambda batch, mode, temp: {"0:0:1": {"label": "contradict", "confidence": 0.2, "method": "llm-batch"}}
+    sink = []
+    by_ci = eq.detect_semantic_edges(to_process, min_confidence=0.9, cc_runner=runner, predictions_sink=sink)
+    assert by_ci == {}  # below τ -> no edge
+    assert len(sink) == 1 and sink[0]["predicted"] == "contradict" and sink[0]["confidence"] == 0.2
+
+
+# Same-doc relaxation + cosine dedup gate + symmetric edges — fork-B expansion (t/3336, embedder mocked)
+
+def _fake_embedder(texts):
+    # Deterministic tiny vectors: identical strings -> identical vector (cosine 1.0); P/Q orthogonal.
+    m = {"X": [1.0, 0.0, 0.0], "P": [1.0, 0.0, 0.0], "Q": [0.0, 1.0, 0.0]}
+    return [m.get(t, [0.0, 0.0, 1.0]) for t in texts]
+
+
+def test_collect_includes_samedoc_only_when_flagged():
+    conflict = {"instances": [_si("neutral", "d1", "aaa"), _si("neutral", "d1", "bbb")]}
+    assert eq._collect_semantic_candidates(conflict) == []  # same-doc skipped by default
+    cands = eq._collect_semantic_candidates(conflict, include_same_doc=True)
+    assert len(cands) == 1 and cands[0]["same_doc"] is True
+
+
+def test_apply_samedoc_dedup_drops_near_identical_keeps_distinct():
+    cands = [
+        {"i": 0, "j": 1, "a": "X", "b": "X", "same_doc": True},   # identical -> cosine 1.0 -> drop
+        {"i": 0, "j": 2, "a": "P", "b": "Q", "same_doc": True},   # distinct  -> cosine 0.0 -> keep
+        {"i": 1, "j": 2, "a": "R", "b": "S", "same_doc": False},  # cross-doc -> untouched
+    ]
+    kept = eq._apply_samedoc_dedup(cands, threshold=0.93, embedder=_fake_embedder)
+    pairs = {(c["i"], c["j"]) for c in kept}
+    assert pairs == {(0, 2), (1, 2)}  # the identical same-doc pair dropped; others kept
+
+
+def test_detect_samedoc_symmetric_end_to_end():
+    to_process = [(None, {"claim_id": "c0", "instances": [
+        _si("neutral", "d1", "P"), _si("neutral", "d1", "Q")]})]  # same-doc, distinct -> kept by dedup
+    runner = lambda batch, mode, temp: {"0:0:1": {"label": "contradict", "confidence": 0.95}}
+    by_ci = eq.detect_semantic_edges(
+        to_process, min_confidence=0.9, cc_runner=runner,
+        include_same_doc=True, dedup_threshold=0.93, embedder=_fake_embedder)
+    assert len(by_ci[0]) == 2  # symmetric attack edges
+    assert {(e["source"], e["target"]) for e in by_ci[0]} == {("inst-0", "inst-1"), ("inst-1", "inst-0")}
+
+
+def test_detect_samedoc_dedup_blocks_duplicate_extraction():
+    # Near-identical same-doc pair (the "54% vs 45%-typo" trap) is dropped before classification -> no edge.
+    to_process = [(None, {"claim_id": "c0", "instances": [
+        _si("neutral", "d1", "X"), _si("neutral", "d1", "X")]})]
+    called = {"n": 0}
+    def runner(batch, mode, temp):
+        called["n"] += 1
+        return {}
+    by_ci = eq.detect_semantic_edges(
+        to_process, min_confidence=0.9, cc_runner=runner,
+        include_same_doc=True, dedup_threshold=0.93, embedder=_fake_embedder)
+    assert by_ci == {}
+    assert called["n"] == 0  # dedup removed the only candidate; classifier never called
+
+
+def test_cosine_basic():
+    assert eq._cosine([1.0, 0.0], [1.0, 0.0]) == 1.0
+    assert eq._cosine([1.0, 0.0], [0.0, 1.0]) == 0.0
+    assert eq._cosine([0.0, 0.0], [1.0, 1.0]) == 0.0  # degenerate -> 0
+
+
+# _safe_env AI-key forwarding — classifier auth path (t/3336 live-run failure: keys stripped -> unresolved)
+
+def test_safe_env_default_strips_ai_keys_but_forwards_on_request():
+    import os
+    key = "GEMINI_API_KEY"
+    saved = os.environ.get(key)
+    try:
+        os.environ[key] = "test-sentinel-not-a-real-key"
+        assert key not in eq._safe_env()                       # default: bridge gets no AI keys
+        assert eq._safe_env(include_ai_keys=True).get(key) == "test-sentinel-not-a-real-key"
+    finally:
+        if saved is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = saved
+
+
+def test_safe_env_does_not_inject_absent_ai_keys():
+    import os
+    key = "GROQ_API_KEY"
+    saved = os.environ.get(key)
+    try:
+        os.environ.pop(key, None)
+        assert key not in eq._safe_env(include_ai_keys=True)   # absent key not fabricated
+    finally:
+        if saved is not None:
+            os.environ[key] = saved
+
+
 if __name__ == "__main__":
     import pytest
 

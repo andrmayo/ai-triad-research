@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 // Licensed under the MIT License. See LICENSE file in the project root.
 
-export type OverviewTab = 'topic-scope' | 'extraction' | 'argument-network' | 'arg-strength' | 'commitments' | 'transcript' | 'convergence' | 'reflections' | 'gaps' | 'grounding' | 'lineage' | 'adaptive' | 'pov-progression' | 'fr-context' | 'prompt-diff' | 'utility' | 'exclusion-overview' | 'emotional-register';
+export type OverviewTab = 'topic-scope' | 'extraction' | 'argument-network' | 'arg-strength' | 'commitments' | 'steelmans' | 'transcript' | 'convergence' | 'reflections' | 'gaps' | 'grounding' | 'lineage' | 'adaptive' | 'pov-progression' | 'fr-context' | 'prompt-diff' | 'utility' | 'exclusion-overview' | 'emotional-register';
 
 export type EntryTab = 'tax-refs' | 'details' | 'claims' | 'evidence' | 'citations' | 'brief' | 'plan' | 'draft' | 'lookahead' | 'cite' | 'moderator' | 'exclusion' | 'affect';
 
@@ -34,6 +34,8 @@ export interface ModeratorTraceData {
   selection_prompt?: string; selection_response?: string;
   health_score?: number; health_components?: Record<string, number>; health_trend?: number;
   intervention_recommended?: boolean; intervention_move?: string | null;
+  /** t/3513 — 'engine' when the deterministic floor proposed it after the moderator declined. */
+  intervention_source?: 'moderator' | 'engine' | null;
   intervention_validated?: boolean; intervention_suppressed_reason?: string | null;
   intervention_suppression_explanation?: string | null;
   intervention_target?: string | null;

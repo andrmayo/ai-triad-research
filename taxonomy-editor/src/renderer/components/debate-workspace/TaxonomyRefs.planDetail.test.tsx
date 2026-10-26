@@ -19,7 +19,8 @@ vi.mock('./utils', () => ({
   getNodeLabel: (id: string) => `Label for ${id}`,
   getNodeWeight: () => null,
   focusMainWindowNode: vi.fn(),
-  handleExplainEntry: vi.fn(),
+  buildExplainPrompt: vi.fn(() => 'prompt'),
+  buildSelectionExplainPrompt: vi.fn(() => 'selection prompt'),
   fixMarkdownLinks: (s: string) => s,
   resolvePolRef: () => ({ id: '', relevance: null }),
   getPolicyAction: () => undefined,
@@ -105,6 +106,44 @@ describe('TaxonomyRefsSection — PLAN anchor → inline POV detail (t/1724)', (
     fireEvent.click(screen.getByRole('button', { name: ANCHOR }));
     fireEvent.click(screen.getByText('close-detail'));
     expect(screen.queryByTestId('ref-detail')).toBeNull();
+  });
+});
+
+describe('AnticipatedBox — legacy object-shape items (t/3418, React #31 regression)', () => {
+  beforeEach(() => { vi.clearAllMocks(); usePreferencesStore.setState({ viewMode: 'advanced' }); });
+
+  it('renders without throwing when anticipated_challenges/responses are legacy {challenge, type} objects', () => {
+    const stageDiagnostics = [
+      {
+        stage: 'plan',
+        raw_response: '',
+        work_product: {
+          strategic_goal: 'Win the point',
+          anticipated_challenges: [{ challenge: 'They will cite cost.', type: 'economic' }],
+          anticipated_responses: [{ challenge: 'Point to long-run savings.' }],
+        },
+      },
+    ];
+    expect(() =>
+      render(<TaxonomyRefsSection refs={[]} stageDiagnostics={stageDiagnostics} forceExpanded />)
+    ).not.toThrow();
+    expect(screen.getByText('economic: They will cite cost.')).toBeInTheDocument();
+    expect(screen.getByText('Point to long-run savings.')).toBeInTheDocument();
+  });
+
+  it('still renders plain tagged-string items (new schema) unchanged', () => {
+    const stageDiagnostics = [
+      {
+        stage: 'plan',
+        raw_response: '',
+        work_product: {
+          strategic_goal: 'Win the point',
+          anticipated_challenges: ['economic: They will cite cost.'],
+        },
+      },
+    ];
+    render(<TaxonomyRefsSection refs={[]} stageDiagnostics={stageDiagnostics} forceExpanded />);
+    expect(screen.getByText('economic: They will cite cost.')).toBeInTheDocument();
   });
 });
 

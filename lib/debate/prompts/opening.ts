@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 // Licensed under the MIT License. See LICENSE file in the project root.
 
-import type { DocumentAnalysis, DebateAudience } from '../types.js';
+import type { DocumentAnalysis, DebateAudience, PovInfo, SpeakerId } from '../types.js';
 import { documentAnalysisContext } from '../documentAnalysis.js';
 import {
   getCharacterBlock,
@@ -11,8 +11,10 @@ import {
   getStyleReinforcement,
   getPolicymakerFraming,
   formatDoctrinalBoundaries,
+  gradeTargetPreamble,
 } from './shared-helpers.js';
 import { sourceContext, MUST_CORE_BEHAVIORS, STEELMAN_INSTRUCTION } from './shared-instructions.js';
+import { NARRATIVE_CHECK_INSTRUCTION } from './narrative.js';
 
 // ── 4-Stage opening pipeline prompts ─────────────────────────
 
@@ -26,11 +28,19 @@ export interface OpeningStagePromptInput {
   taxonomyContext: string;
   priorStatements: string;
   isFirst: boolean;
+  /** Labels of speakers who have already given their opening, in order. Used to generate a dynamic prior_steelmans example. */
+  priorSpeakerLabels?: string[];
   sourceContent?: string;
   documentAnalysis?: DocumentAnalysis;
   audience?: DebateAudience;
   userSeedClaims?: { id: string; text: string; bdi_category?: string }[];
   edgeContext?: string;
+  /** Moderator's narrative voicing of each camp (h3), pre-formatted by narrativeVoicingDebaterBlock. */
+  narrativeVoicing?: string;
+  /** Resolved soul for this speaker (t/3988). */
+  soul: PovInfo;
+  /** Resolved souls for the other speakers (t/3988). Keys are SpeakerId. */
+  opponentSouls?: Partial<Record<SpeakerId, PovInfo>>;
 }
 
 export function briefOpeningStagePrompt(input: OpeningStagePromptInput): string {
@@ -42,11 +52,11 @@ export function briefOpeningStagePrompt(input: OpeningStagePromptInput): string 
 
 Your task is to analyze the debate topic and identify the strongest framing strategy for ${input.label}'s opening statement. This is pure analysis — do not write any debate statement or adopt the debater's voice.
 
-${input.taxonomyContext}
+${gradeTargetPreamble(input.audience)}${input.taxonomyContext}
 ${input.edgeContext ? `\n=== KNOWN CROSS-POV TENSIONS ===\n${input.edgeContext}\n` : ''}
 === DEBATE TOPIC ===
 "${input.topic}"${input.background ? `\n\n=== BACKGROUND CONTEXT ===\nThe user provided the following supporting context. Use it to inform your analysis, but keep it separate from the debate question itself.\n${input.background}` : ''}${documentBlock}
-${input.userSeedClaims && input.userSeedClaims.length > 0 ? `\n=== USER-STATED POSITIONS ===\nThe user framed this debate with the following positions. Factor these into your analysis.\n${input.userSeedClaims.map(c => `- [${c.id}] ${c.text}`).join('\n')}\n` : ''}${input.priorStatements}
+${input.userSeedClaims && input.userSeedClaims.length > 0 ? `\n=== USER-STATED POSITIONS ===\nThe user framed this debate with the following positions. Factor these into your analysis.\n${input.userSeedClaims.map(c => `- [${c.id}] ${c.text}`).join('\n')}\n` : ''}${input.narrativeVoicing ? `${input.narrativeVoicing}\n` : ''}${input.priorStatements}
 
 Analyze the topic${input.isFirst ? '' : ' and prior opening statements'} and produce a structured brief. Focus on:
 1. What are the key dimensions of this topic that ${input.label}'s perspective can address?
@@ -91,10 +101,10 @@ NOTE: Only speakers listed in the prior statements have actually spoken. Do not 
 
 export function planOpeningStagePrompt(input: OpeningStagePromptInput, brief: string): string {
   return `You are ${input.label}, planning the structure of your opening statement.
-${getCharacterBlock(input.pov)}
+${getCharacterBlock(input.pov, input.soul)}
 Your perspective: ${input.pov}.
-${formatDoctrinalBoundaries(input.pov)}
-=== SITUATION BRIEF ===
+${formatDoctrinalBoundaries(input.pov, input.soul)}
+${gradeTargetPreamble(input.audience)}=== SITUATION BRIEF ===
 ${brief}
 
 Plan your opening statement strategy. This is your first appearance — you need to:
@@ -132,6 +142,18 @@ FALSIFIABILITY — calibrate evidence demands:
 
 ASSUMPTIONS — your nodes list their assumptions. Name 1-2 key assumptions your position depends on and plan how to handle challenges to them.
 
+ANTICIPATED CHALLENGES - forecast where you are actually vulnerable, not where you are safe:
+- Give the STRONGEST version of each challenge (steelman it). A challenge you can easily
+  dismiss is worthless - mirror the steelman discipline you apply to opponents.
+- Ground each in a specific target: a taxonomy node, a concrete claim, or a named
+  assumption. Never "they'll say it's risky."
+- Tag each as ATTACK (an objection an opponent will raise) or ASSUMPTION (a load-bearing
+  premise of YOUR position you are exposing). These are different - give at least one of each.
+- Where a node in your context shows a Vulnerability: line (its pre-computed strongest
+  counterargument), GROUND your ATTACK-type challenge for that node in it — sharpen or restate
+  that objection rather than inventing a weaker one. It is the strongest known attack on the
+  node; anticipate it, don't dodge it.
+
 Respond ONLY with a JSON object (no markdown, no code fences):
 {
   "strategic_goal": "1-2 sentences: what your opening should accomplish",
@@ -144,7 +166,7 @@ Respond ONLY with a JSON object (no markdown, no code fences):
     {"frame": "how you will frame the issue", "why": "why this framing favors your perspective"},
     {"frame": "alternative or complementary framing", "why": "what this framing reveals that the first doesn't"}
   ],
-  "anticipated_challenges": ["what opponents will likely challenge", "what assumptions you're exposing"]
+  "anticipated_challenges": ["ATTACK: <strongest specific objection an opponent will raise, naming the node/claim/assumption it targets>", "ASSUMPTION: <a load-bearing premise of your position you are exposing, and why it is contestable>"]
 }`;
 }
 
@@ -158,8 +180,8 @@ export function draftOpeningStagePrompt(input: OpeningStagePromptInput, brief: s
       : '';
 
   return `You are ${input.label}, an AI debater representing the ${input.pov} perspective on AI policy.
-${getCharacterBlock(input.pov)}
-${otherDebaters(input.label)}
+${getCharacterBlock(input.pov, input.soul)}
+${otherDebaters(input.label, input.opponentSouls)}
 ${getReadingLevel(input.audience)}
 ${getDetailInstruction(input.audience)}
 ${getPolicymakerFraming(input.audience)}
@@ -168,13 +190,13 @@ OUTPUT: Respond ONLY with a JSON object (no markdown, no code fences, no preambl
 ${MUST_CORE_BEHAVIORS}
 
 ${STEELMAN_INSTRUCTION}
-${formatDoctrinalBoundaries(input.pov)}
+${formatDoctrinalBoundaries(input.pov, input.soul)}
 === SITUATION BRIEF ===
 ${brief}
 
 === YOUR ARGUMENT PLAN ===
 ${plan}
-
+${input.narrativeVoicing ? `${input.narrativeVoicing}\n` : ''}
 ${input.userSeedClaims && input.userSeedClaims.length > 0 ? `=== USER-STATED POSITIONS ===\nThe user framed this debate with the following positions. Engage with these directly — state which you agree with, which you challenge, and why. Reference their IDs in your claim_sketches targets.\n${input.userSeedClaims.map(c => `- [${c.id}] ${c.text}`).join('\n')}\n\n` : ''}=== YOUR ASSIGNMENT ===
 Deliver your opening statement as ${input.label} — stay in character. Frame the issue from your perspective and establish your core argument. Be specific, substantive, and persuasive.
 ${hasDocument ? documentInstructions : ''}
@@ -183,6 +205,12 @@ ${input.isFirst ? 'You are delivering the first opening statement.' : `You have 
 IMPORTANT: You may only attribute named positions to speakers whose openings appear in the PRIOR OPENING POSITIONS section above. If only one speaker has spoken, do not use 'they' or 'both positions' — name the specific speaker. Do not attribute positions to speakers who have not yet delivered their opening.`}
 
 Execute the argument plan above. Write your opening statement following the plan's structure.
+
+ADDRESS YOUR ANTICIPATED CHALLENGES: For each challenge in your plan's anticipated_challenges,
+make a deliberate choice - either (a) pre-empt it in your opening (concede-and-bound it, or
+plant the seed of your rebuttal so it can't land cold later), or (b) deliberately leave it
+unaddressed because raising it now costs more than it saves. Do not silently ignore them.
+Pre-empting your strongest anticipated objection is often the most persuasive move an opening can make.
 
 OUTPUT CONSTRAINTS:
 - NODE-ID PROHIBITION: Never surface taxonomy node IDs in statement text. Use plain language.
@@ -196,7 +224,7 @@ PARAGRAPH STRUCTURE:
 - A single unbroken block will be rejected — structure your argument into clear, quotable sections.
 
 ${getStyleReinforcement(input.audience)}
-
+${input.narrativeVoicing ? `${NARRATIVE_CHECK_INSTRUCTION}\n` : ''}
 Respond ONLY with a JSON object matching this exact schema (no markdown, no code fences):
 {
   "statement": "your opening statement (3-5 paragraphs separated by \\n\\n)",
@@ -206,10 +234,13 @@ Respond ONLY with a JSON object matching this exact schema (no markdown, no code
   "claim_sketches": [
     {"claim": "near-verbatim headline assertion from your statement", "targets": [${input.isFirst ? '' : '"AN-3"'}], "relationship": "${input.isFirst ? '' : 'extends'}"},
     {"claim": "near-verbatim supporting sub-claim or premise", "targets": [], "relationship": ""}
-  ]
+  ]${input.isFirst ? '' : `,
+  "prior_steelmans": [
+    ${(input.priorSpeakerLabels ?? ['<prior speaker>']).map(s => `{"speaker": "${s}", "steelman_claim": "one-sentence strongest version of ${s}'s position in their own terms"}`).join(',\n    ')}
+  ]`}
 }${input.isFirst ? '' : `
 
-NOTE: At least one claim_sketch MUST have a non-empty "targets" array referencing a prior speaker's AN node, with a support/neutral relationship. Allowed opening relationships: "extends", "integrates", "concedes_and_pivots", "specifies".`}`;
+NOTE: (1) At least one claim_sketch MUST have a non-empty "targets" array referencing a prior speaker's AN node, with a support/neutral relationship. Allowed opening relationships: "extends", "integrates", "concedes_and_pivots", "specifies". (2) prior_steelmans is REQUIRED — include one entry per prior speaker. Each steelman_claim must be a single sentence capturing the strongest, most charitable version of that speaker's position in their own terms, with their evidence and reasoning — not a dismissal or paraphrase of their conclusion alone.`}`;
 }
 
 export function citeOpeningStagePrompt(

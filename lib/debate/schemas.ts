@@ -9,6 +9,7 @@
 
 import { z } from 'zod';
 import { POV_KEYS } from './types.js';
+import { validatePovTags } from '../schema/povTags.js';
 
 // ── Shared enums ──────────────────────────────────────────
 
@@ -137,6 +138,17 @@ export const PovNodeSchema = z.object({
     bdi_impact: z.enum(['belief', 'desire', 'intention']),
   })).optional(),
   change_history: z.array(ChangeHistoryEntrySchema).optional(),
+  // POV tags (t/3955): curated, top-level, POV nodes only. Declared here because a plain z.object STRIPS
+  // unknown keys, so a parse-then-save path would otherwise silently delete tags. Element-level checks
+  // (kebab-case, unique, registered under this node's POV) run in the superRefine below, via the one
+  // shared rule validatePovTags. Absent or empty = untagged (see taxonomy-schema.json node_fields).
+  pov_tags: z.array(z.string()).optional(),
+  // Selection skips superseded nodes; resolveNode still returns them. See taxonomyLoader.ts › loadTaxonomy.
+  superseded_by: z.string().optional(),
+}).superRefine((node, ctx) => {
+  for (const message of validatePovTags(node.id, node.pov_tags)) {
+    ctx.addIssue({ code: 'custom', path: ['pov_tags'], message });
+  }
 });
 
 export const SituationNodeSchema = z.object({
@@ -153,6 +165,9 @@ export const SituationNodeSchema = z.object({
   graph_attributes: GraphAttributesSchema.optional(),
   disagreement_type: DisagreementTypeSchema.optional(),
   debate_refs: z.array(z.string()).optional(),
+  // Situations never carry POV tags (t/3955; spec §2.2). Declared as never so a present value is
+  // REJECTED rather than silently stripped by z.object's unknown-key handling.
+  pov_tags: z.never({ error: 'pov_tags is only allowed on POV nodes; situations ignore tags (t/3955)' }).optional(),
 });
 
 // ── Edge schemas ──────────────────────────────────────────
@@ -213,6 +228,28 @@ export const ArgumentClaimSchema = z.object({
   supported_by: z.array(z.union([z.string(), SupportLinkSchema])).optional(),
   attacked_by: z.array(ArgumentAttackSchema).optional(),
 });
+
+// ── Session schemas ───────────────────────────────────────
+
+/**
+ * Zod schema for soul-file provenance (matches SoulProvenance from soulDocSchema.ts).
+ * Declared here for use in DebateSessionSchema without circular deps.
+ */
+export const SessionSoulProvenanceSchema = z.object({
+  file: z.string(),
+  hash: z.string(),
+});
+
+/**
+ * Persisted Zod schema for DebateSession optional fields.
+ * `.passthrough()` preserves all existing fields in saved sessions.
+ * Declare every new optional session field here so it is not stripped on
+ * re-parse (t/2890 class). Old debates without the field still load (`.optional()`).
+ */
+export const DebateSessionSchema = z.object({
+  soul_provenance: z.record(z.string(), SessionSoulProvenanceSchema).optional(),
+  failover_untracked: z.boolean().optional(),
+}).passthrough();
 
 // ── Synthesis schemas ─────────────────────────────────────
 

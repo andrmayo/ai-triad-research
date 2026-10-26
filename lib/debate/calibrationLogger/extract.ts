@@ -16,6 +16,7 @@ import type { NeutralEvaluation } from '../neutralEvaluator.js';
 import { classifyClaimOutcomes, summarizeOutcomes } from '../claimOutcomes.js';
 import { computeSourceAuthority } from '../sourceAuthority.js';
 import type { DocMetaMap } from '../evidenceFromSummaries.js';
+import type { ConflictFile } from '../taxonomyLoader.js';
 import { PROMPT_VERSION } from '../prompts.js';
 import { DEFAULT_ATTACK_WEIGHTS } from '../qbaf.js';
 import { POLARITY_RESOLVED_THRESHOLD, SEMANTIC_RECYCLING_THRESHOLD, ATTACK_DEDUP_THRESHOLD } from '../constants.js';
@@ -40,9 +41,45 @@ import {
   computeLocalSufficiency,
   computeCruxSemanticDivergence,
   computeFrameSurvivalMetrics,
+  computeAifB5Metrics,
 } from './extract-metrics.js';
 
+// ── Shared types ─────────────────────────────────────────────
+
+/** Closed union of all possible debate termination reasons (t/1671, t/3502, t/3585). */
+export type TerminationReason =
+  | 'natural_conclusion'
+  | 'max_iterations'
+  | 'situation_cap'
+  | 'api_ceiling'
+  | 'first_round_exit'
+  | 'unknown';
+
 // ── Extraction logic ────────────────────────────────────────
+
+/**
+ * Derive the termination reason from a completed debate session.
+ * Pure function — no side effects. Used by extractCalibrationData and
+ * runHeadlessDebate (t/3599) so the derivation is not duplicated.
+ */
+export function deriveTerminationReason(session: DebateSession): TerminationReason {
+  const asd = (session as any).adaptive_staging_diagnostics as {
+    phases?: { phase: string; rounds: number[]; exit_reason: string; force_active?: boolean }[];
+  } | undefined;
+  const rounds = session.transcript.filter((e: { type: string }) => e.type === 'statement').length;
+  const hitApiCeiling = session.transcript.some((e: { content: string }) =>
+    typeof e.content === 'string' && e.content.includes('API hard ceiling hit'),
+  );
+  const lastAsdPhase = asd?.phases && asd.phases.length > 0 ? asd.phases[asd.phases.length - 1] : undefined;
+  if (hitApiCeiling) return 'api_ceiling';
+  if (lastAsdPhase !== undefined && lastAsdPhase.force_active !== undefined) {
+    return lastAsdPhase.force_active
+      ? (/Max total rounds/i.test(lastAsdPhase.exit_reason) ? 'max_iterations' : 'situation_cap')
+      : 'natural_conclusion';
+  }
+  if (rounds <= 1) return 'first_round_exit';
+  return 'unknown';
+}
 
 /**
  * Extract calibration data from a completed debate session.
@@ -72,6 +109,7 @@ export function extractCalibrationData(
     explorationSummary?: import('../explorationSummary.js').ExplorationSummary;
     docMeta?: DocMetaMap;
     insularityInterventions?: { speaker: string; round: number; injected_node_id: string; target_camp: string }[];
+    conflicts?: readonly ConflictFile[];
   } = {},
 ): CalibrationDataPoint {
   const now = new Date().toISOString();
@@ -138,23 +176,14 @@ export function extractCalibrationData(
     convergenceScoreAtTermination = last.composite?.convergence_score ?? null;
     signalsAtTransition = last.signals ?? null;
   }
-  // ── Termination reason (t/1671) ──
-  // Derived from structured force_active stamped in crossRespond.ts — not prose regex.
+  // ── Round count ── (still needed by affect signals below; also derived inside deriveTerminationReason)
+  const rounds = session.transcript.filter((e: { type: string }) => e.type === 'statement').length;
+  // ── Termination reason (t/1671, t/3502) — delegated to shared pure function ──
+  const terminationReason = deriveTerminationReason(session);
+  // ── API ceiling flag — also needed at line hit_api_ceiling output field ──
   const hitApiCeiling = session.transcript.some((e: { content: string }) =>
     typeof e.content === 'string' && e.content.includes('API hard ceiling hit'),
   );
-  const lastAsdPhase = asd?.phases && asd.phases.length > 0 ? asd.phases[asd.phases.length - 1] : undefined;
-  let terminationReason: 'natural_conclusion' | 'max_iterations' | 'situation_cap' | 'api_ceiling' | 'unknown' = 'unknown';
-  if (hitApiCeiling) {
-    terminationReason = 'api_ceiling';
-  } else if (lastAsdPhase !== undefined && lastAsdPhase.force_active !== undefined) {
-    terminationReason = lastAsdPhase.force_active
-      ? (/Max total rounds/i.test(lastAsdPhase.exit_reason) ? 'max_iterations' : 'situation_cap')
-      : 'natural_conclusion';
-  }
-
-  // ── Round count ──
-  const rounds = session.transcript.filter((e: { type: string }) => e.type === 'statement').length;
 
   // ── Parameter 6: Compression window — claims forgotten rate ──
   const ledger = session.unanswered_claims_ledger ?? [];
@@ -409,6 +438,13 @@ export function extractCalibrationData(
     working_tree_state: 'unknown',
     // Same-evaluator comparison window key (t/1846); omitted on sessions that predate the pin.
     ...(session.evaluator_model_id ? { evaluator_model_id: session.evaluator_model_id } : {}),
+
+    // Multi-provider model tracking (t/4040); omitted on single-model rows and pre-t/4040 sessions.
+    ...(session.initial_speaker_models ? { speaker_models: session.initial_speaker_models } : {}),
+    ...(session.speaker_model_failovers ? { speaker_model_failovers: session.speaker_model_failovers } : {}),
+    ...(session.model_pool ? { model_pool: session.model_pool } : {}),
+    ...(session.model_api_id ? { model_api_id: session.model_api_id } : {}),
+    ...(session.failover_tracking ? { failover_tracking: session.failover_tracking } : {}),
 
     argumentative_saturation_at_transition: argumentativeSaturationAtTransition,
     argumentation_exit_threshold: config.argumentationExitThreshold ?? 0.65,
@@ -869,6 +905,18 @@ export function extractCalibrationData(
         frame_reframe_targeted_count: fs.frameReframeTargetedCount,
         frame_survival: fs.frameSurvival,
       };
+    })(),
+
+    // ── Drift telemetry shadow log (t/3603) ──────────────────
+    drift_telemetry_series: session.drift_telemetry && session.drift_telemetry.length > 0
+      ? session.drift_telemetry
+      : null,
+
+    // ── AIF B5 metrics (t/3715) ─────────────────────────────
+    aif_b5_metrics: (() => {
+      const nodes = an?.nodes ?? [];
+      if (nodes.length === 0 || !config.conflicts) return null;
+      return computeAifB5Metrics(nodes, config.conflicts, session.convergence_signals);
     })(),
   };
 }

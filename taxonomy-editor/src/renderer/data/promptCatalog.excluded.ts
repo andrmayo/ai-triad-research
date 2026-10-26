@@ -35,12 +35,18 @@ export const PROMPT_CATALOG_EXCLUDED: PromptExclusion[] = [
   // ── CL INTERNAL: repair / classifier / gate helpers — not user-inspected turn prompts.
   { name: 'dolceComplianceRetryPrompt', reason: 'DOLCE-compliance repair micro-prompt (CL t/2835#1).' },
   { name: 'entailmentRepairPrompt', reason: 'Entailment repair micro-prompt (CL t/2835#1).' },
+  { name: 'readabilityEditPassPrompt', reason: 'Post-draft readability repair pass: rewrites an already-generated debate turn to the audience reading-grade target while preserving the argument, debate moves, and voice. A mechanical copy-edit transform, not a turn-authoring prompt the reader inspects — INTERNAL, same class as the dolce/entailment repair passes. (CL t/2835#1)' },
   { name: 'classifyCounterfactualTypePrompt', reason: 'Classifier helper, not a user-facing turn prompt (CL t/2835#1).' },
   { name: 'coverageCheckPrompt', reason: 'Coverage gate helper, not a user-facing turn prompt (CL t/2835#1).' },
   { name: 'elementDecompositionPrompt', reason: 'Statement→information-elements helper (CL t/2835#1).' },
   { name: 'cruxRefreshPrompt', reason: 'Mid-debate crux-maintenance micro-prompt (CL t/2835#1).' },
   { name: 'consensusSituationPrompt', reason: 'Niche convergence→enrichment sub-prompt (CL t/2835#1).' },
   { name: 'crossCuttingNodePrompt', reason: 'Niche convergence→enrichment sub-prompt (CL t/2835#1).' },
+
+  // ── Inquiry pipeline (t/3580): backend-only evaluator-model prompt, not user-inspected.
+  //    Produces a structured InquiryResult via a single LLM call in the inquiry synthesis pass;
+  //    no UX entry point in taxonomy-editor. Will get a catalog entry once the inquiry UX ships.
+  { name: 'inquirySynthesisPrompt', reason: 'Backend-only evaluator prompt for the inquiry synthesis pass (t/3580). Not exposed in taxonomy-editor UI.' },
 
   // ── CL INTERNAL (t/2859): trivial UI utility, not a user-inspected content prompt.
   //    vernacularPrompt + aphorismPrompt ruled EXPOSE (now catalogued); this is the one

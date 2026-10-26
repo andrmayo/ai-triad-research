@@ -3,6 +3,7 @@
 
 import type { TranscriptEntry, TaxonomyRef } from '../../types/debate';
 import { useTaxonomyStore } from '../../hooks/useTaxonomyStore';
+import { allNodesById } from '../../hooks/useTaxonomyStore/superseded';
 import { speakerLabel } from './speakerHelpers';
 import { api } from '@bridge';
 import { nodePovFromId } from '@lib/debate/nodeIdUtils';
@@ -79,8 +80,10 @@ export function getNodeLabel(nodeId: string): string {
     const node = state.situations?.nodes?.find((n: { id: string }) => n.id === nodeId);
     if (node) return node.label;
   } else {
-    const povFile = state[tab as 'accelerationist' | 'safetyist' | 'skeptic'];
-    const node = povFile?.nodes?.find((n: { id: string }) => n.id === nodeId);
+    // t/4362: a transcript may cite a node now held out of state.<pov>.nodes as superseded.
+    // allNodesById looks up the exact stored node across the full set (superseded included),
+    // so a cited id still resolves to its as-cited label.
+    const node = allNodesById(state).get(nodeId);
     if (node) return node.label;
   }
   return nodeId;
@@ -90,8 +93,7 @@ export function getNodeWeight(nodeId: string): { category?: string; confidence?:
   const state = useTaxonomyStore.getState();
   const { tab } = nodeIdToTab(nodeId);
   if (tab === 'situations') return null;
-  const povFile = state[tab as 'accelerationist' | 'safetyist' | 'skeptic'];
-  const node = povFile?.nodes?.find((n: { id: string }) => n.id === nodeId);
+  const node = allNodesById(state).get(nodeId); // t/4362: exact stored node, superseded included
   if (!node) return null;
   return { category: node.category, confidence: node.confidence, priority: node.priority, operationality: node.operationality };
 }
@@ -130,6 +132,20 @@ export function buildExplainPrompt(entry: TranscriptEntry): string {
 
 export function handleExplainEntry(entry: TranscriptEntry) {
   const prompt = buildExplainPrompt(entry);
+  void api.clipboardWriteText(prompt);
+  void api.openExternal('https://gemini.google.com/app');
+}
+
+/** t/4514: the right-click "Explain…" prompt for a selection, scoped to that excerpt only
+ *  (not the whole entry) — kept separate from buildExplainPrompt's whole-entry scoping. */
+export function buildSelectionExplainPrompt(selectedText: string): string {
+  return `Explain this excerpt from a debate between the Accelerationist, the Safetyist, and the Skeptic:\n\n${selectedText}\n`;
+}
+
+/** t/4514: copy a prompt to the clipboard and open Gemini — the "Open in Gemini" escape hatch,
+ *  now secondary to the inline in-app answer. Prompt-agnostic so it serves both the card's
+ *  whole-entry prompt and the right-click selection prompt. */
+export function openPromptInGemini(prompt: string): void {
   void api.clipboardWriteText(prompt);
   void api.openExternal('https://gemini.google.com/app');
 }

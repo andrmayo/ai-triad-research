@@ -4,6 +4,9 @@
 import { useState, useRef, useEffect, useCallback, useMemo, Fragment } from 'react';
 import { api } from '@bridge';
 import { useDebateStore } from '../../hooks/useDebateStore';
+import { isRunLeaseHeldLocally, getRemoteRunLeaseHolder } from '../../hooks/useDebateStore/shared/debateRunLease';
+import { isCompressionDue } from '../../hooks/useDebateStore/shared/compressionTrigger';
+import { useLongPressSelectionMenu } from '../../hooks/useLongPressSelectionMenu';
 import { useShallow } from 'zustand/react/shallow';
 import { useTaxonomyStore } from '../../hooks/useTaxonomyStore';
 import type { SpeakerId } from '../../types/debate';
@@ -26,7 +29,9 @@ import { UsernamePromptDialog } from '../shared/UsernamePromptDialog';
 import { DiagnosticsChatSidebar } from '../debate-diagnostics/chat';
 import type { NavigateCommand } from '../debate-diagnostics/chat';
 import { getGlobalRecorder } from '@lib/flight-recorder/index';
-import { initDebatePopoutCloseHandler } from '../../hooks/useDebateStore/shared/guards';
+import { initDebatePopoutCloseHandler, isDebatePopoutWindow } from '../../hooks/useDebateStore/shared/guards';
+import { RemoteDriverOverlay } from './RemoteDriverOverlay';
+import { requestExplainForSelection } from './explainRequestBus';
 import { useCommunityStore } from '../../hooks/useCommunityStore';
 import { useUserProfile } from '../../hooks/useAuthStatus';
 import { CommunityShareBanner } from '../shared/CommunityShareBanner';
@@ -345,8 +350,13 @@ function DebateContextMenu({
         Similar Perspectives for &lsquo;{truncatedText}&rsquo;
       </button>
       <button className="debate-context-menu-item" onClick={() => {
-        void api.clipboardWriteText(`EXPLAIN: ${menu.selectedText}`);
-        void api.openExternal('https://gemini.google.com/app');
+        // t/4514: open the same inline in-app panel the card's "Explain" button uses, scoped to
+        // this selection, via the entry's registered handler. No handler registered (panel not
+        // mounted for this entry) falls back to the old clipboard+browser escape hatch.
+        if (!requestExplainForSelection(menu.entryId, menu.selectedText)) {
+          void api.clipboardWriteText(`EXPLAIN: ${menu.selectedText}`);
+          void api.openExternal('https://gemini.google.com/app');
+        }
         onClose();
       }}>
         Explain&hellip;
@@ -533,22 +543,6 @@ function DebateToolbar({
         {diagnosticsEnabled ? 'Diagnostics ON' : 'Diagnostics'}
       </button>
       <GlobalModeControl defaultTier={defaultTier} setDefaultTier={setDefaultTier} />
-    </div>
-  );
-}
-
-function RemoteDriverOverlay({ show }: { show: boolean }) {
-  if (!show) return null;
-  return (
-    <div className="debate-remote-overlay" style={{
-      display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
-      padding: '12px 16px', margin: '0 8px 8px',
-      background: 'var(--warning-bg, rgba(234,179,8,0.12))',
-      border: '1px solid var(--warning-border, rgba(234,179,8,0.3))',
-      borderRadius: 6, fontSize: '0.85rem', color: 'var(--text-primary)',
-    }}>
-      <span style={{ fontSize: '1.1rem' }}>&#8599;</span>
-      <span>Debate running in popout window. Controls are disabled here until the popout is closed.</span>
     </div>
   );
 }
@@ -780,13 +774,44 @@ function PhaseActionBar({
   );
 }
 
-function NeutralEvalSlot({ showEvaluation, activeDebate }: { showEvaluation: boolean; activeDebate: ActiveDebateSession }) {
+function NeutralEvalSlot({ showEvaluation, activeDebate, onClose }: { showEvaluation: boolean; activeDebate: ActiveDebateSession; onClose: () => void }) {
   if (!showEvaluation || !activeDebate.neutral_evaluations || activeDebate.neutral_evaluations.length === 0) return null;
   return (
     <NeutralEvaluationPanel
       evaluations={activeDebate.neutral_evaluations}
       speakerMapping={activeDebate.neutral_speaker_mapping}
+      onClose={onClose}
     />
+  );
+}
+
+// Evaluation + parameter-history panels live inside the transcript's scroll column
+// (t/3843) — rendering them as siblings of .debate-scroll-content let their content
+// outgrow the fixed-height .debate-workspace and clip against its overflow:hidden,
+// while squeezing the transcript's own scroll area toward zero height.
+function DebateScrollPanels({
+  activeDebate, showEvaluation, setShowEvaluation, showParamHistory, setShowParamHistory,
+}: {
+  activeDebate: ActiveDebateSession;
+  showEvaluation: boolean;
+  setShowEvaluation: React.Dispatch<React.SetStateAction<boolean>>;
+  showParamHistory: boolean;
+  setShowParamHistory: React.Dispatch<React.SetStateAction<boolean>>;
+}) {
+  return (
+    <>
+      {/* Neutral evaluation panel — toggled via Evaluation button */}
+      <NeutralEvalSlot
+        showEvaluation={showEvaluation}
+        activeDebate={activeDebate}
+        onClose={() => setShowEvaluation(false)}
+      />
+
+      {/* Parameter calibration history */}
+      {showParamHistory && (
+        <ParameterHistoryPanel onClose={() => setShowParamHistory(false)} />
+      )}
+    </>
   );
 }
 
@@ -826,14 +851,6 @@ function DebateActionRegion({
         showEvaluation={showEvaluation}
         setShowEvaluation={setShowEvaluation}
       />
-
-      {/* Neutral evaluation panel — toggled via Evaluation button */}
-      <NeutralEvalSlot showEvaluation={showEvaluation} activeDebate={activeDebate} />
-
-      {/* Parameter calibration history */}
-      {showParamHistory && (
-        <ParameterHistoryPanel onClose={() => setShowParamHistory(false)} />
-      )}
     </>
   );
 }
@@ -1021,18 +1038,15 @@ function useDebateWorkspaceEffects({
   // Phase 8: Auto-compress context when transcript grows large
   useEffect(() => {
     if (!activeDebate || debateGenerating) return;
+    // t/3917: while an automatic run owns this debate (in this window or another), the run
+    // compresses between rounds itself (clarificationSlice compressIfDue). Under Option A
+    // the owner may not even mount this workspace. A viewer compressing would waste an AI
+    // call whose save is skipped; the holder's UI compressing would race the run.
+    if (useDebateStore.getState().driverIsRemote || isRunLeaseHeldLocally(activeDebate.id) || getRemoteRunLeaseHolder(activeDebate.id)) return;
     if (Date.now() < compressionCooldownRef.current) return;
-    if (activeDebate.transcript.length >= 16) {
-      const lastSummaryIdx = activeDebate.context_summaries.length > 0
-        ? activeDebate.transcript.findIndex(
-            (e) => e.id === activeDebate.context_summaries[activeDebate.context_summaries.length - 1].up_to_entry_id,
-          )
-        : -1;
-      const uncompressed = activeDebate.transcript.length - (lastSummaryIdx + 1) - 8;
-      if (uncompressed >= 8) {
-        compressionCooldownRef.current = Date.now() + 60_000;
-        void compressOldTranscript();
-      }
+    if (isCompressionDue(activeDebate)) {
+      compressionCooldownRef.current = Date.now() + 60_000;
+      void compressOldTranscript();
     }
   }, [activeDebate?.transcript.length, debateGenerating]);
 
@@ -1183,15 +1197,12 @@ function useDebateSelectionMenu(activeDebate: DWStore['activeDebate'], defaultTi
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [commentPopover, setCommentPopover] = useState<CommentPopoverState | null>(null);
 
-  // Phase 7: Context menu handler
-  const handleContextMenu = useCallback((e: React.MouseEvent) => {
+  const buildMenuState = useCallback((container: EventTarget | null, x: number, y: number): ContextMenuState | null => {
     const selection = window.getSelection();
     const selectedText = selection?.toString().trim() || '';
-    if (!selectedText) return; // No selection → use default browser menu
+    if (!selectedText) return null; // No selection → use default browser menu
 
-    e.preventDefault();
-
-    const { entryId, isPoverStatement } = findSelectedEntry(selection?.anchorNode, e.currentTarget);
+    const { entryId, isPoverStatement } = findSelectedEntry(selection?.anchorNode, container);
 
     // Compute text offsets + active tier within the debate-statement-content element
     let startOffset = 0;
@@ -1205,19 +1216,16 @@ function useDebateSelectionMenu(activeDebate: DWStore['activeDebate'], defaultTi
       }
     }
 
-    setContextMenu({
-      x: e.clientX,
-      y: e.clientY,
-      selectedText,
-      entryId,
-      isPoverStatement,
-      tier,
-      startOffset,
-      endOffset,
-    });
+    return { x, y, selectedText, entryId, isPoverStatement, tier, startOffset, endOffset };
   }, [activeDebate?.transcript, defaultTier]);
 
-  return { contextMenu, setContextMenu, commentPopover, setCommentPopover, handleContextMenu };
+  // Phase 7 (desktop right-click) + t/3382 (touch long-press-to-select, which never
+  // fires `contextmenu` — iOS/Android intercept it with the native selection callout)
+  // share one trigger model via the shared hook: show the menu once a selection is final.
+  const { onContextMenu: handleContextMenu, onTouchEnd: handleTouchEnd } =
+    useLongPressSelectionMenu(buildMenuState, setContextMenu);
+
+  return { contextMenu, setContextMenu, commentPopover, setCommentPopover, handleContextMenu, handleTouchEnd };
 }
 
 // ── Main component ───────────────────────────────────────
@@ -1282,7 +1290,7 @@ export function DebateWorkspace({ onExport, exportStatus }: {
 
   const { findVisible, findQuery, setFindQuery, findCurrentIndex, findTotal, findOffsets, findNext, findPrev, closeFind } = useDebateFind(activeDebate);
   const { coverageMap, strengthWeighted } = useDebateCoverage(activeDebate);
-  const { contextMenu, setContextMenu, commentPopover, setCommentPopover, handleContextMenu } = useDebateSelectionMenu(activeDebate, defaultTier);
+  const { contextMenu, setContextMenu, commentPopover, setCommentPopover, handleContextMenu, handleTouchEnd } = useDebateSelectionMenu(activeDebate, defaultTier);
 
   // useFlag is a hook — hoist above the early returns below (rules-of-hooks, t/2299).
   const chatRedesign = useFlag('DEBATE_CHAT_REDESIGN');
@@ -1324,13 +1332,13 @@ export function DebateWorkspace({ onExport, exportStatus }: {
         />
       )}
 
-      {/* Remote driver overlay — popout window is driving this debate */}
-      <RemoteDriverOverlay show={showRemoteOverlay} />
+      {/* Remote driver overlay — another window (the pop-out, or the main window when this is the pop-out) drives this debate */}
+      <RemoteDriverOverlay show={showRemoteOverlay} inPopout={isDebatePopoutWindow()} />
 
       {/* Scrollable content: header (title+status+DEBATERS strip), debaters, transcript.
           The header scrolls with the transcript rather than staying pinned (user request):
           on a phone the fixed header consumed ~half the viewport. */}
-      <div className="debate-scroll-content" onContextMenu={handleContextMenu}>
+      <div className="debate-scroll-content" onContextMenu={handleContextMenu} onTouchEnd={handleTouchEnd}>
         <DebateHeader
           activeDebate={activeDebate}
           coverageMap={coverageMap}
@@ -1366,6 +1374,13 @@ export function DebateWorkspace({ onExport, exportStatus }: {
           selectedDiagEntry={selectedDiagEntry}
           selectDiagEntry={selectDiagEntry}
           transcriptEndRef={transcriptEndRef}
+        />
+        <DebateScrollPanels
+          activeDebate={activeDebate}
+          showEvaluation={showEvaluation}
+          setShowEvaluation={setShowEvaluation}
+          showParamHistory={showParamHistory}
+          setShowParamHistory={setShowParamHistory}
         />
       </div>
 

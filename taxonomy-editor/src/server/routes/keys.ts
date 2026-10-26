@@ -15,8 +15,11 @@ import type { Router } from '../httpKit.js';
 import type { ServerCtx } from './context.js';
 import { json, error, param, query, getClientIp } from '../httpKit.js';
 import { getGlobalRecorder } from '../../../../lib/flight-recorder/index.js';
+import { log } from '../logger.js';
+import { assertKeyForBackend } from '../../../../lib/ai-client/apiKeyFallback.js';
 import * as rateLimiter from '../security/rateLimiter.js';
 import { getConfig } from '../runtimeConfig.js';
+import { resolveDebateTierModel, getResolvedApiModelId } from '../ai/aiBackends.js';
 import {
   hasApiKey, storeApiKey, deleteApiKey, deleteAllApiKeys,
   getStoredApiKeys, addApiKey, removeApiKey, type AIBackend,
@@ -51,16 +54,57 @@ function maskedKeyList(keys: string[]): { index: number; masked: string }[] {
 // were added (t/1458); the keysValidation test now forces this map to stay in
 // sync with ai-models.json.
 type KeyProbe = (key: string) => Promise<Response>;
+
+// t/3563 (mirrors ElectronMain's t/3556 fix, PR #2302): resolve the Gemini probe model from
+// ai-models.json's `debateTiers.basic.gemini` (the registry's designated current cheap/fast Gemini
+// model) rather than hardcoding a literal. A hardcoded id caused a false "Invalid API key" the moment
+// that model was retired from the provider — a valid key passes auth but the retired model resolves
+// non-2xx, indistinguishable from a bad key. Deriving from the registry SSOT makes a future retirement
+// a registry edit, not a second hand-maintained literal. Falls back to a WARN-logged last-known-good
+// literal only if the registry is unreadable (fallback-path-logging rule); a retirement landing on that
+// literal would reproduce this bug, but that's strictly rarer than "the registry file can't be read".
+const GEMINI_PROBE_FALLBACK_MODEL = 'gemini-2.5-flash-lite';
+
+// CodeQL #5919 (js/file-access-to-http): the probe model id is read from ai-models.json and
+// interpolated into the URL PATH of a request that carries the user's API key. Constrain it to a
+// bare model-name segment so a malformed or tampered registry value (`/`, `?`, `#`, `:`, `%`, `@`)
+// cannot redirect the key to a different Google endpoint or path. Exported for unit testing.
+export function isSafeGeminiProbeModelId(id: string): boolean {
+  return /^gemini-[a-z0-9][a-z0-9.-]{0,63}$/.test(id);
+}
+
+function resolveGeminiProbeModel(): string {
+  const friendlyId = resolveDebateTierModel('basic', 'gemini');
+  if (!friendlyId) {
+    log.server.warn(
+      { component: 'keys', backend: 'gemini', cause: 'debate-tier-model-unresolved' },
+      'Could not resolve debateTiers.basic.gemini from ai-models.json — falling back to a hardcoded probe model id, which can drift the same way t/3556 did',
+    );
+    return GEMINI_PROBE_FALLBACK_MODEL;
+  }
+  const apiModelId = getResolvedApiModelId(friendlyId); // friendly id → provider apiModelId
+  if (!isSafeGeminiProbeModelId(apiModelId)) {
+    log.server.warn(
+      { component: 'keys', backend: 'gemini', cause: 'probe-model-id-rejected', friendlyId, apiModelId },
+      'Registry gemini probe model id is not a bare gemini-* model name — refusing to put it in the key-probe URL; falling back to the hardcoded probe model id',
+    );
+    return GEMINI_PROBE_FALLBACK_MODEL;
+  }
+  return apiModelId;
+}
+
 export const KEY_VALIDATION_PROBES: Record<string, KeyProbe> = {
   // t/1572: generateContent, not the list endpoint — list-models returns 200 for
   // any key (public metadata), so it can't distinguish a valid key from garbage.
-  // 1-token body keeps the cost effectively zero. Model is a stable production id;
-  // if it's ever retired the probe returns non-200 (an appropriate signal to bump).
+  // 1-token body keeps the cost effectively zero. t/3563: model is resolved at call
+  // time from the registry SSOT (see resolveGeminiProbeModel) so it can't drift to a
+  // retired id. t/3747: key in x-goog-api-key header, not the ?key= query string —
+  // matches the other seven probes and avoids URL-based credential leakage.
   gemini: key => fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(key)}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${resolveGeminiProbeModel()}:generateContent`,
     {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
       body: JSON.stringify({ contents: [{ parts: [{ text: 'hi' }] }], generationConfig: { maxOutputTokens: 1 } }),
     },
   ),
@@ -88,6 +132,7 @@ export { extractProviderReason, deriveKeyErrorMessage };
 export async function validateProviderKey(backend: string, key: string): Promise<{ valid: boolean; error?: string }> {
   const probe = KEY_VALIDATION_PROBES[backend];
   if (!probe) return { valid: false, error: `Unsupported backend: ${backend}` };
+  assertKeyForBackend(key, backend, 'probe'); // t/4105 C5: a direct send that bypasses callProvider, so the foreign-key guard runs here (throws; never a silent 'invalid')
   try {
     const resp = await probe(key);
     if (resp.ok) return { valid: true };

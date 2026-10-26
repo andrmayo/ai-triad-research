@@ -9,14 +9,14 @@ Internet ──HTTPS──> Azure Container Apps (1-5 replicas)
                         ├── Node.js server (port 7862)
                         ├── PowerShell 7 (terminal + AI commands)
                         ├── Python (embeddings)
-                        └── GitHub REST API (jpsnover/ai-triad-data)
+                        └── GitHub REST API (AI-Rosetta-Stone/ai-triad-data)
                               ├── Read: Contents/Trees/Blobs APIs
                               ├── Write: session branches + PRs
                               ├── Auth: GitHub App via Key Vault PEM
                               └── Cache: /tmp/taxonomy-cache (local SSD)
 ```
 
-Data is read from and written to `jpsnover/ai-triad-data` via the GitHub REST API. No persistent volume, no Azure Files, no local git clone. A baked taxonomy snapshot in the container image provides fallback during GitHub outages (read-only mode).
+Data is read from and written to `AI-Rosetta-Stone/ai-triad-data` via the GitHub REST API. No persistent volume, no Azure Files, no local git clone. A baked taxonomy snapshot in the container image provides fallback during GitHub outages (read-only mode).
 
 ## BYOK (Bring Your Own Key)
 
@@ -29,7 +29,7 @@ stored in Azure Key Vault via managed identity.
 - [Azure CLI](https://aka.ms/install-azure-cli) (`az`)
 - An Azure subscription
 - The container image built and pushed to `ghcr.io` (happens automatically on tag push via GitHub Actions)
-- A GitHub App with Contents read/write access to `jpsnover/ai-triad-data`
+- A GitHub App with Contents read/write access to `AI-Rosetta-Stone/ai-triad-data`
 
 ## Quick Start
 
@@ -82,7 +82,11 @@ The `deploy-azure.yml` workflow deploys on manual trigger. To use it:
 
 1. Set up Azure OIDC credentials (service principal with federated identity)
 2. Add repository secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`
-3. Trigger from GitHub Actions > Deploy to Azure > Run workflow
+3. Trigger with the commit SHA to deploy — the deploy pins that commit's image by immutable digest (t/3679 deploy-by-digest); `sha` is required and there is no `:latest` fallback:
+   ```bash
+   gh workflow run deploy-azure.yml -f environment=production -f auth_mode=optional -f sha=<commit>
+   ```
+   (or GitHub Actions > Deploy to Azure > Run workflow, supplying the `sha` input). See [runbooks/production-release.md](runbooks/production-release.md).
 
 No API key secrets needed in GitHub — keys are managed per-user in the app.
 

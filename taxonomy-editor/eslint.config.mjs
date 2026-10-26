@@ -11,9 +11,17 @@
 //     2000, both counting blank + comment lines (skipBlankLines/skipComments:false)
 //     for one stable number. Existing offenders are baselined in Block C and the
 //     baseline shrinks monotonically to zero as the epic t/1681 Phase-2 splits land.
-//     ADR-007 §1 soft-warn tiers are deliberately deferred here: `npm run verify` caps
-//     warnings at --max-warnings=4256, so advisory warns would count against that
-//     ceiling and risk hard failures — hard-gate only (TL ruling, t/1691#2).
+//
+// t/3822 correction: ADR-007 §1 soft-warn tiers were previously deferred here because
+// "npm run verify caps warnings at --max-warnings=4256, so advisory warns would count
+// against that ceiling." That reasoning was false on both counts — package.json's
+// `verify` script is LOCAL-ONLY (0 references in ci.yml; CI lints via
+// `pnpm run --if-present lint` at ci.yml:557, errors-only, no --max-warnings), and the
+// 4256 figure was stale (measured 628 warnings on origin/main 704c8f93, 2026-10-01,
+// via `eslint src/ --max-warnings=999999` — the ceiling is now set to 650 in
+// package.json). The ceiling exists to catch a local warning-count regression before
+// it's noticed any other way; it has never gated a merge. Soft-warn tiers remain
+// deferred for now as a separate decision, not because of this (false) constraint.
 
 import tseslint from 'typescript-eslint';
 import reactHooks from 'eslint-plugin-react-hooks';
@@ -23,6 +31,11 @@ import noActionableErrorMessageNesting from '../lib/eslint-rules/no-actionable-e
 import noUnmanagedModuleResources from './eslint-rules/no-unmanaged-module-resources.js';
 import noInlineStyle from './eslint-rules/no-inline-style.js';
 import noRawDataRootRead from './eslint-rules/no-raw-data-root-read.js';
+import noDataRootWrite from './eslint-rules/no-data-root-write.js';
+import complexityBudget from '../lib/eslint-rules/complexity-budget.js';
+import requireWindowsHide from '../lib/eslint-rules/require-windows-hide.js';
+import requireWindowsHideDisableReason from '../lib/eslint-rules/require-windows-hide-disable-reason.js';
+import noBareThrow from '../lib/eslint-rules/no-bare-throw.js';
 
 const localPlugin = {
   rules: {
@@ -32,6 +45,12 @@ const localPlugin = {
     'no-inline-style': noInlineStyle,
     'no-actionable-error-message-nesting': noActionableErrorMessageNesting,
     'no-raw-data-root-read': noRawDataRootRead,
+    'no-data-root-write': noDataRootWrite,
+    'complexity-budget': complexityBudget,
+    'require-windows-hide': requireWindowsHide,
+    'require-windows-hide-unverifiable': requireWindowsHide,
+    'require-windows-hide-disable-reason': requireWindowsHideDisableReason,
+    'no-bare-throw': noBareThrow,
   },
 };
 
@@ -77,7 +96,16 @@ export default tseslint.config(
         variables: true,
         allowNamedExports: false,
       }],
+      // Built-in stays at 'warn' (condition 3, SO e/240): it warns per-function when any
+      // single function exceeds 15 — advisory only, does not count against --max-warnings
+      // in a meaningful way today. Our complexity-budget rule at 'error' below is the gate:
+      // it enforces per-file ratchet semantics against a recorded baseline (t/3821).
       'complexity': ['warn', { max: 15 }],
+      // Per-file cyclomatic complexity budget gate (t/3821 SO condition 1).
+      // Errors when any file regresses its baseline max or countOver.
+      // Baseline is write-only-downward: auto-shrinks on decomposition, never grows on regression.
+      // Built-in `complexity` above stays at 'warn' — both rules coexist without conflict.
+      'local/complexity-budget': ['error', { baseline: '../lib/eslint-rules/complexity-baseline.json', threshold: 15 }],
       // ADR-003 enforcement (t/1323, repo-review B-401): every catch records to the
       // flight recorder. Flipped warn→error once the tree was clean (0 violations).
       'local/require-flight-recorder-in-catch': 'error',
@@ -92,6 +120,14 @@ export default tseslint.config(
       // Custom rule (not no-restricted-syntax) so it restricts to error-named identifiers
       // and unwraps TSAsExpression — no false positives on data.message HTTP response fields.
       'local/no-actionable-error-message-nesting': 'error',
+      // Flashing-console prevention (t/3914, t/3922): child_process calls need windowsHide: true.
+      // Blocking since t/4238 (T2: warn-first from 2026-10-05, then 0 hits in every package for a full CI
+      // cycle). Demoting it back to 'warn' is itself a gate change.
+      'local/require-windows-hide': ['error', { report: 'missing' }],
+      // An unverifiable options object (a wrapper or cross-module options) warns only: no merge is blocked
+      // when no fix is available (TL e/351#2). A disable needs a reason + ticket (disable-reason rule).
+      'local/require-windows-hide-unverifiable': ['warn', { report: 'unverifiable' }],
+      'local/require-windows-hide-disable-reason': 'error',
     },
   },
   {
@@ -133,6 +169,38 @@ export default tseslint.config(
     ],
     rules: {
       'local/no-raw-data-root-read': 'error',
+    },
+  },
+  // ── Block A-dataroot-write: data-root WRITE gate (t/4372, t/4264's AC4) ──
+  // Write-side sibling of Block A-dataroot above. Flags a raw fs write (or a literal
+  // /mnt/shared path) whose argument traces to a data-root resolver — a staging deployment
+  // sharing that root would write onto PROD's share (t/4264: staging wrote/evicted prod's
+  // anonymous sessions this way). Class-A writable state must route through
+  // getStateRoot()/resolveStatePath() instead (t/2643).
+  // Warn-first (T1, t/4372): this PR fixes every current hit, so it starts at zero on the
+  // resulting tree. Promotion to 'error' (a blocking CI gate) is T2 per the ticket's own tier
+  // note — not done here.
+  // tripwire: green != verified — a new hit is a true positive; silence it only with an inline
+  // eslint-disable + TL-approved rationale at the call site, never by baselining here.
+  {
+    files: ['src/server/**/*.ts'],
+    ignores: [
+      ...TEST_GLOBS,             // tests hit resolver + fs.write constantly — not migration remnants
+      'src/server/storage/**',   // sanctioned home for data-root-adjacent writes (the backend itself)
+      'src/server/config.ts',    // defines the resolver functions themselves
+    ],
+    rules: {
+      'local/no-data-root-write': 'warn',
+    },
+  },
+  // ── Block A-bare-throw: no bare `throw new Error('…')` in server code (t/4153, root rule #19) ──
+  // One rule and one baseline, shared with lib (lib/eslint-rules/no-bare-throw.js). Warn-first ratchet:
+  // only a NEW bare throw warns, so today's tree adds no warnings. Promotion to 'error' is T2 (t/4092).
+  {
+    files: ['src/server/**/*.ts'],
+    ignores: TEST_GLOBS,
+    rules: {
+      'local/no-bare-throw': ['warn', { baseline: 'lib/eslint-rules/bare-throw-baseline.json' }],
     },
   },
   // ── Block B: LOC budget for test source (syntactic parse; tests are outside the

@@ -17,6 +17,7 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { tavilySearch, buildSearchAugmentedPrompt } from '../search/tavily.js';
 import { ActionableError } from './errors.js';
+import { resolveGenericFallbackKey, keyHint, isKeyRoutingRefusal, assertKeyForBackend, LISTING_WARN } from '../ai-client/apiKeyFallback.js';
 import type { GenerateRequest, GenerateResponse } from './cacheTypes.js';
 import { buildCacheUsage, emptyCacheUsage, flattenEnvelope } from './cacheTypes.js';
 
@@ -27,12 +28,16 @@ import {
   CLI_RETRY_CONFIG,
   resolveModel,
   getDefaultTimeout,
+  resolveTimeout,
+  getModelMinTimeout,
   GEMINI_BASE,
   geminiGroundedSearch,
   DEFAULT_MODEL,
+  utf8ByteLength,
 } from '../ai-client/index.js';
 import { callGeminiBatchEmbed } from '../ai-client/providers/gemini-embeddings.js';
 import { getGlobalRecorder } from '../flight-recorder/index.js';
+import { DebateRateLimiter } from './debateRateLimiter.js';
 import {
   computeEmbedding as onnxComputeEmbedding,
   tryWarmup as onnxTryWarmup,
@@ -58,10 +63,23 @@ export interface GenerateOptions extends SharedGenerateOptions {
 
 export interface AIAdapter {
   generateText(prompt: string, model: string, options?: GenerateOptions): Promise<string>;
+  /** The host-loaded ai-models registry (CLI reads the file; Electron/web/server load it their own way).
+   *  REQUIRED (t/3614): consumers apply the pure, imported `getModelMinTimeout(model, adapter.registry)` —
+   *  the floor computation is one correct answer per model and stays imported; only the registry DATA is
+   *  host-provided. Required-not-optional so a stub can no longer answer 0 without conspicuously
+   *  hand-rolling an empty ModelRegistry (the t/3612 defect: 7 adapters silently returned 0). */
+  registry: ModelRegistry;
   /** Optional callback for retry progress events. Set by the engine to surface retries in the UI. */
   onRetryProgress?: (info: { attempt: number; maxRetries: number; backoffSeconds: number; message: string }) => void;
   generate?(request: GenerateRequest): Promise<GenerateResponse>;
   computeQueryEmbedding?(text: string): Promise<{ vector: number[] }>;
+  /**
+   * The provider-reported model string from the most recent successful generateText call.
+   * Set by CLI adapters for forensic dating of silent provider model swaps (t/4195).
+   * ADDITIVE-OPTIONAL — NO consumer may branch on this field until the exemption lapses
+   * (the moment a consumer uses it for routing or gating logic, not logging/display).
+   */
+  readonly lastProviderModel?: string;
 }
 
 /**
@@ -128,13 +146,14 @@ function resolveApiKey(backend: string, explicitKey?: string): string {
   if (explicitKey) return explicitKey;
   const backendKey = process.env[BACKEND_ENV_KEYS[backend] ?? ''];
   if (backendKey) return backendKey;
-  const fallback = process.env.AI_API_KEY;
+  // AI_API_KEY is a fallback for gemini ONLY (t/4105); for any other backend a set AI_API_KEY throws, naming its own variable.
+  const fallback = resolveGenericFallbackKey(backend);
   if (fallback) return fallback;
   throw new ActionableError({
     goal: `Resolve API key for ${backend} backend`,
     problem: `No API key for ${backend}`,
     location: 'aiAdapter.resolveApiKey',
-    nextSteps: [`Set the ${BACKEND_ENV_KEYS[backend] ?? 'AI_API_KEY'} environment variable or Register-AIBackend`],
+    nextSteps: [`Set ${keyHint(backend)}, or Register-AIBackend`], // PowerShell's hint: gemini alone offers AI_API_KEY
   });
 }
 
@@ -145,11 +164,13 @@ function emitUsageTelemetry(
   model: string,
   latencyMs: number,
   usage?: ProviderResult['usage'],
+  modelId?: string, // t/3946: friendly model id (e.g. "claude-sonnet-5") for cost-report lookup
 ): void {
   const entry = {
     ts: new Date().toISOString(),
     backend,
     model,
+    ...(modelId !== undefined ? { modelId } : {}),
     latencyMs: Math.round(latencyMs),
     ...usage,
   };
@@ -173,8 +194,10 @@ function callEnvelopeProvider(
   const sysText = envelopeSystemText(req.envelope);
   return callProvider(fetch, backend, req.envelope.layer4_variable, req.model, apiKey, {
     ...req.options,
-    timeoutMs: req.options?.timeoutMs ?? getDefaultTimeout(req.model, registry),
+    timeoutMs: resolveTimeout(req.options?.timeoutMs, req.model, registry), // t/3644: floor-enforced
     systemMessage: sysText || undefined,
+    requestedModelId: req.model, // t/3677: served-identity record
+    identityRegistry: registry, // t/3731: served-identity classifier cross-check
   });
 }
 
@@ -186,6 +209,7 @@ export async function countTokens(
 ): Promise<{ tokenCount: number; accurate: boolean }> {
   const key = apiKey ?? process.env.GEMINI_API_KEY ?? process.env.AI_API_KEY;
   if (key) {
+    assertKeyForBackend(key, 'gemini', 'countTokens'); // t/4105 C5: a direct send that bypasses callProvider, so the foreign-key guard runs here
     try {
       const url = `${GEMINI_BASE}/gemini-2.5-flash:countTokens?key=${key}`;
       const resp = await fetch(url, {
@@ -217,6 +241,7 @@ function computeEmbeddingViaPython(repoRoot: string, text: string): number[] | n
     const stdout = execFileSync(PYTHON, [script, 'encode', text], {
       timeout: 60_000,
       maxBuffer: 10 * 1024 * 1024,
+      windowsHide: true,
     }).toString('utf-8');
     const vector = JSON.parse(stdout) as number[];
     if (Array.isArray(vector) && vector.length > 0) return vector;
@@ -230,6 +255,8 @@ function computeEmbeddingViaPython(repoRoot: string, text: string): number[] | n
 
 export function createCLIAdapter(repoRoot: string, explicitApiKey?: string): ExtendedAIAdapter {
   const registry = loadRegistry(repoRoot);
+  const rateLimiter = new DebateRateLimiter(!!explicitApiKey);
+  let _lastProviderModel: string | undefined;
 
   // Warm up ONNX embedding model in background (loads once, stays warm for all calls)
   onnxTryWarmup().then(ok => {
@@ -292,20 +319,28 @@ export function createCLIAdapter(repoRoot: string, explicitApiKey?: string): Ext
     }
   }
 
+  function rateLimiterWarn(msg: string): void {
+    getGlobalRecorder()?.record({ type: 'system.scaling_warning', component: 'ai-adapter', level: 'warn', message: msg });
+    process.stderr.write(`[rate-pacing] WARN ${msg}\n`);
+  }
+
   async function doGenerateText(prompt: string, model: string, options?: GenerateOptions): Promise<string> {
+    await rateLimiter.waitIfNeeded(rateLimiterWarn);
     const { apiModelId, backend, fixedTemperature } = resolveModel(registry, model);
     const apiKey = resolveApiKey(backend, explicitApiKey);
-    // Opus models require extended per-call time on complex structured topics (t/1075, t/1069#6).
-    // Apply a 300s floor for any model whose ID contains 'opus'; other models use the registry default.
+    // Use registry-driven timeout (tiered default + minTimeoutMs floor from ai-models.json — t/3518 Phase 2).
+    // Floor applies even when caller passes an explicit timeout so slow-flagship models can't be
+    // accidentally undersized by a short timeoutMs (matches behaviour of the old string-match floor).
     const baseTimeoutMs = options?.timeoutMs ?? getDefaultTimeout(model, registry);
-    const timeoutMs = model.includes('opus') ? Math.max(baseTimeoutMs, 300_000) : baseTimeoutMs;
-    const opts = { ...options, timeoutMs, fixedTemperature };
+    const floorMs = getModelMinTimeout(model, registry);
+    const timeoutMs = Math.max(baseTimeoutMs, floorMs);
+    const opts = { ...options, timeoutMs, fixedTemperature, requestedModelId: model, identityRegistry: registry }; // t/3677/t/3731
 
     const t0 = performance.now();
     getGlobalRecorder()?.record({
       type: 'ai.request', component: 'ai-adapter', level: 'info',
       message: `generateText ${backend}/${apiModelId}`,
-      data: { backend, model: apiModelId, fn: 'generateText' },
+      data: { backend, model: apiModelId, fn: 'generateText', promptBytes: utf8ByteLength(prompt) },
     });
 
     const attemptCall = () => callWithTimeout(
@@ -321,13 +356,30 @@ export function createCLIAdapter(repoRoot: string, explicitApiKey?: string): Ext
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const result = await attemptCall();
-        emitUsageTelemetry(backend, apiModelId, performance.now() - t0, result.usage);
+        emitUsageTelemetry(backend, apiModelId, performance.now() - t0, result.usage, model);
         getGlobalRecorder()?.record({
           type: 'ai.response', component: 'ai-adapter', level: 'info',
           duration_ms: Math.round(performance.now() - t0),
           message: `generateText success ${backend}/${apiModelId}`,
-          data: { backend, model: apiModelId, fn: 'generateText', usage: result.usage },
+          data: { backend, model: apiModelId, fn: 'generateText', usage: result.usage, rawStopReason: result.rawStopReason, diagnostics: result.diagnostics },
         });
+        if (result.stopReason === 'max_tokens') {
+          throw new ActionableError({
+            goal: 'Generate AI response',
+            problem: `Response truncated at provider output limit (${result.rawStopReason ?? 'max_tokens'}) — JSON parse would fail on partial output`,
+            location: 'aiAdapter.doGenerateText',
+            nextSteps: ['Raise maxTokens for this stage', 'Shorten the prompt'],
+          });
+        }
+        if (result.stopReason === 'content_filter') {
+          throw new ActionableError({
+            goal: 'Generate AI response',
+            problem: `Response blocked by provider content policy (${result.rawStopReason ?? 'content_filter'})`,
+            location: 'aiAdapter.doGenerateText',
+            nextSteps: ['Review the prompt for policy-violating content', 'Try a different model or backend'],
+          });
+        }
+        _lastProviderModel = result.providerReportedModel;
         return result.text;
       } catch (err) {
         lastErr = err;
@@ -343,6 +395,10 @@ export function createCLIAdapter(repoRoot: string, explicitApiKey?: string): Ext
         break;
       }
     }
+
+    // SO e/284#12 cond 6: a refused primary key throws to the caller. It is never a reason to fail over,
+    // or another provider would silently serve a request meant for this one.
+    if (isKeyRoutingRefusal(lastErr)) throw lastErr;
 
     const errMsg = lastErr instanceof Error ? lastErr.message : String(lastErr);
     const isAuthError = errMsg.includes('401') || errMsg.includes('403');
@@ -361,6 +417,13 @@ export function createCLIAdapter(repoRoot: string, explicitApiKey?: string): Ext
       if (isAuthError && fb.backend === backend) continue;
       let fbKey: string;
       try { fbKey = resolveApiKey(fb.backend, explicitApiKey); } catch (err) {
+        // A SECONDARY link with only AI_API_KEY is skipped (the primary already failed on its own provider);
+        // a foreign-credential refusal is never softened.
+        if (isKeyRoutingRefusal(err, 'AIApiKeyForeignCredentialRefused')) throw err;
+        if (isKeyRoutingRefusal(err, 'AIApiKeyGeminiOnlyRefused')) {
+          process.stderr.write(`[cascade] WARN skipping ${fb.backend}/${fb.apiModelId}: ${LISTING_WARN}
+`);
+        }
         getGlobalRecorder()?.record({ type: 'ai.fallback', component: 'ai-adapter', level: 'warn', message: `Fallback key resolution failed for ${fb.backend}/${fb.apiModelId}`, error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } });
         continue;
       }
@@ -376,9 +439,10 @@ export function createCLIAdapter(repoRoot: string, explicitApiKey?: string): Ext
           fbTimeoutMs,
           options?.signal,
         );
-        emitUsageTelemetry(fb.backend, fb.apiModelId, performance.now() - t0, fbResult.usage);
+        emitUsageTelemetry(fb.backend, fb.apiModelId, performance.now() - t0, fbResult.usage, fbModel);
         return fbResult.text;
       } catch (err) {
+        if (isKeyRoutingRefusal(err)) throw err; // cond 6: a refusal is never absorbed by the cascade
         getGlobalRecorder()?.record({ type: 'ai.fallback', component: 'ai-adapter', level: 'warn', message: `Fallback provider ${fb.backend}/${fb.apiModelId} failed`, error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } });
         continue;
       }
@@ -396,6 +460,7 @@ export function createCLIAdapter(repoRoot: string, explicitApiKey?: string): Ext
   }
 
   async function doGenerate(request: GenerateRequest): Promise<GenerateResponse> {
+    await rateLimiter.waitIfNeeded(rateLimiterWarn);
     const { apiModelId, backend, fixedTemperature } = resolveModel(registry, request.model);
     const apiKey = resolveApiKey(backend, explicitApiKey);
     const resolvedReq = { ...request, model: apiModelId, options: { ...request.options, fixedTemperature } };
@@ -404,7 +469,7 @@ export function createCLIAdapter(repoRoot: string, explicitApiKey?: string): Ext
     getGlobalRecorder()?.record({
       type: 'ai.request', component: 'ai-adapter', level: 'info',
       message: `generate (envelope) ${backend}/${apiModelId}`,
-      data: { backend, model: apiModelId, fn: 'generate' },
+      data: { backend, model: apiModelId, fn: 'generate', promptBytes: utf8ByteLength(flattenEnvelope(request.envelope)) },
     });
     try {
       const result = await withRetry(
@@ -418,13 +483,29 @@ export function createCLIAdapter(repoRoot: string, explicitApiKey?: string): Ext
         outputTokens: result.usage?.completionTokens,
         cacheReadTokens: result.usage?.cachedTokens,
       });
-      emitUsageTelemetry(backend, apiModelId, latency, result.usage);
+      emitUsageTelemetry(backend, apiModelId, latency, result.usage, request.model);
       getGlobalRecorder()?.record({
         type: 'ai.response', component: 'ai-adapter', level: 'info',
         duration_ms: Math.round(latency),
         message: `generate (envelope) success ${backend}/${apiModelId}`,
-        data: { backend, model: apiModelId, fn: 'generate', usage: { inputTokens: result.usage?.promptTokens, outputTokens: result.usage?.completionTokens, cachedTokens: result.usage?.cachedTokens } },
+        data: { backend, model: apiModelId, fn: 'generate', usage: { inputTokens: result.usage?.promptTokens, outputTokens: result.usage?.completionTokens, cachedTokens: result.usage?.cachedTokens }, rawStopReason: result.rawStopReason, diagnostics: result.diagnostics },
       });
+      if (result.stopReason === 'max_tokens') {
+        throw new ActionableError({
+          goal: 'Generate AI response',
+          problem: `Response truncated at provider output limit (${result.rawStopReason ?? 'max_tokens'}) — JSON parse would fail on partial output`,
+          location: 'aiAdapter.generate',
+          nextSteps: ['Raise maxTokens for this stage', 'Shorten the prompt'],
+        });
+      }
+      if (result.stopReason === 'content_filter') {
+        throw new ActionableError({
+          goal: 'Generate AI response',
+          problem: `Response blocked by provider content policy (${result.rawStopReason ?? 'content_filter'})`,
+          location: 'aiAdapter.generate',
+          nextSteps: ['Review the prompt for policy-violating content', 'Try a different model or backend'],
+        });
+      }
       return { text: result.text, usage, model: apiModelId, backend, responseTimeMs: Math.round(latency) };
     } catch (err) {
       getGlobalRecorder()?.record({
@@ -446,7 +527,9 @@ export function createCLIAdapter(repoRoot: string, explicitApiKey?: string): Ext
 
   const adapter: ExtendedAIAdapter = {
     generateText: doGenerateText,
+    registry,
     generate: process.env.DEBATE_ENVELOPE !== '0' ? doGenerate : undefined,
+    get lastProviderModel() { return _lastProviderModel; },
 
     async generateTextWithSearch(prompt: string, model?: string): Promise<{ text: string; searchQueries?: string[]; citations?: GroundingCitation[] }> {
       const resolved = model || DEFAULT_MODEL;

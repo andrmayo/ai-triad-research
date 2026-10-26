@@ -25,6 +25,14 @@ if ($_candidateRepoRoot -and (Test-Path (Join-Path $_candidateRepoRoot '.aitriad
     $script:IsDevInstall = $false
 }
 
+# Sentinel for an ambiguous (backend, apiModelId) pricing-key pair (t/3951):
+# Get-AICostPricing's ApiModelIdMap stores this instead of either candidate
+# model id when two DIFFERENT models share a pair, so a caller can never
+# last-write-wins into mispricing one model as another. Defined here (not in
+# Get-AICostPricing.ps1 itself) so it exists before ANY Private/Public file
+# loads, regardless of dot-source order.
+$script:AmbiguousPricingKeyMarker = [PSCustomObject]@{ PSTypeName = 'AITriad.AmbiguousPricingKeyMarker' }
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ClaimsByPov — per-POV claim counts for AITSource objects
 # ─────────────────────────────────────────────────────────────────────────────
@@ -43,7 +51,7 @@ class AITModelInfo {
     [double] $Temperature
     [int]    $MaxTokens
     [string] $ExtractionMode      # fire | single_shot | auto_fire
-    [string] $TaxonomyFilter      # rag | full | rag_per_chunk
+    [string] $TaxonomyFilter      # rag | compact | full | rag_per_chunk
     [int]    $TaxonomyNodes
     [double] $FireConfidenceThreshold
     [bool]   $Chunked
@@ -186,6 +194,7 @@ class AITClaim {
     [bool]     $HasWarrant      # evidence_criteria.has_warrant (FactualClaim only)
     [string]   $EvidenceLevel   # evidence_criteria.category_criteria.evidence_level (FactualClaim only)
     [string]   $Verbatim        # verbatim quote (KeyPoint only)
+    [string]   $Via             # a marked copy's exact id when the claim came from it (t/4337 spec 7.4); DocId is then the canonical. Provenance only.
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -606,6 +615,20 @@ class AICallLogEntry {
     [string]   $PromptStart  # first 160 chars of the rendered prompt
     [int]      $RetryCount   # 0 first attempt, N for the Nth retry
     [string]   $Status       # HTTP/API status (e.g. 200, 429, 500, timeout)
+    [string]   $Model        # registry id actually called; '' on lines written before t/4088
+    [string]   $Backend      # ai-models.json backend of that model; '' on pre-t/4088 lines
+    [string]   $KeySource    # where the key came from (closed vocabulary), never the key; '' if unknown
+}
+
+# One batch entry for Set-PovNodeTags (t/3969, TL t/3969#2 cond B.1). A [string[]] property —
+# not a bare [string[]]$Tags cmdlet parameter — because the hazard TL flagged is in the CALLER
+# (e.g. `-Tags (Get-Something)` returning one string): a typed class property binds a single
+# string the same way a typed parameter does (confirmed: PowerShell's standard
+# scalar-to-single-element-array coercion applies to both), turning a caller's accidental
+# scalar into a one-element array instead of silently sending a raw string to the CLI/writer.
+class PovTagAssignment {
+    [string]   $NodeId
+    [string[]] $Tags
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -741,6 +764,7 @@ if (Test-Path $TaxonomyDir) {
 if ($script:TaxonomyData.Count -eq 0) {
     Write-Warning "Taxonomy: no valid JSON files loaded from $TaxonomyDir — most commands will not work."
 }
+Update-TaxonomySupersessionCache  # POV .nodes become selectable; full set indexed (t/4356)
 
 # Load policy registry
 $script:PolicyRegistry = $null
@@ -846,6 +870,8 @@ Export-ModuleMember -Function @(
     'Assert-CleanDataTree'
     # t/2916 — durable batch writer: field-surgical node-field edits (sweep-proof)
     'Save-JsonNodeFieldEdits'
+    # t/3969 — validatePovTags-enforcing pov_tags batch writer (the t/3962 writer)
+    'Set-PovNodeTags'
     'Invoke-HierarchyProposal'
     'Set-TaxonomyHierarchy'
     'Invoke-SchemaMigration'
@@ -863,6 +889,8 @@ Export-ModuleMember -Function @(
     'Test-OntologyCompliance'
     # t/3011 — data-boundary gate validator for situation per-POV BDI decomposition
     'Test-SituationBdiCompliance'
+    # t/3901 — pure, module-free BDI-violation classifier for the data-repo pre-commit hook
+    'Get-SituationBdiViolationsFromJson'
     'Get-RelevantTaxonomyNodes'
     'Invoke-QbafConflictAnalysis'
     'Test-ExtractionQuality'
@@ -883,6 +911,7 @@ Export-ModuleMember -Function @(
     'Get-LatestFlightRecorderDump'
     'Get-AzureFlightRecorder'
     'Show-FlightRecorder'
+    'Export-SourcesIndex',
     'Update-AITSourceIndex'
     'Get-PovLineage'
     'Get-IntellectualLineage'
@@ -891,17 +920,29 @@ Export-ModuleMember -Function @(
     'Get-TaxonomyProcess'
     'Request-FlightRecorderDump'
     'Get-FlightRecorderReport'
+    # t/3726 — structured error/retry summary from a flight recorder JSONL dump
+    'Read-FlightRecorderDump'
+    # t/3768 — structured debate-issue analysis from a flight recorder JSONL dump
+    'Invoke-DebateDiagnosis'
+    # p/550 — McCabe (cyclomatic) complexity, AST-based, per function
+    'Measure-CodeComplexity'
+    # t/3829 — complexity-ratchet baseline generator + enforcer
+    'Update-ComplexityBaseline'
+    'Test-ComplexityBudget'
     'Get-AITClaim'
     'Compare-EmbeddingModel'
     'Test-RerankerBaseline'
     'New-SyntheticCorpus'
     'Update-SyntheticCorpus'
     'Sync-SyntheticCorpus'
+    'Get-SyntheticStatement'
     'Export-SyntheticEmbeddings'
     'Test-SynthesisCompleteness'
     'Get-ImportReport'
     'Get-CalibrationTrend'
     'Test-TaxEditorHealth'
+    # t/3584 — hosted inquiry data-presence smoke (defeats ADR-001 silent-empty)
+    'Test-TaxEditorInquiry'
     # t/2787 — smoke-test /api/embeddings/compute in production
     'Test-EmbeddingHealth'
     'Test-TaxEditorEndpoints'
@@ -913,6 +954,7 @@ Export-ModuleMember -Function @(
     'Get-FreeTierStatus'
     'Sync-FreeTierKeys'
     'Invoke-TaxEditorSmokeTest'
+    'Invoke-TaxEditorLoadTest'
     # t/2668 — analytics storage round-trip diagnosis
     # t/2775 — validate the built preload.cjs artifact before launch
     'Test-PreloadHealth'
@@ -937,6 +979,7 @@ Export-ModuleMember -Function @(
     'Deploy-TaxEditorInfra'
     'Get-TaxEditorBlob'
     'Restore-TaxEditorBlob'
+    'Move-GitHubIdentityData'
     'Get-CriticalInteraction'
     'Test-CriticalInteractions'
     'Merge-FlightRecorderDumps'
@@ -944,6 +987,7 @@ Export-ModuleMember -Function @(
     'Set-TriadConfig'
     'Invoke-TriadConfigReload'
     'Invoke-VernacularBatch'
+    'Invoke-DebateGroundingBatch'
     # t/1224 — Organization data model
     'Get-Organization'
     'Find-OrganizationByPOV'
@@ -963,6 +1007,12 @@ Export-ModuleMember -Function @(
     # t/1308 — cc→sit migration
     'Invoke-CcToSitMigration'
     'Test-AIApiKey'
+    # t/3564 — drift-proof model-tier resolver (reads ai-models.json debateTiers)
+    'Get-AITierModel'
+    # t/3596 — derived belief-node → source index (sidecar source_index.json)
+    'Build-NodeSourceIndex'
+    # t/3598 — referential-integrity gate on citation links + source_index (advisory)
+    'Test-CitationLinkIntegrity'
     'Test-GeminiKeyPool'
     'Test-AIBackendHealth'
     'Test-AIBackendQuota'
@@ -999,6 +1049,8 @@ Export-ModuleMember -Function @(
     # t/1806 — Entity ontology Phase 1: extraction + maintenance reports
     'Invoke-EntityExtraction'
     'Get-EntityReport'
+    # t/4075 — review surface for advisory existing-entity candidates (never links)
+    'Get-EntityExtractionCandidates'
     # t/1894 — Entity ontology Phase 2-B: batch mention indexer (entity_mentions.json)
     'Update-EntityMentionIndex'
     # t/3124 — Claim-side entity grounding: writes entity_refs[] onto summary claims
@@ -1007,6 +1059,8 @@ Export-ModuleMember -Function @(
     'Invoke-LogicalFormPass'
     # t/2196 — Vite dev server diagnostic
     'Get-ViteDevStatus'
+    # t/3869 — resolves the true main-checkout root from inside any worktree (nested or sibling)
+    'Get-WorktreeMainRoot'
     # t/2330 — Debate session state diagnostic
     'Get-DebateSessionState'
     # t/2335 — Debate index field-type integrity check (per-session files)

@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
+﻿# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 # Licensed under the MIT License. See LICENSE file in the project root.
 
 #Requires -Version 5.1
@@ -31,6 +31,12 @@ $script:AIApiLastModel = ''
 # (t/1647).
 $script:AIApiCorrelationId = ''
 $script:AIApiLastCorrelationId = ''
+# t/4164 (mirrors lib/ai-client/providers/claude.ts, t/3942): current Claude models (Opus 4.7+,
+# Sonnet 5+, Fable, Haiku 5.5) return 400 "`temperature` is deprecated for this model" for ANY
+# temperature. Per-process, per-ApiModelId memo: the first rejection is WARNed once and recorded
+# here (Invoke-AIApiRequest); New-AIClaudeRequestBody then omits temperature for that model.
+# Deliberately NOT an ai-models.json field: that is a config-schema change (T2).
+$script:ClaudeSamplingRejected = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
 
 function Set-AIApiCorrelationId {
     <#
@@ -137,8 +143,7 @@ if ($script:ModelRegistry.Count -eq 0) {
         'claude-opus-4'         = @{ Backend = 'claude';  ApiModelId = 'claude-opus-4-20250514' }
         'claude-sonnet-4-5'     = @{ Backend = 'claude';  ApiModelId = 'claude-sonnet-4-5-20250514' }
         'claude-haiku-3.5'      = @{ Backend = 'claude';  ApiModelId = 'claude-3-5-haiku-20241022' }
-        'groq-llama-3.3-70b'    = @{ Backend = 'groq';    ApiModelId = 'llama-3.3-70b-versatile' }
-        'groq-llama-4-scout'    = @{ Backend = 'groq';    ApiModelId = 'meta-llama/llama-4-scout-17b-16e-instruct' }
+        'groq-openai-gpt-oss-120b' = @{ Backend = 'groq'; ApiModelId = 'openai/gpt-oss-120b' }   # t/4165: llama-3.3-70b and llama-4-scout are retired
     }
 }
 
@@ -219,7 +224,7 @@ function Protect-SensitiveText {
 # ─────────────────────────────────────────────────────────────────────────────
 # Resolve-AIApiKey
 # Resolves the API key for a given backend using the priority:
-#   explicit -ApiKey > backend-specific env var > AI_API_KEY fallback
+#   explicit -ApiKey > backend-specific env var > AI_API_KEY fallback (gemini only, t/4102)
 # ─────────────────────────────────────────────────────────────────────────────
 <#
 .SYNOPSIS
@@ -231,7 +236,9 @@ function Protect-SensitiveText {
     1. Explicit key passed via -ExplicitKey parameter.
     2. Backend-specific environment variable (GEMINI_API_KEY, ANTHROPIC_API_KEY
        or CLAUDE_API_KEY, GROQ_API_KEY, OPENAI_API_KEY, AZURE_OPENAI_API_KEY).
-    3. Universal fallback: $env:AI_API_KEY.
+    3. Gemini only: the generic fallback $env:AI_API_KEY. For any other
+       backend, a set AI_API_KEY with no backend variable is refused with an
+       error naming that backend's own variable (t/4102).
 
     Returns $null if no key is found at any level.  The resolved source is
     tracked in $script:LastApiKeySource for diagnostic logging.
@@ -249,6 +256,76 @@ function Protect-SensitiveText {
 
     Returns the explicit key, ignoring environment variables.
 #>
+$script:AIApiKeyEnvVarMap = @{
+    'gemini' = @('GEMINI_API_KEY')
+    'claude' = @('ANTHROPIC_API_KEY', 'CLAUDE_API_KEY')
+    'groq'   = @('GROQ_API_KEY')
+    'openai' = @('OPENAI_API_KEY')
+    'azure'  = @('AZURE_OPENAI_API_KEY')
+    'zai'    = @('ZAI_API_KEY')
+    'moonshot' = @('MOONSHOT_API_KEY')
+    'xai'    = @('XAI_API_KEY')
+    'deepseek' = @('DEEPSEEK_API_KEY')
+}
+$script:AIApiKeyFallbackWarned = @{}
+# FullyQualifiedErrorId of the gemini-only AI_API_KEY refusal (t/4102). Match it with Test-AIApiKeyGeminiOnlyRefusal.
+$script:GeminiOnlyRefusalErrorId = 'AIApiKeyGeminiOnlyRefused'
+# FullyQualifiedErrorId of the refusal of a key that is another backend's named credential (t/4087). Named in
+# parallel with the TS KeyRefusalKind (lib/ai-client/apiKeyFallback.ts) so logs read the same from both tools.
+# NO consumer branches on this id: every path surfaces the refusal, nothing softens it. That is why it shipped
+# T0 (t/4110). THE EXEMPTION LAPSES the moment a consumer branches on it; that change is T1 or higher.
+$script:ForeignCredentialRefusalErrorId = 'AIApiKeyForeignCredentialRefused'
+
+function Test-AIApiKeyGeminiOnlyRefusal {
+    <#
+    .SYNOPSIS
+        True when an ErrorRecord is Resolve-AIApiKey's gemini-only AI_API_KEY refusal (t/4102). Classifies by
+        error kind (FullyQualifiedErrorId), so a listing path can soften exactly this refusal and nothing else.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)][System.Management.Automation.ErrorRecord]$ErrorRecord)
+    return ($ErrorRecord.FullyQualifiedErrorId -like "$script:GeminiOnlyRefusalErrorId*")
+}
+
+# The env var (of a backend OTHER than $Backend) that holds exactly $Key, or '' if none. A key equal to
+# another backend's named variable IS that backend's credential, whatever route it took to get here.
+function Get-AIApiKeyForeignOwner {
+    param([string]$Key, [string]$Backend)
+    $OwnVars = if ($script:AIApiKeyEnvVarMap.ContainsKey($Backend)) { @($script:AIApiKeyEnvVarMap[$Backend]) } else { @() }
+    foreach ($Var in $OwnVars) {
+        if ([System.Environment]::GetEnvironmentVariable($Var) -ceq $Key) { return '' }
+    }
+    foreach ($Other in ($script:AIApiKeyEnvVarMap.Keys | Sort-Object)) {
+        if ($Other -eq $Backend) { continue }
+        foreach ($Var in $script:AIApiKeyEnvVarMap[$Other]) {
+            $Value = [System.Environment]::GetEnvironmentVariable($Var)
+            if (-not [string]::IsNullOrWhiteSpace($Value) -and $Value -ceq $Key) { return $Var }
+        }
+    }
+    ''
+}
+
+# t/4087: an env-var key may only ever reach the backend it is named for. Refuse, before any send, a key
+# that is another backend's named credential. The message names variables, never key material.
+function Assert-AIApiKeyBackend {
+    param([string]$Key, [string]$Backend, [string]$Route)
+    $Owner = Get-AIApiKeyForeignOwner -Key $Key -Backend $Backend
+    if (-not $Owner) { return }
+    $script:LastApiKeySource = "(refused: $Route matches `$env:$Owner)"
+    $Message = @(
+        "Goal:     Resolve an API key for the '$Backend' backend"
+        "Error:    the $Route key is the value of `$env:$Owner, another backend's credential; it will not be sent to '$Backend' (t/4087)"
+        'Location: Resolve-AIApiKey (AIEnrich.psm1)'
+        "Resolve:  set the '$Backend' backend's own key variable, or pass -ApiKey with a key issued for '$Backend'"
+    ) -join [Environment]::NewLine
+    # Typed kind, named in parallel with AIApiKeyGeminiOnlyRefused and identical in the TS client (TL e/284#14).
+    # Never softened anywhere: every path surfaces it.
+    throw [System.Management.Automation.ErrorRecord]::new(
+        [System.InvalidOperationException]::new($Message), $script:ForeignCredentialRefusalErrorId,
+        [System.Management.Automation.ErrorCategory]::PermissionDenied, $Backend)
+}
+
 function Resolve-AIApiKey {
     [CmdletBinding()]
     param(
@@ -257,23 +334,12 @@ function Resolve-AIApiKey {
     )
 
     if (-not [string]::IsNullOrWhiteSpace($ExplicitKey)) {
+        Assert-AIApiKeyBackend -Key $ExplicitKey -Backend $Backend -Route 'explicit -ApiKey'
         $script:LastApiKeySource = 'explicit parameter'
         return $ExplicitKey
     }
 
-    $EnvVarMap = @{
-        'gemini' = @('GEMINI_API_KEY')
-        'claude' = @('ANTHROPIC_API_KEY', 'CLAUDE_API_KEY')
-        'groq'   = @('GROQ_API_KEY')
-        'openai' = @('OPENAI_API_KEY')
-        'azure'  = @('AZURE_OPENAI_API_KEY')
-        'zai'    = @('ZAI_API_KEY')
-        'moonshot' = @('MOONSHOT_API_KEY')
-        'xai'    = @('XAI_API_KEY')
-        'deepseek' = @('DEEPSEEK_API_KEY')
-    }
-
-    $BackendEnvVars = $EnvVarMap[$Backend]
+    $BackendEnvVars = $script:AIApiKeyEnvVarMap[$Backend]
     foreach ($BackendEnvVar in $BackendEnvVars) {
         $BackendKey = [System.Environment]::GetEnvironmentVariable($BackendEnvVar)
         if (-not [string]::IsNullOrWhiteSpace($BackendKey)) {
@@ -282,8 +348,33 @@ function Resolve-AIApiKey {
         }
     }
 
+    # AI_API_KEY is the generic fallback for the gemini backend ONLY (PI decision, t/4102). The fallback
+    # can't say which provider's key it holds, so offering it elsewhere sends an unknown credential to that
+    # provider. For any other backend a set AI_API_KEY is refused actionably, naming the variable the
+    # backend actually reads. The message names variables, never key material.
     $Fallback = $env:AI_API_KEY
+    if ($Backend -ne 'gemini' -and -not [string]::IsNullOrWhiteSpace($Fallback)) {
+        $OwnVars = if ($script:AIApiKeyEnvVarMap.ContainsKey($Backend)) { @($script:AIApiKeyEnvVarMap[$Backend]) -join ' or ' } else { "the '$Backend' backend's key variable" }
+        $script:LastApiKeySource = '(refused: $env:AI_API_KEY is gemini-only)'
+        $Message = @(
+            "Goal:     Resolve an API key for the '$Backend' backend"
+            "Error:    no key for backend '$Backend': `$env:AI_API_KEY is set, but it is the fallback for the gemini backend only and is never sent to '$Backend' (t/4102)"
+            'Location: Resolve-AIApiKey (AIEnrich.psm1)'
+            "Resolve:  set $OwnVars, or pass -ApiKey with a key issued for '$Backend'"
+        ) -join [Environment]::NewLine
+        # A typed error kind, so callers classify this refusal by kind, never by message text or check order
+        # (SO e/284#12). Only listing/status paths and SECONDARY cascade links may treat it as "not configured";
+        # a call's primary backend always surfaces it, and it is never a reason to fail over.
+        throw [System.Management.Automation.ErrorRecord]::new(
+            [System.InvalidOperationException]::new($Message), $script:GeminiOnlyRefusalErrorId,
+            [System.Management.Automation.ErrorCategory]::PermissionDenied, $Backend)
+    }
     if (-not [string]::IsNullOrWhiteSpace($Fallback)) {
+        Assert-AIApiKeyBackend -Key $Fallback -Backend $Backend -Route '$env:AI_API_KEY fallback'
+        if (-not $script:AIApiKeyFallbackWarned.ContainsKey($Backend)) {
+            $script:AIApiKeyFallbackWarned[$Backend] = $true
+            Write-Warning "No key variable for the '$Backend' backend is set; using the generic `$env:AI_API_KEY fallback for '$Backend' (warned once per backend per session)."
+        }
         $script:LastApiKeySource = '$env:AI_API_KEY (fallback)'
         return $Fallback
     }
@@ -318,6 +409,47 @@ function Get-AIApiKeySource {
     return $script:LastApiKeySource
 }
 
+function ConvertTo-AICallLogKeySource {
+    <#
+    .SYNOPSIS
+        Map a Resolve-AIApiKey source label to the AI call log's closed KeySource vocabulary (t/4088).
+    .DESCRIPTION
+        The vocabulary is defined once, in tests/fixtures/ai-call-log/README.md: explicit,
+        env:<VAR> (a known backend key variable), fallback:AI_API_KEY, store, keyvault, none.
+        Anything unmappable returns '' with a WARN (TL t/4088#3). The result names WHERE the key came
+        from; the key is compared, never returned or logged.
+
+        An 'explicit parameter' key whose value is the backend's own named variable is reported as
+        env:<VAR>. That is how the cascade passes a fallback link its env-resolved key, so without
+        this every fallback link would be logged as 'explicit'.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()][string]$SourceLabel,
+        [AllowEmptyString()][string]$Backend,
+        [AllowEmptyString()][string]$Key
+    )
+    $OwnVars = if ($script:AIApiKeyEnvVarMap.ContainsKey($Backend)) { @($script:AIApiKeyEnvVarMap[$Backend]) } else { @() }
+    $KnownVars = @($script:AIApiKeyEnvVarMap.Values | ForEach-Object { $_ })
+
+    if ($SourceLabel -like '(keyless*') { return 'none' }
+    if ($SourceLabel -eq '$env:AI_API_KEY (fallback)') { return 'fallback:AI_API_KEY' }
+    if ($SourceLabel -match '^\$env:([A-Z][A-Z0-9_]*)$' -and $Matches[1] -in $KnownVars) { return "env:$($Matches[1])" }
+    if ($SourceLabel -eq 'explicit parameter') {
+        foreach ($Var in $OwnVars) {
+            $Value = [System.Environment]::GetEnvironmentVariable($Var)
+            if (-not [string]::IsNullOrEmpty($Value) -and $Value -ceq $Key) { return "env:$Var" }
+        }
+        if ($Backend -eq 'gemini' -and -not [string]::IsNullOrEmpty($env:AI_API_KEY) -and $env:AI_API_KEY -ceq $Key) {
+            return 'fallback:AI_API_KEY'
+        }
+        return 'explicit'
+    }
+    Write-Warning "AI call log: key source '$SourceLabel' for backend '$Backend' is not in the KeySource vocabulary; logging '' (t/4088)."
+    return ''
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Measure-PromptTokens — pre-flight token estimation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -344,7 +476,12 @@ function Measure-PromptTokens {
         [string]$ApiKey = ''
     )
 
-    $GeminiKey = Resolve-AIApiKey -ExplicitKey $ApiKey -Backend 'gemini'
+    # countTokens is a Gemini endpoint, so this deliberately resolves the GEMINI key (t/4087: correct
+    # key -> backend pairing). A foreign explicit key is refused by Resolve-AIApiKey; degrade to the
+    # heuristic rather than fail a pre-flight estimate.
+    $GeminiKey = $null
+    try { $GeminiKey = Resolve-AIApiKey -ExplicitKey $ApiKey -Backend 'gemini' }
+    catch { Write-Warning "Measure-PromptTokens: $($_.Exception.Message.Split([Environment]::NewLine)[1].Trim()) -- using the character heuristic (Accurate=`$false)" }
     if ($GeminiKey) {
         try {
             # Key travels in the x-goog-api-key header, not the URL — a ?key= query
@@ -443,7 +580,7 @@ function Get-AIDefaultTimeoutSec {
         'azure'     { 180 }
         'claude'    { 180 }
         'groq'      { 120 }
-        'zai'       { 240 }
+        'zai'       { 300 }
         'moonshot'  { 240 }
         'xai'       { 240 }
         'gemini'    { 120 }
@@ -458,139 +595,327 @@ function Get-AIDefaultTimeoutSec {
     return $base
 }
 
-<#
-.SYNOPSIS
-    Calls an AI backend with a prompt and returns the generated text.
-.DESCRIPTION
-    Central dispatcher for all AI API calls in the AITriad module.  Accepts a
-    prompt and model name, looks up the backend (Gemini, Claude, or Groq) from
-    the model registry (ai-models.json), builds the backend-specific HTTP
-    request, executes it with automatic retry on transient errors (HTTP 429,
-    503, 529), and returns a uniform result object.
+# ─────────────────────────────────────────────────────────────────────────────
+# Backend request profiles (t/4135 B1) — one row per backend in ai-models.json.
+# Everything Invoke-AIApi needs to BUILD a request for a backend lives in its row;
+# tests/AIBackendProfiles.Completeness.Tests.ps1 fails if a registry backend has no
+# row or a row names no registry backend. Row fields:
+#   DisplayName  — human label (matches ai-models.json backends[].label)
+#   RequestShape — body builder: gemini | claude | chat (OpenAI-compatible
+#                  /chat/completions) | openai-responses
+#   UriTemplate  — {model} = ApiModelId; {azure-endpoint} = $env:AZURE_OPENAI_ENDPOINT
+#                  (required); {ollama-host} = $env:OLLAMA_HOST or http://localhost:11434
+#   AuthStyle    — x-goog-api-key | x-api-key+anthropic-version | bearer | api-key | none
+#   ModelInBody  — the body carries "model" (azure addresses it by deployment URI and
+#                  gemini by URI path; only the chat builder branches on it)
+#   EnvHint      — the "Set ..." text of the missing-key warning (pinned by tests)
+#   ResponseShape    — envelope parser (t/4135 B2): gemini | claude | chat | openai-responses
+#   ParseDisplayName — the name in the parser's "unexpected response shape" WARN (pinned by
+#                      the characterization tests; it predates, and differs from, DisplayName)
+# ─────────────────────────────────────────────────────────────────────────────
+$script:AIBackendProfiles = @{
+    'gemini'   = @{ DisplayName = 'Google Gemini'; RequestShape = 'gemini'; ResponseShape = 'gemini'; ParseDisplayName = 'Gemini'; AuthStyle = 'x-goog-api-key'; ModelInBody = $false
+                    UriTemplate = 'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent'
+                    EnvHint = 'GEMINI_API_KEY or AI_API_KEY' }   # the AI_API_KEY fallback is gemini-only (t/4102)
+    'claude'   = @{ DisplayName = 'Anthropic Claude'; RequestShape = 'claude'; ResponseShape = 'claude'; ParseDisplayName = 'Claude'; AuthStyle = 'x-api-key+anthropic-version'; ModelInBody = $true
+                    UriTemplate = 'https://api.anthropic.com/v1/messages'; EnvHint = 'ANTHROPIC_API_KEY / CLAUDE_API_KEY' }
+    'groq'     = @{ DisplayName = 'Groq'; RequestShape = 'chat'; ResponseShape = 'chat'; ParseDisplayName = 'Groq'; AuthStyle = 'bearer'; ModelInBody = $true
+                    UriTemplate = 'https://api.groq.com/openai/v1/chat/completions'; EnvHint = 'GROQ_API_KEY' }
+    'openai'   = @{ DisplayName = 'OpenAI'; RequestShape = 'openai-responses'; ResponseShape = 'openai-responses'; ParseDisplayName = 'OpenAI'; AuthStyle = 'bearer'; ModelInBody = $true
+                    UriTemplate = 'https://api.openai.com/v1/responses'; EnvHint = 'OPENAI_API_KEY' }
+    'azure'    = @{ DisplayName = 'Azure OpenAI'; RequestShape = 'chat'; ResponseShape = 'chat'; ParseDisplayName = 'Azure OpenAI'; AuthStyle = 'api-key'; ModelInBody = $false
+                    UriTemplate = '{azure-endpoint}/openai/deployments/{model}/chat/completions?api-version=2024-10-21'
+                    EnvHint = 'AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT' }
+    # t/1409 — local and keyless: no Authorization header.
+    'ollama'   = @{ DisplayName = 'Ollama (Local)'; RequestShape = 'chat'; ResponseShape = 'chat'; ParseDisplayName = 'Ollama'; AuthStyle = 'none'; ModelInBody = $true
+                    UriTemplate = '{ollama-host}/v1/chat/completions'; EnvHint = '(no env var — local, keyless)' }
+    'zai'      = @{ DisplayName = 'Z.AI (GLM)'; RequestShape = 'chat'; ResponseShape = 'chat'; ParseDisplayName = 'z.ai'; AuthStyle = 'bearer'; ModelInBody = $true   # t/1437
+                    UriTemplate = 'https://api.z.ai/api/paas/v4/chat/completions'; EnvHint = 'ZAI_API_KEY' }
+    'moonshot' = @{ DisplayName = 'Moonshot (Kimi)'; RequestShape = 'chat'; ResponseShape = 'chat'; ParseDisplayName = 'Moonshot'; AuthStyle = 'bearer'; ModelInBody = $true   # t/1936
+                    UriTemplate = 'https://api.moonshot.ai/v1/chat/completions'; EnvHint = 'MOONSHOT_API_KEY' }
+    'xai'      = @{ DisplayName = 'xAI (Grok)'; RequestShape = 'chat'; ResponseShape = 'chat'; ParseDisplayName = 'xAI'; AuthStyle = 'bearer'; ModelInBody = $true   # t/2583
+                    UriTemplate = 'https://api.x.ai/v1/chat/completions'; EnvHint = 'XAI_API_KEY' }
+    'deepseek' = @{ DisplayName = 'DeepSeek'; RequestShape = 'chat'; ResponseShape = 'chat'; ParseDisplayName = 'DeepSeek'; AuthStyle = 'bearer'; ModelInBody = $true   # t/1938
+                    UriTemplate = 'https://api.deepseek.com/v1/chat/completions'; EnvHint = 'DEEPSEEK_API_KEY' }
+}
 
-    The result object has six properties:
-      Text        — the generated text content
-      Backend     — 'gemini', 'claude', 'groq', or 'openai'
-      Model       — the model ID that was used
-      Truncated   — $true if the response was cut short by max_tokens
-      Usage       — token counts (InputTokens, OutputTokens, TotalTokens) or $null
-      RawResponse — the full deserialized API response
-
-    Returns $null on failure (with warnings explaining the issue).
-.PARAMETER Prompt
-    The prompt text to send to the AI model.
-.PARAMETER Model
-    Model identifier from ai-models.json (e.g., 'gemini-2.5-flash',
-    'claude-sonnet-4-5', 'groq-llama-3.3-70b').  Defaults to 'gemini-2.5-flash'.
-.PARAMETER ApiKey
-    Optional explicit API key.  If empty, resolved via Resolve-AIApiKey.
-.PARAMETER Temperature
-    Sampling temperature (0.0–2.0).  Lower = more deterministic.  Defaults to 0.1.
-.PARAMETER MaxTokens
-    Maximum tokens in the response.  Defaults to 1024.
-.PARAMETER JsonMode
-    When specified, requests JSON-formatted output from the backend.
-.PARAMETER ResponseSchema
-    Optional JSON Schema hashtable for structured output enforcement.
-    When provided, implies -JsonMode. Gemini and Groq enforce the schema
-    via constrained decoding; Claude injects the schema into the prompt.
-.PARAMETER TimeoutSec
-    HTTP request timeout in seconds.  Defaults to 120.
-.PARAMETER MaxRetries
-    Number of retry attempts on transient failures.  Defaults to 5.
-.PARAMETER RetryDelays
-    Array of delay durations (seconds) between retries.  Defaults to @(15, 45, 90, 120).
-.PARAMETER FallbackModels
-    Ordered list of models to try if the primary model fails permanently.
-    If omitted, uses the fallback chain from ai-models.json (if defined for
-    the primary model). Pass an empty array @() to disable fallback.
-.PARAMETER SkipTokenCheck
-    Skip the pre-flight token count check that warns when a prompt exceeds
-    80% of the model's context window.
-.EXAMPLE
-    $Result = Invoke-AIApi -Prompt 'Summarize this document...' -Model 'gemini-2.5-flash'
-    $Result.Text  # The generated summary
-
-.EXAMPLE
-    $Result = Invoke-AIApi -Prompt $Prompt -Model 'claude-sonnet-4-5' -JsonMode -MaxTokens 4096
-    $Parsed = $Result.Text | ConvertFrom-Json
-
-    Requests JSON output from Claude and parses it.
-.EXAMPLE
-    Invoke-AIApi -Prompt 'Hello' -Model 'groq-llama-3.3-70b' -Temperature 0.7
-
-    Calls the Groq backend with higher creativity.
-.EXAMPLE
-    Invoke-AIApi -Prompt $P -Model 'gemini-2.5-flash' -FallbackModels @('groq-llama-3.3-70b-versatile')
-
-    Falls back to Groq if Gemini fails.
-#>
-function Invoke-AIApi {
+function New-AIEnrichActionableError {
+    <#
+    .SYNOPSIS
+        AIEnrich's own actionable-error builder (t/4078). Returns an ErrorRecord to throw.
+    .DESCRIPTION
+        AITriad's New-ActionableError lives in AITriad/Private and is NOT visible from this separately
+        imported module, so calling it here threw CommandNotFoundException instead of the real error
+        (the same class as t/3123 Protect-SensitiveText, fixed the same way: a copy in THIS module).
+        The message is rendered exactly as New-ActionableError renders it (Goal: / Error: / Location: /
+        Resolve: with numbered steps), and the ErrorRecord mirrors its -AsErrorRecord shape: error id
+        'ActionableError' and TargetObject {ErrorType; Goal; Problem; Location; NextSteps}.
+    #>
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$Prompt,
-        [string]$SystemInstruction = '',
-        [ArgumentCompleter({ param($cmd, $param, $word) $script:ModelRegistry.Keys | Where-Object { $_ -like "$word*" } | Sort-Object })]
-        [string]$Model       = 'gemini-2.5-flash',
-        [string]$ApiKey      = '',
-        [double]$Temperature = 0.1,
-        [int]   $MaxTokens   = 1024,
-        [switch]$JsonMode,
-        [hashtable]$ResponseSchema,
-        [int]   $TimeoutSec  = 0,
-        [int]   $MaxRetries  = 5,
-        [int[]] $RetryDelays = @(15, 45, 90, 120),
-        [string[]]$FallbackModels,
-        [switch]$SkipTokenCheck,
-        # t/3242 — optional AI Call Log hook (IoC). A scriptblock invoked once per call with
-        # ($RetryCount, $Status). Defined in AITriad (Invoke-AIByUsage) so it retains that module's
-        # affinity and can reach the AITriad-private Write-AICallLogEntry across the module boundary.
-        [scriptblock]$CallLogger
-    )
+    [OutputType([System.Management.Automation.ErrorRecord])]
+    param([Parameter(Mandatory)][string]$Goal, [Parameter(Mandatory)][string]$Problem,
+          [Parameter(Mandatory)][string]$Location, [Parameter(Mandatory)][string[]]$NextSteps)
+    $StepList = @(for ($i = 0; $i -lt $NextSteps.Count; $i++) { "   $($i + 1). $($NextSteps[$i])" }) -join "`n"
+    $Message = "`n  Goal:     $Goal`n  Error:    $Problem`n  Location: $Location`n  Resolve:`n$StepList"
+    $Target = [ordered]@{ ErrorType = $null; Goal = $Goal; Problem = $Problem; Location = $Location; NextSteps = @($NextSteps) }
+    [System.Management.Automation.ErrorRecord]::new([System.Exception]::new($Message), 'ActionableError',
+        [System.Management.Automation.ErrorCategory]::NotSpecified, $Target)
+}
 
-    # -- Resolve model info from registry -------------------------------------
-    $ModelInfo = $script:ModelRegistry[$Model]
-    if (-not $ModelInfo) {
-        Write-Warning "Unknown model '$Model'. Valid models: $($script:ModelRegistry.Keys -join ', ')"
-        return $null
+function Get-AIBackendEnvHint {
+    <#
+    .SYNOPSIS
+        The env-var hint for the missing-key warning: the backend's profile EnvHint, or the
+        unknown-backend text when $script:AIBackendProfiles has no row for it (t/4135).
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([string]$Backend)
+    if ($script:AIBackendProfiles.ContainsKey($Backend)) { return $script:AIBackendProfiles[$Backend].EnvHint }
+    "(unknown backend '$Backend' — expected gemini/claude/groq/openai/azure/ollama/zai/moonshot/xai/deepseek)"
+}
+
+function Get-AIRequestUri {
+    <#
+    .SYNOPSIS
+        Expands a backend profile's UriTemplate (t/4135): {azure-endpoint} from
+        $env:AZURE_OPENAI_ENDPOINT (throws when unset), {ollama-host} from $env:OLLAMA_HOST,
+        and {model} from the ApiModelId. Trailing slashes on both env values are trimmed.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][hashtable]$BackendProfile, [string]$ApiModelId)
+    $Uri = $BackendProfile.UriTemplate
+    if ($Uri.Contains('{azure-endpoint}')) {
+        $AzureEndpoint = $env:AZURE_OPENAI_ENDPOINT
+        if ([string]::IsNullOrWhiteSpace($AzureEndpoint)) {
+            # t/4078: AIEnrich's own builder; AITriad's New-ActionableError is not visible from this
+            # module (the t/3123 Protect-SensitiveText class) and surfaced as CommandNotFoundException.
+            throw (New-AIEnrichActionableError `
+                -Goal 'Call Azure OpenAI API' `
+                -Problem 'AZURE_OPENAI_ENDPOINT environment variable is not set' `
+                -Location 'Invoke-AIApi (azure)' `
+                -NextSteps @(
+                    'Set $env:AZURE_OPENAI_ENDPOINT to your Azure OpenAI resource URL',
+                    'Example: https://my-resource.openai.azure.com'
+                ))
+        }
+        $Uri = $Uri.Replace('{azure-endpoint}', $AzureEndpoint.TrimEnd('/'))
     }
-
-    $Backend    = $ModelInfo.Backend
-    $ApiModelId = $ModelInfo.ApiModelId
-
-    if ($TimeoutSec -le 0) { $TimeoutSec = Get-AIDefaultTimeoutSec -Model $Model }
-
-    # -- Resolve API key ------------------------------------------------------
-    # t/1409: Ollama runs models locally and has no auth surface — skip both the
-    # key resolution and the missing-key gate. The key-required backends still
-    # gate as before; the $EnvHint switch stays exhaustive so no future backend
-    # produces the blank-token warning (AC#1).
-    $ResolvedKey = ''
-    if ($Backend -eq 'ollama') {
-        $script:LastApiKeySource = '(keyless — local Ollama)'
+    if ($Uri.Contains('{ollama-host}')) {
+        $OllamaHost = if ($env:OLLAMA_HOST) { $env:OLLAMA_HOST.TrimEnd('/') } else { 'http://localhost:11434' }
+        $Uri = $Uri.Replace('{ollama-host}', $OllamaHost)
     }
-    else {
-        $ResolvedKey = Resolve-AIApiKey -ExplicitKey $ApiKey -Backend $Backend
-        if ([string]::IsNullOrWhiteSpace($ResolvedKey)) {
-            $EnvHint = switch ($Backend) {
-                'gemini' { 'GEMINI_API_KEY' }
-                'claude' { 'ANTHROPIC_API_KEY / CLAUDE_API_KEY' }
-                'groq'   { 'GROQ_API_KEY' }
-                'openai' { 'OPENAI_API_KEY' }
-                'azure'  { 'AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT' }
-                'ollama' { '(no env var — local, keyless)' }
-                'zai'    { 'ZAI_API_KEY' }
-                'moonshot' { 'MOONSHOT_API_KEY' }
-                'xai'    { 'XAI_API_KEY' }
-                'deepseek' { 'DEEPSEEK_API_KEY' }
-                default  { "(unknown backend '$Backend' — expected gemini/claude/groq/openai/azure/ollama/zai/moonshot/xai/deepseek)" }
+    $Uri.Replace('{model}', $ApiModelId)
+}
+
+function Get-AIRequestHeaderTable {
+    <#
+    .SYNOPSIS
+        The request headers for a profile AuthStyle (t/4135). 'none' (and an unknown style)
+        gives an empty table, which Invoke-AIApi sends as no Headers at all.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([string]$AuthStyle, [string]$ResolvedKey)
+    switch ($AuthStyle) {
+        # Gemini's key travels in a header, not the URL: a ?key= query param leaks via proxy
+        # logs and PS5.1 error-record URIs (t/2530 L1).
+        'x-goog-api-key'              { return @{ 'x-goog-api-key' = $ResolvedKey } }
+        'x-api-key+anthropic-version' { return @{ 'x-api-key' = $ResolvedKey; 'anthropic-version' = '2023-06-01' } }
+        'bearer'                      { return @{ 'Authorization' = "Bearer $ResolvedKey" } }
+        'api-key'                     { return @{ 'api-key' = $ResolvedKey } }
+    }
+    return @{}
+}
+
+function Get-AIResponseFormat {
+    <#
+    .SYNOPSIS
+        The OpenAI-style structured-output format (t/4135): json_schema (strict) when a
+        ResponseSchema is given, else json_object. Used by the chat and Responses builders.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([hashtable]$ResponseSchema)
+    if ($ResponseSchema) {
+        return @{
+            type        = 'json_schema'
+            json_schema = @{
+                name   = 'response'
+                schema = $ResponseSchema
+                strict = $true
             }
-            Write-Warning "No API key found for $Backend backend. Set $EnvHint or AI_API_KEY."
-            return $null
+        }
+    }
+    return @{ type = 'json_object' }
+}
+
+function New-AIChatRequestBody {
+    <#
+    .SYNOPSIS
+        Pure: the OpenAI-compatible /chat/completions body (groq, zai, moonshot, xai, deepseek,
+        ollama, azure). -IncludeModel:$false omits "model" (azure). JsonMode adds response_format.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([string]$ApiModelId, [switch]$IncludeModel, [string]$Prompt, [string]$SystemInstruction,
+          [double]$Temperature, [int]$MaxTokens, [switch]$JsonMode, [hashtable]$ResponseSchema)
+    $Messages = [System.Collections.Generic.List[object]]::new()
+    if ($SystemInstruction) {
+        $Messages.Add(@{ role = 'system'; content = $SystemInstruction })
+    }
+    $Messages.Add(@{ role = 'user'; content = $Prompt })
+
+    if ($IncludeModel) {
+        $ChatBody = @{
+            model       = $ApiModelId
+            messages    = @($Messages)
+            temperature = $Temperature
+            max_tokens  = $MaxTokens
+        }
+    } else {
+        $ChatBody = @{
+            messages    = @($Messages)
+            temperature = $Temperature
+            max_tokens  = $MaxTokens
+        }
+    }
+    if ($JsonMode) { $ChatBody['response_format'] = Get-AIResponseFormat -ResponseSchema $ResponseSchema }
+    return $ChatBody
+}
+
+function New-AIGeminiRequestBody {
+    <#
+    .SYNOPSIS
+        Pure: the Gemini generateContent body, with all four safety categories at BLOCK_NONE.
+        JsonMode sets responseMimeType; a ResponseSchema is converted by ConvertTo-GeminiSchema.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([string]$Prompt, [string]$SystemInstruction, [double]$Temperature, [int]$MaxTokens,
+          [switch]$JsonMode, [hashtable]$ResponseSchema)
+    $Categories = @('HARASSMENT', 'HATE_SPEECH', 'SEXUALLY_EXPLICIT', 'DANGEROUS_CONTENT')
+    $SafetyList = $Categories | ForEach-Object {
+        @{ category = "HARM_CATEGORY_$_"; threshold = 'BLOCK_NONE' }
+    }
+
+    $GenConfig = @{
+        temperature     = $Temperature
+        maxOutputTokens = $MaxTokens
+    }
+    if ($JsonMode) {
+        $GenConfig['responseMimeType'] = 'application/json'
+        if ($ResponseSchema) {
+            $GenConfig['responseSchema'] = ConvertTo-GeminiSchema -Schema $ResponseSchema
         }
     }
 
-    # -- Log AI configuration --------------------------------------------------
+    $GeminiBody = @{
+        contents         = @(@{ parts = @(@{ text = $Prompt }) })
+        generationConfig = $GenConfig
+        safetySettings   = $SafetyList
+    }
+    if ($SystemInstruction) {
+        $GeminiBody['systemInstruction'] = @{ parts = @(@{ text = $SystemInstruction }) }
+    }
+    return $GeminiBody
+}
+
+function New-AIClaudeRequestBody {
+    <#
+    .SYNOPSIS
+        The Anthropic Messages body. Claude has no JSON mode here: a ResponseSchema is
+        appended to the prompt as an instruction instead. Temperature is left out for a model
+        in $script:ClaudeSamplingRejected (t/4164); that memo read is its only module state.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([string]$ApiModelId, [string]$Prompt, [string]$SystemInstruction, [double]$Temperature,
+          [int]$MaxTokens, [hashtable]$ResponseSchema)
+    $ClaudePrompt = $Prompt
+    if ($ResponseSchema) {
+        $SchemaJson = $ResponseSchema | ConvertTo-Json -Depth 10
+        $ClaudePrompt = $Prompt + "`n`nYou MUST respond with a JSON object conforming to this schema:`n$SchemaJson"
+    }
+
+    $ClaudeBody = @{
+        model      = $ApiModelId
+        max_tokens = $MaxTokens
+        messages   = @(@{
+            role    = 'user'
+            content = $ClaudePrompt
+        })
+    }
+    if (-not $script:ClaudeSamplingRejected.Contains([string]$ApiModelId)) {
+        $ClaudeBody['temperature'] = $Temperature
+    }
+    if ($SystemInstruction) {
+        $ClaudeBody['system'] = $SystemInstruction
+    }
+    return $ClaudeBody
+}
+
+function New-AIOpenAIResponsesRequestBody {
+    <#
+    .SYNOPSIS
+        Pure: the OpenAI Responses API (/v1/responses) body. No temperature is sent; JsonMode
+        puts the response format under text.format.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([string]$ApiModelId, [string]$Prompt, [string]$SystemInstruction, [int]$MaxTokens,
+          [switch]$JsonMode, [hashtable]$ResponseSchema)
+    $OpenAIBody = @{
+        model             = $ApiModelId
+        max_output_tokens = $MaxTokens
+    }
+    if ($SystemInstruction) {
+        $OpenAIBody['instructions'] = $SystemInstruction
+    }
+    $OpenAIBody['input'] = $Prompt
+    if ($JsonMode) { $OpenAIBody['text'] = @{ format = Get-AIResponseFormat -ResponseSchema $ResponseSchema } }
+    return $OpenAIBody
+}
+
+function New-AIApiRequest {
+    <#
+    .SYNOPSIS
+        Builds Invoke-AIApi's request {Uri; Headers; Body} from the backend's row in
+        $script:AIBackendProfiles (t/4135). Body is the builder's table as ConvertTo-Json
+        -Depth 10. A backend with no row gets Uri '', Headers @{} and Body ''.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([string]$Backend, [string]$ApiModelId, [string]$ResolvedKey, [string]$Prompt,
+          [string]$SystemInstruction, [double]$Temperature, [int]$MaxTokens,
+          [switch]$JsonMode, [hashtable]$ResponseSchema)
+    $Request = @{ Uri = ''; Headers = @{}; Body = '' }
+    if (-not $script:AIBackendProfiles.ContainsKey($Backend)) { return $Request }
+    $BackendProfile = $script:AIBackendProfiles[$Backend]
+
+    $Request.Uri     = Get-AIRequestUri -BackendProfile $BackendProfile -ApiModelId $ApiModelId
+    $Request.Headers = Get-AIRequestHeaderTable -AuthStyle $BackendProfile.AuthStyle -ResolvedKey $ResolvedKey
+    $Common = @{ Prompt = $Prompt; SystemInstruction = $SystemInstruction; MaxTokens = $MaxTokens; ResponseSchema = $ResponseSchema }
+    $BodyObject = switch ($BackendProfile.RequestShape) {
+        'gemini'           { New-AIGeminiRequestBody @Common -Temperature $Temperature -JsonMode:$JsonMode }
+        'claude'           { New-AIClaudeRequestBody @Common -Temperature $Temperature -ApiModelId $ApiModelId }
+        'openai-responses' { New-AIOpenAIResponsesRequestBody @Common -ApiModelId $ApiModelId -JsonMode:$JsonMode }
+        'chat'             { New-AIChatRequestBody @Common -Temperature $Temperature -ApiModelId $ApiModelId -JsonMode:$JsonMode -IncludeModel:([bool]$BackendProfile.ModelInBody) }
+    }
+    $Request.Body = $BodyObject | ConvertTo-Json -Depth 10
+    return $Request
+}
+
+function Write-AIApiConfigLog {
+    <#
+    .SYNOPSIS
+        Invoke-AIApi's [AI] configuration log (t/4135 B2, moved verbatim): the Verbose line on
+        every call, and the coloured host line on the first call of a session, a model change
+        or a correlation-id change. Updates the module's last-model / last-correlation state.
+    #>
+    [CmdletBinding()]
+    param([string]$Backend, [string]$Model, [string]$ApiModelId)
     # Correlation prefix: when a per-doc token is set (Set-AIApiCorrelationId,
     # e.g. the doc id from Invoke-DocumentSummary), every log line names the doc
     # it belongs to. In a parallel batch this is the only reliable way to
@@ -612,411 +937,98 @@ function Invoke-AIApi {
     }
     $script:AIApiLastModel = $Model
     $script:AIApiLastCorrelationId = $script:AIApiCorrelationId
+}
 
-    # -- Pre-flight token check ---------------------------------------------------
-    if (-not $SkipTokenCheck) {
-        $PromptLength = $Prompt.Length + $SystemInstruction.Length
-        $EstTokens = [Math]::Ceiling($PromptLength / 3.2)
-        $ContextLimit = if ($script:ContextWindows.ContainsKey($Backend)) { $script:ContextWindows[$Backend] } else { 131072 }
-        if ($EstTokens -gt ($ContextLimit * 0.8)) {
-            Write-Warning "$Model`: prompt is ~$EstTokens tokens (est.), which exceeds 80% of the $ContextLimit-token context window. Consider chunking or using a model with a larger context."
-        }
+# t/4078 retry policy (TL sign-off t/4078#3). HTTP codes retried on the RetryDelays schedule, up to
+# MaxRetries attempts. Other 4xx (400/401/403/404) are never retried: a retry cannot fix a bad request,
+# model id or key.
+$script:AIRetryableHttpStatus = @(429, 500, 502, 503, 504, 529)
+# A failure with no HTTP response (a timeout or a connection failure) is retried at most this many times
+# per call, whatever MaxRetries is: each attempt can burn the whole TimeoutSec, and a provider that did
+# finish the request bills it again (t/4078#3 billing note).
+$script:AINoResponseMaxRetries = 1
+
+function Get-AIErrorHttpStatus {
+    <#
+    .SYNOPSIS
+        The HTTP status code carried by an exception's Response (HttpResponseMessage, or the old
+        WebRequest shape), or $null when it has none. Safe under Set-StrictMode (t/4078).
+    #>
+    [CmdletBinding()]
+    param($Exception)
+    if ($null -eq $Exception -or -not $Exception.PSObject.Properties['Response']) { return $null }
+    $Resp = $Exception.Response
+    if ($null -eq $Resp -or -not $Resp.PSObject.Properties['StatusCode']) { return $null }
+    return $Resp.StatusCode.value__
+}
+
+function Get-AIRestFailureClass {
+    <#
+    .SYNOPSIS
+        Classifies an Invoke-RestMethod failure (t/4078) as [pscustomobject]{ Kind; StatusCode; Reason }.
+    .DESCRIPTION
+        Kind is 'http' (the error carries an HTTP response), 'timeout' (no response; a TimeoutException or
+        a cancellation anywhere in the exception chain: PS7 surfaces -TimeoutSec expiry as a
+        TaskCanceledException wrapping a TimeoutException, FQID ConnectionTimeoutReached), 'connection'
+        (no response; an HttpRequestException, SocketException or WebException, e.g. refused or DNS),
+        'other' (anything else) or 'none' (no error record). Reason is the text the retry WARN names:
+        'HTTP 502', 'timeout', 'connection failure', or ''.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param($ErrorRecord)
+    if (-not $ErrorRecord) { return [pscustomobject]@{ Kind = 'none'; StatusCode = $null; Reason = '' } }
+    $Status = Get-AIErrorHttpStatus -Exception $ErrorRecord.Exception
+    if ($null -ne $Status) { return [pscustomobject]@{ Kind = 'http'; StatusCode = [int]$Status; Reason = "HTTP $Status" } }
+    $Kind = 'other'
+    for ($e = $ErrorRecord.Exception; $null -ne $e; $e = $e.InnerException) {
+        if ($e -is [System.TimeoutException] -or $e -is [System.OperationCanceledException]) { $Kind = 'timeout'; break }
+        if ($e -is [System.Net.Http.HttpRequestException] -or $e -is [System.Net.Sockets.SocketException] -or $e -is [System.Net.WebException]) { $Kind = 'connection' }
     }
+    $Reason = switch ($Kind) { 'timeout' { 'timeout' } 'connection' { 'connection failure' } default { '' } }
+    [pscustomobject]@{ Kind = $Kind; StatusCode = $null; Reason = $Reason }
+}
 
-    # -- ResponseSchema implies JsonMode ----------------------------------------
-    if ($ResponseSchema) { $JsonMode = [switch]::Present }
+function Test-AIRestFailureRetryable {
+    <#
+    .SYNOPSIS
+        True when a classified failure may be retried (t/4078): an HTTP code in
+        $script:AIRetryableHttpStatus, or a timeout/connection failure while fewer than
+        $script:AINoResponseMaxRetries no-response retries have been made. The caller still
+        stops at the last attempt.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)]$Failure, [int]$NoResponseRetries)
+    switch ($Failure.Kind) {
+        'http'       { return ($Failure.StatusCode -in $script:AIRetryableHttpStatus) }
+        'timeout'    { return ($NoResponseRetries -lt $script:AINoResponseMaxRetries) }
+        'connection' { return ($NoResponseRetries -lt $script:AINoResponseMaxRetries) }
+    }
+    return $false
+}
 
-    # -- Build backend-specific request ---------------------------------------
-    $Uri         = ''
-    $Headers     = @{}
-    $Body        = ''
+function Invoke-AIRestWithRetry {
+    <#
+    .SYNOPSIS
+        Invoke-AIApi's retry loop (t/4135 B2; policy t/4078): POSTs the same UTF-8 body bytes up to
+        MaxRetries times and returns [pscustomobject]{ Response; LastError; Attempt }.
+    .DESCRIPTION
+        HTTP 429, 500, 502, 503, 504 and 529 are retried; a timeout or connection failure (no HTTP
+        response) is retried at most once per call; anything else (400/401/403/404, ...) stops the loop
+        at once. Nothing is retried after the last attempt. The delay is RetryDelays[Attempt], clamped
+        to the last entry; a 429 waits at least 120s. Each retry WARNs with its reason ('HTTP 502',
+        'timeout', 'connection failure') and calls Start-Sleep. Attempt is the zero-based index of the
+        last attempt made. The whole loop finishes before Invoke-AIApi's cascade moves to another link.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param([string]$Backend, [string]$Uri, [hashtable]$Headers, [string]$Body, [int]$TimeoutSec,
+          [int]$MaxRetries, [int[]]$RetryDelays)
     $ContentType = 'application/json; charset=utf-8'
-
-    switch ($Backend) {
-        'gemini' {
-            # Key travels in the x-goog-api-key header, not the URL — a ?key= query
-            # param leaks via proxy logs and PS5.1 error-record URIs (t/2530 L1).
-            $Uri = "https://generativelanguage.googleapis.com/v1beta/models/${ApiModelId}:generateContent"
-            $Headers['x-goog-api-key'] = $ResolvedKey
-
-            $Categories = @('HARASSMENT', 'HATE_SPEECH', 'SEXUALLY_EXPLICIT', 'DANGEROUS_CONTENT')
-            $SafetyList = $Categories | ForEach-Object {
-                @{ category = "HARM_CATEGORY_$_"; threshold = 'BLOCK_NONE' }
-            }
-
-            $GenConfig = @{
-                temperature     = $Temperature
-                maxOutputTokens = $MaxTokens
-            }
-            if ($JsonMode) {
-                $GenConfig['responseMimeType'] = 'application/json'
-                if ($ResponseSchema) {
-                    $GenConfig['responseSchema'] = ConvertTo-GeminiSchema -Schema $ResponseSchema
-                }
-            }
-
-            $GeminiBody = @{
-                contents         = @(@{ parts = @(@{ text = $Prompt }) })
-                generationConfig = $GenConfig
-                safetySettings   = $SafetyList
-            }
-            if ($SystemInstruction) {
-                $GeminiBody['systemInstruction'] = @{ parts = @(@{ text = $SystemInstruction }) }
-            }
-            $Body = $GeminiBody | ConvertTo-Json -Depth 10
-        }
-
-        'claude' {
-            $Uri = 'https://api.anthropic.com/v1/messages'
-            $Headers = @{
-                'x-api-key'         = $ResolvedKey
-                'anthropic-version' = '2023-06-01'
-            }
-
-            $ClaudePrompt = $Prompt
-            if ($ResponseSchema) {
-                $SchemaJson = $ResponseSchema | ConvertTo-Json -Depth 10
-                $ClaudePrompt = $Prompt + "`n`nYou MUST respond with a JSON object conforming to this schema:`n$SchemaJson"
-            }
-
-            $ClaudeBody = @{
-                model      = $ApiModelId
-                max_tokens = $MaxTokens
-                messages   = @(@{
-                    role    = 'user'
-                    content = $ClaudePrompt
-                })
-                temperature = $Temperature
-            }
-            if ($SystemInstruction) {
-                $ClaudeBody['system'] = $SystemInstruction
-            }
-            $Body = $ClaudeBody | ConvertTo-Json -Depth 10
-        }
-
-        'groq' {
-            $Uri = 'https://api.groq.com/openai/v1/chat/completions'
-            $Headers = @{
-                'Authorization' = "Bearer $ResolvedKey"
-            }
-
-            $GroqMessages = [System.Collections.Generic.List[object]]::new()
-            if ($SystemInstruction) {
-                $GroqMessages.Add(@{ role = 'system'; content = $SystemInstruction })
-            }
-            $GroqMessages.Add(@{ role = 'user'; content = $Prompt })
-
-            $GroqBody = @{
-                model       = $ApiModelId
-                messages    = @($GroqMessages)
-                temperature = $Temperature
-                max_tokens  = $MaxTokens
-            }
-            if ($JsonMode) {
-                if ($ResponseSchema) {
-                    $GroqBody['response_format'] = @{
-                        type        = 'json_schema'
-                        json_schema = @{
-                            name   = 'response'
-                            schema = $ResponseSchema
-                            strict = $true
-                        }
-                    }
-                } else {
-                    $GroqBody['response_format'] = @{ type = 'json_object' }
-                }
-            }
-
-            $Body = $GroqBody | ConvertTo-Json -Depth 10
-        }
-
-        # t/1437 — z.ai / GLM-5.3 exposes an OpenAI-compatible /chat/completions endpoint
-        # at https://api.z.ai/api/paas/v4/. Request shape matches Groq exactly; the only
-        # differences are the URL and that we point at $ApiModelId directly. 1M-token
-        # context ($script:ContextWindows.zai) so the pre-flight token check tolerates
-        # very large prompts sanely.
-        'zai' {
-            $Uri = 'https://api.z.ai/api/paas/v4/chat/completions'
-            $Headers = @{
-                'Authorization' = "Bearer $ResolvedKey"
-            }
-
-            $ZaiMessages = [System.Collections.Generic.List[object]]::new()
-            if ($SystemInstruction) {
-                $ZaiMessages.Add(@{ role = 'system'; content = $SystemInstruction })
-            }
-            $ZaiMessages.Add(@{ role = 'user'; content = $Prompt })
-
-            $ZaiBody = @{
-                model       = $ApiModelId
-                messages    = @($ZaiMessages)
-                temperature = $Temperature
-                max_tokens  = $MaxTokens
-            }
-            if ($JsonMode) {
-                if ($ResponseSchema) {
-                    $ZaiBody['response_format'] = @{
-                        type        = 'json_schema'
-                        json_schema = @{
-                            name   = 'response'
-                            schema = $ResponseSchema
-                            strict = $true
-                        }
-                    }
-                } else {
-                    $ZaiBody['response_format'] = @{ type = 'json_object' }
-                }
-            }
-
-            $Body = $ZaiBody | ConvertTo-Json -Depth 10
-        }
-
-        # t/1936 — Moonshot (Kimi) exposes an OpenAI-compatible /chat/completions
-        # endpoint at https://api.moonshot.ai/v1. Request shape matches Groq/z.ai
-        # exactly (Bearer auth, system+user messages); the model id (kimi-k3) flows
-        # from ai-models.json via $ApiModelId. 1M-token context
-        # ($script:ContextWindows.moonshot) so the pre-flight token check tolerates
-        # very large prompts sanely.
-        'moonshot' {
-            $Uri = 'https://api.moonshot.ai/v1/chat/completions'
-            $Headers = @{
-                'Authorization' = "Bearer $ResolvedKey"
-            }
-
-            $MoonshotMessages = [System.Collections.Generic.List[object]]::new()
-            if ($SystemInstruction) {
-                $MoonshotMessages.Add(@{ role = 'system'; content = $SystemInstruction })
-            }
-            $MoonshotMessages.Add(@{ role = 'user'; content = $Prompt })
-
-            $MoonshotBody = @{
-                model       = $ApiModelId
-                messages    = @($MoonshotMessages)
-                temperature = $Temperature
-                max_tokens  = $MaxTokens
-            }
-            if ($JsonMode) {
-                if ($ResponseSchema) {
-                    $MoonshotBody['response_format'] = @{
-                        type        = 'json_schema'
-                        json_schema = @{
-                            name   = 'response'
-                            schema = $ResponseSchema
-                            strict = $true
-                        }
-                    }
-                } else {
-                    $MoonshotBody['response_format'] = @{ type = 'json_object' }
-                }
-            }
-
-            $Body = $MoonshotBody | ConvertTo-Json -Depth 10
-        }
-
-        # t/2583 — xAI (Grok) exposes an OpenAI-compatible /chat/completions
-        # endpoint at https://api.x.ai/v1. Request shape matches Groq/z.ai/Moonshot
-        # exactly (Bearer auth, system+user messages); the model id (grok-4.6) flows
-        # from ai-models.json via $ApiModelId. 500K-token context
-        # ($script:ContextWindows.xai) so the pre-flight token check tolerates
-        # very large prompts sanely.
-        'xai' {
-            $Uri = 'https://api.x.ai/v1/chat/completions'
-            $Headers = @{
-                'Authorization' = "Bearer $ResolvedKey"
-            }
-
-            $XaiMessages = [System.Collections.Generic.List[object]]::new()
-            if ($SystemInstruction) {
-                $XaiMessages.Add(@{ role = 'system'; content = $SystemInstruction })
-            }
-            $XaiMessages.Add(@{ role = 'user'; content = $Prompt })
-
-            $XaiBody = @{
-                model       = $ApiModelId
-                messages    = @($XaiMessages)
-                temperature = $Temperature
-                max_tokens  = $MaxTokens
-            }
-            if ($JsonMode) {
-                if ($ResponseSchema) {
-                    $XaiBody['response_format'] = @{
-                        type        = 'json_schema'
-                        json_schema = @{
-                            name   = 'response'
-                            schema = $ResponseSchema
-                            strict = $true
-                        }
-                    }
-                } else {
-                    $XaiBody['response_format'] = @{ type = 'json_object' }
-                }
-            }
-
-            $Body = $XaiBody | ConvertTo-Json -Depth 10
-        }
-
-        # t/1938 — DeepSeek exposes an OpenAI-compatible /v1/chat/completions endpoint
-        # at https://api.deepseek.com/. Bearer auth ($env:DEEPSEEK_API_KEY); request
-        # shape matches Groq/z.ai exactly. 64K-token context ($script:ContextWindows.deepseek).
-        'deepseek' {
-            $Uri = 'https://api.deepseek.com/v1/chat/completions'
-            $Headers = @{
-                'Authorization' = "Bearer $ResolvedKey"
-            }
-
-            $DeepSeekMessages = [System.Collections.Generic.List[object]]::new()
-            if ($SystemInstruction) {
-                $DeepSeekMessages.Add(@{ role = 'system'; content = $SystemInstruction })
-            }
-            $DeepSeekMessages.Add(@{ role = 'user'; content = $Prompt })
-
-            $DeepSeekBody = @{
-                model       = $ApiModelId
-                messages    = @($DeepSeekMessages)
-                temperature = $Temperature
-                max_tokens  = $MaxTokens
-            }
-            if ($JsonMode) {
-                if ($ResponseSchema) {
-                    $DeepSeekBody['response_format'] = @{
-                        type        = 'json_schema'
-                        json_schema = @{
-                            name   = 'response'
-                            schema = $ResponseSchema
-                            strict = $true
-                        }
-                    }
-                } else {
-                    $DeepSeekBody['response_format'] = @{ type = 'json_object' }
-                }
-            }
-
-            $Body = $DeepSeekBody | ConvertTo-Json -Depth 10
-        }
-
-        # t/1409 — Ollama exposes an OpenAI-compatible /v1/chat/completions endpoint
-        # on http://localhost:11434 with no auth. Request shape matches Groq exactly.
-        'ollama' {
-            $OllamaHost = if ($env:OLLAMA_HOST) { $env:OLLAMA_HOST.TrimEnd('/') } else { 'http://localhost:11434' }
-            $Uri = "$OllamaHost/v1/chat/completions"
-            # No Authorization header — Ollama is local, keyless.
-            $OllamaMessages = [System.Collections.Generic.List[object]]::new()
-            if ($SystemInstruction) {
-                $OllamaMessages.Add(@{ role = 'system'; content = $SystemInstruction })
-            }
-            $OllamaMessages.Add(@{ role = 'user'; content = $Prompt })
-
-            $OllamaBody = @{
-                model       = $ApiModelId
-                messages    = @($OllamaMessages)
-                temperature = $Temperature
-                max_tokens  = $MaxTokens
-            }
-            if ($JsonMode) {
-                if ($ResponseSchema) {
-                    $OllamaBody['response_format'] = @{
-                        type        = 'json_schema'
-                        json_schema = @{
-                            name   = 'response'
-                            schema = $ResponseSchema
-                            strict = $true
-                        }
-                    }
-                } else {
-                    $OllamaBody['response_format'] = @{ type = 'json_object' }
-                }
-            }
-
-            $Body = $OllamaBody | ConvertTo-Json -Depth 10
-        }
-
-        'azure' {
-            $AzureEndpoint = $env:AZURE_OPENAI_ENDPOINT
-            if ([string]::IsNullOrWhiteSpace($AzureEndpoint)) {
-                throw (New-ActionableError `
-                    -Goal 'Call Azure OpenAI API' `
-                    -Problem 'AZURE_OPENAI_ENDPOINT environment variable is not set' `
-                    -Location 'Invoke-AIApi (azure)' `
-                    -NextSteps @(
-                        'Set $env:AZURE_OPENAI_ENDPOINT to your Azure OpenAI resource URL',
-                        'Example: https://my-resource.openai.azure.com'
-                    ))
-            }
-            $AzureEndpoint = $AzureEndpoint.TrimEnd('/')
-            $Uri = "$AzureEndpoint/openai/deployments/$ApiModelId/chat/completions?api-version=2024-10-21"
-            $Headers = @{
-                'api-key' = $ResolvedKey
-            }
-
-            $AzureMessages = [System.Collections.Generic.List[object]]::new()
-            if ($SystemInstruction) {
-                $AzureMessages.Add(@{ role = 'system'; content = $SystemInstruction })
-            }
-            $AzureMessages.Add(@{ role = 'user'; content = $Prompt })
-
-            $AzureBody = @{
-                messages    = @($AzureMessages)
-                temperature = $Temperature
-                max_tokens  = $MaxTokens
-            }
-            if ($JsonMode) {
-                if ($ResponseSchema) {
-                    $AzureBody['response_format'] = @{
-                        type        = 'json_schema'
-                        json_schema = @{
-                            name   = 'response'
-                            schema = $ResponseSchema
-                            strict = $true
-                        }
-                    }
-                } else {
-                    $AzureBody['response_format'] = @{ type = 'json_object' }
-                }
-            }
-
-            $Body = $AzureBody | ConvertTo-Json -Depth 10
-        }
-
-        'openai' {
-            $Uri = 'https://api.openai.com/v1/responses'
-            $Headers = @{
-                'Authorization' = "Bearer $ResolvedKey"
-            }
-
-            $OpenAIBody = @{
-                model             = $ApiModelId
-                max_output_tokens = $MaxTokens
-            }
-            if ($SystemInstruction) {
-                $OpenAIBody['instructions'] = $SystemInstruction
-                $OpenAIBody['input'] = $Prompt
-            } else {
-                $OpenAIBody['input'] = $Prompt
-            }
-            if ($JsonMode) {
-                if ($ResponseSchema) {
-                    $OpenAIBody['text'] = @{
-                        format = @{
-                            type        = 'json_schema'
-                            json_schema = @{
-                                name   = 'response'
-                                schema = $ResponseSchema
-                                strict = $true
-                            }
-                        }
-                    }
-                } else {
-                    $OpenAIBody['text'] = @{ format = @{ type = 'json_object' } }
-                }
-            }
-
-            $Body = $OpenAIBody | ConvertTo-Json -Depth 10
-        }
-    }
-
-    # -- Call API with retry logic --------------------------------------------
     $Response  = $null
     $LastError = $null
+    $NoResponseRetries = 0
 
     for ($Attempt = 0; $Attempt -lt $MaxRetries; $Attempt++) {
         try {
@@ -1040,328 +1052,693 @@ function Invoke-AIApi {
             $LastError = $null
             break
         } catch {
-            $LastError  = $_
-            $StatusCode = $_.Exception.Response.StatusCode.value__
+            $LastError = $_
+            $Failure   = Get-AIRestFailureClass -ErrorRecord $_
+            $Retryable = Test-AIRestFailureRetryable -Failure $Failure -NoResponseRetries $NoResponseRetries
+            if (-not $Retryable -or $Attempt -ge ($MaxRetries - 1)) { break }
+            if ($Failure.Kind -ne 'http') { $NoResponseRetries++ }
 
-            if ($StatusCode -in @(429, 503, 529) -and $Attempt -lt ($MaxRetries - 1)) {
-                if ($Attempt -lt $RetryDelays.Count) { $Delay = $RetryDelays[$Attempt] } else { $Delay = $RetryDelays[-1] }
-                # Server-side rate limiting (429) needs a longer wait than transient errors
-                if ($StatusCode -eq 429) { $Delay = [Math]::Max($Delay, 120) }
-                Write-Warning "$($Backend): HTTP $StatusCode — retrying in ${Delay}s (attempt $($Attempt + 1)/$MaxRetries)"
-                Start-Sleep -Seconds $Delay
-            } else {
-                break
-            }
+            if ($Attempt -lt $RetryDelays.Count) { $Delay = $RetryDelays[$Attempt] } else { $Delay = $RetryDelays[-1] }
+            # Server-side rate limiting (429) needs a longer wait than transient errors
+            if ($Failure.StatusCode -eq 429) { $Delay = [Math]::Max($Delay, 120) }
+            Write-Warning "$($Backend): $($Failure.Reason) — retrying in ${Delay}s (attempt $($Attempt + 1)/$MaxRetries)"
+            Start-Sleep -Seconds $Delay
         }
     }
+    [pscustomobject]@{ Response = $Response; LastError = $LastError; Attempt = $Attempt }
+}
 
-    # t/3242 — AI Call Log capture (IoC). Fire the injected logger ONCE per call HERE, before the
-    # failure $null-return AND the success extraction, so a failed call is logged too (TL C, cond.3).
-    # Fail-safe (cond.2): the logger — and the audit write it drives — must never break the AI call.
-    if ($CallLogger) {
-        if ($null -ne $Response -and $null -eq $LastError) { $LogStatus = 200 }
-        elseif ($LastError -and $LastError.Exception.Response) { $LogStatus = $LastError.Exception.Response.StatusCode.value__ }
-        elseif ($LastError) { $LogStatus = 'error' }
-        else { $LogStatus = '?' }
-        try { & $CallLogger $Attempt ([string]$LogStatus) }
-        catch { Write-Warning "Invoke-AIApi: call-logger threw ($($_.Exception.Message)); continuing (audit log is non-fatal)." }
+# t/4164: the 400 body that marks a Claude model's temperature rejection ("`temperature` is
+# deprecated for this model"; "temperature ... not supported"). Narrower than the TS check (any 400
+# body naming temperature), so an unrelated 400 that merely mentions it still fails as a 400.
+$script:ClaudeSamplingRejectionPattern = '(?i)temperature[\s\S]{0,80}?(deprecated|unsupported|not supported)'
+
+function Test-AIClaudeSamplingRejection {
+    <#
+    .SYNOPSIS
+        True when a failed call is a Claude temperature rejection the t/4164 re-send handles: the
+        backend's RequestShape is 'claude', the model is not memoized yet (so the body carried
+        temperature), the status is 400 and the error body matches $script:ClaudeSamplingRejectionPattern.
+        Reads only ErrorDetails.Message (the PS7 HttpClient shape), never the response stream, so
+        Write-AIApiFailure can still read a WebRequest-shape body afterwards.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([string]$Backend, [string]$ApiModelId, $LastError)
+    if (-not $LastError -or -not $script:AIBackendProfiles.ContainsKey($Backend)) { return $false }
+    if ($script:AIBackendProfiles[$Backend].RequestShape -ne 'claude') { return $false }
+    if ($script:ClaudeSamplingRejected.Contains($ApiModelId)) { return $false }
+    if ((Get-AIErrorHttpStatus -Exception $LastError.Exception) -ne 400) { return $false }
+    if (-not ($LastError.PSObject.Properties['ErrorDetails'] -and $LastError.ErrorDetails)) { return $false }
+    return ([string]$LastError.ErrorDetails.Message -match $script:ClaudeSamplingRejectionPattern)
+}
+
+function Invoke-AIApiRequest {
+    <#
+    .SYNOPSIS
+        Builds Invoke-AIApi's request (New-AIApiRequest @RequestArgs) and sends it through
+        Invoke-AIRestWithRetry; returns that call's { Response; LastError; Attempt }.
+    .DESCRIPTION
+        t/4164 (mirrors claude.ts, t/3942): when a Claude model rejects temperature with a 400
+        (Test-AIClaudeSamplingRejection), the model is added to $script:ClaudeSamplingRejected, one
+        WARN names it, and the request is rebuilt (New-AIClaudeRequestBody now omits temperature) and
+        re-sent ONCE through a fresh Invoke-AIRestWithRetry, so the re-send does not count against
+        MaxRetries. Later calls to that model omit temperature from the start. The re-send can happen
+        at most once per call: the model is memoized before it, so a second 400 fails normally.
+
+        CallLogger: Invoke-AIApi still logs ONE entry per call. When the re-send happened, the entry
+        carries the re-send's outcome (its status and its own zero-based Attempt index); the rejected
+        first request is not logged separately and is not counted as a retry.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param([Parameter(Mandatory)][hashtable]$RequestArgs, [int]$TimeoutSec, [int]$MaxRetries, [int[]]$RetryDelays)
+    $Send = @{ Backend = $RequestArgs.Backend; TimeoutSec = $TimeoutSec; MaxRetries = $MaxRetries; RetryDelays = $RetryDelays }
+    $Request = New-AIApiRequest @RequestArgs
+    $Call = Invoke-AIRestWithRetry @Send -Uri $Request.Uri -Headers $Request.Headers -Body $Request.Body
+    $ApiModelId = [string]$RequestArgs.ApiModelId
+    if (-not (Test-AIClaudeSamplingRejection -Backend $RequestArgs.Backend -ApiModelId $ApiModelId -LastError $Call.LastError)) {
+        return $Call
     }
 
-    if ($null -ne $LastError -or $null -eq $Response) {
-        if ($LastError) { $StatusCode = $LastError.Exception.Response.StatusCode.value__ } else { $StatusCode = '?' }
-        $Hint = switch ($StatusCode) {
-            401     { 'Check your API key — it may be invalid or expired.' }
-            403     { 'Access denied — verify your API key has the required permissions.' }
-            429     { 'Rate limit exceeded — wait a moment and try again.' }
-            { $_ -in 500, 502, 503 } { 'Server error — the API may be temporarily unavailable.' }
-            default { '' }
+    [void]$script:ClaudeSamplingRejected.Add($ApiModelId)
+    $SafeBody = Protect-SensitiveText -Text ([string]$Call.LastError.ErrorDetails.Message) -Secret $RequestArgs.ResolvedKey
+    if ($SafeBody.Length -gt 200) { $SafeBody = $SafeBody.Substring(0, 200) }
+    $Dropped = ([double]$RequestArgs.Temperature).ToString([cultureinfo]::InvariantCulture)
+    Write-Warning "Claude model `"$ApiModelId`" rejected temperature=$Dropped; retrying without it. Later calls to this model omit temperature for the rest of the process. API: $SafeBody"
+
+    $Request = New-AIApiRequest @RequestArgs
+    return Invoke-AIRestWithRetry @Send -Uri $Request.Uri -Headers $Request.Headers -Body $Request.Body
+}
+
+function Invoke-AICallLogHook {
+    <#
+    .SYNOPSIS
+        Fires Invoke-AIApi's injected AI Call Log hook once per call (t/3242; moved by t/4135 B2).
+    .DESCRIPTION
+        Runs before both the failure return and the success extraction, so a failed call is
+        logged too. The status is 200 on success, else the HTTP code, else 'error' (a failure
+        with no HTTP response), else '?' (no attempt made). The third argument is the t/4088
+        context { Model; Backend; KeySource } of the link ACTUALLY called. Fail-safe: anything
+        the hook (or building its context) throws is a WARN, never a failed AI call. Whatever
+        the hook writes to the pipeline is passed through to the caller, as before.
+    #>
+    [CmdletBinding()]
+    param([scriptblock]$CallLogger, $Response, $LastError, [int]$Attempt,
+          [string]$Model, [string]$Backend, [string]$KeySourceLabel, [string]$ResolvedKey)
+    if (-not $CallLogger) { return }
+    if ($null -ne $Response -and $null -eq $LastError) { $LogStatus = 200 }
+    elseif ($LastError -and $LastError.Exception.Response) { $LogStatus = $LastError.Exception.Response.StatusCode.value__ }
+    elseif ($LastError) { $LogStatus = 'error' }
+    else { $LogStatus = '?' }
+    # t/4088: Backend is the registry value Invoke-AIApi resolved, never a prefix guess. A
+    # two-argument logger still works; it just ignores the third argument.
+    try {
+        $LogContext = [pscustomobject]@{
+            Model     = $Model
+            Backend   = $Backend
+            KeySource = ConvertTo-AICallLogKeySource -SourceLabel $KeySourceLabel -Backend $Backend -Key $ResolvedKey
         }
-        # Scrub any key/token that the exception message or response body may echo
-        # before it reaches a log (t/2530 L14).
-        $SafeMsg = Protect-SensitiveText -Text $LastError.Exception.Message -Secret $ResolvedKey
-        Write-Warning "$($Backend): API call failed (HTTP $StatusCode) — $SafeMsg"
-        if ($Hint) { Write-Warning "$($Backend): $Hint" }
-        # Capture the HTTP error BODY — it carries the real reason (e.g. a 400's message). t/3196:
-        # Invoke-RestMethod (HttpClient) surfaces the response body on $_.ErrorDetails.Message, NOT
-        # on Exception.Response.GetResponseStream() (the old WebRequest shape) — so the previous
-        # read silently caught nothing on every HttpClient failure, and the body was invisible
-        # (this masked the t/3123 400 during diagnosis). Prefer ErrorDetails.Message; fall back to
-        # the WebRequest stream for any caller still on that path.
-        try {
-            $ErrBody = $null
-            if ($LastError.PSObject.Properties['ErrorDetails'] -and $LastError.ErrorDetails -and $LastError.ErrorDetails.Message) {
-                $ErrBody = [string]$LastError.ErrorDetails.Message
-            }
-            elseif ($LastError.Exception.Response -and ($LastError.Exception.Response | Get-Member -Name GetResponseStream -MemberType Method -ErrorAction SilentlyContinue)) {
-                $ErrStream = $LastError.Exception.Response.GetResponseStream()
-                $ErrReader = [System.IO.StreamReader]::new($ErrStream)
-                $ErrBody   = $ErrReader.ReadToEnd()
-                $ErrReader.Close()
-            }
-            if (-not [string]::IsNullOrWhiteSpace($ErrBody)) {
-                $SafeBody = Protect-SensitiveText -Text $ErrBody -Secret $ResolvedKey
-                Write-Warning "$($Backend): Response body: $SafeBody"
-            }
-        } catch { }
+        & $CallLogger $Attempt ([string]$LogStatus) $LogContext
+    }
+    catch { Write-Warning "Invoke-AIApi: call-logger threw ($($_.Exception.Message)); continuing (audit log is non-fatal)." }
+}
 
-        # -- Model cascade: try fallback models ----------------------------------
-        $CascadeModels = $FallbackModels
-        if ($null -eq $CascadeModels -and $script:FallbackChains.ContainsKey($Model)) {
-            $CascadeModels = $script:FallbackChains[$Model]
+function Get-AIApiFailureStatusCode {
+    <#
+    .SYNOPSIS
+        The status of a failed Invoke-AIApi call (t/4135 B2): the HTTP code of LastError's
+        response ($null when it has none), or '?' when there is no LastError at all.
+    #>
+    [CmdletBinding()]
+    param($LastError)
+    if ($LastError) { return Get-AIErrorHttpStatus -Exception $LastError.Exception }
+    return '?'
+}
+
+function Get-AIApiFailureLabel {
+    <#
+    .SYNOPSIS
+        The parenthesised status in Invoke-AIApi's failure line (t/4078): "timeout after <N>s" for a
+        timeout, "connection failure" for a failure with no HTTP response, else "HTTP <code>" (which
+        stays "HTTP " / "HTTP ?" for an unclassified error / no error record, as before).
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param($LastError, $StatusCode, [int]$TimeoutSec)
+    switch ((Get-AIRestFailureClass -ErrorRecord $LastError).Kind) {
+        'timeout'    { return "timeout after ${TimeoutSec}s" }
+        'connection' { return 'connection failure' }
+    }
+    return "HTTP $StatusCode"
+}
+
+function Write-AIApiFailure {
+    <#
+    .SYNOPSIS
+        Invoke-AIApi's failure WARNs (t/4135 B2): the failure line, a hint for 401/403/429/5xx,
+        and the HTTP error body. The message and the body are scrubbed of the key (t/2530 L14).
+    .DESCRIPTION
+        t/3196: Invoke-RestMethod (HttpClient) surfaces the response body on
+        $_.ErrorDetails.Message, NOT on Exception.Response.GetResponseStream() (the old
+        WebRequest shape), so ErrorDetails.Message is read first and the stream is the fallback
+        for any caller still on that path. A blank body is not logged; reading it never throws.
+    #>
+    [CmdletBinding()]
+    param([string]$Backend, $LastError, $StatusCode, [string]$ResolvedKey, [int]$TimeoutSec)
+    $Hint = switch ($StatusCode) {
+        401     { 'Check your API key — it may be invalid or expired.' }
+        403     { 'Access denied — verify your API key has the required permissions.' }
+        429     { 'Rate limit exceeded — wait a moment and try again.' }
+        { $_ -in 500, 502, 503 } { 'Server error — the API may be temporarily unavailable.' }
+        default { '' }
+    }
+    $SafeMsg = Protect-SensitiveText -Text $LastError.Exception.Message -Secret $ResolvedKey
+    $StatusLabel = Get-AIApiFailureLabel -LastError $LastError -StatusCode $StatusCode -TimeoutSec $TimeoutSec
+    Write-Warning "$($Backend): API call failed ($StatusLabel) — $SafeMsg"
+    if ($Hint) { Write-Warning "$($Backend): $Hint" }
+    try {
+        $ErrBody = $null
+        if ($LastError.PSObject.Properties['ErrorDetails'] -and $LastError.ErrorDetails -and $LastError.ErrorDetails.Message) {
+            $ErrBody = [string]$LastError.ErrorDetails.Message
         }
-        if ($CascadeModels -and $CascadeModels.Count -gt 0) {
-            foreach ($FbModel in $CascadeModels) {
-                $FbInfo = $script:ModelRegistry[$FbModel]
-                if (-not $FbInfo) { continue }
-                if ($StatusCode -in @(401, 403) -and $FbInfo.Backend -eq $Backend) { continue }
-                $FbKey = Resolve-AIApiKey -ExplicitKey '' -Backend $FbInfo.Backend
-                if ([string]::IsNullOrWhiteSpace($FbKey)) { continue }
+        elseif ($LastError.Exception.Response -and ($LastError.Exception.Response | Get-Member -Name GetResponseStream -MemberType Method -ErrorAction SilentlyContinue)) {
+            $ErrStream = $LastError.Exception.Response.GetResponseStream()
+            $ErrReader = [System.IO.StreamReader]::new($ErrStream)
+            $ErrBody   = $ErrReader.ReadToEnd()
+            $ErrReader.Close()
+        }
+        if (-not [string]::IsNullOrWhiteSpace($ErrBody)) {
+            $SafeBody = Protect-SensitiveText -Text $ErrBody -Secret $ResolvedKey
+            Write-Warning "$($Backend): Response body: $SafeBody"
+        }
+    } catch { }
+}
 
-                Write-Warning "Cascade: falling back to $FbModel ($($FbInfo.Backend))"
-                $FbParams = @{
-                    Prompt         = $Prompt
-                    Model          = $FbModel
-                    ApiKey         = $FbKey
-                    Temperature    = $Temperature
-                    MaxTokens      = $MaxTokens
-                    TimeoutSec     = $TimeoutSec
-                    MaxRetries     = 2
-                    RetryDelays    = @(5, 15)
-                    FallbackModels = @()
-                    SkipTokenCheck = $true
-                    CallLogger     = $CallLogger   # t/3242 cond.1: forward the logger through the cascade
-                }
-                if ($SystemInstruction) { $FbParams['SystemInstruction'] = $SystemInstruction }
-                if ($JsonMode)          { $FbParams['JsonMode'] = $true }
-                if ($ResponseSchema)    { $FbParams['ResponseSchema'] = $ResponseSchema }
+function Invoke-AIModelCascade {
+    <#
+    .SYNOPSIS
+        Invoke-AIApi's model cascade (t/4135 B2): after the primary call fails, tries each
+        fallback link in order and returns the first non-null result, or $null.
+    .DESCRIPTION
+        Links are FallbackModels, else the primary's $script:FallbackChains entry; an empty
+        FallbackModels (@()) disables the cascade. A link is skipped when it is not a registered
+        model, when the primary failed 401/403 and the link is on the same backend, or when no
+        key resolves for it. Each link is a recursive Invoke-AIApi (New-AICascadeLinkParams) with
+        MaxRetries 2, RetryDelays 5/15, no further fallback, no token check and the CallLogger
+        forwarded. A link exhausts its own retries before the next link is tried.
 
-                $FbResult = Invoke-AIApi @FbParams
-                if ($null -ne $FbResult) { return $FbResult }
+        t/4078 §2: TimeoutSec is the caller's EXPLICIT -TimeoutSec (Invoke-AIApi passes 0 when the
+        caller gave none); 0 means each link uses its own model's Get-AIDefaultTimeoutSec, never
+        the primary's resolved default.
+
+        t/4102: a link whose only key is the gemini-only $env:AI_API_KEY is "not configured"
+        here, not an error: it is skipped with a WARN (SO e/284#2 cond. 1). Every other refusal,
+        including AIApiKeyForeignCredentialRefused, propagates. The primary backend's refusal
+        never reaches this cascade: Invoke-AIApi throws it at key resolution, before any
+        request, so no link further down the chain can serve it (SO e/284#10).
+    #>
+    [CmdletBinding()]
+    param($FallbackModels, [string]$Model, [string]$Backend, $StatusCode,
+          [string]$Prompt, [string]$SystemInstruction, [double]$Temperature, [int]$MaxTokens,
+          [int]$TimeoutSec, [switch]$JsonMode, [hashtable]$ResponseSchema, [scriptblock]$CallLogger)
+    $CascadeModels = $FallbackModels
+    if ($null -eq $CascadeModels -and $script:FallbackChains.ContainsKey($Model)) {
+        $CascadeModels = $script:FallbackChains[$Model]
+    }
+    if (-not ($CascadeModels -and $CascadeModels.Count -gt 0)) { return $null }
+    foreach ($FbModel in $CascadeModels) {
+        $FbInfo = $script:ModelRegistry[$FbModel]
+        if (-not $FbInfo) { continue }
+        if ($StatusCode -in @(401, 403) -and $FbInfo.Backend -eq $Backend) { continue }
+        try { $FbKey = Resolve-AIApiKey -ExplicitKey '' -Backend $FbInfo.Backend }
+        catch {
+            if (-not (Test-AIApiKeyGeminiOnlyRefusal -ErrorRecord $_)) { throw }
+            Write-Warning "Cascade: skipping $FbModel ($($FbInfo.Backend)): `$env:AI_API_KEY applies to gemini only and no key for '$($FbInfo.Backend)' is set"
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($FbKey)) { continue }
+
+        Write-Warning "Cascade: falling back to $FbModel ($($FbInfo.Backend))"
+        $FbParams = New-AICascadeLinkParams -FbModel $FbModel -FbKey $FbKey -Prompt $Prompt `
+            -SystemInstruction $SystemInstruction -Temperature $Temperature -MaxTokens $MaxTokens `
+            -TimeoutSec $TimeoutSec -JsonMode:$JsonMode -ResponseSchema $ResponseSchema -CallLogger $CallLogger
+
+        $FbResult = Invoke-AIApi @FbParams
+        if ($null -ne $FbResult) { return $FbResult }
+    }
+    return $null
+}
+
+function New-AICascadeLinkParams {
+    <#
+    .SYNOPSIS
+        The splat for one cascade link's recursive Invoke-AIApi call (t/4135 B2; split out by t/4078).
+    .DESCRIPTION
+        MaxRetries 2, RetryDelays 5/15, FallbackModels @() (no further cascade), SkipTokenCheck and the
+        CallLogger forwarded (t/3242 cond.1). SystemInstruction, JsonMode and ResponseSchema are passed
+        only when set. TimeoutSec is the caller's explicit value when > 0, else the LINK model's own
+        Get-AIDefaultTimeoutSec (t/4078 §2), so a slow fallback is not cut off at a fast primary's default.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([string]$FbModel, [string]$FbKey, [string]$Prompt, [string]$SystemInstruction,
+          [double]$Temperature, [int]$MaxTokens, [int]$TimeoutSec, [switch]$JsonMode,
+          [hashtable]$ResponseSchema, [scriptblock]$CallLogger)
+    $LinkTimeoutSec = if ($TimeoutSec -gt 0) { $TimeoutSec } else { Get-AIDefaultTimeoutSec -Model $FbModel }
+    $FbParams = @{
+        Prompt         = $Prompt
+        Model          = $FbModel
+        ApiKey         = $FbKey
+        Temperature    = $Temperature
+        MaxTokens      = $MaxTokens
+        TimeoutSec     = $LinkTimeoutSec
+        MaxRetries     = 2
+        RetryDelays    = @(5, 15)
+        FallbackModels = @()
+        SkipTokenCheck = $true
+        CallLogger     = $CallLogger   # t/3242 cond.1: forward the logger through the cascade
+    }
+    if ($SystemInstruction) { $FbParams['SystemInstruction'] = $SystemInstruction }
+    if ($JsonMode)          { $FbParams['JsonMode'] = $true }
+    if ($ResponseSchema)    { $FbParams['ResponseSchema'] = $ResponseSchema }
+    return $FbParams
+}
+
+function Write-AIEnvelopeShapeWarning {
+    <#
+    .SYNOPSIS
+        The "unexpected response shape" WARN an envelope parser emits before it returns $null
+        (t/4135 B2): the parser's display name, the response's first five top-level keys, and
+        the path the parser expected.
+    #>
+    [CmdletBinding()]
+    param([string]$DisplayName, $Response, [string]$Expected)
+    $TopKeys = ($Response.PSObject.Properties.Name | Select-Object -First 5) -join ', '
+    Write-Warning "$($DisplayName): unexpected response shape (top-level keys: $TopKeys). Expected $Expected"
+}
+
+function ConvertFrom-AIGeminiEnvelope {
+    <#
+    .SYNOPSIS
+        Parses a Gemini generateContent response (t/4135 B2) into { Text; Truncated; Usage },
+        or WARNs and returns $null when generation was blocked or the shape is unexpected.
+        Truncated is finishReason MAX_TOKENS; Usage carries CachedTokens (0 when absent).
+    #>
+    [CmdletBinding()]
+    param($Response)
+    try {
+        $Usage = $null
+        $Candidate = $Response.candidates[0]
+        $FinishReason = $Candidate.finishReason
+        if ($FinishReason -and $FinishReason -notin @('STOP', 'MAX_TOKENS')) {
+            Write-Warning "Gemini: generation stopped with finishReason=$FinishReason (content may have been blocked)"
+            return $null
+        }
+        $Truncated = ($FinishReason -eq 'MAX_TOKENS')
+        # t/4270: a candidate with no content.parts (a thinking model that spent maxOutputTokens before
+        # any text, finishReason MAX_TOKENS) has no text; it is not an unexpected shape. Text stays $null
+        # so ConvertFrom-AIResponseEnvelope WARNs "response had no text" with the finish reason.
+        $Content = if ($Candidate.PSObject.Properties['content']) { $Candidate.content } else { $null }
+        $Parts = if ($Content -and $Content.PSObject.Properties['parts']) { @($Content.parts) } else { @() }
+        $Text = if ($Parts.Count -gt 0) { $Parts[0].text } else { $null }
+        $um = $Response.usageMetadata
+        if ($um) {
+            $CachedCount = if ($um.PSObject.Properties['cachedContentTokenCount']) { [int]($um.cachedContentTokenCount) } else { 0 }
+            $Usage = [PSCustomObject]@{
+                InputTokens  = [int]($um.promptTokenCount)
+                OutputTokens = [int]($um.candidatesTokenCount)
+                CachedTokens = $CachedCount
+                TotalTokens  = [int]($um.totalTokenCount)
             }
         }
+    } catch {
+        Write-AIEnvelopeShapeWarning -DisplayName 'Gemini' -Response $Response -Expected 'candidates[].content.parts[].text'
+        return $null
+    }
+    @{ Text = $Text; Truncated = $Truncated; Usage = $Usage }
+}
 
+function ConvertFrom-AIClaudeEnvelope {
+    <#
+    .SYNOPSIS
+        Parses an Anthropic Messages response (t/4135 B2) into { Text; Truncated; Usage }: the
+        first text block, stop_reason max_tokens, input+output usage. WARNs and returns $null
+        on an unexpected shape.
+    #>
+    [CmdletBinding()]
+    param($Response)
+    try {
+        $Usage = $null
+        $Text = ($Response.content | Where-Object { $_.type -eq 'text' } | Select-Object -First 1).text
+        $Truncated = ($Response.stop_reason -eq 'max_tokens')
+        $u = $Response.usage
+        if ($u) {
+            $Usage = [PSCustomObject]@{
+                InputTokens  = [int]($u.input_tokens)
+                OutputTokens = [int]($u.output_tokens)
+                TotalTokens  = [int]($u.input_tokens) + [int]($u.output_tokens)
+            }
+        }
+    } catch {
+        Write-AIEnvelopeShapeWarning -DisplayName 'Claude' -Response $Response -Expected 'content[].text'
+        return $null
+    }
+    @{ Text = $Text; Truncated = $Truncated; Usage = $Usage }
+}
+
+function ConvertFrom-AIChatEnvelope {
+    <#
+    .SYNOPSIS
+        Parses an OpenAI-compatible /chat/completions response (t/4135 B2; groq, azure, ollama,
+        zai, moonshot, xai, deepseek) into { Text; Truncated; Usage }: choices[0].message.content,
+        finish_reason length. WARNs under DisplayName and returns $null on an unexpected shape.
+    #>
+    [CmdletBinding()]
+    param($Response, [string]$DisplayName)
+    try {
+        $Usage = $null
+        $Choice = $Response.choices[0]
+        $Text = $Choice.message.content
+        $Truncated = ($Choice.finish_reason -eq 'length')
+        $u = $Response.usage
+        if ($u) {
+            $Usage = [PSCustomObject]@{
+                InputTokens  = [int]($u.prompt_tokens)
+                OutputTokens = [int]($u.completion_tokens)
+                TotalTokens  = [int]($u.total_tokens)
+            }
+        }
+    } catch {
+        Write-AIEnvelopeShapeWarning -DisplayName $DisplayName -Response $Response -Expected 'choices[].message.content'
+        return $null
+    }
+    @{ Text = $Text; Truncated = $Truncated; Usage = $Usage }
+}
+
+function ConvertFrom-AIOpenAIResponsesEnvelope {
+    <#
+    .SYNOPSIS
+        Parses an OpenAI Responses API response (t/4135 B2) into { Text; Truncated; Usage }: the
+        first output_text of the first message output, status incomplete. WARNs and returns
+        $null on an unexpected shape.
+    #>
+    [CmdletBinding()]
+    param($Response)
+    try {
+        $Usage = $null
+        $MsgOutput = $Response.output | Where-Object { $_.type -eq 'message' } | Select-Object -First 1
+        $Text = ($MsgOutput.content | Where-Object { $_.type -eq 'output_text' } | Select-Object -First 1).text
+        $Truncated = ($Response.status -eq 'incomplete')
+        $u = $Response.usage
+        if ($u) {
+            $Usage = [PSCustomObject]@{
+                InputTokens  = [int]($u.input_tokens)
+                OutputTokens = [int]($u.output_tokens)
+                TotalTokens  = [int]($u.total_tokens)
+            }
+        }
+    } catch {
+        Write-AIEnvelopeShapeWarning -DisplayName 'OpenAI' -Response $Response -Expected 'output[].content[].text'
+        return $null
+    }
+    @{ Text = $Text; Truncated = $Truncated; Usage = $Usage }
+}
+
+function Get-AIEnvelopeStopReason {
+    <#
+    .SYNOPSIS
+        The stop/finish reason a response envelope carries, as "<field>=<value>" text for a WARN, or ''
+        when it has none (t/4078 §3): gemini candidates[0].finishReason, claude stop_reason, chat
+        choices[0].finish_reason, openai-responses status (+ incomplete_details.reason). Never throws:
+        a malformed or non-object body (an HTML page) simply has no reason.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([string]$ResponseShape, $Response)
+    try {
+        switch ($ResponseShape) {
+            'gemini' { $v = $Response.candidates[0].finishReason; if ($v) { return "finishReason=$v" } }
+            'claude' { $v = $Response.stop_reason; if ($v) { return "stop_reason=$v" } }
+            'chat'   { $v = $Response.choices[0].finish_reason; if ($v) { return "finish_reason=$v" } }
+            'openai-responses' {
+                $v = $Response.status
+                $Detail = $Response.incomplete_details.reason
+                if ($v -and $Detail) { return "status=$v, incomplete_details.reason=$Detail" }
+                if ($v) { return "status=$v" }
+            }
+        }
+    } catch { Write-Verbose "Get-AIEnvelopeStopReason: no readable stop reason ($($_.Exception.Message))" }
+    return ''
+}
+
+function Write-AIEmptyTextWarning {
+    <#
+    .SYNOPSIS
+        The WARN for a 200 response that yielded no text (t/4078 §3): the backend's display name, the
+        backend id and model, and the envelope's stop/finish reason when it has one, so "the provider
+        stopped" (max_tokens, safety, tool_use) is told apart from "the parser missed the shape".
+    #>
+    [CmdletBinding()]
+    param([string]$Backend, [string]$Model, [hashtable]$BackendProfile, $Response)
+    $Name   = if ($BackendProfile) { $BackendProfile.DisplayName } else { $Backend }
+    $Shape  = if ($BackendProfile) { $BackendProfile.ResponseShape } else { '' }
+    $Reason = Get-AIEnvelopeStopReason -ResponseShape $Shape -Response $Response
+    if (-not $Reason) { $Reason = 'no stop reason in the response' }
+    Write-Warning "$($Name): response had no text (backend $Backend, model $Model, $Reason). Returning `$null so a fallback can be tried."
+}
+
+function ConvertFrom-AIResponseEnvelope {
+    <#
+    .SYNOPSIS
+        Dispatches a backend's response to its envelope parser by the profile's ResponseShape
+        (t/4135 B2). Returns { Text; Truncated; Usage }, or $null when the parser rejected the
+        response or the response had no text.
+    .DESCRIPTION
+        t/4078 §3: a parsed response whose Text is null, empty or whitespace (a well-formed envelope
+        with no text part, or a malformed / HTML body the claude and openai parsers read as no text)
+        WARNs via Write-AIEmptyTextWarning and returns $null, like any failed call, so a cascade link
+        that gets it moves on to the next link. A backend with no profile row has no parser, so it
+        takes the same path.
+    #>
+    [CmdletBinding()]
+    param([string]$Backend, [string]$Model, $Response)
+    $BackendProfile = if ($script:AIBackendProfiles.ContainsKey($Backend)) { $script:AIBackendProfiles[$Backend] } else { $null }
+    $Shape = if ($BackendProfile) { $BackendProfile.ResponseShape } else { '' }
+    $Parsed = switch ($Shape) {
+        'gemini'           { ConvertFrom-AIGeminiEnvelope -Response $Response }
+        'claude'           { ConvertFrom-AIClaudeEnvelope -Response $Response }
+        'chat'             { ConvertFrom-AIChatEnvelope -Response $Response -DisplayName $BackendProfile.ParseDisplayName }
+        'openai-responses' { ConvertFrom-AIOpenAIResponsesEnvelope -Response $Response }
+        default            { @{ Text = $null; Truncated = $false; Usage = $null } }
+    }
+    if ($null -eq $Parsed) { return $null }
+    if ([string]::IsNullOrWhiteSpace([string]$Parsed.Text)) {
+        Write-AIEmptyTextWarning -Backend $Backend -Model $Model -BackendProfile $BackendProfile -Response $Response
+        return $null
+    }
+    return $Parsed
+}
+
+<#
+.SYNOPSIS
+    Calls an AI backend with a prompt and returns the generated text.
+.DESCRIPTION
+    Central dispatcher for all AI API calls in the AITriad module.  Accepts a
+    prompt and model name, looks up the backend (Gemini, Claude, or Groq) from
+    the model registry (ai-models.json), builds the backend-specific HTTP
+    request, executes it with automatic retry on transient errors (HTTP 429,
+    500, 502, 503, 504, 529 on the RetryDelays schedule; a timeout or connection
+    failure at most once; never another 4xx), and returns a uniform result object.
+
+    The result object has six properties:
+      Text        — the generated text content
+      Backend     — 'gemini', 'claude', 'groq', or 'openai'
+      Model       — the model ID that was used
+      Truncated   — $true if the response was cut short by max_tokens
+      Usage       — token counts (InputTokens, OutputTokens, TotalTokens) or $null
+      RawResponse — the full deserialized API response
+
+    Returns $null on failure (with warnings explaining the issue), including a
+    200 response with no text (t/4078).
+.PARAMETER Prompt
+    The prompt text to send to the AI model.
+.PARAMETER Model
+    Model identifier from ai-models.json (e.g., 'gemini-2.5-flash',
+    'claude-sonnet-4-5', 'groq-openai-gpt-oss-120b').  Defaults to 'gemini-2.5-flash'.
+.PARAMETER ApiKey
+    Optional explicit API key.  If empty, resolved via Resolve-AIApiKey.
+.PARAMETER Temperature
+    Sampling temperature (0.0–2.0).  Lower = more deterministic.  Defaults to 0.1.
+.PARAMETER MaxTokens
+    Maximum tokens in the response.  Defaults to 1024.
+.PARAMETER JsonMode
+    When specified, requests JSON-formatted output from the backend.
+.PARAMETER ResponseSchema
+    Optional JSON Schema hashtable for structured output enforcement.
+    When provided, implies -JsonMode. Gemini and Groq enforce the schema
+    via constrained decoding; Claude injects the schema into the prompt.
+.PARAMETER TimeoutSec
+    HTTP request timeout in seconds.  Defaults to the model's Get-AIDefaultTimeoutSec.
+    When given, it also applies to every fallback link; when omitted, each link
+    uses its own model's default.
+.PARAMETER MaxRetries
+    Maximum number of attempts (1-10, so 1 means no retry).  Defaults to 5.
+.PARAMETER RetryDelays
+    Array of delay durations (seconds) between retries.  Defaults to @(15, 45, 90, 120).
+.PARAMETER FallbackModels
+    Ordered list of models to try if the primary model fails permanently.
+    If omitted, uses the fallback chain from ai-models.json (if defined for
+    the primary model). Pass an empty array @() to disable fallback.
+.PARAMETER SkipTokenCheck
+    Skip the pre-flight token count check that warns when a prompt exceeds
+    80% of the model's context window.
+.EXAMPLE
+    $Result = Invoke-AIApi -Prompt 'Summarize this document...' -Model 'gemini-2.5-flash'
+    $Result.Text  # The generated summary
+
+.EXAMPLE
+    $Result = Invoke-AIApi -Prompt $Prompt -Model 'claude-sonnet-4-5' -JsonMode -MaxTokens 4096
+    $Parsed = $Result.Text | ConvertFrom-Json
+
+    Requests JSON output from Claude and parses it.
+.EXAMPLE
+    Invoke-AIApi -Prompt 'Hello' -Model 'groq-openai-gpt-oss-120b' -Temperature 0.7
+
+    Calls the Groq backend with higher creativity.
+.EXAMPLE
+    Invoke-AIApi -Prompt $P -Model 'gemini-2.5-flash' -FallbackModels @('groq-openai-gpt-oss-120b')
+
+    Falls back to Groq if Gemini fails.
+#>
+function Invoke-AIApi {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Prompt,
+        [string]$SystemInstruction = '',
+        [ArgumentCompleter({ param($cmd, $param, $word) $script:ModelRegistry.Keys | Where-Object { $_ -like "$word*" } | Sort-Object })]
+        [string]$Model       = 'gemini-2.5-flash',
+        [string]$ApiKey      = '',
+        [double]$Temperature = 0.1,
+        [int]   $MaxTokens   = 1024,
+        [switch]$JsonMode,
+        [hashtable]$ResponseSchema,
+        [int]   $TimeoutSec  = 0,
+        # t/4078: at least one attempt. 0 used to send no request at all and fail with "(HTTP ?) — ".
+        [ValidateRange(1, 10)]
+        [int]   $MaxRetries  = 5,
+        [int[]] $RetryDelays = @(15, 45, 90, 120),
+        [string[]]$FallbackModels,
+        [switch]$SkipTokenCheck,
+        # t/3242 — optional AI Call Log hook (IoC). A scriptblock invoked once per call with
+        # ($RetryCount, $Status). Defined in AITriad (Invoke-AIByUsage) so it retains that module's
+        # affinity and can reach the AITriad-private Write-AICallLogEntry across the module boundary.
+        [scriptblock]$CallLogger
+    )
+
+    # -- Resolve model info from registry -------------------------------------
+    $ModelInfo = $script:ModelRegistry[$Model]
+    if (-not $ModelInfo) {
+        Write-Warning "Unknown model '$Model'. Valid models: $($script:ModelRegistry.Keys -join ', ')"
         return $null
     }
 
-    # -- Extract text from backend-specific response envelope -----------------
-    $Text      = $null
-    $Truncated = $false
-    $Usage     = $null
+    $Backend    = $ModelInfo.Backend
+    $ApiModelId = $ModelInfo.ApiModelId
 
-    switch ($Backend) {
-        'gemini' {
-            try {
-                $Candidate = $Response.candidates[0]
-                $FinishReason = $Candidate.finishReason
-                if ($FinishReason -and $FinishReason -notin @('STOP', 'MAX_TOKENS')) {
-                    Write-Warning "Gemini: generation stopped with finishReason=$FinishReason (content may have been blocked)"
-                    return $null
-                }
-                $Truncated = ($FinishReason -eq 'MAX_TOKENS')
-                $Text = $Candidate.content.parts[0].text
-                $um = $Response.usageMetadata
-                if ($um) {
-                    $CachedCount = if ($um.PSObject.Properties['cachedContentTokenCount']) { [int]($um.cachedContentTokenCount) } else { 0 }
-                    $Usage = [PSCustomObject]@{
-                        InputTokens  = [int]($um.promptTokenCount)
-                        OutputTokens = [int]($um.candidatesTokenCount)
-                        CachedTokens = $CachedCount
-                        TotalTokens  = [int]($um.totalTokenCount)
-                    }
-                }
-            } catch {
-                $TopKeys = ($Response.PSObject.Properties.Name | Select-Object -First 5) -join ', '
-                Write-Warning "Gemini: unexpected response shape (top-level keys: $TopKeys). Expected candidates[].content.parts[].text"
-                return $null
-            }
-        }
-        'claude' {
-            try {
-                $Text = ($Response.content | Where-Object { $_.type -eq 'text' } | Select-Object -First 1).text
-                $Truncated = ($Response.stop_reason -eq 'max_tokens')
-                $u = $Response.usage
-                if ($u) {
-                    $Usage = [PSCustomObject]@{
-                        InputTokens  = [int]($u.input_tokens)
-                        OutputTokens = [int]($u.output_tokens)
-                        TotalTokens  = [int]($u.input_tokens) + [int]($u.output_tokens)
-                    }
-                }
-            } catch {
-                $TopKeys = ($Response.PSObject.Properties.Name | Select-Object -First 5) -join ', '
-                Write-Warning "Claude: unexpected response shape (top-level keys: $TopKeys). Expected content[].text"
-                return $null
-            }
-        }
-        'groq' {
-            try {
-                $Choice = $Response.choices[0]
-                $Text = $Choice.message.content
-                $Truncated = ($Choice.finish_reason -eq 'length')
-                $u = $Response.usage
-                if ($u) {
-                    $Usage = [PSCustomObject]@{
-                        InputTokens  = [int]($u.prompt_tokens)
-                        OutputTokens = [int]($u.completion_tokens)
-                        TotalTokens  = [int]($u.total_tokens)
-                    }
-                }
-            } catch {
-                $TopKeys = ($Response.PSObject.Properties.Name | Select-Object -First 5) -join ', '
-                Write-Warning "Groq: unexpected response shape (top-level keys: $TopKeys). Expected choices[].message.content"
-                return $null
-            }
-        }
-        # t/1437 — z.ai / GLM-5.3 response shape mirrors Groq/OpenAI.
-        'zai' {
-            try {
-                $Choice = $Response.choices[0]
-                $Text = $Choice.message.content
-                $Truncated = ($Choice.finish_reason -eq 'length')
-                $u = $Response.usage
-                if ($u) {
-                    $Usage = [PSCustomObject]@{
-                        InputTokens  = [int]($u.prompt_tokens)
-                        OutputTokens = [int]($u.completion_tokens)
-                        TotalTokens  = [int]($u.total_tokens)
-                    }
-                }
-            } catch {
-                $TopKeys = ($Response.PSObject.Properties.Name | Select-Object -First 5) -join ', '
-                Write-Warning "z.ai: unexpected response shape (top-level keys: $TopKeys). Expected choices[].message.content"
-                return $null
-            }
-        }
-        # t/1936 — Moonshot (Kimi) response shape mirrors Groq/z.ai/OpenAI.
-        'moonshot' {
-            try {
-                $Choice = $Response.choices[0]
-                $Text = $Choice.message.content
-                $Truncated = ($Choice.finish_reason -eq 'length')
-                $u = $Response.usage
-                if ($u) {
-                    $Usage = [PSCustomObject]@{
-                        InputTokens  = [int]($u.prompt_tokens)
-                        OutputTokens = [int]($u.completion_tokens)
-                        TotalTokens  = [int]($u.total_tokens)
-                    }
-                }
-            } catch {
-                $TopKeys = ($Response.PSObject.Properties.Name | Select-Object -First 5) -join ', '
-                Write-Warning "Moonshot: unexpected response shape (top-level keys: $TopKeys). Expected choices[].message.content"
-                return $null
-            }
-        }
-        # t/2583 — xAI (Grok) response shape mirrors Groq/z.ai/OpenAI.
-        'xai' {
-            try {
-                $Choice = $Response.choices[0]
-                $Text = $Choice.message.content
-                $Truncated = ($Choice.finish_reason -eq 'length')
-                $u = $Response.usage
-                if ($u) {
-                    $Usage = [PSCustomObject]@{
-                        InputTokens  = [int]($u.prompt_tokens)
-                        OutputTokens = [int]($u.completion_tokens)
-                        TotalTokens  = [int]($u.total_tokens)
-                    }
-                }
-            } catch {
-                $TopKeys = ($Response.PSObject.Properties.Name | Select-Object -First 5) -join ', '
-                Write-Warning "xAI: unexpected response shape (top-level keys: $TopKeys). Expected choices[].message.content"
-                return $null
-            }
-        }
-        # t/1938 — DeepSeek's /v1/chat/completions mirrors the Groq/OpenAI response shape.
-        'deepseek' {
-            try {
-                $Choice = $Response.choices[0]
-                $Text = $Choice.message.content
-                $Truncated = ($Choice.finish_reason -eq 'length')
-                $u = $Response.usage
-                if ($u) {
-                    $Usage = [PSCustomObject]@{
-                        InputTokens  = [int]($u.prompt_tokens)
-                        OutputTokens = [int]($u.completion_tokens)
-                        TotalTokens  = [int]($u.total_tokens)
-                    }
-                }
-            } catch {
-                $TopKeys = ($Response.PSObject.Properties.Name | Select-Object -First 5) -join ', '
-                Write-Warning "DeepSeek: unexpected response shape (top-level keys: $TopKeys). Expected choices[].message.content"
-                return $null
-            }
-        }
-        # t/1409 — Ollama's /v1/chat/completions mirrors the Groq/OpenAI response shape.
-        'ollama' {
-            try {
-                $Choice = $Response.choices[0]
-                $Text = $Choice.message.content
-                $Truncated = ($Choice.finish_reason -eq 'length')
-                $u = $Response.usage
-                if ($u) {
-                    $Usage = [PSCustomObject]@{
-                        InputTokens  = [int]($u.prompt_tokens)
-                        OutputTokens = [int]($u.completion_tokens)
-                        TotalTokens  = [int]($u.total_tokens)
-                    }
-                }
-            } catch {
-                $TopKeys = ($Response.PSObject.Properties.Name | Select-Object -First 5) -join ', '
-                Write-Warning "Ollama: unexpected response shape (top-level keys: $TopKeys). Expected choices[].message.content"
-                return $null
-            }
-        }
-        'azure' {
-            try {
-                $Choice = $Response.choices[0]
-                $Text = $Choice.message.content
-                $Truncated = ($Choice.finish_reason -eq 'length')
-                $u = $Response.usage
-                if ($u) {
-                    $Usage = [PSCustomObject]@{
-                        InputTokens  = [int]($u.prompt_tokens)
-                        OutputTokens = [int]($u.completion_tokens)
-                        TotalTokens  = [int]($u.total_tokens)
-                    }
-                }
-            } catch {
-                $TopKeys = ($Response.PSObject.Properties.Name | Select-Object -First 5) -join ', '
-                Write-Warning "Azure OpenAI: unexpected response shape (top-level keys: $TopKeys). Expected choices[].message.content"
-                return $null
-            }
-        }
-        'openai' {
-            try {
-                $MsgOutput = $Response.output | Where-Object { $_.type -eq 'message' } | Select-Object -First 1
-                $Text = ($MsgOutput.content | Where-Object { $_.type -eq 'output_text' } | Select-Object -First 1).text
-                $Truncated = ($Response.status -eq 'incomplete')
-                $u = $Response.usage
-                if ($u) {
-                    $Usage = [PSCustomObject]@{
-                        InputTokens  = [int]($u.input_tokens)
-                        OutputTokens = [int]($u.output_tokens)
-                        TotalTokens  = [int]($u.total_tokens)
-                    }
-                }
-            } catch {
-                $TopKeys = ($Response.PSObject.Properties.Name | Select-Object -First 5) -join ', '
-                Write-Warning "OpenAI: unexpected response shape (top-level keys: $TopKeys). Expected output[].content[].text"
-                return $null
-            }
+    # t/4078 §2: the cascade gets only the caller's EXPLICIT -TimeoutSec ($null -> 0 when it was not
+    # passed), so each fallback link resolves its own model's default instead of inheriting this one's.
+    $ExplicitTimeoutSec = [int]$PSBoundParameters['TimeoutSec']
+    if ($TimeoutSec -le 0) { $TimeoutSec = Get-AIDefaultTimeoutSec -Model $Model }
+
+    # -- Resolve API key ------------------------------------------------------
+    # t/1409: Ollama runs models locally and has no auth surface — skip both the
+    # key resolution and the missing-key gate. The key-required backends still
+    # gate as before; every backend's EnvHint comes from its $script:AIBackendProfiles
+    # row, which the completeness test keeps exhaustive, so no future backend
+    # produces the blank-token warning (AC#1).
+    $ResolvedKey = ''
+    $KeySourceLabel = ''
+    if ($Backend -eq 'ollama') {
+        $script:LastApiKeySource = '(keyless — local Ollama)'
+        $KeySourceLabel = $script:LastApiKeySource
+    }
+    else {
+        $ResolvedKey = Resolve-AIApiKey -ExplicitKey $ApiKey -Backend $Backend
+        $KeySourceLabel = $script:LastApiKeySource   # captured now, so nothing later in the call can overwrite it (t/4088)
+        if ([string]::IsNullOrWhiteSpace($ResolvedKey)) {
+            $EnvHint = Get-AIBackendEnvHint -Backend $Backend
+            Write-Warning "No API key found for $Backend backend. Set $EnvHint."
+            return $null
         }
     }
+
+    # -- Log AI configuration --------------------------------------------------
+    Write-AIApiConfigLog -Backend $Backend -Model $Model -ApiModelId $ApiModelId
+
+    # -- Pre-flight token check ---------------------------------------------------
+    if (-not $SkipTokenCheck) {
+        $PromptLength = $Prompt.Length + $SystemInstruction.Length
+        $EstTokens = [Math]::Ceiling($PromptLength / 3.2)
+        $ContextLimit = if ($script:ContextWindows.ContainsKey($Backend)) { $script:ContextWindows[$Backend] } else { 131072 }
+        if ($EstTokens -gt ($ContextLimit * 0.8)) {
+            Write-Warning "$Model`: prompt is ~$EstTokens tokens (est.), which exceeds 80% of the $ContextLimit-token context window. Consider chunking or using a model with a larger context."
+        }
+    }
+
+    # -- ResponseSchema implies JsonMode ----------------------------------------
+    if ($ResponseSchema) { $JsonMode = [switch]::Present }
+
+    # -- Build backend-specific request ---------------------------------------
+    # t/4135 B1: the per-backend facts live in $script:AIBackendProfiles; New-AIApiRequest builds
+    # the URI, headers and JSON body from the backend's row (an unknown backend gets '' / @{} / '').
+    $RequestArgs = @{
+        Backend = $Backend; ApiModelId = $ApiModelId; ResolvedKey = $ResolvedKey; Prompt = $Prompt
+        SystemInstruction = $SystemInstruction; Temperature = $Temperature; MaxTokens = $MaxTokens
+        JsonMode = [bool]$JsonMode; ResponseSchema = $ResponseSchema
+    }
+
+    # -- Call API with retry logic (t/4135 B2: Invoke-AIRestWithRetry) ---------
+    # t/4164: Invoke-AIApiRequest builds the request and, for a Claude model that rejects temperature,
+    # re-sends it once without temperature (memoized per model; not counted against MaxRetries).
+    $Call = Invoke-AIApiRequest -RequestArgs $RequestArgs -TimeoutSec $TimeoutSec -MaxRetries $MaxRetries -RetryDelays $RetryDelays
+    $Response  = $Call.Response
+    $LastError = $Call.LastError
+
+    # t/3242 — AI Call Log capture (IoC), fired ONCE per call HERE, before the failure $null-return
+    # AND the success extraction, so a failed call is logged too (TL C, cond.3). Fail-safe (cond.2).
+    Invoke-AICallLogHook -CallLogger $CallLogger -Response $Response -LastError $LastError -Attempt $Call.Attempt `
+        -Model $Model -Backend $Backend -KeySourceLabel $KeySourceLabel -ResolvedKey $ResolvedKey
+
+    if ($null -ne $LastError -or $null -eq $Response) {
+        $StatusCode = Get-AIApiFailureStatusCode -LastError $LastError
+        Write-AIApiFailure -Backend $Backend -LastError $LastError -StatusCode $StatusCode -ResolvedKey $ResolvedKey -TimeoutSec $TimeoutSec
+
+        # -- Model cascade: try fallback models ----------------------------------
+        $FbResult = Invoke-AIModelCascade -FallbackModels $FallbackModels -Model $Model -Backend $Backend `
+            -StatusCode $StatusCode -Prompt $Prompt -SystemInstruction $SystemInstruction -Temperature $Temperature `
+            -MaxTokens $MaxTokens -TimeoutSec $ExplicitTimeoutSec -JsonMode:$JsonMode -ResponseSchema $ResponseSchema `
+            -CallLogger $CallLogger
+        return $FbResult
+    }
+
+    # -- Extract text from backend-specific response envelope -----------------
+    # t/4135 B2: dispatched by the profile's ResponseShape; $null means the parser WARNed, or (t/4078 §3)
+    # the response had no text.
+    $Parsed = ConvertFrom-AIResponseEnvelope -Backend $Backend -Model $Model -Response $Response
+    if ($null -eq $Parsed) { return $null }
+    $Truncated = $Parsed.Truncated
 
     if ($Truncated) {
         Write-Warning "$($Backend): response was truncated (max_tokens reached). Output may be incomplete."
     }
 
     return [PSCustomObject]@{
-        Text        = $Text
+        Text        = $Parsed.Text
         Backend     = $Backend
         Model       = $Model
         Truncated   = $Truncated
-        Usage       = $Usage
+        Usage       = $Parsed.Usage
         RawResponse = $Response
     }
 }
@@ -1779,5 +2156,5 @@ function Repair-TruncatedJson {
 Set-Alias -Name 'Invoke-GeminiApi'   -Value 'Invoke-AIApi'
 Set-Alias -Name 'Get-GeminiMetadata' -Value 'Get-AIMetadata'
 
-Export-ModuleMember -Function Invoke-AIApi, Get-AIMetadata, Resolve-AIApiKey, Get-AIApiKeySource, Repair-TruncatedJson, Measure-PromptTokens, Set-AIApiCorrelationId, Protect-SensitiveText `
+Export-ModuleMember -Function Invoke-AIApi, Get-AIMetadata, Resolve-AIApiKey, Get-AIApiKeySource, Test-AIApiKeyGeminiOnlyRefusal, Repair-TruncatedJson, Measure-PromptTokens, Set-AIApiCorrelationId, Protect-SensitiveText `
                     -Alias    Invoke-GeminiApi, Get-GeminiMetadata

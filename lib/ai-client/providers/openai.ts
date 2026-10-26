@@ -2,8 +2,10 @@
 // Licensed under the MIT License. See LICENSE file in the project root.
 
 import { ActionableError } from '../../debate/errors.js';
-import { withTimeout, makeFetchSignal } from '../retry.js';
+import { makeFetchSignal } from '../retry.js';
+import { fetchWithDiagnostics } from '../instrumentation.js';
 import type { FetchFn, GenerateOptions, ProviderResult } from '../types.js';
+import { normalizeStopReason } from './stopReason.js';
 
 export async function generateViaOpenAI(
   fetchFn: FetchFn,
@@ -23,7 +25,7 @@ export async function generateViaOpenAI(
     reqBody.instructions = opts.systemMessage;
   }
 
-  const response = await fetchFn('https://api.openai.com/v1/responses', {
+  const { response, bodyText, diagnostics } = await fetchWithDiagnostics(fetchFn, 'https://api.openai.com/v1/responses', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -31,9 +33,7 @@ export async function generateViaOpenAI(
     },
     body: JSON.stringify(reqBody),
     signal: makeFetchSignal(timeoutMs, opts.signal),
-  });
-
-  const bodyText = await withTimeout(response.text(), 60_000, 'Reading OpenAI response');
+  }, 60_000, 'Reading OpenAI response');
 
   if (response.status === 429 || response.status === 503) {
     throw new ActionableError({
@@ -53,7 +53,10 @@ export async function generateViaOpenAI(
   }
 
   let json: {
+    model?: string; // provider-reported served identity (t/3677)
     output?: { type: string; content?: { type: string; text: string }[] }[];
+    status?: string;
+    incomplete_details?: { reason?: string };
     usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number; input_tokens_details?: { cached_tokens?: number } };
   };
   try {
@@ -83,5 +86,16 @@ export async function generateViaOpenAI(
     cachedTokens: u.input_tokens_details?.cached_tokens,
     totalTokens: u.total_tokens,
   } : undefined;
-  return { text, usage, rawResponsePreview: text ? undefined : bodyText.slice(0, 200) };
+  // Responses API surfaces truncation as status:"incomplete" + incomplete_details.reason
+  // ("max_output_tokens"); a normal finish is status:"completed" — there is no choices[].finish_reason.
+  const rawStopReason = json.incomplete_details?.reason ?? json.status ?? undefined;
+  return {
+    text,
+    usage,
+    rawResponsePreview: text ? undefined : bodyText.slice(0, 200),
+    stopReason: normalizeStopReason(rawStopReason),
+    rawStopReason,
+    diagnostics,
+    providerReportedModel: json.model,
+  };
 }

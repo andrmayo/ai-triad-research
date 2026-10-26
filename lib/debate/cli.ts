@@ -15,6 +15,7 @@ import { createCLIAdapter } from './aiAdapter.js';
 import { resolveRepoRoot, resolveDataRoot, loadTaxonomy, loadSourceContent, fetchUrlContent, loadConflicts, loadVocabulary } from './taxonomyLoader.js';
 import { DebateEngine } from './debateEngine.js';
 import type { DebateConfig } from './debateEngine.js';
+import { runHeadlessDebate } from './headlessRunner.js';
 import type { DebateSourceType, SpeakerId, DebateAudience } from './types.js';
 import { POVER_INFO, DEBATE_AUDIENCES, POV_KEYS } from './types.js';
 import { formatSituationDebateContext } from './prompts.js';
@@ -22,6 +23,8 @@ import { FlightRecorder, getGlobalRecorder, setGlobalRecorder, RECORDER_CAPACITY
 import { generateSlug, formatDebateMarkdown, buildDiagnosticsOutput, buildHarvestOutput } from './formatters.js';
 import { ActionableError } from './errors.js';
 import { runExploreFirstPipeline } from './explorationPreset.js';
+import { resolvePoverInfo } from './soulDocLoader.js';
+import { validateSeatTagsConfig, loadSoulOverrides, buildSoulOverrideResolver, validateNoSeatConflict, type CLISeatTags, type CLISoulOverrides } from './cli.helpers.js';
 import { safeSerialize, atomicWriteSync, sweepOrphanedTempFiles } from './persistence.js';
 import { recordLockHolder } from './lockHolder.js';
 import { computeQualityScore } from './qualityScore.js';
@@ -75,6 +78,24 @@ interface CLIConfig {
   exploreFirst?: boolean;
   exploreModel?: string;
   excludeGreatestHits?: boolean;
+  breadthAwareSituationSelection?: boolean;
+  /** Moderator voices each camp's story before the openings (h3 experiment). */
+  narrativeVoicing?: boolean;
+  /**
+   * Per-seat POV-tag assignment for the tag pilot (t/3963).
+   * Keys are speaker ids (accelerationist / safetyist / skeptic).
+   * Each entry is validated against the POV-tag registry at load time.
+   * Wired to engineConfig.seat_tags.
+   */
+  seatTags?: CLISeatTags;
+  /**
+   * Per-seat soul document overrides (t/4305).
+   * Values are file paths (repo-relative or absolute) to JSON soul files.
+   * Each file is read, validated against SoulDocumentSchema, and loaded at startup.
+   * When present, the CLI wraps the default soulResolver so overridden seats return the
+   * pre-loaded soul; non-overridden seats call through to resolvePoverInfo.
+   */
+  soulOverrides?: CLISoulOverrides;
 }
 
 interface GoldenFixtureConfig extends CLIConfig {
@@ -167,6 +188,30 @@ function resolvePerturbationConfig(
     : undefined;
 }
 
+// Extracted from `main` to keep `main` within the complexity baseline (t/4305).
+function resolveSessionSouls(config: CLIConfig, repoRoot: string) {
+  const resolvedSeatTags = config.seatTags
+    ? validateSeatTagsConfig(config.seatTags)
+    : undefined;
+
+  if (config.seatTags && config.soulOverrides) {
+    validateNoSeatConflict(config.seatTags, config.soulOverrides);
+  }
+
+  const soulOverrideMap = config.soulOverrides
+    ? loadSoulOverrides(config.soulOverrides, repoRoot)
+    : undefined;
+  const effectiveSoulResolver = soulOverrideMap && Object.keys(soulOverrideMap).length > 0
+    ? buildSoulOverrideResolver(soulOverrideMap, resolvePoverInfo)
+    : resolvePoverInfo;
+
+  if (soulOverrideMap) {
+    log(`Soul overrides loaded for seats: ${Object.keys(soulOverrideMap).join(', ')}`);
+  }
+
+  return { resolvedSeatTags, effectiveSoulResolver };
+}
+
 async function main(): Promise<void> {
   const { configPath, disableTurnValidation, maxTurnRetries, perturbationPrompt, perturbationTurn, exploreFirst: cliExploreFirst, exploreModel: cliExploreModel, resumePath } = parseArgs();
   let configText: string;
@@ -223,6 +268,17 @@ async function main(): Promise<void> {
         'Ensure no trailing commas, unquoted keys, or missing brackets',
       ],
       innerError: err,
+    });
+  }
+  if (config.pacing != null && !config.useAdaptiveStaging) {
+    throw new ActionableError({
+      goal: 'Run headless debate',
+      problem: `'pacing' is set to '${config.pacing}' but 'useAdaptiveStaging' is not enabled — pacing has no effect in fixed-round mode`,
+      location: 'cli.main',
+      nextSteps: [
+        "Set 'useAdaptiveStaging: true' to enable adaptive staging with the specified pacing.",
+        "Or remove 'pacing' from the config to run fixed rounds (use 'rounds' to control the count).",
+      ],
     });
   }
   const startTime = Date.now();
@@ -293,7 +349,7 @@ async function main(): Promise<void> {
       id: sitNode.id,
       label: sitNode.label,
       description: sitNode.description,
-      interpretations: sitNode.interpretations as { accelerationist: string; safetyist: string; skeptic: string },
+      interpretations: sitNode.interpretations,
       assumes: sitNode.graph_attributes?.assumes,
       steelmanVulnerability: typeof sitNode.graph_attributes?.steelman_vulnerability === 'string'
         ? sitNode.graph_attributes.steelman_vulnerability : undefined,
@@ -407,8 +463,12 @@ async function main(): Promise<void> {
     log('Talmudic references: method-only');
   }
 
+  // Validate seatTags and load soul overrides (extracted to resolveSessionSouls for complexity budget).
+  const { resolvedSeatTags, effectiveSoulResolver } = resolveSessionSouls(config, repoRoot);
+
   // Build engine config
   const engineConfig: DebateConfig = {
+    soulResolver: effectiveSoulResolver,
     topic,
     name: config.name,
     sourceType,
@@ -447,6 +507,9 @@ async function main(): Promise<void> {
     stageModels: config.stageModels,
     utilityModels: config.utilityModels,
     excludeGreatestHits: config.excludeGreatestHits,
+    breadthAwareSituationSelection: config.breadthAwareSituationSelection,
+    narrativeVoicing: config.narrativeVoicing,
+    seat_tags: resolvedSeatTags,
   };
 
   // Prepare output paths early so the snapshot callback can write partial files
@@ -520,10 +583,9 @@ async function main(): Promise<void> {
     session = result.production;
   } else {
     log(`Starting debate: "${topic.slice(0, 80)}..." with ${activePovers.join(', ')}, ${engineConfig.useAdaptiveStaging ? `adaptive (${config.pacing ?? 'moderate'})` : `${engineConfig.rounds} rounds`}`);
-    const engine = new DebateEngine(engineConfig, adapter, taxonomy);
-    session = await engine.run((p) => {
+    ({ session } = await runHeadlessDebate(engineConfig, adapter, taxonomy, (p) => {
       log(`[${p.phase}] ${p.speaker ? `${p.speaker}: ` : ''}${p.message}`);
-    });
+    }));
   }
   activeDebateId = session.id;
 
@@ -537,13 +599,12 @@ async function main(): Promise<void> {
       ...(config.url ? { url: config.url } : {}),
       ...(config.name ? { name: config.name } : {}),
       model: config.model ?? model,
-      rounds: config.rounds ?? 3,
       protocol: config.protocolId ?? 'structured',
       audience: config.audience,
       activePovers: config.activePovers,
       responseLength: config.responseLength ?? 'medium',
       ...(config.temperature != null ? { temperature: config.temperature } : {}),
-      ...(config.useAdaptiveStaging ? { adaptiveStaging: true, pacing: config.pacing ?? 'moderate' } : {}),
+      ...(config.useAdaptiveStaging ? { adaptiveStaging: true, pacing: config.pacing ?? 'moderate' } : { adaptiveStaging: false, rounds: config.rounds ?? 3 }),
     },
   };
 
@@ -722,11 +783,12 @@ async function runCiGolden(): Promise<void> {
       );
 
       const adapter = createCLIAdapter(repoRoot, config.apiKey);
-      const model = config.model ?? 'gemini-2.0-flash-lite';
+      const model = config.model ?? 'gemini-3.5-flash-lite';
       const activePovers = (config.activePovers ?? ['accelerationist', 'safetyist', 'skeptic']) as Exclude<SpeakerId, 'user'>[];
       const qualityFloor = config.quality_floor ?? 30;
 
       const engineConfig: DebateConfig = {
+        soulResolver: resolvePoverInfo,
         topic: config.topic ?? '',
         sourceType: 'topic',
         sourceRef: '',
@@ -747,8 +809,7 @@ async function runCiGolden(): Promise<void> {
           : undefined,
       };
 
-      const engine = new DebateEngine(engineConfig, adapter, taxonomy);
-      const session = await engine.run((p) => {
+      const { session } = await runHeadlessDebate(engineConfig, adapter, taxonomy, (p) => {
         log(`  [${p.phase}] ${p.speaker ? `${p.speaker}: ` : ''}${p.message}`);
       });
 

@@ -16,12 +16,15 @@ import { createRequire } from 'module';
 import { getGlobalRecorder } from '../../../../lib/flight-recorder/index.js';
 
 const require = createRequire(import.meta.url);
-import { getApiKey, getApiKeys, getProjectRoot, EMBED_SCRIPT, resolveDataPath, isEmbeddingWorkerOffloadEnabled, type AIBackend } from '../config.js';
-import { writeAICallLogEntry, isAICallLogEnabled } from './aiCallLog.js';
+import { getApiKey, getProjectRoot, EMBED_SCRIPT, resolveDataPath, isEmbeddingWorkerOffloadEnabled, getApiKeySource } from '../config.js';
+import { isKeyRoutingRefusal } from '../../../../lib/ai-client/apiKeyFallback.js';
+import { chainLinkKeys, throwNoApiKeyError } from './chainLinkKeys.js';
+import { writeAICallLogEntry, isAICallLogEnabled, classifyKeySource, resolveChainLinkKeySource, emitChainLinkComplete, type ChainLinkComplete } from './aiCallLog.js';
+import { logGenerateOutcome } from './generateOutcomeLog.js';
 import { ActionableError } from '../../../../lib/debate/errors.js';
 import { parseJsonRobust } from '../../../../lib/debate/helpers.js';
-import { extractProviderReason, deriveKeyErrorMessage } from './providerErrors.js';
 import { readFileWithMtime } from './fsCache.js';
+import { getCurrentUserId } from '../security/userContext.js';
 import { readDataFile } from '../storage/readDataFile.js';
 import { tavilySearch, buildSearchAugmentedPrompt } from '../../../../lib/search/tavily.js';
 import { resolveEmbeddings, type EmbeddingFallback } from '../../../../lib/embeddings/embeddingResolver.js';
@@ -36,14 +39,14 @@ import {
 } from '../../../../lib/embeddings/onnxEmbedding.js';
 // t/3183 (t/2977 Item B): off-main-thread ONNX compute via the shared worker (t/3181). Consumed
 // only when EMBEDDING_WORKER_OFFLOAD is on; flag-off never touches this path (byte-identical).
-import { computeEmbeddingsOffThread } from '../../../../lib/embeddings/offThreadEmbedding.js';
+import { computeEmbeddingsOffThread, isWorkerPoolShedError, poolStats } from '../../../../lib/embeddings/offThreadEmbedding.js';
 import {
   resolveBackend,
   callProvider,
   withRetry,
   buildModelEntryMap,
   getApiModelId as getApiModelIdFromMap,
-  getDefaultTimeout,
+  resolveTimeout,
   withTimeout,
   SERVER_RETRY_CONFIG,
   geminiGroundedSearch,
@@ -129,8 +132,10 @@ export interface GenerateTextProgress {
 let _modelEntryCache: Record<string, ModelEntry> | null = null;
 let _fallbackChainCache: Record<string, string[]> | null = null;
 let _defaultsCache: Record<string, string> | null = null;
+let _debateTiersCache: Record<string, Record<string, string>> | null = null;
+let _rawRegistryCache: ModelRegistry | null = null;
 let _modelConfigMtime = 0;
-function loadModelConfig(): { entryMap: Record<string, ModelEntry>; fallbackChains: Record<string, string[]>; defaults: Record<string, string> } {
+function loadModelConfig(): { entryMap: Record<string, ModelEntry>; fallbackChains: Record<string, string[]>; defaults: Record<string, string>; debateTiers: Record<string, Record<string, string>> } {
   try {
     const configPath = path.join(getProjectRoot(), 'ai-models.json');
     const { content: raw, mtimeMs } = readFileWithMtime(configPath, _modelEntryCache ? _modelConfigMtime : undefined);
@@ -139,6 +144,8 @@ function loadModelConfig(): { entryMap: Record<string, ModelEntry>; fallbackChai
       _modelEntryCache = buildModelEntryMap(registry);
       _fallbackChainCache = registry.fallbackChains ?? {};
       _defaultsCache = registry.defaults ?? {};
+      _debateTiersCache = (registry.debateTiers ?? {}) as Record<string, Record<string, string>>;
+      _rawRegistryCache = registry;
       _modelConfigMtime = mtimeMs;
       log.api.debug({ models: Object.keys(_modelEntryCache!).length, chains: Object.keys(_fallbackChainCache!).length }, 'Reloaded model config');
     }
@@ -147,15 +154,33 @@ function loadModelConfig(): { entryMap: Record<string, ModelEntry>; fallbackChai
       type: 'system.error',
       component: 'ai-backends',
       level: 'error',
-      message: 'Operation failed',
+      message: 'Failed to load/reload the model registry (ai-models.json) — serving from the previous cache or empty maps', // e/134 #4
       error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
     });
     log.api.warn({ err }, 'Failed to load model config');
     if (!_modelEntryCache) _modelEntryCache = {};
     if (!_fallbackChainCache) _fallbackChainCache = {};
     if (!_defaultsCache) _defaultsCache = {};
+    if (!_debateTiersCache) _debateTiersCache = {};
   }
-  return { entryMap: _modelEntryCache!, fallbackChains: _fallbackChainCache!, defaults: _defaultsCache! };
+  return { entryMap: _modelEntryCache!, fallbackChains: _fallbackChainCache!, defaults: _defaultsCache!, debateTiers: _debateTiersCache! };
+}
+
+/** t/3563: the friendly model id designated for a debate tier + backend in ai-models.json
+ *  (e.g. debateTiers.basic.gemini). Single source of truth for "the current, cheap, fast model
+ *  for this backend" — used by the key-probe so a model retirement is a registry edit, not a
+ *  hand-maintained literal. Returns undefined if the registry lacks the tier/backend entry. */
+export function resolveDebateTierModel(tier: string, backend: string): string | undefined {
+  return loadModelConfig().debateTiers[tier]?.[backend];
+}
+
+/** t/3581: the raw parsed model registry (ai-models.json), for consumers that need the whole
+ *  ModelRegistry rather than a decomposed slice — e.g. deriveDebateConfig in the inquiry pipeline.
+ *  Same mtime-cached read as the rest of this module; returns an empty registry if the file is
+ *  unreadable (loadModelConfig already WARNs on that path). */
+export function getModelRegistry(): ModelRegistry {
+  loadModelConfig(); // ensure the cache is populated / refreshed
+  return _rawRegistryCache ?? ({ backends: [], models: [] } as unknown as ModelRegistry);
 }
 
 function loadModelMap(): Record<string, string> {
@@ -163,12 +188,14 @@ function loadModelMap(): Record<string, string> {
   return Object.fromEntries(Object.entries(entryMap).map(([k, v]) => [k, v.apiModelId]));
 }
 
-function getFallbackChain(modelId: string): string[] {
+// t/4196 Stage 1: registry is required (null = prefix-only, acknowledged) so a mismatch between
+// ai-models.json and resolveBackend's id-prefix guess can't silently pick the wrong chain shape.
+function getFallbackChain(modelId: string, registry: Pick<ModelRegistry, 'models'> | null): string[] {
   const { fallbackChains, defaults } = loadModelConfig();
   const explicit = fallbackChains[modelId];
   if (explicit) return explicit;
 
-  const backend = resolveBackend(modelId);
+  const backend = resolveBackend(modelId, registry);
   const chain: string[] = [];
   const sameDefault = defaults[backend];
   if (sameDefault && sameDefault !== modelId) chain.push(sameDefault);
@@ -218,6 +245,7 @@ export interface TokenUsage {
 export interface GenerateResult {
   text: string;
   tokenUsage?: TokenUsage;
+  servedModel: string;
 }
 
 /** Convert shared ProviderResult.usage to the local TokenUsage shape. */
@@ -244,8 +272,8 @@ export { resolveBackend };
  * making the fallback chain useless. Without an explicit key each model resolves
  * its own per-backend key, so the full cross-provider chain is kept.
  */
-export function buildModelsToTry(resolved: string, hasExplicitKey: boolean): string[] {
-  return filterChainForExplicitKey([resolved, ...getFallbackChain(resolved)], hasExplicitKey);
+export function buildModelsToTry(resolved: string, hasExplicitKey: boolean, registry: Pick<ModelRegistry, 'models'> | null): string[] {
+  return filterChainForExplicitKey([resolved, ...getFallbackChain(resolved, registry)], hasExplicitKey, registry);
 }
 
 /**
@@ -254,11 +282,14 @@ export function buildModelsToTry(resolved: string, hasExplicitKey: boolean): str
  * belongs to one provider. No-op when there's no explicit key or the chain is
  * empty. Split out from buildModelsToTry so the filtering is unit-testable
  * without loading ai-models.json.
+ * t/4196 Stage 1 (key-routing site, AC2): this decides which models a caller's explicit key may
+ * be sent to — an id-prefix/registry disagreement here sends the key to the wrong provider (the
+ * t/4099 class). registry is required; pass null only with a reason for prefix-only acceptance.
  */
-export function filterChainForExplicitKey(models: string[], hasExplicitKey: boolean): string[] {
+export function filterChainForExplicitKey(models: string[], hasExplicitKey: boolean, registry: Pick<ModelRegistry, 'models'> | null): string[] {
   if (!hasExplicitKey || models.length === 0) return models;
-  const primaryBackend = resolveBackend(models[0]);
-  return models.filter(m => resolveBackend(m) === primaryBackend);
+  const primaryBackend = resolveBackend(models[0], registry);
+  return models.filter(m => resolveBackend(m, registry) === primaryBackend);
 }
 
 /** Parse a withRetry progress message and forward it to onRetry + the recorder. */
@@ -317,7 +348,7 @@ function buildGenerateOptions(
   const entry = entryMap[currentModel];
   return {
     temperature: options?.temperature ?? _debateTemperature ?? 0.7,
-    timeoutMs: timeoutMs ?? getDefaultTimeout(currentModel),
+    timeoutMs: resolveTimeout(timeoutMs, currentModel, getModelRegistry()), // t/3644: floor-enforced
     ...(entry?.fixedTemperature != null ? { fixedTemperature: entry.fixedTemperature } : {}),
     // t/2510: caller cancellation (client disconnect) → callProvider passes this into
     // the provider fetch's init.signal (AbortSignal.any with the per-attempt timeout).
@@ -328,19 +359,8 @@ function buildGenerateOptions(
     // CLI adapter's schema-enforced path exactly (no prompt-instructed divergence).
     ...(options?.responseSchema ? { responseSchema: options.responseSchema } : {}),
     ...(options?.maxTokens != null ? { maxTokens: options.maxTokens } : {}),
+    identityRegistry: getModelRegistry(), // t/4019: served-identity classifier cross-check
   };
-}
-
-// No key for any model in the chain — throw a backend-named ActionableError.
-function throwNoApiKeyError(backend: string, modelsToTry: string[]): never {
-  const names: Record<string, string> = { gemini: 'Gemini', claude: 'Claude', groq: 'Groq', openai: 'OpenAI', tavily: 'Tavily', deepseek: 'DeepSeek', moonshot: 'Moonshot (Kimi)', xai: 'xAI (Grok)' };
-  const backendName = names[backend] ?? backend;
-  throw new ActionableError({
-    goal: `Generate text via ${backendName}`,
-    problem: `No API key configured for any model in the fallback chain: ${modelsToTry.join(' → ')}`,
-    location: 'aiBackends.generateText',
-    nextSteps: [`Set your ${backendName} API key in Settings`, 'Or switch to a backend that has a key configured'],
-  });
 }
 
 export async function generateText(
@@ -349,32 +369,32 @@ export async function generateText(
   onRetry?: (p: GenerateTextProgress) => void,
   timeoutMs?: number,
   explicitApiKey?: string | string[],
-  options?: { temperature?: number; signal?: AbortSignal; responseSchema?: Record<string, unknown>; maxTokens?: number },
+  options?: {
+    temperature?: number;
+    signal?: AbortSignal;
+    responseSchema?: Record<string, unknown>;
+    maxTokens?: number;
+    /** t/4088: called once per chain link completion (success or failure) for the AI call log. */
+    onChainLinkComplete?: ChainLinkComplete;
+  },
 ): Promise<GenerateResult> {
   const resolved = model || DEFAULT_MODEL;
   const explicitKeys = normalizeExplicitKeys(explicitApiKey);
-  const modelsToTry = buildModelsToTry(resolved, explicitKeys !== undefined);
+  const registry = getModelRegistry(); // read once per call, not once per chain link (TL e/284#19)
+  const modelsToTry = buildModelsToTry(resolved, explicitKeys !== undefined, registry);
   const entryMap = loadModelConfig().entryMap;
 
   let lastError: unknown;
+  const onChainLinkComplete = options?.onChainLinkComplete; // t/4088: hoisted once — repeated optional access adds no further complexity
   for (let mi = 0; mi < modelsToTry.length; mi++) {
     const currentModel = modelsToTry[mi];
-    const backend = resolveBackend(currentModel);
-    const keys = explicitKeys ?? await getApiKeys(backend);
-    if (keys.length === 0) {
-      if (mi < modelsToTry.length - 1) {
-        getGlobalRecorder()?.record({
-          type: 'ai.fallback', component: 'ai-adapter', level: 'info',
-          message: `Skipping ${currentModel}: no ${backend} API key — trying next fallback`,
-          data: { model: currentModel, backend, fallbackIndex: mi, chain: modelsToTry },
-        });
-        // t/3176 (Fallback-Path Logging): the FR record above is info-only → invisible in prod log
-        // dashboards. WARN so a silent key-gap that degrades the model chain is greppable.
-        log.api.warn({ model: currentModel, backend, fallbackIndex: mi }, 'generateText: no API key for backend — skipping to next fallback chain entry');
-        continue;
-      }
-      throwNoApiKeyError(backend, modelsToTry);
-    }
+    const backend = resolveBackend(currentModel, registry); // registry first (t/4105 cond 3)
+    const keys = await chainLinkKeys(modelsToTry, mi, backend, explicitKeys);
+    if (!keys) continue;
+
+    // t/4088: per-link retry count and key source for the AI call log.
+    let linkRetryCount = 0;
+    const linkKeySource = await resolveChainLinkKeySource(onChainLinkComplete, explicitKeys, keys, backend);
 
     const apiModel = getApiModelId(currentModel);
     const opts = buildGenerateOptions(options, timeoutMs, currentModel, entryMap);
@@ -392,7 +412,7 @@ export async function generateText(
           (apiKey) => callProvider(fetch, backend, prompt, apiModel, apiKey, opts)),
         SERVER_RETRY_CONFIG,
         `${backend}/${apiModel}`,
-        (msg: string) => reportProviderRetry(msg, backend, apiModel, onRetry),
+        (msg: string) => { linkRetryCount++; reportProviderRetry(msg, backend, apiModel, onRetry); },
         options?.signal,
       );
 
@@ -403,14 +423,23 @@ export async function generateText(
           data: { originalModel: resolved, fallbackModel: currentModel, fallbackIndex: mi },
         });
       }
-      return { text: result.text, tokenUsage: mapUsage(result.usage) };
+      emitChainLinkComplete(onChainLinkComplete, { model: currentModel, backend, keySource: linkKeySource, retryCount: linkRetryCount, status: '200' });
+      const tokenUsage = mapUsage(result.usage);
+      logGenerateOutcome({ model: currentModel, backend, retryCount: linkRetryCount, tokenUsage }); // t/4410 sizing
+      return { text: result.text, tokenUsage, servedModel: currentModel };
     } catch (err) {
       // t/2524: a deliberate cancellation (client disconnect) must NOT advance the
       // fallback chain — otherwise every remaining chain entry emits a spurious
       // warn-level ai.fallback on user cancel. Rethrow AbortError immediately (same
       // name-check as t/2507; DOMException-compatible).
-      if ((err as { name?: unknown } | null)?.name === 'AbortError') throw err;
+      if ((err as { name?: unknown } | null)?.name === 'AbortError') {
+        emitChainLinkComplete(onChainLinkComplete, { model: currentModel, backend, keySource: linkKeySource, retryCount: linkRetryCount, status: 'aborted' });
+        throw err;
+      }
+      if (isKeyRoutingRefusal(err)) throw err; // cond 6: a refused key is never a reason to fail over — no log entry (no call made)
       lastError = err;
+      emitChainLinkComplete(onChainLinkComplete, { model: currentModel, backend, keySource: linkKeySource, retryCount: linkRetryCount, status: deriveCallLogStatus(err) });
+      logGenerateOutcome({ model: currentModel, backend, retryCount: linkRetryCount, err }); // t/4410 sizing: 429 cause
       if (mi < modelsToTry.length - 1) {
         const nextModel = modelsToTry[mi + 1];
         getGlobalRecorder()?.record({
@@ -422,6 +451,7 @@ export async function generateText(
     }
   }
 
+  if (lastError === undefined) throwNoApiKeyError(resolveBackend(resolved, registry), modelsToTry); // every link was skipped
   throw lastError;
 }
 
@@ -432,7 +462,9 @@ export async function generateTextWithSearch(
   prompt: string, model?: string, explicitApiKey?: string | string[],
 ): Promise<{ text: string; searchQueries?: string[]; citations?: SharedGroundingCitation[] }> {
   const resolved = model || DEFAULT_MODEL;
-  const backend = resolveBackend(resolved);
+  // t/4196 Stage 1 (key-routing site, AC2): decides gemini vs Tavily+LLM, and which key goes
+  // downstream — the server-side twin of t/4141's embeddings.ts fix. Registry first (t/4105 cond 3).
+  const backend = resolveBackend(resolved, getModelRegistry());
 
   if (backend !== 'gemini') {
     const tavilyKey = await getApiKey('tavily');
@@ -543,15 +575,15 @@ export async function generateTextByUsage(
   if (!isAICallLogEnabled()) {
     return generateText(prompt, merged.model, onRetry, merged.timeoutMs, explicitApiKey, { temperature: merged.temperature, signal });
   }
-  let retryCount = 0;
-  const countingOnRetry = (p: GenerateTextProgress): void => { retryCount++; onRetry?.(p); };
-  // .then(onFulfilled, onRejected), not try/catch: the audit write is a settle-time side effect and the
-  // error is re-thrown UNCHANGED. generateText already records its own failures, so this wrapper must not
-  // double-record — the error propagates to the existing recorder (ADR-003: no swallow).
-  return await generateText(prompt, merged.model, countingOnRetry, merged.timeoutMs, explicitApiKey, { temperature: merged.temperature, signal }).then(
-    (result) => { writeAICallLogEntry({ scenario: usageId, promptId: usageId, promptStart: prompt, retryCount, status: '200' }); return result; },
-    (err: unknown) => { writeAICallLogEntry({ scenario: usageId, promptId: usageId, promptStart: prompt, retryCount, status: deriveCallLogStatus(err) }); throw err; },
-  );
+  // t/4088: per-chain-link logging via onChainLinkComplete — model/backend/keySource captured per link.
+  // countingOnRetry replaced: retry count is now tracked inside generateText per link (t/4088).
+  return generateText(prompt, merged.model, onRetry, merged.timeoutMs, explicitApiKey, {
+    temperature: merged.temperature,
+    signal,
+    onChainLinkComplete: ({ model, backend, keySource, retryCount, status }) => {
+      writeAICallLogEntry({ scenario: usageId, promptId: usageId, promptStart: prompt, model, backend, keySource, retryCount, status });
+    },
+  });
 }
 
 /**
@@ -582,12 +614,20 @@ export async function generateTextWithSearchByUsage(
 
   // t/3245: AI Call Log capture. generateTextWithSearch exposes no retry callback → RetryCount 0. Same
   // .then(onFulfilled, onRejected) settle-side-effect pattern as generateTextByUsage (no double-record).
+  // t/4088: derive model/backend/keySource up-front; generateTextWithSearch doesn't expose chain links.
   if (!isAICallLogEnabled()) {
     return generateTextWithSearch(prompt, merged.model, explicitApiKey);
   }
+  const searchModel = merged.model ?? DEFAULT_MODEL;
+  const searchBackend = resolveBackend(searchModel, getModelRegistry());
+  const normalizedSearchKeys = normalizeExplicitKeys(explicitApiKey);
+  const searchKeySource = normalizedSearchKeys !== undefined
+    ? classifyKeySource(normalizedSearchKeys[0] ?? '', searchBackend)
+    : await getApiKeySource(searchBackend);
+  const logCtx = { scenario: usageId, promptId: usageId, promptStart: prompt, model: searchModel, backend: searchBackend, keySource: searchKeySource };
   return await generateTextWithSearch(prompt, merged.model, explicitApiKey).then(
-    (result) => { writeAICallLogEntry({ scenario: usageId, promptId: usageId, promptStart: prompt, retryCount: 0, status: '200' }); return result; },
-    (err: unknown) => { writeAICallLogEntry({ scenario: usageId, promptId: usageId, promptStart: prompt, retryCount: 0, status: deriveCallLogStatus(err) }); throw err; },
+    (result) => { writeAICallLogEntry({ ...logCtx, retryCount: 0, status: '200' }); return result; },
+    (err: unknown) => { writeAICallLogEntry({ ...logCtx, retryCount: 0, status: deriveCallLogStatus(err) }); throw err; },
   );
 }
 
@@ -704,7 +744,8 @@ export function _resetPythonAvailableForTest(): void {
   _pythonAvailable = null;
 }
 
-const EMBEDDINGS_REQUEST_TIMEOUT_MS = 45_000;
+// Exported (t/4287) so routes/ai.ts can size its endpoint timeout per chunk count — see below.
+export const EMBEDDINGS_REQUEST_TIMEOUT_MS = 45_000;
 
 // Chunk-and-yield ceiling for a single computeEmbeddings call (t/2914 item 2). One large
 // in-process ONNX batch blocks the event loop for the whole compute — a real prod 2389-text
@@ -716,7 +757,10 @@ const EMBEDDINGS_REQUEST_TIMEOUT_MS = 45_000;
 // (~200/792) still blocked the loop enough to trip ACA liveness 503s at chunk=256; halving the
 // chunk yields the loop 2× as often between ONNX passes → fewer liveness 503s. Interim only
 // (reduces, doesn't eliminate — the durable fix is worker-offload, t/2977 Item B / t/3183).
-const EMBEDDING_COMPUTE_CHUNK = 128;
+// t/4287: chunks run SEQUENTIALLY (resolveEmbeddingsChunked) — a smaller chunk size does NOT
+// cut a batch's total compute time, only yields more often. routes/ai.ts scales its endpoint
+// timeout by chunk count instead of lowering this constant.
+export const EMBEDDING_COMPUTE_CHUNK = 128;
 
 // t/3183 C6 (t/2977#6) — PROVISIONAL demand baseline for the novel-text class's 3rd recurrence.
 // The worker (Item B) raises the compute CEILING (a big batch no longer blocks the loop) but does
@@ -785,6 +829,22 @@ export async function resolveEmbeddingsChunked(
 // t/1641/t/1643: `_explicitApiKey` is retained for call-site arity (server.ts passes
 // the free-tier key) but is no longer consumed — embeddings are computed by the local
 // Python encoder or the in-process ONNX fallback, both 384-dim/all-MiniLM-L6-v2, no API.
+/**
+ * t/3373: emit the clean, greppable worker-pool-shed WARN token IFF `err` is a queue-shed (i.e. its
+ * ActionableError carries WORKER_POOL_SHED_CODE). Does NOT throw or swallow — the offload wrapper
+ * re-throws so the resolve/fallback/503 path is byte-identical. Must be called at the offload
+ * boundary (before resolveEmbeddings, which discards the shed code into a generic error). Exported
+ * so the shed-vs-generic discrimination is unit-testable without the full computeEmbeddings surface.
+ * component:'api' is the proven Log-Analytics sink (t/3110/t/3308 lesson); DevOps matches the token.
+ */
+export function logWorkerPoolShedIfApplicable(err: unknown, ctx: { requester: string; inputCount: number }): void {
+  if (!isWorkerPoolShedError(err)) return;
+  log.api.warn(
+    { component: 'api', subsystem: 'ai-backends', requester: ctx.requester, inputCount: ctx.inputCount, ...poolStats() },
+    'embeddings worker-pool shed',
+  );
+}
+
 export async function computeEmbeddings(
   texts: string[], ids?: string[], _explicitApiKey?: string,
   opts?: { requester?: string },
@@ -843,7 +903,16 @@ export async function computeEmbeddings(
     // which the canary sees — no silent in-thread fallback.
     chain.push({
       name: 'onnx-batch-worker',
-      compute: (t) => computeEmbeddingsOffThread(t, { requester }).then(vecs => vecs.map(v => Array.from(v))),
+      compute: (t) => computeEmbeddingsOffThread(t, { requester })
+        .then(vecs => vecs.map(v => Array.from(v)))
+        .catch((err: unknown) => {
+          // t/3373: emit the clean shed token HERE, then re-throw UNCHANGED (byte-identical resolve
+          // path). It must be here — resolveEmbeddings swallows each fallback's error and re-throws a
+          // generic 'All embedding fallbacks failed', so the shed's ActionableError.code is gone by
+          // computeEmbeddings' catch. See logWorkerPoolShedIfApplicable.
+          logWorkerPoolShedIfApplicable(err, { requester, inputCount: t.length });
+          throw err;
+        }),
     });
   } else if (await onnxTryWarmup()) {
     // Flag OFF → today's exact in-thread call (warms + uses the main-thread session) → byte-identical.
@@ -905,6 +974,12 @@ export async function computeEmbeddings(
         ],
       });
     }
+    // e/134 (Shared Lib handoff, e/134#2 + t/3538): resolveEmbeddings now throws a well-formed
+    // ActionableError naming the tried fallback chain. Preserve that precise diagnosis instead of
+    // relabeling EVERY failure as an ONNX-init failure — the old blanket wrap misdirected triage
+    // (a fallback-exhaustion or worker-module error reported as "ONNX fallback failed to initialize").
+    // Only synthesize the generic ONNX message when the underlying error is NOT already actionable.
+    if (err instanceof ActionableError) throw err;
     throw new ActionableError({
       goal: 'Compute embeddings',
       problem: `No local embedding encoder available after ${elapsedMs}ms — the Python sentence-transformers venv is absent and the in-process ONNX all-MiniLM-L6-v2 fallback failed to initialize`,
@@ -920,7 +995,7 @@ export async function computeEmbeddings(
 function computeBatchViaLocalPython(texts: string[], ids: string[]): Promise<number[][]> {
   const input = texts.map((text, i) => ({ id: ids[i], text }));
   return new Promise((resolve, reject) => {
-    const child = execFile(PYTHON, [EMBED_SCRIPT, 'batch-encode'], { timeout: 120_000, maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
+    const child = execFile(PYTHON, [EMBED_SCRIPT, 'batch-encode'], { timeout: 120_000, maxBuffer: 50 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
       if (err) { reject(new Error(`Python batch-encode failed: ${err.message}\n${stderr}`)); return; }
       try {
         const map = JSON.parse(stdout) as Record<string, number[]>;
@@ -948,7 +1023,7 @@ function computeBatchViaLocalPython(texts: string[], ids: string[]): Promise<num
 function isPythonEmbeddingAvailable(): Promise<boolean> {
   if (_pythonAvailable !== null) return Promise.resolve(_pythonAvailable);
   return new Promise(resolve => {
-    execFile(PYTHON, ['-c', 'import sentence_transformers'], { timeout: 10_000 }, (err) => {
+    execFile(PYTHON, ['-c', 'import sentence_transformers'], { timeout: 10_000, windowsHide: true }, (err) => {
       _pythonAvailable = !err;
       // t/3176 (Fallback-Path Logging): unavailable Python → the compute path silently degrades to
       // the ONNX/API fallback for the process lifetime. WARN (not info) so it surfaces in prod logs.
@@ -960,7 +1035,7 @@ function isPythonEmbeddingAvailable(): Promise<boolean> {
 
 function computeQueryViaLocalPython(text: string): Promise<number[]> {
   return new Promise((resolve, reject) => {
-    execFile(PYTHON, [EMBED_SCRIPT, 'encode', text], { timeout: 60_000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+    execFile(PYTHON, [EMBED_SCRIPT, 'encode', text], { timeout: 60_000, maxBuffer: 10 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
       if (err) { reject(new Error(`Python embed failed: ${err.message}\n${stderr}`)); return; }
       try {
         const v = JSON.parse(stdout) as number[];
@@ -1137,6 +1212,14 @@ export async function updateNodeEmbeddings(nodes: { id: string; text: string; po
     // t/3176 (Fallback-Path Logging): a read failure here silently starts from an EMPTY baseline —
     // this write only re-adds the current nodes, so any embeddings the file held for OTHER nodes are
     // dropped until the next full re-embed. That data-losing degradation must not be silent. WARN.
+    // e/134 #2: the FR record is mandatory in server scope (docs/error-handling.md) — the Pino WARN
+    // alone doesn't reach a flight-recorder dump; record both.
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'ai-backends', level: 'warn',
+      message: 'updateNodeEmbeddings: embeddings file unreadable — continuing with an EMPTY baseline (other nodes’ stored embeddings are discarded this write; they re-populate on the next full embed)',
+      error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      data: { path: EMBEDDINGS_REL_PATH },
+    });
     log.api.warn(
       { err: (err as Error).message, path: EMBEDDINGS_REL_PATH },
       'updateNodeEmbeddings: embeddings file unreadable — continuing with an EMPTY baseline (other nodes’ stored embeddings are discarded this write; they re-populate on the next full embed)',
@@ -1154,7 +1237,35 @@ export async function updateNodeEmbeddings(nodes: { id: string; text: string; po
     }
   }
   data.node_count = Object.keys(data.nodes).length;
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+  // e/134 #1 (CRITICAL): this is a production write path. A disk-full or read-only-mount
+  // condition previously threw a raw exception with no FR record and no ActionableError.
+  // Record + wrap so the failure is diagnosable and carries recovery guidance.
+  try {
+    // embeddings.json is genuine data-of-record (not class-A state), the write-side mirror of
+    // readDataFile.ts's own documented large-file exception: 63 MB exceeds the GitHub Contents
+    // API's 1 MB limit, so this bypasses the storage backend by design on both read
+    // (largeFile:true) and write. getDataRoot() is correct here.
+    // eslint-disable-next-line local/no-data-root-write -- see comment above
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+  } catch (err) {
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'ai-backends', level: 'error',
+      message: `Failed to write embeddings.json (${data.node_count} nodes)`,
+      error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      data: { path: filePath, nodeCount: data.node_count },
+    });
+    throw new ActionableError({
+      goal: 'Persist updated node embeddings',
+      problem: 'Writing embeddings.json failed — likely a full disk, read-only mount, or permission denial on the data root',
+      location: 'aiBackends.updateNodeEmbeddings',
+      nextSteps: [
+        'Check the data-root disk for a full or read-only condition (ENOSPC / EROFS / EACCES)',
+        `Verify the process can write to ${filePath} and its parent directory`,
+        'Re-run the embedding update once the disk/mount condition is resolved',
+      ],
+      innerError: err, // t/2761: chain the raw fs error rather than embedding its message
+    });
+  }
   embeddingsCache = null;
   embeddingsLoadInFlight = null; // bust any in-flight read that would return the stale file
 }
@@ -1180,7 +1291,7 @@ interface NliFields {
  */
 function classifyNliViaPython(pairs: { text_a: string; text_b: string }[]): Promise<unknown[]> {
   return new Promise((resolve, reject) => {
-    const child = execFile(PYTHON, [EMBED_SCRIPT, 'nli-classify'], { timeout: NLI_TIMEOUT_MS, maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
+    const child = execFile(PYTHON, [EMBED_SCRIPT, 'nli-classify'], { timeout: NLI_TIMEOUT_MS, maxBuffer: 50 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
       if (err) {
         const isTimeout = !!(err as { killed?: boolean }).killed || /ETIMEDOUT|timed?\s*out/i.test(err.message);
         getGlobalRecorder()?.record({
@@ -1347,53 +1458,5 @@ export async function classifyNli(
 }
 
 // ── Model discovery (refresh) ──
-
-export async function refreshAIModels(): Promise<unknown> {
-  const result: Record<string, { ok: boolean; count: number; error?: string }> = {};
-  for (const backend of ['gemini', 'claude', 'groq'] as AIBackend[]) {
-    const key = await getApiKey(backend);
-    if (!key) { result[backend] = { ok: false, count: 0, error: 'No API key' }; continue; }
-    try {
-      if (backend === 'gemini') {
-        const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${key}`);
-        if (!resp.ok) {
-          // t/1624: a non-200 is a result, not a swallowed failure. Parse the
-          // provider error body for the specific reason (SERVICE_DISABLED,
-          // restricted, quota, invalid…) instead of collapsing every case into a
-          // bare `HTTP ${status}`, and record it structured. NO key material in
-          // the message/log/FR — the key rides in the fetch URL, never the payload.
-          let reason: string | undefined;
-          try {
-            reason = extractProviderReason(await resp.json());
-          } catch {
-            /* body absent or non-JSON — silent by design: the non-200 is still
-               recorded below with reason:null, so no diagnostic is lost. */
-          }
-          getGlobalRecorder()?.record({
-            type: 'system.error',
-            component: 'ai-backends',
-            level: 'warn',
-            message: 'Gemini model discovery rejected the request',
-            data: { backend: 'gemini', httpStatus: resp.status, reason: reason ?? null },
-          });
-          result[backend] = { ok: false, count: 0, error: deriveKeyErrorMessage(resp.status, reason) };
-          continue;
-        }
-        const json = await resp.json() as { models: unknown[] };
-        result[backend] = { ok: true, count: json.models?.length || 0 };
-      } else {
-        result[backend] = { ok: true, count: 0, error: 'Discovery not implemented for this backend in container mode' };
-      }
-    } catch (err) {
-      getGlobalRecorder()?.record({
-        type: 'system.error',
-        component: 'ai-backends',
-        level: 'error',
-        message: 'Operation failed',
-        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
-      });
-      result[backend] = { ok: false, count: 0, error: String(err) };
-    }
-  }
-  return result;
-}
+// Moved to refreshModels.ts (t/4318, to keep this file under its max-lines budget).
+export { refreshAIModels, clearRefreshAIModelsCacheForTests } from './refreshModels.js';

@@ -60,26 +60,46 @@ export const CLUSTERS = {
     ],
   },
 
-  // ── EXCLUDED from the web invariance leg (gate-co-located, TL t/2940). Carried to t/3299. ──
+  // ── RE-INCLUDED t/3299 B (lazy chunk — reached via forced flag + store-nav) ──
   summaries: {
     css: 'analysis/SummariesTab.css',
-    excluded:
-      "SummariesTab mounts only when activeTab==='summaries' AND useFlag('env-electron-summaries') " +
-      "is on (App.tsx); its chunk does NOT load on the POV tabs the web smoke reaches, so a probe " +
-      "captures only CSS defaults (vacuous gate, t/2940#9). RE-INCLUDE (t/3299 B) once the spec " +
-      "enables env-electron-summaries + navigates to the summaries tab before probing.",
+    // Unlike the eager clusters above, SummariesTab is a LAZY chunk that App.tsx mounts only when
+    // activeTab==='summaries' AND useFlag('env-electron-summaries') is on — so its CSS is NOT
+    // navigation-independent. Two enablers make it reachable from the web smoke (t/3299 B):
+    //   1. FLAG: the smoke server runs with FEATURE_FLAG_ENV=electron (serve.mjs), so the
+    //      env:electron-scoped `env-electron-summaries` seed resolves TRUE → both the App.tsx render
+    //      gate AND SummariesTab's own useFlag pass.
+    //   2. NAV: `switchTab` drives useTaxonomyStore.setActiveTab(...) directly (via the
+    //      window.__ZUSTAND_STORES__.taxonomy handle) instead of clicking a [data-tab] — the
+    //      summaries nav button lives behind the advanced-view "Other Tools" popover (Toolbar.tsx),
+    //      so store-nav is the selector-stable way in. The spec WAITS for the lazy chunk's CSS to
+    //      inject before probing (a bare click would race the dynamic import).
+    // All 8 selectors are single-class styled rules in SummariesTab.css (verified) carrying
+    // theme-varying vars (--border-color / --bg-secondary / --text-muted), so the 4-theme capture
+    // is meaningful, not a vacuous defaults snapshot.
+    switchTab: 'summaries',
     selectors: [
       'sumt-card', 'sumt-detail-panel', 'sumt-pov-badge', 'sumt-tag',
       'sumt-stance', 'sumt-tab-bar', 'sumt-node-item', 'sumt-viewmode-btn',
     ],
   },
+
+  // ── RE-INCLUDED t/3299 C (separate popout WINDOW in Electron, but a web-reachable HASH ROUTE) ──
   debatePopout: {
     css: 'debate/DebatePopoutWindow.css',
-    excluded:
-      "Rendered in a SEPARATE BrowserWindow (popout) — unreachable from the web smoke's single page, " +
-      "so its CSS never loads here (probe = defaults, t/2940#9). RE-INCLUDE (t/3299 C) once the " +
-      "harness opens the popout route/window, or cover via a popout-specific smoke; else it stays on " +
-      "the manual four-theme + LOC-ratchet guard.",
+    // In Electron the popout is a separate BrowserWindow, but in the WEB build it's just a hash
+    // route: App.tsx early-returns <DebatePopoutWindow/> when location.hash starts with
+    // '#debate-window' (needs only bridgeReady — no electronAPI, no debate id), and the component
+    // lazy-imports DebatePopoutWindow.css at module top. So a fresh page navigated to
+    // BASE + '#debate-window' loads the CSS even with no debate loaded (it renders LoadingProgress).
+    // The old `excluded` premise ("unreachable from the web smoke's single page") only held for the
+    // Electron path — the web hash route was always reachable.
+    // `gotoHash` = a FULL-DOCUMENT route (distinct from switchTab/openTab, which stay in the main
+    // app), so the spec/harness probe it on a THROWAWAY page that doesn't clobber the shared page.
+    // All 4 selectors are single-class styled rules in DebatePopoutWindow.css (verified) carrying
+    // theme-varying vars (--bg / --text-primary / --text-muted / --danger) → meaningful 4-theme
+    // capture, not a vacuous defaults snapshot.
+    gotoHash: '#debate-window',
     selectors: [
       'debate-popout-shell', 'debate-popout-error-box',
       'debate-popout-error-title', 'debate-popout-hint',

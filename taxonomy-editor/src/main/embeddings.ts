@@ -7,7 +7,7 @@ import path from 'path';
 import { execFile, type ExecFileException } from 'child_process';
 import { fileURLToPath } from 'node:url';
 import { Worker as NodeWorker } from 'node:worker_threads';
-import { loadApiKey } from './apiKeyStore.js';
+import { loadApiKey, hasApiKey } from './apiKeyStore.js';
 import { app, net } from 'electron';
 import { PROJECT_ROOT, resolveDataPath } from './fileIO.js';
 import { ActionableError } from '../../../lib/debate/errors.js';
@@ -38,6 +38,7 @@ import {
   withTimeout,
   resolveBackend,
   getDefaultTimeout,
+  resolveTimeout,
   GEMINI_BASE,
   GEMINI_SAFETY_SETTINGS,
   callProvider,
@@ -47,9 +48,10 @@ import {
   generateViaGeminiStream,
   DEFAULT_MODEL,
 } from '../../../lib/ai-client/index.js';
-import type { GenerateOptions, RateLimitType as SharedRateLimitType, FetchFn, UrlContextMetadata, GeminiContent } from '../../../lib/ai-client/index.js';
-import type { ModelEntry } from '../../../lib/ai-client/index.js';
-import { resolveModelEntry as resolveModelEntryFromCache } from './modelConfigCache.js';
+import type { GenerateOptions, RateLimitType as SharedRateLimitType, FetchFn, UrlContextMetadata, GeminiContent, StopReason, ProviderCallDiagnostics } from '../../../lib/ai-client/index.js';
+import type { ModelEntry, ModelRegistry } from '../../../lib/ai-client/index.js';
+import { assertKeyForBackend } from '../../../lib/ai-client/apiKeyFallback.js';
+import { resolveModelEntry as resolveModelEntryFromCache, getMainRegistry } from './modelConfigCache.js';
 
 // ── Electron net.fetch wrapper ──
 // Electron's net.fetch requires Buffer.from for string bodies in some cases.
@@ -131,7 +133,7 @@ export function warmupEmbeddingModel(): void {
       execFile(
         PYTHON,
         [EMBED_SCRIPT, 'encode', 'warmup'],
-        { timeout: 120_000, maxBuffer: 1024 * 1024 },
+        { timeout: 120_000, maxBuffer: 1024 * 1024, windowsHide: true },
         (err) => {
           if (err) {
             console.warn('[embeddings] Python warmup failed (non-fatal):', err.message);
@@ -278,7 +280,7 @@ async function embedItems(items: { id: string; text: string }[]): Promise<Record
     const child = execFile(
       PYTHON,
       [EMBED_SCRIPT, 'batch-encode'],
-      { timeout: 120_000, maxBuffer: 50 * 1024 * 1024 },
+      { timeout: 120_000, maxBuffer: 50 * 1024 * 1024, windowsHide: true },
       (err, stdout, stderr) => {
         if (err) {
           reject(new Error(`Python batch-encode failed: ${err.message}\n${stderr}`));
@@ -471,7 +473,7 @@ async function classifyNliBatch(pairs: NliPair[]): Promise<NliResult[]> {
     const child = execFile(
       PYTHON,
       [EMBED_SCRIPT, 'nli-classify'],
-      { timeout: 120_000, maxBuffer: 50 * 1024 * 1024 },
+      { timeout: 120_000, maxBuffer: 50 * 1024 * 1024, windowsHide: true },
       (err, stdout, stderr) => {
         if (err) {
           const combined = `${stderr || ''}${stdout || ''}`.toLowerCase();
@@ -516,7 +518,7 @@ async function classifyNliBatch(pairs: NliPair[]): Promise<NliResult[]> {
 
 // ---------- Gemini API fallback ----------
 
-const GEMINI_MODEL = 'gemini-embedding-001';
+const GEMINI_MODEL = 'gemini-embedding-001'; // model-lint:allow-external — embedding model, governed by the embeddings API not the chat registry (t/3559)
 // GEMINI_BASE is imported from shared lib/ai-client
 const BATCH_SIZE = 100;
 const MAX_RETRIES = 5;
@@ -530,6 +532,7 @@ async function callGeminiBatchApi(
   taskType: 'RETRIEVAL_DOCUMENT' | 'RETRIEVAL_QUERY',
   apiKey: string,
 ): Promise<number[][]> {
+  assertKeyForBackend(apiKey, 'gemini', 'embedding'); // t/4105 C5: a direct send that bypasses callProvider, so the foreign-key guard runs here
   const url = `${GEMINI_BASE}/${GEMINI_MODEL}:batchEmbedContents?key=${apiKey}`;
 
   const requests = texts.map(text => ({
@@ -670,6 +673,40 @@ function resolveModelEntry(friendlyId: string): ModelEntry | undefined {
   return resolveModelEntryFromCache(findModelsConfig(), friendlyId);
 }
 
+// t/3614: registry is now required by getDefaultTimeout/getModelMinTimeout — cached via
+// modelConfigCache's mtime-guarded loader, reusing this file's existing config-path resolution.
+// Exported for aiHandlers.ts (t/4196): resolveBackend's registry param must never be omitted.
+export function resolveRegistry(): ModelRegistry {
+  return getMainRegistry(findModelsConfig());
+}
+
+/**
+ * KeySource for the AI call log (t/4088), given a resolved backend: Electron's `generateText`
+ * only ever loads keys via the encrypted key store (`loadApiKey`/`hasApiKey`) — never an env var
+ * or an explicit-key parameter — so 'store' and 'none' (keyless Ollama) are the only sources that
+ * occur on this path; '' covers the key-not-found case (which `generateText` itself refuses before
+ * any call, so this value only ever reaches the log via a caller's own catch-block entry).
+ */
+export function resolveAiCallLogKeySource(backend: string): string {
+  if (backend === 'ollama') return 'none';
+  return hasApiKey(backend as Parameters<typeof hasApiKey>[0]) ? 'store' : '';
+}
+
+/**
+ * The Model/Backend/KeySource context for an AI call log entry (t/4088), given the caller's
+ * requested model (or none, which defaults the same way `generateText` does). Callers compute
+ * this ONCE before calling `generateText` and reuse it for both the success and failure log
+ * entries, since the desktop path has no fallback chain (t/4048) — the requested model is always
+ * the model actually called.
+ */
+export function resolveAiCallLogContext(model?: string): { model: string; backend: string; keySource: string } {
+  const friendlyModel = model || DEFAULT_MODEL;
+  // registry passed explicitly (AC 3, t/4088): resolveBackend's registry param is optional and
+  // falls through to an id-prefix guess when omitted — this is the registry-first form.
+  const backend = resolveBackend(friendlyModel, resolveRegistry());
+  return { model: friendlyModel, backend, keySource: resolveAiCallLogKeySource(backend) };
+}
+
 /** Return a fixedTemperature override for GenerateOptions when the entry requires one. */
 function fixedTempOverride(entry: ModelEntry | undefined): { fixedTemperature?: number } {
   return entry?.fixedTemperature != null ? { fixedTemperature: entry.fixedTemperature } : {};
@@ -686,17 +723,29 @@ export function setDebateTemperature(temp: number | null): void {
   else console.log('[AI] Debate temperature reset to default (0.7)');
 }
 
+// t/3528: trailing options grouped in one object rather than five positional params —
+// every prior addition (signal t/2507, responseSchema, maxTokens t/3524) forced every
+// caller to pass placeholder `undefined` holes to reach the new param.
+export interface GenerateTextCallOptions {
+  timeoutMs?: number;
+  temperature?: number;
+  signal?: AbortSignal;
+  responseSchema?: Record<string, unknown>;
+  maxTokens?: number;
+}
+
 export async function generateText(
   prompt: string,
   model?: string,
   onRetry?: (progress: GenerateTextProgress) => void,
-  timeoutMs?: number,
-  temperature?: number,
-  signal?: AbortSignal,
-  responseSchema?: Record<string, unknown>,
-): Promise<string> {
+  opts?: GenerateTextCallOptions,
+): Promise<{ text: string; stopReason?: StopReason; diagnostics?: ProviderCallDiagnostics; servedModel?: string }> {
+  const { timeoutMs, temperature, signal, responseSchema, maxTokens } = opts ?? {};
   const friendlyModel = model || DEFAULT_MODEL;
-  const backend = resolveBackend(friendlyModel);
+  // registry passed explicitly (t/4141): resolveBackend's registry param is optional and falls
+  // through to an id-prefix guess when omitted, routing the request and its key to a provider
+  // the registry didn't name.
+  const backend = resolveBackend(friendlyModel, resolveRegistry());
   const entry = resolveModelEntry(friendlyModel);
   const resolvedModel = entry?.apiModelId ?? friendlyModel;
 
@@ -726,17 +775,19 @@ export async function generateText(
     _lastLoggedModel = friendlyModel;
   }
 
-  const opts: GenerateOptions = {
+  const providerOpts: GenerateOptions = {
     temperature: temperature ?? _debateTemperature ?? 0.7,
-    timeoutMs: timeoutMs ?? getDefaultTimeout(friendlyModel),
+    timeoutMs: resolveTimeout(timeoutMs, friendlyModel, resolveRegistry()), // t/3644: floor-enforced
     ...fixedTempOverride(entry),
     ...(signal ? { signal } : {}),
     ...(responseSchema ? { responseSchema } : {}),
+    ...(maxTokens !== undefined ? { maxTokens } : {}),
+    identityRegistry: resolveRegistry(), // t/4018: lets callProvider's served-identity classifier warn on divergence
   };
 
   const providerFn = backend === 'deepseek'
-    ? () => generateViaDeepSeekStream(electronFetch, prompt, resolvedModel, apiKey, opts)
-    : () => callProvider(electronFetch, backend, prompt, resolvedModel, apiKey, opts);
+    ? () => generateViaDeepSeekStream(electronFetch, prompt, resolvedModel, apiKey, providerOpts)
+    : () => callProvider(electronFetch, backend, prompt, resolvedModel, apiKey, providerOpts);
 
   const result = await withRetry(
     providerFn,
@@ -758,7 +809,24 @@ export async function generateText(
   );
 
   console.log('[generateText] Success, result length:', result.text.length);
-  return result.text;
+  // t/4048 (e/275#2/#4, SO condition 4 satisfied for this backend): desktop has no fallback
+  // chain — lib/debate/aiAdapter.ts's createCLIAdapter is the only code that walks the model
+  // registry's fallback-chain config, and it's CLI-only, never this path — so servedModel is
+  // simply the single model this call resolved to, DERIVED from the same defaulting as the call
+  // itself (friendlyModel = model || DEFAULT_MODEL), never echoed from the raw `model` param.
+  // THIS EXEMPTION LAPSES the moment this function starts walking that per-model fallback
+  // config: servedModel must become the answering link, and e/268#6 condition 4's
+  // forced-fallback test becomes mandatory. See embeddings.noFallbackChainTripwire.test.ts,
+  // which fails loudly if that line is crossed without this comment being revisited. (That
+  // test name-matches the registry field and the two ServerAPI/CLI helper functions that walk
+  // it — spelled out there, deliberately not here, so this comment can't trip its own tripwire.)
+  //
+  // SCOPE (TL review, #3061): servedModel tracks OUR routing (which registry link answered), NOT
+  // whether the provider served that model. Provider-side substitution is classified by
+  // callProvider's ai.model_identity event (t/3677/t/3731) using `result.providerReportedModel`.
+  // That field is deliberately NOT read here: it is a raw provider string (not a registry id) and
+  // forensics-only, so consuming it would lapse its own no-consumer exemption (lib/ai-client/types.ts).
+  return { text: result.text, stopReason: result.stopReason, diagnostics: result.diagnostics, servedModel: friendlyModel };
 }
 
 export interface ChatMessage {
@@ -775,7 +843,8 @@ export async function generateChatStream(
   urlContext?: boolean,
 ): Promise<{ text: string; urlContextMetadata?: UrlContextMetadata }> {
   const friendlyModel = model || DEFAULT_MODEL;
-  const backend = resolveBackend(friendlyModel);
+  // registry passed explicitly (t/4141): see generateText's identical comment.
+  const backend = resolveBackend(friendlyModel, resolveRegistry());
   const entry = resolveModelEntry(friendlyModel);
   const resolvedModel = entry?.apiModelId ?? friendlyModel;
 
@@ -800,8 +869,9 @@ export async function generateChatStream(
     ).join('\n\n') + '\n\n[Assistant]:';
     const opts: GenerateOptions = {
       temperature: temperature ?? 0.7,
-      timeoutMs: getDefaultTimeout(friendlyModel),
+      timeoutMs: getDefaultTimeout(friendlyModel, resolveRegistry()),
       ...fixedTempOverride(entry),
+      identityRegistry: resolveRegistry(), // t/4018: lets callProvider's served-identity classifier warn on divergence
     };
     const providerResult = backend === 'deepseek'
       ? await generateViaDeepSeekStream(electronFetch, prompt, resolvedModel, apiKey, opts, onChunk)
@@ -813,7 +883,7 @@ export async function generateChatStream(
   const geminiContents: GeminiContent[] = messages.map(m => ({ role: m.role, parts: [{ text: m.content }] }));
   const opts: GenerateOptions = {
     temperature: temperature ?? 0.3,
-    timeoutMs: getDefaultTimeout(friendlyModel),
+    timeoutMs: getDefaultTimeout(friendlyModel, resolveRegistry()),
     systemMessage: systemInstruction,
     geminiContents,
     urlContext,
@@ -857,7 +927,7 @@ async function generateWithTavily(
 
   const { augmentedPrompt, searchQueries, citations: searchCitations } = buildSearchAugmentedPrompt(prompt, searchResult);
 
-  const text = await generateText(augmentedPrompt, model);
+  const { text } = await generateText(augmentedPrompt, model);
 
   const citations: GroundingCitation[] = searchCitations.map((c: any) => ({
     uri: c.uri,
@@ -958,7 +1028,8 @@ export async function generateTextWithSearch(
   model?: string,
 ): Promise<{ text: string; searchQueries?: string[]; citations?: GroundingCitation[] }> {
   const resolvedModel = model || DEFAULT_MODEL;
-  const backend = resolveBackend(resolvedModel);
+  // registry passed explicitly (t/4141): see generateText's identical comment.
+  const backend = resolveBackend(resolvedModel, resolveRegistry());
 
   // Non-Gemini: use Tavily search + LLM if Tavily key is available
   if (backend !== 'gemini') {
@@ -966,7 +1037,7 @@ export async function generateTextWithSearch(
     if (tavilyKey) {
       return generateWithTavily(prompt, resolvedModel, tavilyKey);
     }
-    const text = await generateText(prompt, resolvedModel);
+    const { text } = await generateText(prompt, resolvedModel);
     return { text };
   }
 
@@ -981,6 +1052,7 @@ export async function generateTextWithSearch(
     ],
   });
 
+  assertKeyForBackend(apiKey, 'gemini', 'search-grounding'); // t/4105 C5: a direct send that bypasses callProvider, so the foreign-key guard runs here
   const apiModel = resolveModelEntry(resolvedModel)?.apiModelId ?? resolvedModel;
   const url = `${GEMINI_BASE}/${apiModel}:generateContent?key=${apiKey}`;
 

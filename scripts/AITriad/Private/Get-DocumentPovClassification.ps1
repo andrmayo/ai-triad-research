@@ -28,18 +28,16 @@ function Get-DocumentPovClassification {
         [Parameter(Mandatory)]
         [string]$QueryText,
 
-        [string]$Model = 'gemini-3.5-flash-lite',
+        [string]$Model = (Get-AITierModel -Tier basic),
 
         [string]$ApiKey = ''
     )
 
     Set-StrictMode -Version Latest
 
-    if ([string]::IsNullOrWhiteSpace($ApiKey)) {
-        $ApiKey = Resolve-AIApiKey -ExplicitKey '' -Backend 'gemini'
-    }
-
-    if (-not $ApiKey) {
+    # Presence is checked for the model's REGISTRY backend; no env key is resolved into $ApiKey, so a
+    # caller's -ApiKey (or '') is all that is forwarded and Invoke-AIApi resolves the rest (t/4087).
+    if (-not (Get-AIModelKeyStatus -Model $Model -ApiKey $ApiKey).HasKey) {
         Write-Verbose 'CHESS: No API key — returning all POVs'
         return @('accelerationist', 'safetyist', 'skeptic', 'situations')
     }

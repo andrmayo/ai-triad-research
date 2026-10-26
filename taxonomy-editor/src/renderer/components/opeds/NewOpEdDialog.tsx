@@ -13,6 +13,7 @@ import type { TextareaHTMLAttributes, RefObject } from 'react';
 import { api } from '@bridge';
 import type { CreateOpEdParams, CreateOpEdPayload, OpEdProgressEvent } from '../../bridge/types';
 import type { PovKey } from '../../../../../lib/oped/types';
+import outletsData from '@lib/oped/outlets.json';
 import { POV_META } from '@lib/electron-shared/povMeta';
 import { POV_KEYS } from '@lib/debate/types';
 import { CampGlyph, povToCamp } from '../shared/CampGlyph';
@@ -22,25 +23,39 @@ import {
 } from '../../hooks/useTaxonomyStore';
 import { useTierInfo, isFreeTier, type TierInfo } from '../../hooks/useTierInfo';
 import { useAuthStatus } from '../../hooks/useAuthStatus';
+import { OpEdTagPicker, opEdTagBlocksStart, opEdTagSelection, type OpEdTagChoice } from './OpEdTagPicker';
+import { registryOrNull } from '../debate/SeatTagPicker';
+import type { PovNode } from '@lib/debate/taxonomyTypes';
 import './NewOpEdDialog.css';
 
-// ── Outlets (mirror New-OpEd.ps1 ValidateSet + band hints) ────────────────────
+// ── Outlets (t/3864) ───────────────────────────────────────────────────────────
+// The option SET and the default come from the SSOT (lib/oped/outlets.json, t/3861) — never
+// a local array/literal. `label`/`band` are presentation-only (t/3864's design) and may stay
+// local; a key missing from this map still renders (falling back to the key itself), so the
+// dropdown can never silently offer a DIFFERENT set from the backend — the exact failure
+// t/3796 caused.
+const OUTLET_PRESENTATION: Record<string, { label: string; band: string }> = {
+  WashingtonPost:    { label: 'The Washington Post',   band: '~800 words, strong news hook' },
+  NYTimes:           { label: 'The New York Times',    band: '~800 words, sharp thesis' },
+  WallStreetJournal: { label: 'The Wall Street Journal', band: '600–1200 words, business/policy framing' },
+  USAToday:          { label: 'USA Today',             band: '550–750 words, plain and direct' },
+  ForeignAffairs:    { label: 'Foreign Affairs',       band: '800–1500 words, structural analysis' },
+  Politico:          { label: 'Politico',              band: '~1000 words, policy-mechanics focus' },
+  TechPolicyPress:   { label: 'Tech Policy Press',     band: '1200–2000 words, analytical and evidence-grounded' },
+  Regional:          { label: 'Regional / local daily', band: '500–800 words, local relevance' },
+  Generic:           { label: 'Generic',               band: '~800 words, strong news hook' },
+};
 
-const OUTLETS: { value: string; label: string; band: string }[] = [
-  { value: 'WashingtonPost',    label: 'The Washington Post',   band: '~800 words, strong news hook' },
-  { value: 'NYTimes',           label: 'The New York Times',    band: '~800 words, sharp thesis' },
-  { value: 'WallStreetJournal', label: 'The Wall Street Journal', band: '600–1200 words, business/policy framing' },
-  { value: 'USAToday',          label: 'USA Today',             band: '550–750 words, plain and direct' },
-  { value: 'ForeignAffairs',    label: 'Foreign Affairs',       band: '800–1500 words, structural analysis' },
-  { value: 'Politico',          label: 'Politico',              band: '~1000 words, policy-mechanics focus' },
-  { value: 'Regional',          label: 'Regional / local daily', band: '500–800 words, local relevance' },
-  { value: 'Generic',           label: 'Generic',               band: '~800 words, strong news hook' },
-];
+const OUTLETS: { value: string; label: string; band: string }[] = Object.keys(outletsData.outlets).map(value => ({
+  value,
+  label: OUTLET_PRESENTATION[value]?.label ?? value,
+  band: OUTLET_PRESENTATION[value]?.band ?? '',
+}));
 
 // ── Screen-B defaults (must equal New-OpEd's parameter defaults) ──────────────
 
 const DEFAULTS = {
-  outlet: 'Generic',
+  outlet: outletsData.defaultOutlet,
   wordCount: null as number | null, // null ⇒ use the outlet band (cmdlet default)
   thesis: '',
   authorBio: '',
@@ -384,7 +399,7 @@ function OpEdSettingsDrawer({
                     disabled={refreshing}
                     onClick={async () => {
                       setRefreshing(true);
-                      try { await api.refreshAIModels(); await initAIModels(); } catch { /* telemetry — silent by design */ }
+                      try { await api.refreshAIModels({ dryRun: true }); await initAIModels(); } catch { /* telemetry — silent by design */ }
                       setRefreshing(false);
                     }}
                   >{refreshing ? 'Refreshing…' : 'Refresh models'}</button>
@@ -498,6 +513,8 @@ interface CreateFormProps {
   onClose: () => void;
   onDraft: () => void;
   canStart: boolean;
+  /** The optional one-voice POV tag picker (t/3992), rendered by the dialog. */
+  tagPicker: React.ReactNode;
   hasSource: boolean;
   modelHasKey: boolean;
   submitLabel: string;
@@ -589,6 +606,8 @@ function OpEdCreateForm(p: CreateFormProps) {
           <p className="oped-voice-count" aria-live="polite">{voiceCountLine(p.orderedVoices)}</p>
         </div>
 
+        {p.tagPicker}
+
         {/* Outlet */}
         <div>
           <label className="oped-field-label" htmlFor="oped-outlet">Outlet</label>
@@ -668,6 +687,9 @@ export function NewOpEdDialog({ open, onClose, onCreated, allowUrlSource = true 
   const [url, setUrl] = useState('');
   // Default to all three camps selected (t/2849) — a study is normally the full triad.
   const [voices, setVoices] = useState<Set<PovKey>>(new Set(['accelerationist', 'safetyist', 'skeptic']));
+  const [tagChoice, setTagChoice] = useState<OpEdTagChoice | undefined>(undefined);
+  const tagRegistry = useMemo(() => registryOrNull(), []);
+  const nodesFor = (pov: PovKey): PovNode[] => useTaxonomyStore.getState()[pov]?.nodes ?? [];
   const [outlet, setOutlet] = useState(DEFAULTS.outlet);
   const [newsHook, setNewsHook] = useState('');
 
@@ -743,7 +765,8 @@ export function NewOpEdDialog({ open, onClose, onCreated, allowUrlSource = true 
   const orderedVoices = useMemo(() => POV_KEYS.filter(v => voices.has(v)), [voices]);
 
   const hasSource = fromWebPage ? url.trim().length > 0 : topic.trim().length > 0;
-  const canStart = hasSource && orderedVoices.length >= 1 && modelHasKey;
+  // t/3992: a tag below its minimum refuses at setup (TL t/3957#7 B(a)), never mid-generation.
+  const canStart = hasSource && orderedVoices.length >= 1 && modelHasKey && !opEdTagBlocksStart(tagChoice, orderedVoices, nodesFor);
 
   // A URL pasted into the topic box → FromTopic → no source brief → no claims, silently (t/2899).
   // Detect it so we can steer the user to the web-page path (desktop only; web has no URL path).
@@ -793,6 +816,8 @@ export function NewOpEdDialog({ open, onClose, onCreated, allowUrlSource = true 
     if (!ground) params.voiceOnly = true;
     else { params.maxGroundingNodes = maxGroundingNodes; params.maxSituations = maxSituations; }
     const sourceUrl = fromWebPage && url.trim() ? url.trim() : undefined;
+    const tagSelection = opEdTagSelection(tagChoice, orderedVoices); // t/3992
+    if (tagSelection) params.tagSelection = tagSelection;
     return { topic: topic.trim(), url: sourceUrl, params, voices: orderedVoices };
   };
 
@@ -885,6 +910,7 @@ export function NewOpEdDialog({ open, onClose, onCreated, allowUrlSource = true 
             onClose={onClose}
             onDraft={handleDraft}
             canStart={canStart}
+            tagPicker={<OpEdTagPicker voices={orderedVoices} registry={tagRegistry} choice={tagChoice} onChange={setTagChoice} nodesFor={nodesFor} />}
             hasSource={hasSource}
             modelHasKey={modelHasKey}
             submitLabel={submitLabel}

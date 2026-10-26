@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
+# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 # Licensed under the MIT License. See LICENSE file in the project root.
 
 function Get-TopicFrequency {
@@ -78,7 +78,7 @@ function Get-TopicFrequency {
     $ErrorActionPreference = 'Stop'
 
     if (-not $Model) {
-        if ($env:AI_MODEL) { $Model = $env:AI_MODEL } else { $Model = 'gemini-3.5-flash-lite' }
+        if ($env:AI_MODEL) { $Model = $env:AI_MODEL } else { $Model = (Get-AITierModel -Tier basic) }
     }
 
     # ── Validate environment ─────────────────────────────────────────────────
@@ -116,7 +116,11 @@ function Get-TopicFrequency {
     # ── Step 1: Scan summaries and build citation counts ─────────────────────
     Write-Step "Scanning summaries for citations"
 
-    $SummaryFiles = @(Get-ChildItem -Path $SummariesDir -Filter '*.json' -File)
+    # duplicate_of (t/4337): a marked copy's summary isn't counted as a document of its own; its
+    # citations are added back under the canonical after the scan, at most once per node (spec 7.5).
+    $AllSummaryFiles = @(Get-ChildItem -Path $SummariesDir -Filter '*.json' -File)
+    $Resolution      = Get-DefaultSourceResolution -Caller 'Get-TopicFrequency'
+    $SummaryFiles    = @(Select-SelectableSummaryFile -Files $AllSummaryFiles -Resolution $Resolution)
     $SummaryCount = $SummaryFiles.Count
 
     if ($SummaryCount -lt 3) {
@@ -140,17 +144,22 @@ function Get-TopicFrequency {
             continue
         }
 
-        $DocId = $Summary.doc_id
+        # Every summary/key-point/claim field read below is guarded via PSObject.Properties (t/4010):
+        # a bare dot-access on an absent property throws under StrictMode instead of yielding $null,
+        # which made the "skip if missing" checks (and the BaseName fallback) unreachable.
+        $SummaryProps = $Summary.PSObject.Properties
+        $DocId = if ($SummaryProps['doc_id']) { $Summary.doc_id } else { $null }
         if (-not $DocId) { $DocId = $File.BaseName }
 
         # Count key_points per camp
+        $PovSummaries = if ($SummaryProps['pov_summaries']) { $Summary.pov_summaries } else { $null }
         foreach ($Camp in $CampKeys) {
-            $CampData = $Summary.pov_summaries.$Camp
+            $CampData = if ($PovSummaries -and $PovSummaries.PSObject.Properties[$Camp]) { $PovSummaries.$Camp } else { $null }
             if (-not $CampData -or -not $CampData.PSObject.Properties['key_points'] -or -not $CampData.key_points) { continue }
 
             foreach ($KP in @($CampData.key_points)) {
                 $TotalKeyPoints++
-                $NodeId = $KP.taxonomy_node_id
+                $NodeId = if ($KP.PSObject.Properties['taxonomy_node_id']) { $KP.taxonomy_node_id } else { $null }
                 if (-not $NodeId) { continue }
 
                 if (-not $Citations[$Camp].ContainsKey($NodeId)) {
@@ -167,10 +176,11 @@ function Get-TopicFrequency {
         }
 
         # Optionally count factual_claims (attributed equally to all camps)
-        if ($IncludeFactualClaims -and $Summary.factual_claims) {
-            foreach ($Claim in $Summary.factual_claims) {
-                if (-not $Claim.linked_taxonomy_nodes) { continue }
-                foreach ($NodeId in $Claim.linked_taxonomy_nodes) {
+        if ($IncludeFactualClaims -and $SummaryProps['factual_claims'] -and $Summary.factual_claims) {
+            foreach ($Claim in @($Summary.factual_claims)) {
+                # Unmapped claims carry potential_taxonomy_nodes instead (live in the corpus, t/4010).
+                if (-not ($Claim.PSObject.Properties['linked_taxonomy_nodes'] -and $Claim.linked_taxonomy_nodes)) { continue }
+                foreach ($NodeId in @($Claim.linked_taxonomy_nodes)) {
                     if (-not $NodeId) { continue }
                     foreach ($Camp in $CampKeys) {
                         if (-not $Citations[$Camp].ContainsKey($NodeId)) {
@@ -184,6 +194,40 @@ function Get-TopicFrequency {
                             $Citations[$Camp][$NodeId].DocIds.Add($DocId)
                         }
                     }
+                }
+            }
+        }
+    }
+
+    # Duplicate-group union (spec 7.5, t/4337): a copy's model run may cite a node its canonical's
+    # run missed. Count that node for the canonical once; never add to a node it already counts,
+    # so a doc and its copies can't make a topic look more frequent.
+    $AddOncePerDoc = {
+        param([string]$Camp, [string]$NodeId, [string]$Canonical)
+        if (-not $Citations[$Camp].ContainsKey($NodeId)) {
+            $Citations[$Camp][$NodeId] = @{ Count = 0; DocIds = [System.Collections.Generic.List[string]]::new() }
+        }
+        if ($Canonical -notin $Citations[$Camp][$NodeId].DocIds) {
+            $Citations[$Camp][$NodeId].Count++
+            $Citations[$Camp][$NodeId].DocIds.Add($Canonical)
+        }
+    }
+    foreach ($Copy in @(Get-MarkedCopySummary -Files $AllSummaryFiles -Resolution $Resolution -Caller 'Get-TopicFrequency')) {
+        $CopyProps = $Copy.Summary.PSObject.Properties
+        $PovSummaries = if ($CopyProps['pov_summaries']) { $Copy.Summary.pov_summaries } else { $null }
+        foreach ($Camp in $CampKeys) {
+            $CampData = if ($PovSummaries -and $PovSummaries.PSObject.Properties[$Camp]) { $PovSummaries.$Camp } else { $null }
+            if (-not $CampData -or -not $CampData.PSObject.Properties['key_points'] -or -not $CampData.key_points) { continue }
+            foreach ($KP in @($CampData.key_points)) {
+                $NodeId = if ($KP.PSObject.Properties['taxonomy_node_id']) { $KP.taxonomy_node_id } else { $null }
+                if ($NodeId) { & $AddOncePerDoc $Camp $NodeId $Copy.CanonicalId }
+            }
+        }
+        if ($IncludeFactualClaims -and $CopyProps['factual_claims'] -and $Copy.Summary.factual_claims) {
+            foreach ($Claim in @($Copy.Summary.factual_claims)) {
+                if (-not ($Claim.PSObject.Properties['linked_taxonomy_nodes'] -and $Claim.linked_taxonomy_nodes)) { continue }
+                foreach ($NodeId in @($Claim.linked_taxonomy_nodes)) {
+                    if ($NodeId) { foreach ($Camp in $CampKeys) { & $AddOncePerDoc $Camp $NodeId $Copy.CanonicalId } }
                 }
             }
         }
@@ -291,20 +335,13 @@ function Get-TopicFrequency {
         Write-Step "Labeling clusters with AI"
 
         try {
-            if     ($Model -match '^gemini') { $Backend = 'gemini' }
-            elseif ($Model -match '^claude') { $Backend = 'claude' }
-            elseif ($Model -match '^groq')   { $Backend = 'groq'   }
-        elseif ($Model -match '^openai') { $Backend = 'openai' }
-            else                             { $Backend = 'gemini'  }
-
-            $ResolvedKey = Resolve-AIApiKey -ExplicitKey $ApiKey -Backend $Backend
-            if ([string]::IsNullOrWhiteSpace($ResolvedKey)) {
-                Write-Warn "No API key found for $Backend — falling back to -NoAI labeling"
+            # Backend from ai-models.json, never guessed; only the user's -ApiKey is forwarded (t/4087).
+            $KeyStatus = Get-AIModelKeyStatus -Model $Model -ApiKey $ApiKey
+            if (-not $KeyStatus.HasKey) {
+                Write-Warn "No API key found for $($KeyStatus.Backend) — falling back to -NoAI labeling"
                 $NoAI = $true
             }
             else {
-                $ApiKey = $ResolvedKey
-
                 # Build cluster descriptions for the prompt
                 $ClusterDescs = [System.Text.StringBuilder]::new()
                 foreach ($Camp in $TargetCamps) {

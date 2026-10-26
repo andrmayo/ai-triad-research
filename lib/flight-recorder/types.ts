@@ -14,6 +14,7 @@ export type EventType =
   | 'ai.fallback'
   | 'ai.call_by_usage'
   | 'ai.cancelled' // t/2510: request cancelled by client disconnect (info, not a failure)
+  | 'ai.model_identity' // t/3677: provider-reported served model identity captured at the response boundary (log-only, Phase 1)
   // Argument network
   | 'an.extract'
   | 'an.commit'
@@ -26,6 +27,7 @@ export type EventType =
   | 'an.extraction_coverage_error'
   | 'an.exclusion_violation'
   | 'an.nli_direction_gate'
+  | 'an.evidence_qbaf_skipped'
   // Turn pipeline
   | 'turn.stage'
   | 'turn.validate'
@@ -59,6 +61,8 @@ export type EventType =
   | 'debate.lifecycle'
   | 'debate.lookahead.filter'
   | 'debate.opening_added'
+  | 'debate.closure_eligible'
+  | 'debate.stage_draft_fields'
   // State management
   | 'state.save'
   | 'state.save-coalesced'
@@ -85,6 +89,7 @@ export type EventType =
   | 'github.api.error'
   | 'github.api.miss'
   | 'github.api.rate_limit'
+  | 'github.api.refused'
   | 'github.api.circuit_break'
   | 'github.api.conflict'
   // Cache operations
@@ -104,6 +109,7 @@ export type EventType =
   | 'sync.conflict'
   // Overlay operations
   | 'overlay.commit'
+  | 'overlay.commit.rate' // t/4258/t/4281: commits-per-user-per-hour for the C3 scheduler, so a sustained-burst user is measurable before it exhausts the GitHub call budget
   // Storage / IO
   | 'storage.mode'
   | 'storage.fallback'
@@ -114,6 +120,7 @@ export type EventType =
   | 'io.data-loss'    // t/1627: atomicWriteSync could not persist; new content preserved at tmpPath
   | 'io.lock-holder'  // t/2544: lock holder identified on EPERM exhaustion (handle.exe / unavailable fallback)
   | 'io.tmp-orphan'   // t/2555: stranded .tmp/.tmp2 file detected at startup sweep (recovered or preserved)
+  | 'io.contention'   // t/3415: a same-id save/load op waited for an in-flight op on the same id
   // Lock instrumentation
   | 'lock.acquire_attempt'
   | 'lock.acquired'
@@ -161,6 +168,14 @@ export type EventType =
   | 'embed.load-failure'
   // Judge (turn validator)
   | 'judge.skipped'
+  // Server process lifecycle (t/3724): one boot event correlating pid/build/restart-trigger
+  // discovery — distinguishes a routine restart from a crash from a scale-to-zero cycle.
+  | 'server.started'
+  // Inquiry job lifecycle (t/3724) — creation and the terminal not-found case, so a 404's
+  // fallback outcome is a dump grep instead of an inference from client-side symptoms alone.
+  // 'inquiry.abandoned' is deferred until t/3728's job persistence lands (t/3724#1).
+  | 'inquiry.created'
+  | 'inquiry.not_found'
   // System
   | 'system.error'
   | 'system.info'

@@ -15,6 +15,7 @@ import { filterByExclusionRatio, type ExclusionFilterResult } from './exclusionG
 import { POV_PREFIXES } from './nodeIdUtils.js';
 import { loadProvisionalWeights } from './phaseTransitions.js';
 import { WELL_TESTED_EXCLUSION, isReeligible } from './debateTested.js';
+import { applyUnderTestedBoost, type UnderTestedBoostConfig, type UnderTestedBoostResult } from './wellTestedSelection.js';
 
 export interface NodeRelevanceScore {
   nodeId: string;
@@ -52,7 +53,12 @@ export interface RelevanceOptions {
   greatestHitsExclude?: Set<string>;
   /** Well-tested exclusion lever — downweights or excludes well_tested nodes (Phase 3, t/1587). */
   wellTested?: WellTestedConfig;
+  /** Under-tested boost — lifts near-threshold untested/cited nodes so they win selection slots. */
+  underTestedBoost?: UnderTestedBoostConfig;
 }
+
+export type { UnderTestedBoostConfig, UnderTestedBoostResult, TestingSelectionSummary } from './wellTestedSelection.js';
+export { excludeWellTestedModeOptions, summarizeTestingSelection } from './wellTestedSelection.js';
 
 export interface SituationBranchBoostConfig {
   /** Score boost for nodes in topic-relevant branches (default 0.06). */
@@ -235,6 +241,11 @@ export function selectRelevantNodes(
     _lineageBoostResult = { boostedNodeIds: boostedIds, promotedNodeIds: promotedIds, promotedCount: promotedIds.length };
   }
 
+  // Under-tested boost (exclude-well-tested mode) — see wellTestedSelection.ts.
+  const _underTestedBoostResult: UnderTestedBoostResult | undefined = opts.underTestedBoost
+    ? applyUnderTestedBoost(povNodes, effectiveScores, threshold, opts.underTestedBoost)
+    : undefined;
+
   // Pre-filter set: well-tested hard-excludes (t/1981 leak fix) + greatest-hits (t/1438).
   // Building as a pre-filter ensures excluded nodes can't re-enter via minPerCategory refill
   // or POV-diversity floor (the former score=0 approach had both leak paths).
@@ -378,7 +389,19 @@ export function selectRelevantNodes(
     sliced = maxTotal != null ? result.slice(0, maxTotal) : result;
   }
 
-  // Stash diagnostics on the result array for callers that want it
+  // Apply exclusion ratio filter when embeddings and query vector are provided
+  if (opts.nodeEmbeddings && opts.queryVector) {
+    const nodeIds = sliced.map(s => s.node.id);
+    const exclusionResult = filterByExclusionRatio(nodeIds, opts.queryVector, opts.nodeEmbeddings);
+    if (exclusionResult.demoted.length > 0) {
+      const passedSet = new Set(exclusionResult.passed);
+      sliced = sliced.filter(s => passedSet.has(s.node.id));
+    }
+    (sliced as ScoredPovNode[] & { _exclusionFilter?: ExclusionFilterResult })._exclusionFilter = exclusionResult;
+  }
+
+  // Stash diagnostics on the result array for callers that want it. Done AFTER the exclusion-ratio
+  // filter: its .filter() returns a new array, which previously dropped every stash made before it.
   if (_lineageBoostResult) {
     (sliced as ScoredPovNode[] & { _lineageBoost?: LineageBoostResult })._lineageBoost = _lineageBoostResult;
   }
@@ -391,16 +414,8 @@ export function selectRelevantNodes(
   if (_wellTestedResult) {
     (sliced as ScoredPovNode[] & { _wellTested?: WellTestedExclusionResult })._wellTested = _wellTestedResult;
   }
-
-  // Apply exclusion ratio filter when embeddings and query vector are provided
-  if (opts.nodeEmbeddings && opts.queryVector) {
-    const nodeIds = sliced.map(s => s.node.id);
-    const exclusionResult = filterByExclusionRatio(nodeIds, opts.queryVector, opts.nodeEmbeddings);
-    if (exclusionResult.demoted.length > 0) {
-      const passedSet = new Set(exclusionResult.passed);
-      sliced = sliced.filter(s => passedSet.has(s.node.id));
-    }
-    (sliced as ScoredPovNode[] & { _exclusionFilter?: ExclusionFilterResult })._exclusionFilter = exclusionResult;
+  if (_underTestedBoostResult) {
+    (sliced as ScoredPovNode[] & { _underTestedBoost?: UnderTestedBoostResult })._underTestedBoost = _underTestedBoostResult;
   }
 
   return sliced;
@@ -434,6 +449,11 @@ export function buildSituationRootLookup(
   for (const n of nodes) findRoot(n.id);
   return rootCache;
 }
+
+/** Gap below threshold that signals out-of-coverage topics (t/3412).
+ *  When top situation score < threshold − NO_SIT_COVERAGE_MARGIN, the min-floor
+ *  backfill is skipped and 0 situations are injected to avoid misleading grounding. */
+export const NO_SIT_COVERAGE_MARGIN = 0.15;
 
 /**
  * Select relevant situation nodes based on similarity threshold.
@@ -541,7 +561,11 @@ export function selectRelevantSituationNodes(
     .sort((a, b) => b.score - a.score || a.node.id.localeCompare(b.node.id));
 
   const aboveThreshold = scored.filter(s => s.score >= threshold);
-  const selected = aboveThreshold.length >= min
+  const topScore = scored[0]?.score ?? 0;
+  // t/3412: when top score is far below threshold the topic has no taxonomy coverage —
+  // skip min-floor backfill to avoid injecting misleading situations.
+  const outOfCoverage = topScore < threshold - NO_SIT_COVERAGE_MARGIN;
+  const selected = outOfCoverage || aboveThreshold.length >= min
     ? aboveThreshold
     : scored.slice(0, Math.max(min, aboveThreshold.length));
 
@@ -855,6 +879,8 @@ export interface TopicConstraintFilterConfig {
   boostIncrement: number;
   boostCap: number;
   minPerCategory: number;
+  /** Cosine similarity threshold for off_scope_topics embedding demotion. Default 0.35. */
+  offScopeEmbeddingThreshold: number;
 }
 
 export interface TopicConstraintFilterResult {
@@ -868,6 +894,11 @@ export function filterByTopicConstraints(
   nodes: ScoredPovNode[],
   scope: TopicScope | null | undefined,
   config?: Partial<TopicConstraintFilterConfig>,
+  /** Pre-computed embedding vectors for each off_scope_topic string (same order). When provided
+   *  alongside nodeEmbeddings, cosine similarity replaces 4-char stem matching for off-scope demotion. */
+  offScopeVectors?: number[][],
+  /** Node embeddings keyed by node ID — the same object as engine.taxonomy.embeddings. */
+  nodeEmbeddings?: Record<string, { pov: string; vector: number[] }>,
 ): TopicConstraintFilterResult {
   if (!scope) return { nodes, demoted: [], boosted: [], restorations: [] };
 
@@ -875,6 +906,8 @@ export function filterByTopicConstraints(
   const boostIncrement = config?.boostIncrement ?? 0.1;
   const boostCap = config?.boostCap ?? 1.5;
   const minPerCat = config?.minPerCategory ?? 3;
+  const embeddingThreshold = config?.offScopeEmbeddingThreshold ?? 0.35;
+  const useEmbedding = (offScopeVectors?.length ?? 0) > 0 && nodeEmbeddings != null;
 
   const isLowRisk = scope.risk_level === 'low' || scope.risk_level === 'medium';
   const excludedTerms = scope.excluded_scenarios
@@ -912,13 +945,28 @@ export function filterByTopicConstraints(
       }
     }
 
-    if (!reason && offScopeTerms.length > 0) {
-      let matches = 0;
-      for (const term of offScopeTerms) {
-        if (desc.includes(term)) matches++;
-      }
-      if (matches >= 3) {
-        reason = `off-scope: matches ${matches} off-scope topic terms`;
+    if (!reason) {
+      if (useEmbedding) {
+        const nodeVec = nodeEmbeddings![entry.node.id]?.vector;
+        if (nodeVec) {
+          let maxSim = 0;
+          for (const vec of offScopeVectors!) {
+            const sim = cosineSimilarity(nodeVec, vec);
+            if (sim > maxSim) maxSim = sim;
+          }
+          if (maxSim >= embeddingThreshold) {
+            reason = `off-scope: embedding similarity ${maxSim.toFixed(3)} exceeds threshold ${embeddingThreshold}`;
+          }
+        }
+        // No node embedding available → skip demotion for this node (conservative: don't demote on missing data)
+      } else if (offScopeTerms.length > 0) {
+        let matches = 0;
+        for (const term of offScopeTerms) {
+          if (desc.includes(term)) matches++;
+        }
+        if (matches >= 3) {
+          reason = `off-scope: matches ${matches} off-scope topic terms`;
+        }
       }
     }
 

@@ -87,7 +87,7 @@ function Invoke-OrgStanceExtraction {
     # ── Resolve paths + registries ───────────────────────────────────────
     $sourcesRoot = Get-SourcesDir
     if (-not (Test-Path $sourcesRoot)) {
-        throw (New-ActionableError `
+        throw (New-ActionableError -AsErrorRecord `
             -Goal 'Extract org stance claims' `
             -Problem "Sources directory not found: $sourcesRoot" `
             -Location 'Invoke-OrgStanceExtraction' `
@@ -141,15 +141,22 @@ function Invoke-OrgStanceExtraction {
     $skippedAlreadyDone = 0
     $skippedNoOrg      = 0
 
+    # duplicate_of (t/4337 C1): an edge to a marked copy is read through its canonical doc, and one
+    # org reads each resolved doc once. Existing claims keep the ids they were extracted under, so
+    # "covered" accepts either the exact or the resolved id (spec 6.4).
+    $resolution = Get-SourceResolution -SourcesDir $sourcesRoot
+    $queued = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     foreach ($e in $approved) {
         $orgId    = [string]$e.source
-        $sourceId = [string]$e.target
+        $exactId  = [string]$e.target
+        $sourceId = Resolve-SourceId -Resolution $resolution -Id $exactId
         $key      = "$orgId::$sourceId"
 
-        if (-not $Force -and $covered.ContainsKey($key)) {
+        if (-not $Force -and ($covered.ContainsKey($key) -or $covered.ContainsKey("$orgId::$exactId"))) {
             $skippedAlreadyDone++
             continue
         }
+        if (-not $queued.Add($key)) { $skippedAlreadyDone++; continue }
 
         if (-not $orgById.ContainsKey($orgId)) {
             $skippedNoOrg++
@@ -201,7 +208,9 @@ function Invoke-OrgStanceExtraction {
     $moduleRoot = $script:ModuleRoot
     $promptSubs = [System.Collections.Generic.List[PSObject]]::new()
     foreach ($item in $workItems) {
-        $docText = Get-Content $item.Snapshot -Raw
+        # Inline base64 images stripped BEFORE truncating, or the window can be mostly base64 and the
+        # model invents its claims (t/4385).
+        $docText = Read-SnapshotForModel -Path $item.Snapshot -CallerName 'Invoke-OrgStanceExtraction'
         if ($docText.Length -gt $MaxDocChars) { $docText = $docText.Substring(0, $MaxDocChars) }
         $rendered = Get-Prompt -Name 'org-stance-extraction' -Replacements @{
             org_name = $item.OrgName
@@ -306,6 +315,13 @@ function Invoke-OrgStanceExtraction {
                             source_id             = $item.SourceId
                             text                  = [string]$c.text
                             canonical_proposition = [string]$c.canonical_proposition
+                            # anchors (t/4482): FORENSIC/ADDITIVE, NO consumer branches on it yet. THE
+                            # EXEMPTION LAPSES the moment any code path reads anchors to make a decision
+                            # (display, matching, filtering) — see lib/ai-client/types.ts for the model.
+                            # Wrapped in an outer @(): "$x = if (cond) {@(one-elem)} else {@()}" unwraps a
+                            # single-element array to its scalar (an if-as-value PowerShell gotcha, distinct
+                            # from the usual @()-enumeration one) — caught by this PR's own anchors test.
+                            anchors               = @(if ($c.PSObject.Properties['anchors']) { @($c.anchors | ForEach-Object { [string]$_ }) } else { @() })
                             polarity              = [string]$c.polarity
                             extraction_confidence = [double]$c.extraction_confidence
                             extracted_at          = (Get-Date).ToString('o')
@@ -392,6 +408,13 @@ function Invoke-OrgStanceExtraction {
                             source_id             = $item.SourceId
                             text                  = [string]$c.text
                             canonical_proposition = [string]$c.canonical_proposition
+                            # anchors (t/4482): FORENSIC/ADDITIVE, NO consumer branches on it yet. THE
+                            # EXEMPTION LAPSES the moment any code path reads anchors to make a decision
+                            # (display, matching, filtering) — see lib/ai-client/types.ts for the model.
+                            # Wrapped in an outer @(): "$x = if (cond) {@(one-elem)} else {@()}" unwraps a
+                            # single-element array to its scalar (an if-as-value PowerShell gotcha, distinct
+                            # from the usual @()-enumeration one) — caught by this PR's own anchors test.
+                            anchors               = @(if ($c.PSObject.Properties['anchors']) { @($c.anchors | ForEach-Object { [string]$_ }) } else { @() })
                             polarity              = [string]$c.polarity
                             extraction_confidence = [double]$c.extraction_confidence
                             extracted_at          = (Get-Date).ToString('o')
@@ -413,6 +436,26 @@ function Invoke-OrgStanceExtraction {
     }
 
     Write-Progress -Id $ProgressId -Activity 'Extracting stance claims' -Completed
+
+    # ── text_verbatim (t/4382) ───────────────────────────────────────────
+    # Computed here, after collection, so both the sequential and the parallel path get it (the
+    # parallel runspaces can't call module helpers). FORENSIC FIELD: NO consumer branches on
+    # text_verbatim. THE EXEMPTION LAPSES the moment a consumer branches on it (root AGENTS.md, T0).
+    # It records whether `text` is a verbatim span of the source snapshot (Test-StanceTextVerbatim);
+    # a paraphrase passed downstream as a quote can blur Invoke-OrgClaimMatching's polarity signal.
+    $snapshotBySource = @{}; foreach ($w in @($workItems)) { $snapshotBySource[[string]$w.SourceId] = [string]$w.Snapshot }
+    $snapshotText = @{}; $notVerbatim = 0
+    foreach ($c in @($newClaims)) {
+        $sp = $snapshotBySource[[string]$c.source_id]
+        if ($sp -and -not $snapshotText.ContainsKey($sp)) { $snapshotText[$sp] = [System.IO.File]::ReadAllText($sp) }
+        $isVerbatim = [bool]($sp -and (Test-StanceTextVerbatim -Text ([string]$c.text) -Snapshot $snapshotText[$sp]))
+        $c | Add-Member -NotePropertyName 'text_verbatim' -NotePropertyValue $isVerbatim -Force
+        if (-not $isVerbatim) {
+            $notVerbatim++
+            $t = [string]$c.text; $preview = if ($t.Length -gt 80) { $t.Substring(0, 80) + '…' } else { $t }
+            Write-Warning "Invoke-OrgStanceExtraction: claim text for $($c.org_id)::$($c.source_id) is not a verbatim span of its snapshot (paraphrase?): '$preview'"
+        }
+    }
 
     # ── Merge + persist ──────────────────────────────────────────────────
     $writtenNew   = @($newClaims).Count

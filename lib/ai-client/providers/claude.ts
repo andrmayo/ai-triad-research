@@ -2,8 +2,38 @@
 // Licensed under the MIT License. See LICENSE file in the project root.
 
 import { ActionableError } from '../../debate/errors.js';
-import { withTimeout, makeFetchSignal } from '../retry.js';
-import type { FetchFn, GenerateOptions, ProviderResult, ToolCall } from '../types.js';
+import { makeFetchSignal } from '../retry.js';
+import { fetchWithDiagnostics } from '../instrumentation.js';
+import type { FetchFn, GenerateOptions, ProviderResult, ProviderCallDiagnostics, ToolCall } from '../types.js';
+import { normalizeStopReason } from './stopReason.js';
+import { getGlobalRecorder } from '../../flight-recorder/index.js';
+
+// t/3942: current Claude models (Opus 4.7+, Sonnet 5+, Fable) return 400 "`temperature` is
+// deprecated for this model" for ANY temperature. The desktop path always passes one (default 0.7),
+// so without this memo every call paid a rejected request plus a retry. Per-process, per apiModelId:
+// the first rejection is logged once and recorded here; later calls omit temperature up front.
+// Deliberately NOT an ai-models.json field: that is a config-schema change (mandatory SO class).
+const samplingRejectedModels = new Set<string>();
+
+/** Test-only: clear the per-process sampling-rejection memo. */
+export function _resetClaudeSamplingMemoForTests(): void {
+  samplingRejectedModels.clear();
+}
+
+function sendsTemperature(opts: GenerateOptions, apiModelId: string): boolean {
+  return opts.temperature != null && !samplingRejectedModels.has(apiModelId);
+}
+
+/** Record the rejection and log it once (Fallback-Path Logging): later calls skip silently. */
+function memoSamplingRejection(apiModelId: string, dropped: unknown, bodyText: string): void {
+  samplingRejectedModels.add(apiModelId);
+  getGlobalRecorder()?.record({
+    type: 'ai.fallback',
+    component: 'ai-client.claude',
+    level: 'warn',
+    message: `Claude model "${apiModelId}" rejected temperature=${String(dropped)} — retrying without it; later calls to this model omit temperature for the rest of the process. API: ${bodyText.slice(0, 200)}`,
+  });
+}
 
 export async function generateViaClaude(
   fetchFn: FetchFn,
@@ -23,8 +53,8 @@ export async function generateViaClaude(
     max_tokens: opts.maxTokens ?? 8192,
     messages: [{ role: 'user', content: userContent }],
   };
-  // Only include temperature when explicitly requested — some models (e.g. claude-opus-4-7) reject it
-  if (opts.temperature != null) {
+  // Only include temperature when explicitly requested, and never for a model already known to reject it
+  if (sendsTemperature(opts, apiModelId)) {
     reqBody.temperature = opts.temperature;
   }
   if (opts.systemMessage) {
@@ -44,14 +74,12 @@ export async function generateViaClaude(
     'anthropic-version': '2023-06-01',
   };
 
-  const response = await fetchFn('https://api.anthropic.com/v1/messages', {
+  const { response, bodyText, diagnostics } = await fetchWithDiagnostics(fetchFn, 'https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers,
     body: JSON.stringify(reqBody),
     signal: makeFetchSignal(timeoutMs, opts.signal),
-  });
-
-  const bodyText = await withTimeout(response.text(), 180_000, 'Reading Claude response');
+  }, 180_000, 'Reading Claude response');
 
   if (response.status === 429 || response.status === 503) {
     throw new ActionableError({
@@ -61,16 +89,16 @@ export async function generateViaClaude(
       nextSteps: ['Wait a minute and retry', 'Switch to a different AI provider (Settings → AI Model)', 'Check API quota'],
     });
   }
-  // Some models (e.g. claude-opus-4-7) reject temperature — retry without it
+  // Some models (e.g. claude-opus-4-7) reject temperature: retry without it, and memoise (t/3942)
   if (response.status === 400 && reqBody.temperature != null && bodyText.includes('temperature')) {
+    memoSamplingRejection(apiModelId, reqBody.temperature, bodyText);
     delete reqBody.temperature;
-    const retryResponse = await fetchFn('https://api.anthropic.com/v1/messages', {
+    const { response: retryResponse, bodyText: retryBodyText, diagnostics: retryDiagnostics } = await fetchWithDiagnostics(fetchFn, 'https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers,
       body: JSON.stringify(reqBody),
       signal: makeFetchSignal(timeoutMs, opts.signal),
-    });
-    const retryBodyText = await withTimeout(retryResponse.text(), 180_000, 'Reading Claude retry response');
+    }, 180_000, 'Reading Claude retry response');
     if (!retryResponse.ok) {
       throw new ActionableError({
         goal: 'Generate text via Claude',
@@ -79,7 +107,7 @@ export async function generateViaClaude(
         nextSteps: ['Check your API key', 'Verify the model ID', 'Try a different model'],
       });
     }
-    return parseClaudeResponse(retryBodyText);
+    return parseClaudeResponse(retryBodyText, retryDiagnostics, reqBody.max_tokens as number);
   }
   // t/3020: Claude returns HTTP 400 `invalid_request_error` for MONTHLY QUOTA EXHAUSTION (not an
   // auth/model problem) — e.g. "You have reached your specified API usage limits. You will regain
@@ -109,12 +137,14 @@ export async function generateViaClaude(
     });
   }
 
-  return parseClaudeResponse(bodyText);
+  return parseClaudeResponse(bodyText, diagnostics, reqBody.max_tokens as number);
 }
 
-function parseClaudeResponse(bodyText: string): ProviderResult {
+function parseClaudeResponse(bodyText: string, diagnostics: ProviderCallDiagnostics, maxTokensSent: number): ProviderResult {
   let json: {
-    content?: { type: string; text?: string; id?: string; name?: string; input?: Record<string, unknown> }[];
+    content?: { type: string; text?: string; thinking?: string; data?: string; id?: string; name?: string; input?: Record<string, unknown> }[];
+    stop_reason?: string;
+    model?: string; // provider-reported served identity (t/3677)
     usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number };
   };
   try {
@@ -127,7 +157,9 @@ function parseClaudeResponse(bodyText: string): ProviderResult {
       nextSteps: ['Retry the request', 'Check the API key and model ID'],
     });
   }
-  if (!json.content?.length) {
+  // A refusal may carry no content blocks (t/3942): let it through so the caller sees
+  // stopReason 'content_filter' and raises the content-policy error, not a misleading "No content".
+  if (!json.content?.length && json.stop_reason !== 'refusal') {
     throw new ActionableError({
       goal: 'Generate text via Claude',
       problem: `No content in Claude response: ${bodyText.slice(0, 300)}`,
@@ -135,8 +167,9 @@ function parseClaudeResponse(bodyText: string): ProviderResult {
       nextSteps: ['Retry the request', 'Try a different model'],
     });
   }
-  const text = json.content.filter(c => c.type === 'text').map(c => c.text ?? '').join('');
-  const toolUseBlocks = json.content.filter(c => c.type === 'tool_use');
+  const blocks = json.content ?? [];
+  const text = blocks.filter(c => c.type === 'text').map(c => c.text ?? '').join('');
+  const toolUseBlocks = blocks.filter(c => c.type === 'tool_use');
   const toolCalls: ToolCall[] | undefined = toolUseBlocks.length > 0
     ? toolUseBlocks.map(c => ({
         name: c.name!,
@@ -151,5 +184,45 @@ function parseClaudeResponse(bodyText: string): ProviderResult {
     cachedTokens: (u.cache_read_input_tokens ?? 0) || undefined,
     totalTokens: (u.input_tokens ?? 0) + (u.output_tokens ?? 0) || undefined,
   } : undefined;
-  return { text, usage, toolCalls };
+  const rawStopReason = json.stop_reason ?? undefined;
+  const outputDiagnostics = claudeOutputDiagnostics(blocks, text, u?.output_tokens, rawStopReason, maxTokensSent);
+  return {
+    text, usage, toolCalls, stopReason: normalizeStopReason(rawStopReason), rawStopReason,
+    diagnostics: { ...diagnostics, ...outputDiagnostics }, providerReportedModel: json.model,
+  };
+}
+
+const utf8Bytes = (s: string): number => new TextEncoder().encode(s).length;
+
+/**
+ * Output-budget forensics for a Claude response (t/4118): enough for a flight-recorder reader to tell
+ * thinking exhaustion apart from a long answer without byte arithmetic. Recorded only; nothing branches
+ * on it (see ProviderCallDiagnostics). It is NOT thrown as an error here, unlike moonshot.ts: both
+ * runtimes attach `diagnostics` to the FR only on a successful call, so a throw would drop these exact
+ * fields in the case they exist for. Callers still raise their own truncation error on stopReason.
+ */
+export function claudeOutputDiagnostics(
+  blocks: { type: string; thinking?: string; data?: string }[],
+  text: string,
+  outputTokens: number | undefined,
+  rawStopReason: string | undefined,
+  maxTokensSent: number,
+): Partial<ProviderCallDiagnostics> {
+  const thinking = blocks.filter((c) => c.type === 'thinking' || c.type === 'redacted_thinking');
+  const thinkingBytes = thinking.reduce((n, c) => n + utf8Bytes(c.thinking ?? c.data ?? ''), 0);
+  const textBytes = utf8Bytes(text);
+  const total = thinkingBytes + textBytes;
+  const thinkingByteShare = total > 0 ? Math.round((thinkingBytes / total) * 100) / 100 : undefined;
+  const out: Partial<ProviderCallDiagnostics> = {
+    rawStopReason, maxTokensSent, outputTokens, thinkingBlocks: thinking.length, thinkingBytes, thinkingByteShare,
+  };
+  if (rawStopReason === 'max_tokens') {
+    const used = `${outputTokens ?? 'unknown'} of max_tokens ${maxTokensSent} output tokens used`;
+    const pct = Math.round((thinkingByteShare ?? 0) * 100);
+    const split = `thinking ${thinkingBytes} bytes in ${thinking.length} block(s) vs ${textBytes} bytes of text`;
+    out.truncationCause = thinking.length > 0 && (thinkingByteShare ?? 0) >= 0.5
+      ? `Thinking exhausted the output budget: ${used}; thinking was ${pct}% of the output (${split}). Raise maxTokens for thinking models (t/4117) or use a non-thinking model.`
+      : `A long answer exhausted the output budget: ${used}; thinking was ${pct}% of the output (${split}). Raise maxTokens or ask for a shorter answer.`;
+  }
+  return out;
 }

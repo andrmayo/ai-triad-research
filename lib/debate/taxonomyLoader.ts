@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Jeffrey Snover. All rights reserved.
+﻿// Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 // Licensed under the MIT License. See LICENSE file in the project root.
 
 /**
@@ -13,7 +13,10 @@ import type { PolicyRef, SituationStatements } from './taxonomyContext.js';
 import { ActionableError } from './errors.js';
 import { parseNpy, extractNodeVectors } from '../npy.js';
 import { getGlobalRecorder } from '../flight-recorder/index.js';
+import { stripDataUris } from './stripDataUris.js';
 import { fetchUrlForPrompt } from '../url-fetch/fetchUrlForPrompt.js';
+import { buildSupersessionIndex } from './supersession.js';
+import { repairSnapshotMojibake } from '../sanitize/repairSnapshotMojibake.js';
 
 // ── Types ────────────────────────────────────────────────
 
@@ -31,15 +34,39 @@ export interface NodeEmbedding {
 }
 
 export interface LoadedTaxonomy {
+  /** Selectable POV nodes only (no superseded_by). */
   accelerationist: { nodes: PovNode[] };
+  /** Selectable POV nodes only (no superseded_by). */
   safetyist: { nodes: PovNode[] };
+  /** Selectable POV nodes only (no superseded_by). */
   skeptic: { nodes: PovNode[] };
   situations: { nodes: SituationNode[] };
+  /** Selectable edge set — both source and target are non-superseded. Default for all consumers. */
   edges: EdgesFile | null;
+  /** Full edge set including edges to/from superseded nodes. Use for history, display and QBAF readers. */
+  allEdges: EdgesFile | null;
+  /** Embeddings for selectable nodes only. Superseded node embeddings are excluded. */
   embeddings: Record<string, NodeEmbedding>;
   policyRegistry: PolicyRef[];
   /** Lineage category data (L1 + L2 cluster mapping). Absent if file not found. */
   lineageCategories?: LineageCategoryData;
+  /**
+   * All nodes by ID including superseded. Use `.get(id)` when you need the exact stored node
+   * (historical debate citations, audit trails — the node as it was when cited). Never use it
+   * to pick a node for new reasoning; use resolveNode instead.
+   */
+  allNodesById: Map<string, PovNode>;
+  /**
+   * Resolve a node ID to its canonical survivor for new attribution and reasoning.
+   * - Non-superseded node: returns itself.
+   * - Superseded node with a valid chain to a non-superseded node: returns the chain endpoint.
+   * - Superseded node in a cycle or with a dangling target: returns the node itself (WARN at load).
+   * - Unknown ID: returns undefined.
+   *
+   * Contrast with allNodesById.get(id): that returns the exact stored node for historical lookup;
+   * resolveNode follows the chain to give the current canonical node for new reasoning.
+   */
+  resolveNode: (id: string) => PovNode | undefined;
 }
 
 export interface ConflictFile {
@@ -226,6 +253,37 @@ function loadJsonSafe<T>(filePath: string, fallback: T): T {
   }
 }
 
+/** Merge synthetic multi-vector embeddings into the base embedding map in-place. */
+function loadSyntheticEmbeddings(synDir: string, embeddings: Record<string, NodeEmbedding>): void {
+  for (const pov of ['acc', 'saf', 'skp']) {
+    const npyPath = path.join(synDir, `embeddings_${pov}.npy`);
+    const idxPath = path.join(synDir, `index_${pov}.json`);
+    if (!fs.existsSync(npyPath) || !fs.existsSync(idxPath)) continue;
+    const parsed = parseNpy(fs.readFileSync(npyPath));
+    const index = loadJsonSafe<Record<string, { start: number; count: number }>>(idxPath, {});
+    const synVecs = extractNodeVectors(parsed, index, pov);
+    for (const [nodeId, entry] of Object.entries(synVecs)) {
+      if (!entry.vectors?.length) continue;
+      if (embeddings[nodeId]) {
+        embeddings[nodeId].vectors = entry.vectors;
+      } else {
+        embeddings[nodeId] = { pov: entry.pov, vector: entry.vectors[0], vectors: entry.vectors };
+      }
+    }
+  }
+}
+
+/** Normalise the lineage mapping: support both old flat-string and new {l1, l2} value formats. */
+function normalizeLineageMapping(
+  raw: Record<string, string | { l1: string; l2: string }>,
+): Record<string, { l1: string; l2: string }> {
+  const out: Record<string, { l1: string; l2: string }> = {};
+  for (const [name, val] of Object.entries(raw)) {
+    out[name] = typeof val === 'string' ? { l1: val, l2: 'uncategorized' } : val;
+  }
+  return out;
+}
+
 export function loadTaxonomy(repoRoot: string): LoadedTaxonomy {
   const dataRoot = resolveDataRoot(repoRoot);
   const config = loadConfig(repoRoot);
@@ -235,7 +293,7 @@ export function loadTaxonomy(repoRoot: string): LoadedTaxonomy {
   const saf = loadJsonSafe<{ nodes: PovNode[] }>(path.join(taxonomyDir, 'safetyist.json'), { nodes: [] });
   const skp = loadJsonSafe<{ nodes: PovNode[] }>(path.join(taxonomyDir, 'skeptic.json'), { nodes: [] });
   const sit = loadJsonSafe<{ nodes: SituationNode[] }>(path.join(taxonomyDir, 'situations.json'), { nodes: [] });
-  const edges = loadJsonSafe<EdgesFile | null>(path.join(taxonomyDir, 'edges.json'), null);
+  const allEdges = loadJsonSafe<EdgesFile | null>(path.join(taxonomyDir, 'edges.json'), null);
 
   // Embeddings: { model, dimension, node_count, nodes: { [id]: { pov, vector } } }
   const embeddingsRaw = loadJsonSafe<{ nodes?: Record<string, { pov: string; vector: number[] }> }>(
@@ -246,24 +304,7 @@ export function loadTaxonomy(repoRoot: string): LoadedTaxonomy {
 
   // Synthetic multi-vector embeddings (optional — produced by Export-SyntheticEmbeddings)
   const synDir = path.join(taxonomyDir, 'synthetic');
-  for (const pov of ['acc', 'saf', 'skp']) {
-    const npyPath = path.join(synDir, `embeddings_${pov}.npy`);
-    const idxPath = path.join(synDir, `index_${pov}.json`);
-    if (!fs.existsSync(npyPath) || !fs.existsSync(idxPath)) continue;
-
-    const parsed = parseNpy(fs.readFileSync(npyPath));
-    const index = loadJsonSafe<Record<string, { start: number; count: number }>>(idxPath, {});
-    const synVecs = extractNodeVectors(parsed, index, pov);
-
-    for (const [nodeId, entry] of Object.entries(synVecs)) {
-      if (!entry.vectors?.length) continue;
-      if (embeddings[nodeId]) {
-        embeddings[nodeId].vectors = entry.vectors;
-      } else {
-        embeddings[nodeId] = { pov: entry.pov, vector: entry.vectors[0], vectors: entry.vectors };
-      }
-    }
-  }
+  loadSyntheticEmbeddings(synDir, embeddings);
 
   // Policy registry
   const policyRaw = loadJsonSafe<{ policies?: { id: string; action: string; source_povs?: string[] }[] }>(
@@ -284,30 +325,48 @@ export function loadTaxonomy(repoRoot: string): LoadedTaxonomy {
 
   let lineageCategories: LineageCategoryData | undefined;
   if (lineageRaw?.mapping && lineageRaw?.level2_categories) {
-    // Normalize mapping: support both old flat string and new {l1, l2} formats
-    const normalizedMapping: Record<string, { l1: string; l2: string }> = {};
-    for (const [name, val] of Object.entries(lineageRaw.mapping)) {
-      if (typeof val === 'string') {
-        normalizedMapping[name] = { l1: val, l2: 'uncategorized' };
-      } else {
-        normalizedMapping[name] = val;
-      }
-    }
     lineageCategories = {
-      mapping: normalizedMapping,
+      mapping: normalizeLineageMapping(lineageRaw.mapping),
       level2_categories: lineageRaw.level2_categories,
     };
   }
 
+  // ── Supersession: chain resolution + cycle/dangling detection ────────────────
+  const allPovNodes: PovNode[] = [
+    ...(acc.nodes ?? []),
+    ...(saf.nodes ?? []),
+    ...(skp.nodes ?? []),
+  ];
+
+  const warnSupersession = (message: string): void => {
+    getGlobalRecorder()?.record({ type: 'system.error', component: 'taxonomy-loader', level: 'warn', message });
+  };
+
+  const { allNodesById, resolveNode, isSuperseded } = buildSupersessionIndex(allPovNodes, warnSupersession);
+
+  // Filter embeddings: drop superseded POV nodes only; keep all other node types (sit, policy, cc).
+  const selectableEmbeddings: Record<string, NodeEmbedding> = {};
+  for (const [id, emb] of Object.entries(embeddings)) {
+    if (!isSuperseded(id)) selectableEmbeddings[id] = emb;
+  }
+
+  // Build selectable edge set: drop any edge whose source or target is superseded.
+  const edges: EdgesFile | null = allEdges
+    ? { ...allEdges, edges: allEdges.edges.filter(e => !isSuperseded(e.source) && !isSuperseded(e.target)) }
+    : null;
+
   return {
-    accelerationist: { nodes: acc.nodes ?? [] },
-    safetyist: { nodes: saf.nodes ?? [] },
-    skeptic: { nodes: skp.nodes ?? [] },
+    accelerationist: { nodes: (acc.nodes ?? []).filter(n => !n.superseded_by) },
+    safetyist: { nodes: (saf.nodes ?? []).filter(n => !n.superseded_by) },
+    skeptic: { nodes: (skp.nodes ?? []).filter(n => !n.superseded_by) },
     situations: { nodes: sit.nodes ?? [] },
     edges,
-    embeddings,
+    allEdges,
+    embeddings: selectableEmbeddings,
     policyRegistry,
     lineageCategories,
+    allNodesById,
+    resolveNode,
   };
 }
 
@@ -411,7 +470,7 @@ export async function convertToMarkdown(filePath: string): Promise<string> {
 
   if (resolved.endsWith('.md')) {
     try {
-      return fs.readFileSync(fd, 'utf-8');
+      return stripDataUris(repairSnapshotMojibake(fs.readFileSync(fd, 'utf-8')).text).text;
     } finally {
       fs.closeSync(fd);
     }
@@ -453,7 +512,7 @@ export async function htmlToMarkdown(html: string): Promise<string> {
 async function runMarkitdown(filePath: string): Promise<string> {
   const { execFile } = await import('child_process');
   return new Promise((resolve, reject) => {
-    execFile('markitdown', [filePath], { timeout: 30_000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
+    execFile('markitdown', [filePath], { timeout: 30_000, maxBuffer: 10 * 1024 * 1024, windowsHide: true }, (err, stdout) => {
       if (err) return reject(err);
       resolve(stdout);
     });

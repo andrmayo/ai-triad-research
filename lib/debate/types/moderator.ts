@@ -207,6 +207,9 @@ export interface SelectionResult {
     source_round?: number;
   };
   dialectical_diagnostic?: DialecticalDiagnostic;
+  /** Who proposed the intervention (t/3513): the moderator LLM, or the engine's deterministic
+   *  floor when the LLM declined but a measured problem was present. Absent ⇒ 'moderator'. */
+  trigger_source?: 'moderator' | 'engine';
 }
 
 export interface EngineValidationResult {
@@ -276,13 +279,23 @@ export interface ModeratorState {
 
   cooldown_blocked_count: number;
 
+  /** Set once the concluding-phase dormancy check has run (t/3513). Absent on older sessions. */
+  dormancy_checked?: boolean;
+  /** Ledger claim ids the engine floor has already PINned — each claim is pinned once (t/3513). */
+  engine_pinned_claims?: string[];
+
   /** How many times the budget has been refilled (0 = initial budget). */
   budget_epoch: number;
   /** Cooldown gap required after each budget refill — increases with epoch. */
   refill_gap: number;
 
-  /** Crux IDs that have already received a CRUX_FOCUS intervention (fires at most once per crux). */
-  crux_focused_ids?: Set<string>;
+  /**
+   * Crux IDs that have already received a CRUX_FOCUS intervention (fires at most once per crux).
+   * Typed as string[] (not Set) because this field is persisted via JSON.stringify — Set serializes
+   * to {} and is silently lost. Use getFocusedIds() from moderator.ts to read safely, as a saved
+   * {} from a pre-fix session passes nullish guards and must be normalized to [].
+   */
+  crux_focused_ids?: string[];
 
   /** Fraction of identified cruxes each debater has addressed (updated each round). */
   crux_engagement_per_debater?: Record<string, number>;

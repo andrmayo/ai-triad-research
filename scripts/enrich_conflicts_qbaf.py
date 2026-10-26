@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import time
@@ -195,6 +196,109 @@ def _detect_edges(instances):
     return edges
 
 
+# ── Fork-B: deterministic numeric/temporal contradiction detector (t/3302) ────────────────
+# TL's mandatory high-precision complement to the LLM classifier (the naive strawman caught 0/6).
+# Fires ONLY when two within-conflict assertions share a subject AND cite directly incompatible
+# quantities of the SAME kind (percentages, years, or bare numbers). Conservative by design — a miss
+# is fine (the LLM classifier / base prior covers it); a false attack CORRUPTS strength. CL scores
+# its precision/recall separately on the golden (edges carry detector='numeric').
+
+_CC_STOPWORDS = frozenset(
+    "the a an of to in on for and or but with by from as at is are was were be been being this that "
+    "these those it its their his her our your not no than then over under about into within will "
+    "would could should may might can has have had do does did more most less least very".split()
+)
+_CC_WORD_RE = re.compile(r"[a-z]{3,}")
+_CC_PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:%|percent|percentage points?|pp\b)", re.IGNORECASE)
+_CC_YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
+_CC_NUM_RE = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)")
+
+
+def _cc_content_words(text):
+    return {w for w in _CC_WORD_RE.findall((text or "").lower()) if w not in _CC_STOPWORDS}
+
+
+def _cc_percents(text):
+    return {round(float(m.group(1)), 3) for m in _CC_PCT_RE.finditer(text or "")}
+
+
+def _cc_years(text):
+    return {int(m.group(1)) for m in _CC_YEAR_RE.finditer(text or "")}
+
+
+def _cc_bare_numbers(text):
+    """Numbers that are neither a percentage value nor a 4-digit year."""
+    t = text or ""
+    pct_spans = [m.span(1) for m in _CC_PCT_RE.finditer(t)]
+    years = _cc_years(t)
+    out = set()
+    for m in _CC_NUM_RE.finditer(t):
+        if any(s <= m.start(1) < e for (s, e) in pct_spans):
+            continue
+        try:
+            f = float(m.group(1))
+        except ValueError:
+            continue
+        if f == int(f) and int(f) in years:
+            continue
+        out.add(round(f, 3))
+    return out
+
+
+_CC_MAG_RE = re.compile(r"\b(billion|million|trillion|thousand|fold)\b", re.IGNORECASE)
+_CC_CUR_RE = re.compile(r"[$€£]")
+
+
+def _mask_numbers(text):
+    """Replace numeric values (%, years, currency, magnitudes, bare numbers) with a NUM placeholder so an
+    embedding of the result captures the METRIC/subject, not the values (t/3337#5 same-subject gate)."""
+    t = text or ""
+    t = _CC_PCT_RE.sub(" NUM ", t)                       # percentages / 'percent' / pp
+    t = _CC_YEAR_RE.sub(" NUM ", t)                      # years
+    t = re.sub(r"(?<![\w.])\d+(?:\.\d+)?", " NUM ", t)   # bare numbers
+    t = _CC_CUR_RE.sub(" NUM ", t)                       # currency symbols
+    t = _CC_MAG_RE.sub(" NUM ", t)                       # magnitude words
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _detect_numeric_temporal_conflict(text_a, text_b, embedder=None, subject_threshold=0.93):
+    """True iff A and B describe the SAME quantity AND cite directly incompatible values of the same kind.
+
+    Two-stage (t/3337#5, calibrated on the same-doc census — the old ≥3-shared-word subject proxy was
+    0/54 precision, firing on different-subject pairs like "17% postings" vs "24% skills"):
+      1. candidate: >=3 shared content words + a same-kind numeric set (percentages / years / bare;
+         bare needs >=4 shared) non-empty on BOTH sides and disjoint. Same unit-type is enforced by the
+         per-kind branches (a percent can't pair with a bare number).
+      2. same-subject HARD-GATE: mask the numbers, embed both (MiniLM), and fire ONLY if masked-cosine
+         >= subject_threshold (0.93) — i.e. the disjoint numbers describe the same metric, not merely
+         co-occur. embedder is injectable for tests (default = local MiniLM).
+
+    Known v1 residual (accepted, CL t/3337#5): same-metric-DIFFERENT-SCOPE ("top 10%" vs "top 20%") and
+    rounding (63% vs 65%) pass the subject gate — masked-cosine can't separate them; the LLM arbitrates.
+    """
+    shared = _cc_content_words(text_a) & _cc_content_words(text_b)
+    if len(shared) < 3:
+        return False
+    candidate = False
+    pa, pb = _cc_percents(text_a), _cc_percents(text_b)
+    if pa and pb and pa.isdisjoint(pb):
+        candidate = True
+    if not candidate:
+        ya, yb = _cc_years(text_a), _cc_years(text_b)
+        if ya and yb and ya.isdisjoint(yb):
+            candidate = True
+    if not candidate and len(shared) >= 4:
+        na, nb = _cc_bare_numbers(text_a), _cc_bare_numbers(text_b)
+        if na and nb and na.isdisjoint(nb):
+            candidate = True
+    if not candidate:
+        return False
+    # same-subject hard-gate: the numbers must be about the SAME quantity (not just word-overlapping).
+    embedder = embedder or _default_embedder
+    va, vb = embedder([_mask_numbers(text_a), _mask_numbers(text_b)])
+    return _cosine(va, vb) >= subject_threshold
+
+
 def _qbaf_testedness(qbaf, instances):
     """Observability metric for one resolved QBAF (t/3302).
 
@@ -241,12 +345,24 @@ def _qbaf_testedness(qbaf, instances):
     }
 
 
-def _safe_env():
-    """Build a minimal environment for subprocess calls — no API keys leaked."""
+_AI_KEY_VARS = ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "GROQ_API_KEY", "AI_API_KEY")
+
+
+def _safe_env(include_ai_keys=False):
+    """Build a minimal environment for subprocess calls. By default NO API keys are forwarded (the
+    Node qbaf-bridge needs none). include_ai_keys=True additionally forwards the AI backend key vars —
+    REQUIRED for the contradiction-classifier subprocess (_run_cc_shim), which authenticates the LLM
+    call; without them every pair returns 'unresolved' (t/3336 live-run failure). Keys still never reach
+    the bridge call, so this is a scoped forward, not a blanket leak."""
     import os
     allowed = {"PATH", "NODE_PATH", "HOME", "USER", "LANG", "TERM", "SHELL",
                "TMPDIR", "XDG_RUNTIME_DIR", "SYSTEMROOT", "COMSPEC"}
-    return {k: v for k, v in os.environ.items() if k in allowed}
+    env = {k: v for k, v in os.environ.items() if k in allowed}
+    if include_ai_keys:
+        for k in _AI_KEY_VARS:
+            if os.environ.get(k):
+                env[k] = os.environ[k]
+    return env
 
 
 def _run_qbaf_bridge(nodes, edges):
@@ -308,10 +424,11 @@ def _run_qbaf_bridge_batch(batch):
     return [parsed]
 
 
-def enrich_conflict(conflict, node_meta):
+def enrich_conflict(conflict, node_meta, extra_edges=None):
     """Compute QBAF analysis for a single conflict and return the qbaf object.
 
-    Returns None if the conflict doesn't have enough instances for analysis.
+    extra_edges (fork-B semantic-opposition edges, t/3302) are merged after the stance-based edges,
+    deduped on (source, target). Returns None if the conflict has <2 instances.
     """
     instances = conflict.get("instances") or []
     if len(instances) < 2:
@@ -354,8 +471,19 @@ def enrich_conflict(conflict, node_meta):
             node_out["bdi_sub_scores"] = inst["bdi_sub_scores"]
         qbaf_nodes_output.append(node_out)
 
-    # Detect edges
+    # Detect edges (stance-based) + merge fork-B semantic edges (t/3302), deduped on (source,target).
     edges = _detect_edges(instances)
+    if extra_edges:
+        seen = set()
+        for e in edges:
+            seen.add((e["source"], e["target"]))
+            seen.add((e["target"], e["source"]))
+        for e in extra_edges:
+            key = (e["source"], e["target"])
+            if key not in seen:
+                edges.append(e)
+                seen.add(key)
+                seen.add((e["target"], e["source"]))
 
     if not edges:
         # No relationships detected — still useful to record base strengths
@@ -370,7 +498,8 @@ def enrich_conflict(conflict, node_meta):
             "iterations": 0,
         }
 
-    # Return pre-bridge data for batch processing
+    # Return pre-bridge data for batch processing. Provenance fields (detector/edge_origin/confidence)
+    # are persisted in edge_output for audit but stripped from the bridge input (whitelist in main).
     edge_output = []
     for e in edges:
         out = {
@@ -381,6 +510,9 @@ def enrich_conflict(conflict, node_meta):
         }
         if e.get("attack_type"):
             out["attack_type"] = e["attack_type"]
+        for prov in ("detector", "edge_origin", "confidence"):
+            if e.get(prov) is not None:
+                out[prov] = e[prov]
         edge_output.append(out)
 
     return {
@@ -390,6 +522,249 @@ def enrich_conflict(conflict, node_meta):
         "edges": edges,
         "edge_output": edge_output,
     }
+
+
+# ── Fork-B: semantic-opposition edge detection (t/3302, TL-approved seam t/3302#16) ───────
+# Within-conflict pairs with NO stance edge (the recall gap: 97% never attacked) are classified:
+# the deterministic numeric/temporal detector first (high precision), then the LLM contradiction
+# classifier for the rest via the file-based pwsh bridge. contradict->attack, entail->support.
+# Opt-in (--semantic-edges); owner runs the paid classification (--write). CL scores the golden.
+
+_CC_SHIM = _SCRIPT_DIR / "invoke-contradiction-classifier.ps1"
+# Classifier provenance handle (TL GV cond 1, t/3302#24): the ai-usages.json UsageID is the stable
+# id/version for the LLM contradiction classifier (the concrete model resolves from ai-models.json).
+_CC_USAGE_ID = "enrichment.contradiction-classify"
+
+
+def _collect_semantic_candidates(conflict, include_same_doc=False):
+    """Within-conflict pairs that have NO stance-based edge. Returns [{i,j,a,b,same_doc}].
+
+    By default same-doc pairs are skipped (duplicate extractions) except debate: (independent agent
+    positions, t/3214). With include_same_doc=True (fork-B expansion, t/3336) same-doc non-debate pairs
+    are RETAINED and tagged same_doc=True; the caller applies the cosine dedup gate (_apply_samedoc_dedup)
+    to drop near-identical duplicate extractions before classification. Cross-doc pairs are same_doc=False."""
+    instances = conflict.get("instances") or []
+    if len(instances) < 2:
+        return []
+    existing = set()
+    for e in _detect_edges(instances):
+        existing.add((e["source"], e["target"]))
+        existing.add((e["target"], e["source"]))
+    cands = []
+    for i in range(len(instances)):
+        for j in range(i + 1, len(instances)):
+            if (f"inst-{i}", f"inst-{j}") in existing:
+                continue
+            a, b = instances[i], instances[j]
+            doc_a = str(a.get("doc_id") or "")
+            is_same_doc = (a.get("doc_id") == b.get("doc_id")) and not doc_a.startswith("debate:")
+            if is_same_doc and not include_same_doc:
+                continue
+            ta = str(a.get("assertion") or "").strip()
+            tb = str(b.get("assertion") or "").strip()
+            if ta and tb:
+                cands.append({"i": i, "j": j, "a": ta, "b": tb, "same_doc": is_same_doc})
+    return cands
+
+
+def _cosine(u, v):
+    """Cosine similarity of two vectors; 0.0 if either is degenerate."""
+    u = np.asarray(u, dtype=float)
+    v = np.asarray(v, dtype=float)
+    nu = float(np.linalg.norm(u))
+    nv = float(np.linalg.norm(v))
+    if nu == 0.0 or nv == 0.0:
+        return 0.0
+    return float(np.dot(u, v) / (nu * nv))
+
+
+_ST_MODEL = None
+
+
+def _default_embedder(texts):
+    """Encode texts with the local all-MiniLM-L6-v2 model (matches the corpus encoder). Lazy-loaded so
+    the dependency + model load only happen when the same-doc gate is actually used."""
+    global _ST_MODEL
+    if _ST_MODEL is None:
+        from sentence_transformers import SentenceTransformer  # lazy: heavy import, opt-in path only
+        _ST_MODEL = SentenceTransformer("all-MiniLM-L6-v2", trust_remote_code=False)
+    return _ST_MODEL.encode(list(texts), normalize_embeddings=False)
+
+
+def _apply_samedoc_dedup(cands, threshold=0.93, embedder=None):
+    """Drop same-doc candidate pairs whose two assertions are near-identical (cosine >= threshold) —
+    duplicate extractions, not genuine opposition (CL gate t/3336#7; blocks the '54% vs 45%-typo' false
+    attack). Cross-doc pairs (same_doc=False) pass through untouched. embedder(list[str])->list[vec] is
+    injectable for tests (default = local MiniLM). Batch-embeds once."""
+    sd_idx = [k for k, c in enumerate(cands) if c.get("same_doc")]
+    if not sd_idx:
+        return list(cands)
+    embedder = embedder or _default_embedder
+    texts = []
+    for k in sd_idx:
+        texts.append(cands[k]["a"])
+        texts.append(cands[k]["b"])
+    vecs = embedder(texts)
+    drop = set()
+    for m, k in enumerate(sd_idx):
+        if _cosine(vecs[2 * m], vecs[2 * m + 1]) >= threshold:
+            drop.add(k)
+    if drop:
+        _log(f"  Fork-B same-doc dedup: dropped {len(drop)}/{len(sd_idx)} same-doc pair(s) at cosine>={threshold} "
+             f"(near-identical duplicate extractions, t/3336).")
+    return [c for k, c in enumerate(cands) if k not in drop]
+
+
+def _mk_semantic_edge(i, j, detector, edge_type="attacks", confidence=None, classifier=None, tau=None):
+    edge = {
+        "source": f"inst-{i}",
+        "target": f"inst-{j}",
+        "type": edge_type,
+        "weight": 0.6,
+        "detector": detector,      # 'numeric' | 'llm' — provenance for CL scoring + audit
+        "edge_origin": "semantic",
+    }
+    if edge_type == "attacks":
+        edge["attack_type"] = "rebut"
+    if confidence is not None:
+        edge["confidence"] = round(float(confidence), 4)
+    # Provenance (TL GV cond 1, t/3302#24): classifier id/version + operating threshold τ, so a written
+    # edge is auditable + regenerable. Numeric edges carry no classifier (deterministic detector).
+    if classifier is not None:
+        edge["classifier"] = classifier
+    if tau is not None:
+        edge["tau"] = round(float(tau), 4)
+    return edge
+
+
+def _mk_attack_edges(i, j, detector, confidence=None, classifier=None, tau=None):
+    """A contradiction is SYMMETRIC — it tests BOTH claims (TL ruling t/3336#4): emit attack edges in
+    both directions (i->j and j->i) so each endpoint gains an incoming attack (adversarial tier).
+    Entailment stays directional (single support edge) — it is not symmetric."""
+    return [
+        _mk_semantic_edge(i, j, detector, "attacks", confidence, classifier, tau),
+        _mk_semantic_edge(j, i, detector, "attacks", confidence, classifier, tau),
+    ]
+
+
+def _run_cc_shim(batch_conflicts, mode="per-conflict", temperature=0.0):
+    """FILE-BASED bridge to invoke-contradiction-classifier.ps1 (pair texts via a temp-file PATH, NOT
+    inline — quotes/newlines shell-corruption hazard, TL t/3302#16). Returns {id: {label,confidence}}.
+    Fallback: any failure -> {} (no LLM edges) + WARN; never fabricates edges."""
+    import os
+    import tempfile
+    if not batch_conflicts:
+        return {}
+    tmp = None
+    out_tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(suffix=".json", prefix="cc-batch-")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"conflicts": batch_conflicts}, fh, ensure_ascii=False)
+        # Results come back via a FILE (-OutPath), not stdout: the shim's Write-Warning fallback notices
+        # render onto stdout ahead of the JSON and break json.loads (t/3302 live-run failure).
+        out_fd, out_tmp = tempfile.mkstemp(suffix=".json", prefix="cc-out-")
+        os.close(out_fd)
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(_CC_SHIM),
+             "-InputPath", tmp, "-Mode", mode, "-Temperature", str(temperature), "-OutPath", out_tmp],
+            capture_output=True, text=True, timeout=600, cwd=str(_PROJECT_ROOT),
+            env=_safe_env(include_ai_keys=True),  # classifier authenticates the LLM call (t/3336)
+        )
+        if result.returncode != 0:
+            _log(f"  WARN: contradiction-classifier exited {result.returncode} "
+                 f"({result.stderr.strip()[:200]}) — 0 semantic LLM edges (fallback, t/3302).")
+            return {}
+        with open(out_tmp, "r", encoding="utf-8") as fh:
+            parsed = json.loads(fh.read())
+        out = {}
+        for r in parsed.get("results", []):
+            out[str(r.get("id"))] = {"label": r.get("label"), "confidence": r.get("confidence", 0.0),
+                                     "method": r.get("method")}
+        return out
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as exc:
+        _log(f"  WARN: contradiction-classifier failed ({exc}) — 0 semantic LLM edges (fallback, t/3302).")
+        return {}
+    finally:
+        for _p in (tmp, out_tmp):
+            if _p and os.path.exists(_p):
+                try:
+                    os.remove(_p)
+                except OSError:
+                    pass
+
+
+def detect_semantic_edges(to_process, min_confidence=0.0, mode="per-conflict", cc_runner=None,
+                          predictions_sink=None, include_same_doc=False, dedup_threshold=0.93,
+                          embedder=None):
+    """Fork-B semantic edges (t/3302). Numeric/temporal detector first (high precision), then the LLM
+    classifier for the rest. Contradictions emit SYMMETRIC attack edges (both endpoints tested, TL
+    ruling t/3336#4); entailment emits a single directional support edge. Returns {conflict_index:
+    [edge,...]}. cc_runner is injectable for tests.
+
+    include_same_doc (t/3336): relax the same-doc skip and run CL's cosine dedup gate — retain same-doc
+    non-debate pairs EXCEPT near-identical duplicate extractions (cosine >= dedup_threshold). embedder
+    is injectable for tests (default = local MiniLM).
+
+    predictions_sink (t/3336 benefit arm): if a list is passed, EVERY (post-dedup) candidate pair's raw
+    disposition is appended as {conflict_id, source, target, predicted, confidence, method} — numeric as
+    contradict/1.0/numeric and the rest as the classifier's raw (pre-τ) label. CL applies τ=0.90 and
+    recomputes qbaf.testedness for the node-tier Δ. The candidate set == the --write set."""
+    cc_runner = cc_runner or _run_cc_shim
+    edges_by_ci = {}
+    batch_conflicts = []
+    llm_pairs = {}  # pair-id -> (ci, i, j)
+    ci_to_cid = {}  # ci -> conflict id, for predictions_sink attribution
+
+    for ci, (_path, conflict) in enumerate(to_process):
+        cands = _collect_semantic_candidates(conflict, include_same_doc=include_same_doc)
+        if include_same_doc:
+            cands = _apply_samedoc_dedup(cands, threshold=dedup_threshold, embedder=embedder)
+        if not cands:
+            continue
+        cid = str(conflict.get("claim_id") or ci)
+        ci_to_cid[ci] = cid
+        conflict_pairs = []
+        for c in cands:
+            if _detect_numeric_temporal_conflict(c["a"], c["b"], embedder=embedder):
+                edges_by_ci.setdefault(ci, []).extend(
+                    _mk_attack_edges(c["i"], c["j"], "numeric", 1.0, tau=min_confidence))
+                if predictions_sink is not None:
+                    predictions_sink.append({
+                        "conflict_id": cid, "source": f"inst-{c['i']}", "target": f"inst-{c['j']}",
+                        "predicted": "contradict", "confidence": 1.0, "method": "numeric"})
+            else:
+                pid = f"{ci}:{c['i']}:{c['j']}"
+                conflict_pairs.append({"id": pid, "a": c["a"], "b": c["b"]})
+                llm_pairs[pid] = (ci, c["i"], c["j"])
+        if conflict_pairs:
+            batch_conflicts.append({"cid": cid, "pairs": conflict_pairs})
+
+    if batch_conflicts:
+        results = cc_runner(batch_conflicts, mode, 0.0)
+        for pid, (ci, i, j) in llm_pairs.items():
+            r = results.get(pid)
+            if predictions_sink is not None:
+                # Raw, pre-τ — CL applies the τ=0.90 rule (contradict AND conf>=0.90 -> attack).
+                predictions_sink.append({
+                    "conflict_id": ci_to_cid.get(ci), "source": f"inst-{i}", "target": f"inst-{j}",
+                    "predicted": (r.get("label") if r else "missing"),
+                    "confidence": (float(r.get("confidence") or 0.0) if r else 0.0),
+                    "method": ((r.get("method") or "llm") if r else "missing")})
+            if not r:
+                continue
+            conf = float(r.get("confidence") or 0.0)
+            if conf < min_confidence:
+                continue
+            label = r.get("label")
+            if label == "contradict":
+                edges_by_ci.setdefault(ci, []).extend(
+                    _mk_attack_edges(i, j, "llm", conf, classifier=_CC_USAGE_ID, tau=min_confidence))
+            elif label == "entail":
+                edges_by_ci.setdefault(ci, []).append(
+                    _mk_semantic_edge(i, j, "llm", "supports", conf, classifier=_CC_USAGE_ID, tau=min_confidence))
+            # neutral / unresolved / missing -> no edge
+    return edges_by_ci
 
 
 # Resolution margin floor (t/3151, CL neutrality ruling t/3151#2). computed_strength is DF-QuAD
@@ -464,6 +839,23 @@ def main():
                         help="Process a single conflict by claim_id")
     parser.add_argument("--force", action="store_true",
                         help="Recompute QBAF even if already present")
+    parser.add_argument("--semantic-edges", action="store_true",
+                        help="Fork-B (t/3302): add semantic-opposition edges for within-conflict "
+                             "pairs with no stance edge (numeric/temporal detector + LLM classifier)")
+    parser.add_argument("--semantic-min-confidence", type=float, default=0.0,
+                        help="Min LLM confidence to accept a semantic edge (calibrate from CL's P/R curve)")
+    parser.add_argument("--classify-mode", choices=["per-conflict", "per-pair"], default="per-conflict",
+                        help="LLM classify batching mode (per-conflict batch with per-pair fallback)")
+    parser.add_argument("--emit-semantic-predictions", type=str, default="",
+                        help="Benefit-arm dry-run (t/3336): classify all --write candidate pairs and write "
+                             "raw per-pair predictions {conflict_id,source,target,predicted,confidence,method} "
+                             "to this path. No data write. Requires --semantic-edges; ignores --write.")
+    parser.add_argument("--semantic-include-samedoc", action="store_true",
+                        help="Fork-B expansion (t/3336): also consider same-doc non-debate pairs, gated by a "
+                             "cosine dedup (drops near-identical duplicate extractions). Opt-in; off by default.")
+    parser.add_argument("--semantic-dedup-threshold", type=float, default=0.93,
+                        help="Cosine >= this drops a same-doc pair as a duplicate extraction (CL gate, t/3336#7). "
+                             "Only used with --semantic-include-samedoc.")
     args = parser.parse_args()
 
     _log("=" * 60)
@@ -523,13 +915,52 @@ def main():
     # t/3302 observability — aggregate testedness tiers across this run (CL schema t/3302#2).
     tier_counts = {"all_prior": 0, "support_only": 0, "adversarial": 0}
 
+    # Fork-B semantic-opposition pre-pass (t/3302). Computes extra edges per conflict index BEFORE
+    # phase 1 so they merge into the same QBAF graph. Opt-in (--semantic-edges); the LLM path is
+    # paid so the owner runs it under --write.
+    semantic_by_ci = {}
+    if getattr(args, "semantic_edges", False):
+        _emit_path = getattr(args, "emit_semantic_predictions", "") or ""
+        _sink = [] if _emit_path else None
+        _inc_sd = getattr(args, "semantic_include_samedoc", False)
+        _log(f"\n  Fork-B: detecting semantic-opposition edges (mode={args.classify_mode}, "
+             f"min_conf={args.semantic_min_confidence}, include_same_doc={_inc_sd})...")
+        semantic_by_ci = detect_semantic_edges(
+            to_process, min_confidence=args.semantic_min_confidence, mode=args.classify_mode,
+            predictions_sink=_sink, include_same_doc=_inc_sd,
+            dedup_threshold=getattr(args, "semantic_dedup_threshold", 0.93))
+        _n_sem = sum(len(v) for v in semantic_by_ci.values())
+        _log(f"  Fork-B: {_n_sem} semantic edge(s) across {len(semantic_by_ci)} conflict(s).")
+        if _emit_path:
+            # Benefit-arm dry-run (t/3336): dump raw per-pair predictions for CL's node-tier Δ. No data
+            # write — this path exits before the QBAF write phases regardless of --write.
+            _doc = {
+                "_meta": {
+                    "ticket": "t/3336",
+                    "purpose": "benefit-arm corpus predictions (CL scores node-tier Δ vs the ratified bar)",
+                    "candidate_set": "within-conflict pairs with no existing stance edge (== --write set)",
+                    "tau_note": "raw pre-τ predictions; CL applies τ=0.90 (contradict AND conf>=0.90 -> attack)",
+                    "classifier": _CC_USAGE_ID,
+                    "classify_mode": args.classify_mode,
+                    "include_same_doc": _inc_sd,
+                    "dedup_threshold": getattr(args, "semantic_dedup_threshold", 0.93),
+                    "n_predictions": len(_sink),
+                },
+                "predictions": _sink,
+            }
+            with open(_emit_path, "w", encoding="utf-8") as fh:
+                json.dump(_doc, fh, ensure_ascii=False, indent=2)
+            _log(f"  Fork-B benefit arm: wrote {len(_sink)} predictions -> {_emit_path} "
+                 f"(dry-run, no data write). Hand to CL to compute the node-tier Δ.")
+            return
+
     # Phase 1: build local graphs (no subprocess)
     pre_results = []  # (index, path, conflict, pre_data_or_qbaf)
     bridge_batch = []  # items needing bridge computation
     bridge_indices = []  # indices into pre_results for bridge items
 
     for i, (path, conflict) in enumerate(to_process):
-        pre = enrich_conflict(conflict, node_meta)
+        pre = enrich_conflict(conflict, node_meta, extra_edges=semantic_by_ci.get(i))
 
         if pre is None:
             pre_results.append((i, path, conflict, None))
@@ -539,8 +970,10 @@ def main():
             pre_results.append((i, path, conflict, pre))
             bridge_batch.append({
                 "nodes": pre["qbaf_nodes_input"],
+                # Whitelist ONLY the bridge's schema fields — strip attack_type + the fork-B provenance
+                # (detector/edge_origin/confidence), which the DF-QuAD bridge doesn't accept.
                 "edges": [
-                    {k: v for k, v in e.items() if k != "attack_type"}
+                    {"source": e["source"], "target": e["target"], "type": e["type"], "weight": e["weight"]}
                     for e in pre["edges"]
                 ],
             })

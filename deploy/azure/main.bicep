@@ -8,7 +8,7 @@
 // Users enter their own Gemini/Claude/Groq API keys through the app UI.
 // Keys stored in Azure Key Vault via managed identity.
 //
-// Data access: GitHub API-first — reads/writes go to jpsnover/ai-triad-data
+// Data access: GitHub API-first — reads/writes go to AI-Rosetta-Stone/ai-triad-data
 // via GitHub Contents/Trees APIs. No Azure Files, no local git clone.
 //
 // Resources created:
@@ -25,8 +25,19 @@
 @description('Azure region for all resources')
 param location string = resourceGroup().location
 
-@description('Container image (ghcr.io/jpsnover/taxonomy-editor:latest)')
-param containerImage string = 'ghcr.io/jpsnover/taxonomy-editor:latest'
+// t/3679 (deploy-by-digest): the AUTOMATED deploy path ALWAYS passes a resolved, IMMUTABLE
+// `…@sha256:<digest>` here — deploy-azure.yml / deploy-staging.yml resolve the deploy commit's
+// permanent `sha-<commit>` tag to its digest (Resolve-ImageDigest.ps1) and pin the revision to it,
+// so a pod recycle re-pulls IDENTICAL bytes (closing the t/3522/t/3523 mutable-:latest recycle-swap).
+// The `:latest` DEFAULT below is retained ONLY as a manual escape hatch (a hand-run `az deployment
+// group create` with no containerImage) and for a genuine first deploy — NOT a path any automated
+// deploy takes. It is NOT cosmetic: it avoids a hard failure on a manual bootstrap. Detect half
+// (t/3679#7): the resolved digest + deploy-time timestamp are also injected as IMAGE_DIGEST /
+// IMAGE_DEPLOYED_AT env on the revision (deploy-azure.yml) — a recycle without a deploy keeps the
+// SAME IMAGE_DEPLOYED_AT, so the reconcile check's purpose is OUT-OF-BAND revision creation, not
+// recycle-swap (condition 6), which digest-pinning already makes unreachable.
+@description('Container image. The automated deploy path passes a resolved @sha256 digest (t/3679 deploy-by-digest). Default :latest is a manual/first-deploy escape hatch only. ghcr.io/ai-rosetta-stone/taxonomy-editor:latest')
+param containerImage string = 'ghcr.io/ai-rosetta-stone/taxonomy-editor:latest'
 
 @description('Unique suffix for globally unique resource names')
 param uniqueSuffix string = uniqueString(resourceGroup().id)
@@ -52,12 +63,26 @@ param trafficPinRevisionName string = ''
 param trafficPinRevisionNameStaging string = ''
 
 // ── Staging write-isolation (t/2643) ──
-// Set stagingSharedReadOnly=true as the FINAL step of the isolation deployment,
-// AFTER arm-B verification confirms class-A writes route to /mnt/staging-state.
-// The RO flip makes the hard boundary live: missed write sites EROFS instead of
-// silently mutating prod. Deploy order matters — see t/2643#5/#6.
-@description('Flip /mnt/shared to read-only on staging (ARM step 3 of t/2643 isolation). Apply ONLY after arm-B verification passes with /mnt/shared still RW.')
-param stagingSharedReadOnly bool = false
+// FLIPPED TO true (t/4298 escalation, 2026-10-19): staging was still RW on prod's own
+// `taxonomy-data` share — any staging writer to the data root (e.g. G8a inline grounding
+// reconcile, confirmed live on staging today, independent of GROUNDING_SWEEP_ENABLED) wrote
+// directly to the same share prod reads, which also holds authorized-users.json and
+// taxonomy/Origin/embeddings.json. arm-B verification is satisfied: Azure's test revisions
+// already ran successfully against `taxonomy-data-ro` via `-ReadOnlyShared`, no boot problems
+// (p/241#90) — confirming class-A writes already route to /mnt/staging-state, not /mnt/shared.
+// The RO flip makes the hard boundary live: missed write sites EROFS instead of silently
+// mutating prod. Lands with the first deploy after the t/4258 hold, with the PI's go.
+@description('Flip /mnt/shared to read-only on staging (ARM step 3 of t/2643 isolation).')
+param stagingSharedReadOnly bool = true
+
+// ── Staging load-test sizing (t/4203) ──
+// A PARAMETER, not a hand-applied resize: t/4176's own history (t/4242) shows a manual
+// `az containerapp update` resize gets silently reverted by the next ordinary deploy, because
+// the deploy re-applies this template's declared (small) values. Defaulting this to false means
+// every normal deploy-staging run (which never sets it) keeps staging small automatically — the
+// resize can never be "left large" by someone forgetting to revert it (t/4203 AC4).
+@description('Temporarily size staging like prod (2 vCPU/4Gi, maxReplicas 3, concurrentRequests scale rule) for a load test (t/4203). Revert to false for the next ordinary deploy.')
+param stagingLoadTestSize bool = false
 
 // ── Resource Tags ──
 var tags = {
@@ -105,6 +130,9 @@ param authOptional string = '1'
 @description('Comma-separated list of admin userIds (derived storage IDs, not raw emails — see deriveStorageUserId in userContext.ts). Grants the community/calibration review UI and /api/admin/* endpoints. Sourced from the ADMIN_USERS GitHub Actions variable so personal emails stay out of public source. Defaults to jpsnover (matches the server default).')
 param adminUsers string = 'jpsnover,jsnover13-at-gmail-com'
 
+@description('Comma-separated `<idp>:<stableId>=<legacy principal name>` entries (t/4326, read by taxonomy-editor/src/server/principalName.ts): maps a stable provider id (e.g. `github:<numeric id>`) onto the legacy principal name existing data, ADMIN_USERS and READ_ONLY_PRINCIPALS are keyed by. Not secret (numeric ids), but sourced from the IDENTITY_MAP GitHub Actions variable like ADMIN_USERS so personal names stay out of public source. Legacy names may contain spaces; they must not contain quote characters (deploy-azure.yml refuses the value if they do).')
+param identityMap string = ''
+
 // ── GitHub data-sync (optional Phase-2 feature) ──
 // When enabled, web edits commit to a per-user branch in the working tree and
 // the user can open / update a pull request against origin/main from the UI.
@@ -117,7 +145,7 @@ param adminUsers string = 'jpsnover,jsnover13-at-gmail-com'
 @description('Enable GitHub data-sync feature. "1" = on, empty = off.')
 param gitSyncEnabled string = ''
 
-@description('GitHub repo in owner/repo form (e.g. "jpsnover/ai-triad-data") that the server pushes to.')
+@description('GitHub repo in owner/repo form (e.g. "AI-Rosetta-Stone/ai-triad-data") that the server pushes to.')
 param githubRepo string = ''
 
 @description('GitHub App numeric ID. Leave empty to fall back to GITHUB_TOKEN (PAT).')
@@ -156,6 +184,14 @@ param githubRunnerPat string = ''
 @secure()
 @description('HMAC secret for verifying GitHub runner webhook signatures')
 param githubRunnerWebhookSecret string = ''
+
+// Prod's own resources, as a single source of truth (t/4203 SO C1, p/682#44 / e/307#2):
+// stagingLoadTestSize below reads these instead of a hardcoded literal, so the load test
+// always measures whatever prod's CURRENT size actually is, not a stale snapshot of it — the
+// exact gap that made the first version of stagingLoadTestSize "prove it at the size you're
+// moving away from" when t/4263 proposed changing prod's own cpu/memory.
+var prodCpu = '1.5'
+var prodMemory = '3Gi'
 
 var googleEnabled = !empty(googleClientId) && !empty(googleClientSecret)
 var githubEnabled = !empty(githubClientId) && !empty(githubClientSecret)
@@ -496,10 +532,27 @@ resource envStorageSharedRO 'Microsoft.App/managedEnvironments/storages@2024-03-
 var baseEnv = [
   // t/2602: repoint data root from ephemeral /tmp to durable Azure Files mount.
   // Fixes class-A durability (admin flags, runtime-config, calibration logs) and
-  // taxonomy reads (supersedes t/2612 startup.sh symlink). TAXONOMY_CACHE_DIR must
-  // stay in sync with AI_TRIAD_DATA_ROOT (t/2061 invariant; Dockerfile comment).
+  // taxonomy reads (supersedes t/2612 startup.sh symlink).
   { name: 'AI_TRIAD_DATA_ROOT', value: '/mnt/shared' }
-  { name: 'TAXONOMY_CACHE_DIR', value: '/mnt/shared' }
+  // t/4298/t/4299/t/4300: TAXONOMY_CACHE_DIR no longer tracks AI_TRIAD_DATA_ROOT (the
+  // t/2061 "must stay in sync" invariant above was superseded by PR #1078's toRepoPath()
+  // fix, which made the two independent — staging already overrides this one on its own,
+  // below). Co-locating the github-api disk cache with the data root meant any direct
+  // writer to /mnt/shared (reconcile_grounding.py --apply, PS cmdlets) silently became
+  // what prod served, with no check against GitHub — the exact bug validateCacheDirDisjoint()
+  // (t/4300) now catches at boot. Fixed to the SAME ephemeral homedir path config.ts's own
+  // unset-TAXONOMY_CACHE_DIR fallback would compute for github-api mode
+  // (path.join(os.homedir(), '.cache', 'taxonomy-github-api'), HOME=/home/aitriad below) —
+  // set EXPLICITLY here rather than left unset, because an unset value would fall through
+  // to the Dockerfile's own ENV TAXONOMY_CACHE_DIR=/tmp/taxonomy-cache default instead,
+  // landing back in a world-writable /tmp path (the exact symlink-race class config.ts's
+  // own comment says to avoid). TL-approved (t/4299, p/538#77): this cache is intentionally
+  // EPHEMERAL on cold start now — see config.ts's cost arithmetic for why that's acceptable.
+  { name: 'TAXONOMY_CACHE_DIR', value: '/home/aitriad/.cache/taxonomy-github-api' }
+  // t/4176: the code splits per-replica AI RPM and per-client rate limits by this (t/4177, t/4178).
+  // MUST equal the container app's maxReplicas below, and deploy-azure.yml ExpectedEnvVars.
+  { name: 'MAX_REPLICAS', value: '1' }
+  // PROD's origin. Staging overrides it with its own FQDN in stagingEnvOverrides (t/4406).
   { name: 'ALLOWED_ORIGINS', value: 'https://taxonomy-editor.${containerAppEnv.properties.defaultDomain}' }
   { name: 'HOME', value: '/home/aitriad' }
   { name: 'NODE_ENV', value: 'production' }
@@ -511,10 +564,20 @@ var baseEnv = [
   // option. AUTH_DISABLED='1' skips auth entirely. Neither = required sign-in.
   { name: 'AUTH_DISABLED', value: authDisabled }
   { name: 'AUTH_OPTIONAL', value: authOptional }
+  // t/4296 G1: principals forced read-only (writes blocked by #3429's guard) regardless of
+  // proxy-tiers.json — the hosted signed-in smoke identity (t/4134). Fail-closed static list,
+  // idp-scoped `idp:login`. MUST stay in sync with deploy-azure.yml's ExpectedEnvVars gate.
+  // t/4326 SO C2: since #3691 an UNMAPPED GitHub account's principal name is `github-<id>`, so the
+  // smoke account (id 344897154) is listed under BOTH names — read-only holds whether or not
+  // IDENTITY_MAP maps it back to `ai-triad-smoke` (fail-closed either way).
+  { name: 'READ_ONLY_PRINCIPALS', value: 'github:ai-triad-smoke,github:github-344897154' }
   // Admin allowlist — comma-separated derived userIds gating the review UI and
   // /api/admin/* endpoints. Declared here so it survives Bicep deploys (a CLI
   // --set-env-vars value would be wiped by the next full template deployment).
   { name: 'ADMIN_USERS', value: adminUsers }
+  // t/4326: stable-provider-id → legacy principal name map (principalName.ts). Inherited by
+  // staging through stagingBaseEnv (not filtered). MUST stay in sync with ExpectedEnvVars.
+  { name: 'IDENTITY_MAP', value: identityMap }
   // Tell the server to trust Easy Auth headers (X-MS-CLIENT-PRINCIPAL-*).
   // Container Apps should auto-inject this but doesn't reliably do so.
   { name: 'WEBSITE_AUTH_ENABLED', value: 'true' }
@@ -535,24 +598,43 @@ var baseEnv = [
   // t/3165 DURABLE close: the worker-offload flag lives HERE (baseEnv), not a CLI --set-env-vars —
   // a CLI value is wiped by the next full template deploy (the ephemeral-drift trap). It routes the
   // ONNX embedding compute to the off-thread worker (t/3183) so a large novel-text batch can't starve
-  // the event loop past ACA's liveness deadline — the t/3165 fabricated-500 root cause. Requires the
-  // 2 vCPU worker floor above (t/3182). Proven: staging storm-canary GREEN + prod staged-flip AC-1/AC-3
-  // green (loop max 39.6ms under 1536 concurrent computes). MUST stay in sync with deploy-azure.yml's
+  // the event loop past ACA's liveness deadline — the t/3165 fabricated-500 root cause. Designed for
+  // a 2 vCPU worker floor (t/3182); prod now runs 1.5 vCPU by PI decision (t/4263), so the worker and
+  // the loop share 1.5 cores — see the resources comment below. Storm-canary proof was at 2 vCPU:
+  // GREEN + prod staged-flip AC-1/AC-3 green (loop max 39.6ms under 1536 concurrent computes). MUST stay in sync with deploy-azure.yml's
   // ExpectedEnvVars config-drift gate (Gate Co-Location — the gate verifies this value is deployed).
   { name: 'EMBEDDING_WORKER_OFFLOAD', value: '1' }
-  // t/3163 G8a (STAGED enable, TL GO): enable inline grounding reconcile on the write path.
-  // Deployed AHEAD of G8b (GROUNDING_SWEEP_ENABLED), which TL holds until this deploy's real
-  // write-cycle lock telemetry is clean (grounding_lock held ≤~2s, zero stale-break/contention).
-  // baseEnv — never a CLI --set-env-vars (wiped by the next template apply). MUST stay in sync with
-  // deploy-azure.yml ExpectedEnvVars (Gate Co-Location — the config-drift gate verifies it's deployed).
-  { name: 'GROUNDING_RECONCILE_INLINE', value: '1' }
-  // t/3163 G8b (staged enable, TL GO t/3163#9): arm the scheduled grounding sweep (backstop to the
-  // G8a inline reconcile). Gate cleared — Option C measured grounding_lock held 0.00s + zero
-  // stale-break/contention (≤~2s bar), corroborating the code-level lock-safety GV (t/3163#5).
-  // MUST land + deploy TOGETHER WITH the git-ops-timeout fix (#1872, t/3267): the sweep does git
-  // ops, so it must run on the undici-timeout/degrade-and-proceed code, not the untimed-fetch code.
-  // baseEnv (never CLI --set-env-vars) + MUST stay in sync with deploy-azure.yml ExpectedEnvVars.
-  { name: 'GROUNDING_SWEEP_ENABLED', value: '1' }
+  // t/4263 SO C3: pin the worker pool to ONE worker at 1.5 vCPU. configureEmbeddingWorkerPool clamps
+  // to availableParallelism()-1, which counts VISIBLE cores, not the cgroup CPU quota, so an unpinned
+  // pool could oversubscribe the 1.5-vCPU quota. Raise only together with prodCpu (or after the
+  // cgroup-aware clamp lands in lib/embeddings/offThreadEmbedding.ts). Gate-verified in deploy-azure.yml.
+  { name: 'EMBEDDING_WORKER_POOL_SIZE', value: '1' }
+  // t/4312/#3467: PI-approved overlay-commit conflict fence (p/331#2174). Lands ON for both
+  // prod and staging with #3469/#3470's server code, which reads this flag from the
+  // environment and defaults OFF when unset — this entry is what actually arms it. MUST stay
+  // in sync with deploy-azure.yml's ExpectedEnvVars config-drift gate (Gate Co-Location).
+  { name: 'OVERLAY_CONFLICT_STATE_ENABLED', value: '1' }
+  // t/4298: both GROUNDING_RECONCILE_INLINE (G8a, was '1') and GROUNDING_SWEEP_ENABLED (G8b, was
+  // '1') removed from hosted profiles.
+  // - G8b: groundingSweepScheduler.ts's decideSweepArm returns 'blocked-github-api' on the hosted
+  //   github-api profile unconditionally (the t/3333 guard — the sweep shells
+  //   `reconcile_grounding.py --apply`, which writes the local filesystem, and the github-api read
+  //   path never sees that write). Confirmed via Log Analytics: 351/351 prod boots and 89/89
+  //   staging boots over 14 days logged the refusal, 0 "Grounding sweep started".
+  // - G8a: SO review (e/326#2) first flagged that groundingReconcileHook.ts runs the SAME
+  //   reconcile_grounding.py --apply with no STORAGE_MODE guard, so it was suspected to have the
+  //   same no-op problem as G8b. **Resolved, C2 answer (TL, t/4298#8/e/327#5): G8a is gated by the
+  //   `grounding_reconcile_inline` feature flag, which is OFF — G8a has never run at all.
+  //   GROUNDING_RECONCILE_INLINE is an env var nothing reads.**
+  // Kept certifying/enabling two things that never ran: ~25 boot error lines/day in prod from G8b,
+  // plus a deploy gate that passed a check corresponding to nothing. Hosted grounding via a
+  // CI-committed sweep (t/3333 Option A) is unfiled — not asked for; re-add either flag only if
+  // that or an equivalent fix lands.
+  // t/3309 step-3: DATA_ROOT_VALIDATION_ENFORCE (t/3305 boot hard-fail) RETIRED. The boot-time
+  // exit(1) in server.ts is superseded by the /readyz warm-gate: a misprovisioned data root now
+  // makes /readyz report failed → the deploy warm-gate blocks the traffic-shift and rolls back
+  // (Arm-A/Arm-B proven on staging, t/3309). Co-landed with the server.ts exit(1) removal (joint-gv).
+  // The t/3308 warn-alert remains as the warn-only observability backstop for any un-gated path.
 ]
 var envWithToken = githubTokenProvided
   ? concat(baseEnv, [ { name: 'GITHUB_TOKEN', secretRef: githubTokenSecretName } ])
@@ -584,19 +666,33 @@ var stagingEnvOverrides = [
   { name: 'TAXONOMY_CACHE_DIR',  value: '/mnt/staging-state/cache' }
   // Routes all class-A writes (flags, config, calibration, keys) to isolated mount
   { name: 'AI_TRIAD_STATE_ROOT', value: '/mnt/staging-state' }
+  // t/4264 / t/2643 SO (e/307#6): without this, AnonymousSessionStore.defaultBaseDir()
+  // falls back to /mnt/shared/anon-sessions and staging's own TTL/maxSessions eviction
+  // runs over PROD's anonymous session files. Isolates it like the two overrides above.
+  { name: 'ANON_SESSION_DIR',    value: '/mnt/staging-state/anon-sessions' }
   // github-api writes go to the staging branch, not main (t/2650 class-B isolation)
   { name: 'GITHUB_BRANCH',       value: 'staging' }
-  // t/3305: promote the data-root boot validation (t/3296) to HARD-FAIL on staging first —
-  // a misprovisioned data root crash-loops VISIBLY here (real backend + real creds) before we
-  // set this in prod baseEnv. Gated real-env-first (t/2683): staging proves the exit(1) path
-  // against the live github-api ref:'main' corpus, which validated CLEAN on the warn-only boot
-  // (rev staging-4826363, no "validation failed" WARN), so enforce mode boots green not looping.
-  { name: 'DATA_ROOT_VALIDATION_ENFORCE', value: '1' }
+  // t/4446 C1: BRANCH_PREFIX was a hardcoded constant shared with prod, so a user signed into
+  // both environments wrote the SAME api-session/* branch in the prod data repo -- the actual
+  // live exposure the SO found (t/4446#5), broader than the already-closed direct-write-to-main
+  // path above. Staging gets its own prefix; prod stays on the code default ('api-session/').
+  { name: 'SESSION_BRANCH_PREFIX', value: 'staging-api-session/' }
+  // t/4406: staging's OWN origin. Inheriting baseEnv's (prod's) value made staging send prod's host
+  // as its CORS access-control-allow-origin and treat prod's origin as allowed. Hygiene only: it did
+  // NOT block same-origin staging requests (the guard passes Origin host == Host before reading this
+  // list; Host is preserved through ingress, probed t/4406#3) and is NOT the staging sign-in bounce.
+  // Host MUST match the staging app's name below; tests/BicepAllowedOrigins.Tests.ps1 asserts it.
+  { name: 'ALLOWED_ORIGINS',     value: 'https://taxonomy-editor-staging.${containerAppEnv.properties.defaultDomain}' }
+  // NOTE: DATA_ROOT_VALIDATION_ENFORCE was retired in t/3309 step-3 (see baseEnv above) — the
+  // /readyz warm-gate replaces the boot hard-fail. Nothing to override here.
+  // NOTE: S2 (GROUNDING_RECONCILE_INLINE=0 override) DROPPED per TL (e/327#5) — G8a is gated by
+  // the grounding_reconcile_inline feature flag, OFF, and has never run; the env var is inert and
+  // is being removed entirely from hosted baseEnv/the deploy gate in #3431 instead.
 ]
 // stagingBaseEnv = baseEnv with the isolation overrides applied.
 // filter() removes the baseEnv entries that stagingEnvOverrides supersedes.
 var stagingBaseEnv = concat(
-  filter(baseEnv, e => e.name != 'TAXONOMY_CACHE_DIR' && e.name != 'GIT_SYNC_ENABLED'),
+  filter(baseEnv, e => e.name != 'TAXONOMY_CACHE_DIR' && e.name != 'GIT_SYNC_ENABLED' && e.name != 'ALLOWED_ORIGINS'),
   stagingEnvOverrides
 )
 // Rebuild the secret chain for staging — mirrors the prod chain so staging
@@ -614,7 +710,8 @@ var stagingContainerEnv = paidTierEnabled
   ? concat(stagingEnvWithFreeTier, [ { name: 'GEMINI_PAID_KEY', secretRef: paidTierSecretName } ])
   : stagingEnvWithFreeTier
 
-resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
+// API 2025-01-01 (was 2024-03-01): first GA version whose Scale type has cooldownPeriod (t/4249).
+resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
   name: 'taxonomy-editor'
   location: location
   tags: tags
@@ -650,27 +747,39 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
           name: 'taxonomy-editor'
           image: containerImage
           resources: {
-            // 2 vCPU is the CORRECTNESS FLOOR for the embedding worker-offload
-            // (t/3182 / t/2977 C1). The off-thread ONNX worker (EMBEDDING_WORKER_OFFLOAD)
-            // needs a REAL second core: on 1 vCPU the worker time-slices the same core
-            // as the event loop, so a big embed still starves liveness (defeats the
-            // offload). 2 vCPU keeps the loop responsive while the worker computes.
-            // Stays within the ACA Consumption plan (0.25-4 vCPU) - one-line resources
-            // edit, no workload-profile/topology migration. Cost ~$0 (free grant, t/2977#4).
-            // Memory MUST be 4Gi: ACA Consumption only permits FIXED cpu:memory pairs, and
-            // 2.0 vCPU is valid ONLY with 4.0Gi. ARM rejects 2.0/2Gi with
-            // ContainerAppInvalidResourceTotal (the #1771 bug — a deploy would fail the ARM
-            // step; t/3182). Headroom is ample regardless: incident RSS ~650MB/2048 + ~250MB
-            // worker model copy ~= 900MB (embeddings.json is NOT copied to the worker — the
-            // cache resolve stays main-thread, only miss-texts marshal).
-            cpu: json('2.0')
-            memory: '4Gi'
+            // 1.5 vCPU / 3Gi by PI decision (t/4263, 2026-10-19), overriding the 2 vCPU
+            // worker floor of t/3182 / t/2977 C1. That floor was justified as "Cost ~$0
+            // (free grant)"; in fact always-on 2 vCPU / 4Gi is well over the $30 budget
+            // (deploy/azure/runbooks/cost-investigation-2026-10.md).
+            // NOT 1.0/2Gi: the C1b test (t/4263#5) failed it — the synthetic-embeddings
+            // serialize blocked the loop 3.8s and 500'd, novel embeds starved, and a full
+            // serialize peaks ~2.0 GiB (more than a 2Gi limit). The bar is "no worse than
+            // 2.0/4Gi", and 1.5/3Gi met it (2.0's 2,076 MiB serialize peak is 68% of 3Gi). The serialize
+            // loop-block (t/4286) and the 45s novel-embed chunk budget (t/4287) fail at 2.0
+            // too; they are code fixes, not sizing. Before raising back to 2.0, check
+            // alert-event-loop-blocked / ingress-5xx history.
+            // Memory MUST match the fixed ACA Consumption pair: 1.5 vCPU is valid ONLY
+            // with 3.0Gi (Test-BicepAcaResourcePairs.ps1; the #1771 ARM-rejection bug).
+            //
+            // t/4203 SO C1: these are the prodCpu/prodMemory vars (single source of truth),
+            // not independent literals — whoever changes prod's size (this PR) edits the var
+            // near the top of this file, not this line, so stagingLoadTestSize stays correct.
+            cpu: json(prodCpu)
+            memory: prodMemory
           }
           env: containerEnv
           probes: [
             {
               type: 'Liveness'
-              httpGet: { path: '/healthz', port: 7862 }
+              // /health, NOT /healthz (t/4176 incident, 2026-10-13): /healthz is the DATA-LOADED
+              // signal and returns 503 'warming' until the data load finishes. As a liveness path
+              // it killed any replica whose warm-up took longer than 3 x 30s, and at 5 replicas
+              // warming at once every replica crash-looped ("failed liveness probe, will be
+              // restarted"), users got the "Taxonomy data not found" page whenever no replica was
+              // ready. Liveness = process alive (dataRootReadiness.ts design note); readiness
+              // (/healthz, below) still keeps traffic off a replica until its data is loaded.
+              // /health is served by the same event loop, so the loop-block deadline below holds.
+              httpGet: { path: '/health', port: 7862 }
               periodSeconds: 30
               failureThreshold: 3
               // timeoutSeconds made EXPLICIT (was defaulting to ACA's ~1s). This is
@@ -721,24 +830,32 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
       scale: {
         // Scale-out restored after t/683 (ed489b9): AnonymousSessionStore is now
         // file-backed on the shared /mnt/shared volume — AnonymousSessionStore
-        // (debate/session state) IS replica-independent. HOWEVER: brief-export
-        // and oped job stores are still per-process in-memory Maps and are NOT
-        // replica-independent; see maxReplicas cap below (t/2885, 2026-08-20).
+        // (debate/session state) IS replica-independent. Job stores and the allowlist
+        // cache are replica-safe since t/4177; see the maxReplicas cap below.
         // minReplicas reverted 1->0 (t/1354, 2026-07-07): prod was costing
         // ~$24 in its first 6 days of July alone (~$120+/mo projected) from
         // running 1 vCPU/2GiB continuously. Owner accepted the cold-start
         // latency tradeoff this reintroduces (previously fixed for the same
         // reason in e247ef75, 2026-05-05) in exchange for scale-to-zero savings.
         minReplicas: 0
-        // maxReplicas capped at 1 (t/2885, 2026-08-20): brief-export and oped job
-        // NOTE: the phrase "maxReplicas capped at 1" on this line is load-bearing —
+        // t/4249 cost: scale to zero after 120s with no HTTP requests (ACA default 300s).
+        // Each wake bills at least this long. Re-landed after t/4258: on SIGTERM the server
+        // flushes every pending overlay commit (shutdownOverlayFlush.ts, 40s deadline),
+        // inside the 60s terminationGracePeriodSeconds below.
+        cooldownPeriod: 120
+        // Explicit at the live value: under API 2025-01-01, omitting it shows as a what-if Delete (SO C1, #3579).
+        pollingInterval: 30
+        // maxReplicas capped at 1 (t/4176 incident, 2026-10-13: back from 5 to 1).
+        // NOTE: the phrase "maxReplicas capped at" on this line is load-bearing —
         // Test-InMemoryJobStoreScaleGuard.ps1 uses it as a regex anchor to locate
         // the maxReplicas value. Do not edit this comment string without updating the gate.
-        // stores are per-process in-memory Maps. Running >1 replica means a POST
-        // that creates a job on replica A and a GET poll on replica B → 404.
-        // DO NOT raise this above 1 until the job store is backed by shared blob
-        // storage (t/2885 deferred). Raising it silently reintroduces the t/2884
-        // export-404 race with no error at startup.
+        // Why 1: at 5, copies starting together each fetched their data from GitHub, drew
+        // refusals ("non-ok response", "circuit open"), failed the data-loaded probe and were
+        // restarted in a loop — production went down 10:00-10:28Z. The job stores ARE
+        // replica-safe (t/4177); what's missing is a startup that doesn't depend on GitHub
+        // per copy. Raise again only after: liveness on /health (this PR), the refusal type
+        // confirmed, startup reading the shared cache (or the t/4179 lease), and a monitored
+        // 2-copy test. MUST equal MAX_REPLICAS in baseEnv (t/4177, t/4178).
         maxReplicas: 1
         rules: [
           {
@@ -756,7 +873,7 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
 // Separate app for staging deploys — shares the environment and storage but
 // runs independently so a bad staging deploy cannot affect production.
 
-resource containerAppStaging 'Microsoft.App/containerApps@2024-03-01' = {
+resource containerAppStaging 'Microsoft.App/containerApps@2025-01-01' = {
   name: 'taxonomy-editor-staging'
   location: location
   tags: union(tags, { environment: 'staging' })
@@ -790,10 +907,14 @@ resource containerAppStaging 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'taxonomy-editor'
           image: containerImage
-          resources: {
-            cpu: json('0.25')
-            memory: '0.5Gi'
-          }
+          // t/4203: prod-size only while stagingLoadTestSize=true, for the t/4180 load test to
+          // run at a representative size. Defaults back to staging's normal small footprint on
+          // the very next ordinary deploy. SO C1 (p/682#44, e/307#2): reads prodCpu/prodMemory
+          // rather than a hardcoded 2.0/4Gi, so the load test always matches prod's CURRENT
+          // size — if prod's own resources change (e.g. t/4263), this follows automatically.
+          resources: stagingLoadTestSize
+            ? { cpu: json(prodCpu), memory: prodMemory }
+            : { cpu: json('0.25'), memory: '0.5Gi' }
           env: stagingContainerEnv
           probes: [
             {
@@ -828,7 +949,13 @@ resource containerAppStaging 'Microsoft.App/containerApps@2024-03-01' = {
           // (ReadOnly accessMode) makes the hard boundary live: any missed write site
           // fails with EACCES rather than silently mutating prod (t/2643#3 cond 3,
           // t/2643#5 binding correction — RO must come last, never before getStateRoot).
-          storageName: stagingSharedReadOnly ? 'taxonomy-data-ro' : 'taxonomy-data'
+          //
+          // t/4203 SO C3 (p/682#44): coupled to stagingLoadTestSize too — without this,
+          // 3 load-test replicas mount PROD's own taxonomy-data share RW, making the load
+          // test itself a write load against production storage. Confirming staging runs
+          // correctly against RO shared data is exactly the open t/2643 arm-B question, so
+          // this also doubles as that verification once a load test actually runs.
+          storageName: (stagingSharedReadOnly || stagingLoadTestSize) ? 'taxonomy-data-ro' : 'taxonomy-data'
         }
         {
           // Staging-isolated RW share for class-A state (t/2643).
@@ -839,8 +966,26 @@ resource containerAppStaging 'Microsoft.App/containerApps@2024-03-01' = {
       ]
       scale: {
         minReplicas: 0
-        maxReplicas: 1
+        // t/4203: max 3 with an HTTP scale rule only while stagingLoadTestSize=true, so the
+        // t/4180 load test can observe real multi-replica behavior (job-poll 404s, limiter
+        // totals, GitHub calls per startup). Reverts to 1/no-rule on the next ordinary deploy —
+        // same parameter, same reasoning as the resources block above.
+        maxReplicas: stagingLoadTestSize ? 3 : 1
+        // t/4249: match prod's 120s scale-to-zero cooldown (ACA default 300s).
+        cooldownPeriod: 120
+        pollingInterval: 30
+        rules: stagingLoadTestSize
+          ? [
+              {
+                name: 'http-scaler'
+                http: { metadata: { concurrentRequests: '10' } }
+              }
+            ]
+          : []
       }
+      // t/4249 (DevOps Lead review of #3579): explicit, matching prod. Unset, ACA uses 30s,
+      // shorter than the 40s SIGTERM overlay flush deadline (shutdownOverlayFlush.ts, t/4258).
+      terminationGracePeriodSeconds: 60
     }
   }
 }
@@ -981,7 +1126,11 @@ resource authConfig 'Microsoft.App/containerApps/authConfigs@2024-10-02-preview'
       ]
       preserveUrlFragmentsForLogins: false
       tokenStore: {
-        enabled: true
+        // No blob storage backing is configured. enabled:true causes Easy Auth to use
+        // in-memory token storage that is lost on replica recycle → HTTP 500 for signed-in
+        // users (prod incident 2026-10-08). Stateless cookie validation requires no backing
+        // store and survives replica recycling.
+        enabled: false
       }
     }
   }
@@ -1050,14 +1199,21 @@ resource authConfigStaging 'Microsoft.App/containerApps/authConfigs@2024-10-02-p
       ]
       preserveUrlFragmentsForLogins: false
       tokenStore: {
-        enabled: true
+        // Same fix as prod: no blob backing, so stateless cookie validation.
+        enabled: false
       }
     }
   }
 }
 
 // ── Budget Alert ──
-// Alerts at 80% and 100% of $5/month to catch cost overruns early.
+// Monthly Azure cost budget for this resource group (t/4181). PI set the limit to $30/month on 2026-10-15
+// (was $5 since t/3155). Alerts at 50% and 80% actual, 100% actual, and 100% FORECAST, so an overrun is
+// flagged mid-month while there is still time to act, not only after the money is spent.
+// Gemini spend on the operator pool keys is billed outside Azure and is not in this budget.
+
+@description('Monthly Azure cost limit for the resource group, in USD (PI, 2026-10-15).')
+param monthlyBudgetUsd int = 30
 
 @description('Email address for budget alerts')
 param budgetAlertEmail string = ''
@@ -1071,12 +1227,18 @@ resource budget 'Microsoft.Consumption/budgets@2023-11-01' = if (budgetAlertConf
   name: 'budget-aitriad-monthly'
   properties: {
     category: 'Cost'
-    amount: 5
+    amount: monthlyBudgetUsd
     timeGrain: 'Monthly'
     timePeriod: {
       startDate: budgetStartDate
     }
     notifications: {
+      warning50: {
+        enabled: true
+        operator: 'GreaterThanOrEqualTo'
+        threshold: 50
+        contactEmails: [ budgetAlertEmail ]
+      }
       warning80: {
         enabled: true
         operator: 'GreaterThanOrEqualTo'
@@ -1087,6 +1249,13 @@ resource budget 'Microsoft.Consumption/budgets@2023-11-01' = if (budgetAlertConf
         enabled: true
         operator: 'GreaterThanOrEqualTo'
         threshold: 100
+        contactEmails: [ budgetAlertEmail ]
+      }
+      forecast100: {
+        enabled: true
+        operator: 'GreaterThanOrEqualTo'
+        threshold: 100
+        thresholdType: 'Forecasted'
         contactEmails: [ budgetAlertEmail ]
       }
     }
@@ -1110,13 +1279,36 @@ resource restartAlertActionGroup 'Microsoft.Insights/actionGroups@2023-09-01-pre
   }
 }
 
+// t/4426 SO C1: the 10-13 incident (t/4176, OOM-kill) produced Reason_s=="Error" x16 — it never
+// produced a ContainerBackOff/ImagePullBackOff burst. Backtested over 30d prod logs:
+// BackOff/ImagePullBackOff alone never exceeds 3 events total (never fires); adding "Error" fires
+// EXACTLY once, 17 events at 2026-10-13T10:10Z (the real incident), and nowhere else. Dropping
+// StoppingContainer (t/4426's original fix, still correct — it's deploy churn, not a crash signal)
+// without adding Error would have made this alert blind to the one incident it exists to catch.
+//
+// t/4426 SO C2: ContainerAppName_s is injected via replace() from containerApp.name, the single
+// source of truth, instead of a second hardcoded "taxonomy-editor" literal — a future rename of
+// the prod app can't silently blind this alert the way two independent literals could.
+var restartLoopQuery = replace('''
+  ContainerAppSystemLogs_CL
+  | where ContainerAppName_s == "__APP_NAME__"
+  | where Reason_s in ("ContainerBackOff", "ImagePullBackOff", "Error")
+  | summarize RestartCount = count() by RevisionName_s
+  | where RestartCount > 5
+''', '__APP_NAME__', containerApp.name)
+
 resource restartLoopAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
   name: 'alert-restart-loop'
   location: location
   tags: tags
   properties: {
-    displayName: 'Container Restart Loop Detected'
-    description: 'Fires when a container revision restarts 5+ times in 10 minutes — likely a crash loop from a bad deploy.'
+    displayName: 'taxonomy-editor PROD — Restart Loop Detected'
+    // t/4426: was unscoped (any app) and counted StoppingContainer, which every deploy emits —
+    // 38h of data showed 12 prod StoppingContainer events (all deploy churn, 0 real backoffs)
+    // plus staging canary/test-revision crash loops, both firing this as if they were prod.
+    // Scoped to the prod app (see restartLoopQuery above) + Error added back (SO C1) + dropping
+    // StoppingContainer leaves the real crash-loop signals: ContainerBackOff, ImagePullBackOff, Error.
+    description: 'Fires when the PRODUCTION container revision crash-loops (ContainerBackOff/ImagePullBackOff/Error, e.g. OOM-kill) 5+ times in 10 minutes. Scoped to prod only — staging crash loops do not page this (t/4426).'
     severity: 1
     enabled: true
     scopes: [ logAnalytics.id ]
@@ -1125,12 +1317,7 @@ resource restartLoopAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pre
     criteria: {
       allOf: [
         {
-          query: '''
-            ContainerAppSystemLogs_CL
-            | where Reason_s in ("ContainerBackOff", "StoppingContainer", "ImagePullBackOff")
-            | summarize RestartCount = count() by RevisionName_s
-            | where RestartCount > 5
-          '''
+          query: restartLoopQuery
           timeAggregation: 'Count'
           operator: 'GreaterThan'
           threshold: 0
@@ -1196,12 +1383,13 @@ resource rateLimitWarning 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pre
   tags: tags
   properties: {
     displayName: 'GitHub API Rate Limit Warning'
-    description: 'Rate limit remaining below 1,000 for 5 minutes. At 145 calls/hr typical, this indicates unusual consumption.'
+    description: 'Rate limit remaining below 1,000 within a 15-minute window. At 145 calls/hr typical, this indicates unusual consumption.'
     severity: 2
     enabled: true
     scopes: [ logAnalytics.id ]
-    evaluationFrequency: 'PT5M'
-    windowSize: 'PT5M'
+    // t/4248 cost: PT5M -> PT15M eval (log-alert price is per-rule by frequency).
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
     criteria: {
       allOf: [
         {
@@ -1234,7 +1422,8 @@ resource rateLimitCritical 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
     severity: 1
     enabled: true
     scopes: [ logAnalytics.id ]
-    evaluationFrequency: 'PT1M'
+    // t/4248 cost: PT1M -> PT5M eval (log-alert price is per-rule by frequency).
+    evaluationFrequency: 'PT5M'
     windowSize: 'PT5M'
     criteria: {
       allOf: [
@@ -1256,18 +1445,103 @@ resource rateLimitCritical 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
   }
 }
 
+resource aadstsConfigErrorAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'alert-aadsts-config-error'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'AADSTS Config Error (sev-1)'
+    description: 'A config-class AADSTS error (bad/expired client secret, app not found, app disabled, reply-URL mismatch) in the Easy Auth sidecar logs within 10 minutes — e.g. the 2026-10-19 invalid-client-secret incident (t/4288). These codes are ops-caused, never user-caused, so this is sev-1. Split by ContainerAppName_s (t/4288 SO review, e/318 A1) so prod and staging page independently — a staging-only config error should not look like a prod sev-1, or vice versa.'
+    severity: 1
+    enabled: true
+    scopes: [ logAnalytics.id ]
+    evaluationFrequency: 'PT10M'
+    windowSize: 'PT10M'
+    criteria: {
+      allOf: [
+        {
+          // Config-class error_codes only (SO e/318 A1): 7000215 (invalid client secret),
+          // 7000222 (expired secret), 700016 (app not found in tenant), 7000112 (app disabled),
+          // 50011/500113 (reply URL mismatch). Deliberately narrower than the broad \d+ regex
+          // below — these are the codes an operator caused and must act on immediately.
+          query: '''
+            ContainerAppConsoleLogs_CL
+            | where ContainerName_s == "http-auth"
+            | where Log_s matches regex @"AADSTS(7000215|7000222|700016|7000112|50011|500113)\b"
+            | summarize Count = count() by ContainerAppName_s
+          '''
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+          dimensions: [
+            {
+              name: 'ContainerAppName_s'
+              operator: 'Include'
+              values: [ '*' ]
+            }
+          ]
+        }
+      ]
+    }
+    actions: {
+      actionGroups: budgetAlertConfigured ? [ restartAlertActionGroup.id ] : []
+    }
+  }
+}
+
+resource aadstsAnyErrorAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'alert-aadsts-any-error'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'AADSTS Any Error (sev-3)'
+    description: 'Any AADSTS error at all in the Easy Auth sidecar logs within 10 minutes, including user-caused codes (e.g. 50020 account issue, 65001 consent required, 50126 bad credentials). Sev-3 (not sev-1): these are routine and often user-side, not an operator page — kept as a broader backstop/trend signal. Split by ContainerAppName_s, same rationale as alert-aadsts-config-error.'
+    severity: 3
+    enabled: true
+    scopes: [ logAnalytics.id ]
+    evaluationFrequency: 'PT10M'
+    windowSize: 'PT10M'
+    criteria: {
+      allOf: [
+        {
+          query: '''
+            ContainerAppConsoleLogs_CL
+            | where ContainerName_s == "http-auth"
+            | where Log_s matches regex @"AADSTS\d+"
+            | summarize Count = count() by ContainerAppName_s
+          '''
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+          dimensions: [
+            {
+              name: 'ContainerAppName_s'
+              operator: 'Include'
+              values: [ '*' ]
+            }
+          ]
+        }
+      ]
+    }
+    actions: {
+      actionGroups: budgetAlertConfigured ? [ restartAlertActionGroup.id ] : []
+    }
+  }
+}
+
 resource apiErrorSpike 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
   name: 'alert-github-api-error-spike'
   location: location
   tags: tags
   properties: {
     displayName: 'GitHub API Error Spike'
-    description: 'More than 5 GitHub API errors in 5 minutes. May indicate GitHub outage or auth failure.'
+    description: 'More than 15 GitHub API errors in 15 minutes (same rate as the former 5 in 5 min). May indicate GitHub outage or auth failure.'
     severity: 1
     enabled: true
     scopes: [ logAnalytics.id ]
-    evaluationFrequency: 'PT5M'
-    windowSize: 'PT5M'
+    // t/4248 cost: PT5M -> PT15M eval (log-alert price is per-rule by frequency).
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
     criteria: {
       allOf: [
         {
@@ -1275,7 +1549,7 @@ resource apiErrorSpike 'Microsoft.Insights/scheduledQueryRules@2023-03-15-previe
             ContainerAppConsoleLogs_CL
             | where Log_s contains "github.api.error"
             | summarize ErrorCount = count()
-            | where ErrorCount > 5
+            | where ErrorCount > 15
           '''
           timeAggregation: 'Count'
           operator: 'GreaterThan'
@@ -1295,12 +1569,13 @@ resource cacheDegraded 'Microsoft.Insights/scheduledQueryRules@2023-03-15-previe
   tags: tags
   properties: {
     displayName: 'Cache Hit Rate Degraded'
-    description: 'Cache hit rate below 85% over 5 minutes. Indicates excessive cache misses — possible invalidation storm or cache corruption.'
+    description: 'Cache hit rate below 85% over 15 minutes. Indicates excessive cache misses — possible invalidation storm or cache corruption.'
     severity: 2
     enabled: true
     scopes: [ logAnalytics.id ]
-    evaluationFrequency: 'PT5M'
-    windowSize: 'PT5M'
+    // t/4248 cost: PT5M -> PT15M eval (log-alert price is per-rule by frequency).
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
     criteria: {
       allOf: [
         {
@@ -1308,7 +1583,7 @@ resource cacheDegraded 'Microsoft.Insights/scheduledQueryRules@2023-03-15-previe
             ContainerAppConsoleLogs_CL
             | where Log_s contains "cache.miss"
             | summarize Misses = count()
-            | where Misses > 50
+            | where Misses > 150
           '''
           timeAggregation: 'Count'
           operator: 'GreaterThan'
@@ -1328,12 +1603,13 @@ resource fallbackActive 'Microsoft.Insights/scheduledQueryRules@2023-03-15-previ
   tags: tags
   properties: {
     displayName: 'Fallback Data Active'
-    description: 'App serving from baked fallback data for more than 5 minutes. GitHub API is likely unreachable.'
+    description: 'App served from baked fallback data within the last 15 minutes. GitHub API is likely unreachable.'
     severity: 1
     enabled: true
     scopes: [ logAnalytics.id ]
-    evaluationFrequency: 'PT5M'
-    windowSize: 'PT5M'
+    // t/4248 cost: PT5M -> PT15M eval (log-alert price is per-rule by frequency).
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
     criteria: {
       allOf: [
         {
@@ -1342,6 +1618,95 @@ resource fallbackActive 'Microsoft.Insights/scheduledQueryRules@2023-03-15-previ
             | where Log_s contains "storage.fallback"
             | summarize FallbackCount = count()
             | where FallbackCount > 0
+          '''
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+        }
+      ]
+    }
+    actions: {
+      actionGroups: budgetAlertConfigured ? [ restartAlertActionGroup.id ] : []
+    }
+  }
+}
+
+// ── Arm-2 Worker-Queue Saturation Alert (t/3372; trigger for the K=2/Dedicated migration, t/3211) ──
+// Fires on SUSTAINED novel-embed load-shed: the K-slot embedding pool rejected enqueues past its
+// dynamic MAX_QUEUE_DEPTH×liveSlotCount cap (16 at K=1). Sustained sheds = organic demand crossed the
+// ~20 texts/s bar the single worker can serve → the "add a worker / do the Dedicated-profile migration
+// → K=2" trigger (t/3211; ServerAPI then verifies ≈2× throughput + flat main-loop delay). Consumption-
+// compatible — a monitoring resource, no SKU/cost change.
+//
+// MATCH-TOKEN IS A CONTRACT: "embeddings worker-pool shed" is the clean STDOUT token (component:'api',
+// subsystem:'ai-backends'; t/3373) emitted on a genuine worker-pool queue-shed (the 503; carries
+// queueDepth/cap/liveSlots). Do NOT match the pool's flight-recorder-only "queue full" WARN — it never
+// reaches stdout/Log_s, so a KQL match silently NEVER fires (the t/3110/t/3308 sink trap). This is the
+// "already shedding" signal; the PRE-shed early-warning (the ticket's REAL trigger — fire before users
+// feel the shed) is the sibling alert-worker-queue-nearcap below. >5 sheds / 15 min = sustained, not a burst.
+resource workerQueueSaturation 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'alert-worker-queue-saturation'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'Embedding Worker Queue Saturation (K=2 migration trigger)'
+    description: 'The K-slot embedding worker pool load-shed (503) past its queue cap repeatedly over 15 minutes — sustained novel-embed demand exceeding single-worker capacity. Trigger to evaluate the Dedicated-profile migration to K=2 (t/3211/t/3372). Paired with alert-worker-queue-nearcap (the pre-shed early-warning).'
+    severity: 2
+    enabled: true
+    scopes: [ logAnalytics.id ]
+    // t/4248 cost: PT5M -> PT15M eval (log-alert price is per-rule by frequency).
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
+    criteria: {
+      allOf: [
+        {
+          query: '''
+            ContainerAppConsoleLogs_CL
+            | where Log_s contains "embeddings worker-pool shed"
+            | summarize Sheds = count()
+            | where Sheds > 5
+          '''
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+        }
+      ]
+    }
+    actions: {
+      actionGroups: budgetAlertConfigured ? [ restartAlertActionGroup.id ] : []
+    }
+  }
+}
+
+// ── Arm-2 Worker-Queue NEAR-CAP early-warning (t/3372/t/3373; the REAL t/3211 K=2 trigger) ──
+// Fires BEFORE users feel the 503 (the ticket's real intent). ServerAPI's pool emits the stdout token
+// when queue depth is SUSTAINED ≥75% of the dynamic MAX_QUEUE_DEPTH×liveSlotCount cap (t/3373); a paired
+// "…recovered" INFO clears. Consumption-compatible (a monitoring resource, no SKU/cost change).
+//
+// MATCH-TOKEN IS A CONTRACT: "embeddings worker-pool queue depth high" (component:'api',
+// subsystem:'embed-queue'; t/3373) — the near-cap gauge. Lower/sooner than the shed alert; on fire,
+// evaluate the Dedicated-profile migration → K=2 while there's still headroom. >2 hits / 15 min.
+resource workerQueueNearCap 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'alert-worker-queue-nearcap'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'Embedding Worker Queue Near Cap (pre-shed K=2 early-warning)'
+    description: 'The K-slot embedding worker pool queue was sustained near its dynamic cap (>=75%) repeatedly over 15 minutes — pre-shed early warning that novel-embed demand is approaching single-worker capacity. Fires BEFORE the 503 load-shed; the real trigger to evaluate the Dedicated-profile migration to K=2 (t/3211/t/3372/t/3373).'
+    severity: 2
+    enabled: true
+    scopes: [ logAnalytics.id ]
+    // t/4248 cost: PT5M -> PT15M eval (log-alert price is per-rule by frequency).
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
+    criteria: {
+      allOf: [
+        {
+          query: '''
+            ContainerAppConsoleLogs_CL
+            | where Log_s contains "embeddings worker-pool queue depth high"
+            | summarize NearCap = count()
+            | where NearCap > 2
           '''
           timeAggregation: 'Count'
           operator: 'GreaterThan'
@@ -1375,7 +1740,17 @@ resource sweepStallAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-prev
     displayName: 'G8b Grounding Sweep Stalled (failed inline reconcile un-swept > N)'
     description: 'A G8a inline grounding reconcile FAILED and no G8b sweep drained the backlog within N hours — grounding may be silently stale (the failed-inline-then-cold edge, t/3279).'
     severity: 2
-    enabled: true
+    // DISABLED (t/4298). CORRECTED rationale (SO review, e/326#2 — my first version was wrong):
+    // this query reads ContainerAppConsoleLogs_CL exclusively (Azure-only), so it only ever
+    // covered the hosted (github-api profile) sweep. That sweep is unconditionally refused on
+    // hosted (t/3333 guard), so the query's "no sweep complete within N hours of the failure"
+    // condition can NEVER be satisfied there — meaning this does NOT "never fire": it fires on
+    // EVERY inline-reconcile-failure log line on hosted, unconditionally. That's not a "sweep
+    // stalled" signal (there's never a backstop to have stalled); it's a relabeled, always-firing
+    // copy of "an inline failure happened," which is misleading under this alert's name/severity.
+    // Disabling it is still correct, but for THIS reason, not the originally-stated one.
+    // Re-enable only if hosted grounding via a CI-committed sweep (t/3333 Option A) lands.
+    enabled: false
     scopes: [ logAnalytics.id ]
     evaluationFrequency: 'PT30M'
     windowSize: 'PT6H'
@@ -1538,7 +1913,7 @@ resource branchDivergence 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pre
 }
 
 // ── Staging ContainerBackOff Alert (t/2659) ──
-// Fires within 2 min on any ContainerBackOff or ContainerCrashing event on
+// Fires within ~5 min (PT5M eval since t/4248) on any ContainerBackOff or ContainerCrashing event on
 // taxonomy-editor-staging. Staging-specific so it can be distinguished from
 // the generic restartLoopAlert (all apps, 5+ threshold, 5-min eval).
 // Historical proof: staging-151d3e7 incident produced ContainerBackOff rows
@@ -1556,7 +1931,8 @@ resource stagingBackoffAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-
     severity: 1
     enabled: true
     scopes: [ logAnalytics.id ]
-    evaluationFrequency: 'PT1M'
+    // t/4248 cost: PT1M -> PT5M eval (log-alert price is per-rule by frequency).
+    evaluationFrequency: 'PT5M'
     windowSize: 'PT5M'
     criteria: {
       allOf: [
@@ -1582,7 +1958,7 @@ resource stagingBackoffAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-
 // Same query as staging alert but scoped to taxonomy-editor (prod).
 // Severity 0 (Critical) because a prod restart loop means users cannot load the app.
 // Complements the generic restartLoopAlert (all apps, 5-restart threshold)
-// with faster per-minute detection and no restart-count threshold.
+// with no restart-count threshold (PT5M eval since t/4248; was per-minute).
 
 resource prodBackoffAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
   name: 'alert-prod-container-backoff'
@@ -1594,7 +1970,8 @@ resource prodBackoffAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pre
     severity: 0
     enabled: true
     scopes: [ logAnalytics.id ]
-    evaluationFrequency: 'PT1M'
+    // t/4248 cost: PT1M -> PT5M eval (log-alert price is per-rule by frequency).
+    evaluationFrequency: 'PT5M'
     windowSize: 'PT5M'
     criteria: {
       allOf: [
@@ -1629,27 +2006,34 @@ resource prodBackoffAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pre
 // Diagnosis: AppInsights `requests` absent + client log present → envoy-fabricated.
 // See operational-commands.md for the KQL cross-reference runbook.
 
+// t/4426 SO C2: injected via replace() from containerApp.name — see restartLoopQuery's comment.
+var eventLoopBlockedQuery = replace('''
+  ContainerAppConsoleLogs_CL
+  | where ContainerAppName_s == "__APP_NAME__"
+  | where Log_s has "event loop blocked"
+''', '__APP_NAME__', containerApp.name)
+
 resource eventLoopLagAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
   name: 'alert-event-loop-blocked'
   location: location
   tags: tags
   properties: {
-    displayName: 'Event Loop Blocked (>1s starvation) — t/3167'
-    description: '''Node.js event loop blocked >1s — leading indicator of ingress-fabricated 5xx under load (t/3165 pattern).
+    displayName: 'taxonomy-editor PROD — Event Loop Blocked (>1s starvation) — t/3167'
+    description: '''Node.js event loop blocked >1s on the PRODUCTION app — leading indicator of ingress-fabricated 5xx under load (t/3165 pattern).
 Signal: Pino WARN "event loop blocked" fires ONLY on blocks >EVENT_LOOP_LAG_WARN_MS (1000ms); routine 5s gauges say "event-loop max…" without "blocked" and do not trip this.
-Structured fields: component="event-loop", level=warn(40). Primary detector for t/3167. (t/3167)'''
+Structured fields: component="event-loop", level=warn(40). Primary detector for t/3167.
+t/4426: scoped to the prod app (see eventLoopBlockedQuery above) — unscoped, 200/202 matching lines
+in a 38h window came from staging (load-test/canary traffic), so this paged on staging noise. (t/3167, t/4426)'''
     severity: 1
     enabled: true
     scopes: [ logAnalytics.id ]
-    evaluationFrequency: 'PT1M'
+    // t/4248 cost: PT1M -> PT5M eval (log-alert price is per-rule by frequency).
+    evaluationFrequency: 'PT5M'
     windowSize: 'PT5M'
     criteria: {
       allOf: [
         {
-          query: '''
-            ContainerAppConsoleLogs_CL
-            | where Log_s has "event loop blocked"
-          '''
+          query: eventLoopBlockedQuery
           timeAggregation: 'Count'
           operator: 'GreaterThan'
           threshold: 0
@@ -1701,6 +2085,92 @@ Primary detector is eventLoopLagAlert. (t/3167)'''
     actions: budgetAlertConfigured ? [
       { actionGroupId: restartAlertActionGroup.id }
     ] : []
+  }
+}
+
+// ── GitHub API Refusal + Circuit-Open Alerts (t/4202) ──
+// t/4198 investigation: GitHub's 403 ("secondary rate limit" / abuse detection) is a
+// distinct refusal class from the 429 above, and until githubRestClient.ts's t/4202
+// change, its headers (Retry-After, x-ratelimit-*) were never captured at all — the
+// request just fell through to the generic failure path. Logged as 'github.api.refused'
+// so this alert can target that specific refusal class without conflating it with
+// ordinary 429s (already covered by rateLimitWarning/rateLimitCritical above).
+
+resource githubRefusalAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'alert-github-api-refused'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'GitHub API Refused (403 secondary rate limit / abuse detection)'
+    description: 'GitHub returned 403 (not 429) — secondary rate limit or abuse detection, a distinct refusal class from the primary rate limit. (t/4202)'
+    severity: 2
+    enabled: true
+    scopes: [ logAnalytics.id ]
+    // SO C4 (optional cost margin, applied): PT5M -> PT15M. windowSize matches so the
+    // 15-min eval gap has no blind spot between checks.
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
+    criteria: {
+      allOf: [
+        {
+          // Matches logGithubRefusal()'s Pino message (githubRestClient.ts, t/4202) —
+          // NOT the FlightRecorder event type string, which never reaches console
+          // output (FlightRecorder.record() only writes an in-memory ring buffer).
+          query: '''
+            ContainerAppConsoleLogs_CL
+            | where Log_s contains "github-api-refused-403"
+          '''
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+        }
+      ]
+    }
+    actions: {
+      actionGroups: budgetAlertConfigured ? [ restartAlertActionGroup.id ] : []
+    }
+  }
+}
+
+// Circuit breaker opening means every GitHub call is being short-circuited (serving
+// from cache only, t/4179). Matches "circuit-breaker-open" — the cause string
+// githubAPIBackend.ts's listDirectory already emits via log.server.warn whenever it's
+// blocked by the open circuit (NOT githubRestClient.ts's FlightRecorder event, which
+// never reaches console output — confirmed 0 hits during the 10-13 outage, vs this
+// string's 31,747 hits in the same window). Red-armed (t/4202, Lead review):
+//   10-13 09:55-10:30Z (outage window): 31,747 hits
+//   10-14 09:55-10:30Z (clean window):       0 hits
+
+resource circuitOpenAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'alert-github-circuit-open'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'GitHub API Circuit Breaker Open'
+    description: 'The GitHub API circuit breaker opened — all calls are being short-circuited, serving from cache only. (t/4202)'
+    severity: 1
+    enabled: true
+    scopes: [ logAnalytics.id ]
+    // Kept at PT5M by t/4248 SO C1 (e/306#3): since #3266 an open circuit fails hosted saves
+    // closed (503), so this is a user-facing outage signal. Do not slow it for cost (~$1/mo).
+    evaluationFrequency: 'PT5M'
+    windowSize: 'PT5M'
+    criteria: {
+      allOf: [
+        {
+          query: '''
+            ContainerAppConsoleLogs_CL
+            | where Log_s contains "circuit-breaker-open"
+          '''
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+        }
+      ]
+    }
+    actions: {
+      actionGroups: budgetAlertConfigured ? [ restartAlertActionGroup.id ] : []
+    }
   }
 }
 

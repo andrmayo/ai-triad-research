@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See LICENSE file in the project root.
 
 import { type DebateSession, type DebateSourceType, type SpeakerId, type DebatePacing } from '../types.js';
+import type { SeatTag } from '../types/session.js';
 import type { DialecticalStyle } from '../types/phase.js';
 
 // ── Lifecycle stages (for stopAfterStage on resume) ─────
@@ -28,6 +29,10 @@ export interface DebateConfig {
   evaluatorModel?: string;
   modelTier?: import('../types.js').ModelTier;
   speakerModels?: Record<string, string>;
+  /** Backend IDs eligible for this multi-provider run — the `availableBackends ∩ tierMap` set from
+   *  `resolveMultiProviderModels`. Must be provided alongside `speakerModels`; if absent on a
+   *  multi-provider run the fingerprint degrades to model-mixed with a WARN (t/4040). */
+  eligibleBackends?: string[];
   /** Fallback model chain for per-speaker failover. On hard failure (403, 500, empty), the engine tries each model in order, then falls back to the base `model`. Provided by the caller (server or Electron main). */
   fallbackChain?: string[];
   rounds: number;
@@ -102,8 +107,14 @@ export interface DebateConfig {
   enableDiversityRound?: boolean;
   /** Exclude greatest-hits (retread) nodes from debate node selection (t/1438). Requires calibration/greatest-hits.json. */
   excludeGreatestHits?: boolean;
+  /** Moderator voices each camp's story before the openings; debaters affirm or amend their own (h3). Off by default — experiment flag. */
+  narrativeVoicing?: boolean;
   /** Inject comp-linguist per-POV, per-BDI situation register-statements at setup (t/1450 experiment). Off by default. */
   enableSituationStatements?: boolean;
+  /** Use debate_grounding register text instead of description when present on a node (t/3366). Off by default. Falls back to description per node when field absent. */
+  useDebateGrounding?: boolean;
+  /** Rank situation selection by weighted breadth score (relevance + freshness + bdi_entropy via PRE_DEBATE_WEIGHTS) instead of pure relevance (t/3411 experiment). Off by default. */
+  breadthAwareSituationSelection?: boolean;
   /** Enable over-generate/select/rewrite pipeline: N=3 drafts, dedup, greedy top-K, rewrite, coherence gate (t/1581). */
   experiment_overgen_select_rewrite?: boolean;
   /** Exploration summary from a prior cheap-engine run — seeds cruxes, situations, AN priming, and config overrides. */
@@ -137,6 +148,15 @@ export interface DebateConfig {
   moderatorMode?: string;
   /** Talmudic reference corpus config — requires moderatorMode 'talmudic'. */
   talmudicReferences?: import('../types.js').TalmudicReferencesConfig;
+  /** Per-seat tag assignment for one POV (t/3965). Set by deriveDebateConfig from request.tagSelection; copied verbatim to session.seat_tags by initSession. */
+  seat_tags?: Partial<Record<SpeakerId, SeatTag>>;
+  /**
+   * Runtime-injected soul resolver (t/3975/t/4007).
+   * - cli/server/Electron main: pass soulDocLoader.resolvePoverInfo
+   * - Electron renderer / web: pass tagSoulRegistry.resolvePoverInfo
+   * Shared lib/debate code must not import either loader directly.
+   */
+  soulResolver?: import('../soulDocSchema.js').SoulResolverFn;
 }
 
 export interface DebateProgress {
@@ -232,6 +252,8 @@ export interface DebateEngineInternals {
   getKnownNodeIds(): Set<string>;
   getPolicyIds(): Set<string>;
   getSuppressedHints(): Set<string>;
+  /** Returns the resolved soul for a speaker. For tagged seats, returns the wing soul; for untagged, returns POVER_INFO[poverId]. */
+  getSoulForSpeaker(poverId: string): import('../types.js').PovInfo;
   updateHintStreaks(speaker: string, firedHints: string[]): void;
   updateSituationCitations(currentRefs: import('../types.js').TaxonomyRef[]): void;
 }

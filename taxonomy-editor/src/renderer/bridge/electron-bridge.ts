@@ -5,7 +5,7 @@
  * Electron bridge — delegates every AppAPI method to window.electronAPI (IPC).
  * Used when the app runs inside Electron (desktop mode).
  */
-import type { AppAPI, UserPreferences, CreateOpEdPayload, OpEdProgressEvent } from './types';
+import type { AppAPI, UserPreferences } from './types';
 import { makeCancellationError } from './cancellation';
 import { getGlobalRecorder } from '@lib/flight-recorder/index';
 import { ALL_API_KEY_BACKENDS } from '@lib/ai-client/types';
@@ -17,7 +17,7 @@ import {
   localComputeEmbeddings,
 } from '../utils/localEmbedding';
 import { ActionableError } from '@lib/debate/errors';
-import type { OpEdSet, OpEdSetSummary } from '../../../../lib/oped/types';
+import type { OpEdSet } from '../../../../lib/oped/types';
 
 // Fire-and-forget: start local embedding init on module load.
 // Bridge is always available in Electron, so WASM-init-failed is harmless noise.
@@ -50,20 +50,11 @@ export function waitForElectronAPI(timeoutMs = 2000): Promise<void> {
   });
 }
 
-// Op-Ed Studio (t/2576) — the op-ed persistence IPC surface is added to the preload
-// API by t/2575. Until that lands, the methods are absent from window.electronAPI, so
-// we feature-detect (optional-chained cast) and reject with an honest ActionableError.
-// No stub to swap out: when t/2575 installs the real methods, these calls light up.
-type OpEdIpc = {
-  listOpEdSets?: () => Promise<OpEdSetSummary[]>;
-  loadOpEdSet?: (id: string) => Promise<OpEdSet>;
-  saveOpEdSet?: (set: OpEdSet) => Promise<void>;
-  deleteOpEdSet?: (id: string) => Promise<void>;
-  createOpEdSet?: (payload: CreateOpEdPayload) => Promise<{ set_id: string }>;
-  cancelOpEdSet?: (setId: string) => void;
-  onOpEdProgress?: (cb: (e: OpEdProgressEvent) => void) => () => void;
-};
-const opEdIpc = (): OpEdIpc => window.electronAPI as unknown as OpEdIpc;
+// Op-Ed Studio (t/2576) persistence landed with t/2575 — window.electronAPI implements
+// listOpEdSets/loadOpEdSet/saveOpEdSet/deleteOpEdSet/createOpEdSet/cancelOpEdSet/onOpEdProgress
+// unconditionally (t/3532 declared them in electron.d.ts; previously a local ad-hoc
+// feature-detection type stood in for the undeclared surface). rejectOpEdIpc below remains
+// for the genuinely desktop-unsupported methods (sharing needs a hosted public URL).
 function rejectOpEdIpc(goal: string, method: string): Promise<never> {
   return Promise.reject(new ActionableError({
     goal: `Op-Ed Studio: ${goal}`,
@@ -114,12 +105,32 @@ export const api: AppAPI = {
 
   // Taxonomy CRUD
   loadTaxonomyFile: (pov) => window.electronAPI.loadTaxonomyFile(pov),
+  // t/4187: desktop writes the local checkout (single user), so there's no version to track.
+  loadTaxonomyFileForEdit: (pov) => window.electronAPI.loadTaxonomyFile(pov),
+  loadTaxonomyFilesForEdit: (povs) => Promise.all(povs.map((pov) => window.electronAPI.loadTaxonomyFile(pov))),
   saveTaxonomyFile: (pov, data) => window.electronAPI.saveTaxonomyFile(pov, data),
   // New-edge persistence (t/1816). Graceful-degrade until the `save-edges` IPC handler
   // lands (ElectronMain); delegates automatically once preload exposes saveEdges.
   saveEdges: (data) => window.electronAPI.saveEdges?.(data) ?? Promise.reject(new Error('Edge persistence is not available in desktop mode yet (pending the save-edges IPC handler, t/1816)')),
   loadPolicyRegistry: () => window.electronAPI.loadPolicyRegistry(),
+  // t/4034: IPC handler from t/4038. A rejection is recorded by the store as a WARN plus a notice, never a failed save.
+  recountPolicyMembers: (ids) => window.electronAPI.recountPolicyMembers(ids),
   loadLineageCategories: () => window.electronAPI.loadLineageCategories(),
+  // t/3852: durable delete-audit log. Graceful-degrade until the `log-node-deletion` IPC
+  // handler lands (ElectronMain, t/3859) — WARN-record and resolve rather than reject, since
+  // a missing audit log must never block the delete it's meant to record (same fail-safe
+  // contract as aiCallLog.ts).
+  logNodeDeletion: (entry) => {
+    if (!window.electronAPI.logNodeDeletion) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'bridge', level: 'warn',
+        message: 'logNodeDeletion IPC handler not yet available (t/3859) — delete proceeding without a durable log entry',
+        data: { nodeId: entry.nodeId },
+      });
+      return Promise.resolve();
+    }
+    return window.electronAPI.logNodeDeletion(entry);
+  },
   loadLineageInfo: () => window.electronAPI.loadLineageInfo(),
   loadEdges: () => window.electronAPI.loadEdges(),
   getEdgeDetail: (index) => window.electronAPI.getEdgeDetail(index),
@@ -128,6 +139,17 @@ export const api: AppAPI = {
   bulkUpdateEdges: (indices, s) => window.electronAPI.bulkUpdateEdges(indices, s),
   buildNodeSourceIndex: () => window.electronAPI.buildNodeSourceIndex(),
   buildPolicySourceIndex: () => window.electronAPI.buildPolicySourceIndex(),
+  // t/4335: ElectronMain's IPC handler is tracked separately (t/4342) and not installed yet.
+  // Reject loudly (not an empty-but-valid fallback) — an empty Sources tab would otherwise
+  // look like "no sources" instead of "transport missing" (Rosetta review, p/528#145).
+  getNodeSources: (nodeId) => window.electronAPI.getNodeSources
+    ? window.electronAPI.getNodeSources(nodeId)
+    : Promise.reject(new ActionableError({
+      goal: 'Load sources for this node',
+      problem: 'The desktop IPC handler for getNodeSources is not installed in this build (t/4342).',
+      location: 'electron-bridge.getNodeSources',
+      nextSteps: ['Update to a desktop build that includes the node-source-index IPC handler (t/4342).'],
+    })),
 
   // Conflict CRUD
   loadConflictFiles: () => window.electronAPI.loadConflictFiles(),
@@ -163,11 +185,15 @@ export const api: AppAPI = {
   checkDataUpdates: () => window.electronAPI.checkDataUpdates(),
   pullDataUpdates: () => window.electronAPI.pullDataUpdates(),
   getChangedFiles: () => window.electronAPI.getChangedFiles(),
+  // t/4052: IPC handlers from t/4054 (#3030).
+  loadPovTagProposals: () => window.electronAPI.loadPovTagProposals(),
+  reviewPovTagProposal: (nodeId, decision, expectedStatus) => window.electronAPI.reviewPovTagProposal(nodeId, decision, expectedStatus),
   getFileDiff: (filePath) => window.electronAPI.getFileDiff(filePath),
 
   // AI models & keys
   loadAIModels: () => window.electronAPI.loadAIModels(),
-  refreshAIModels: () => window.electronAPI.refreshAIModels(),
+  // t/4031: forward opts only when given, so a plain refresh sends the same IPC call as before.
+  refreshAIModels: (opts) => (opts ? window.electronAPI.refreshAIModels(opts) : window.electronAPI.refreshAIModels()),
   validateApiKey: (key, backend) => window.electronAPI.validateApiKey?.(key, backend) ?? Promise.resolve({ valid: false, error: 'Key validation not available in this version' }),
   verifyStoredKeys: (backend) => window.electronAPI.verifyStoredKeys?.(backend) ?? Promise.resolve({ results: [] }),
   setApiKey: (key, backend) => window.electronAPI.setApiKey(key, backend),
@@ -205,7 +231,7 @@ export const api: AppAPI = {
     // Correlate the request so the cancel channel can target it (t/2508). The main-process
     // handler ignores an unknown trailing arg until it wires requestId + AbortController (t/2509).
     const requestId = opts?.requestId ?? crypto.randomUUID();
-    const invoke = window.electronAPI.generateText(prompt, model, timeout, temperature, requestId);
+    const invoke = window.electronAPI.generateText({ prompt, model, timeoutMs: timeout, temperature, requestId, maxTokens: opts?.maxTokens });
     const signal = opts?.signal;
     if (!signal) return invoke;
     // Race the invoke against the abort signal so the renderer promise rejects PROMPTLY on a
@@ -217,7 +243,7 @@ export const api: AppAPI = {
       cancel();
       return Promise.reject(makeCancellationError('generateText cancelled by caller'));
     }
-    return new Promise<{ text: string }>((resolve, reject) => {
+    return new Promise<Awaited<typeof invoke>>((resolve, reject) => {
       const onAbort = () => { cancel(); reject(makeCancellationError('generateText cancelled by caller')); };
       signal.addEventListener('abort', onAbort, { once: true });
       invoke.then(
@@ -299,6 +325,48 @@ export const api: AppAPI = {
   loadDebateComments: (id) => window.electronAPI.loadDebateComments(id),
   saveDebateComments: (id, data) => window.electronAPI.saveDebateComments(id, data),
 
+  // Inquiry (t/3582/t/3579) — desktop IPC handler landed (ElectronMain, PR #2345).
+  startInquiry: (request, idempotencyKey) => window.electronAPI.startInquiry(request, idempotencyKey),
+  // Main resolves null for an unknown job; map to a thrown error for AppAPI parity with the
+  // web bridge's 404 (t/3582's AppAPI.getInquiry is non-nullable in both builds).
+  getInquiry: async (jobId) => {
+    const result = await window.electronAPI.getInquiry(jobId);
+    if (result === null) {
+      const err = new ActionableError({
+        goal: 'Poll inquiry status',
+        problem: `Inquiry ${jobId} not found`,
+        location: 'electron-bridge.getInquiry',
+        nextSteps: ['Check the job ID', 'Start a new inquiry'],
+      });
+      // Parity with the web bridge's 404 (t/3723) so the poll loop can detect "not found" the
+      // same way regardless of build.
+      (err as ActionableError & { httpStatus: number }).httpStatus = 404;
+      throw err;
+    }
+    return result;
+  },
+  // "My Questions" history + export (t/3683) — ElectronMain IPC leg landed: desktop-local
+  // persistence in userData/inquiry-results (survives the in-memory job Map's 30-min TTL sweep
+  // and app restarts, t/3579's Map alone was not a durable history store).
+  listInquiries: () => window.electronAPI.listInquiries(),
+  exportInquiryToFile: (result, title, format) => window.electronAPI.exportInquiryToFile(result, title, format),
+  // Public share (t/3654) — web-only, mirrors shareOpEdSet/unshareOpEdSet's desktop posture
+  // exactly. The renderer hides the Share control entirely on Electron (isElectronMode()
+  // check in InquiryShareControl) rather than exposing a button that always errors — these
+  // rejections are the type-completeness fallback, not the primary UX signal.
+  shareInquiry: () => Promise.reject(new ActionableError({
+    goal: 'Create a public share link for this question',
+    problem: 'Public sharing is not available in the desktop app.',
+    location: 'electron-bridge.shareInquiry',
+    nextSteps: ['Use the web app to share this question.'],
+  })),
+  unshareInquiry: () => Promise.reject(new ActionableError({
+    goal: 'Revoke a public share link for this question',
+    problem: 'Public sharing is not available in the desktop app.',
+    location: 'electron-bridge.unshareInquiry',
+    nextSteps: ['Use the web app to manage share links.'],
+  })),
+
   // Brief Export — desktop parity via main-process IPC (t/2840). Calls the shared runBriefPipeline
   // in-process; download returns raw bytes wrapped into a Blob (Blob-returning AppAPI in both builds).
   createBriefExport: (debateId, body) => window.electronAPI.createBriefExport(debateId, body),
@@ -326,14 +394,14 @@ export const api: AppAPI = {
   listBriefTemplates: () => Promise.resolve([]),
   deleteBriefTemplate: () => Promise.resolve(),
 
-  // Op-Ed Studio (t/2576) — feature-detected IPC (lands with t/2575); see opEdIpc above.
-  listOpEdSets: () => opEdIpc().listOpEdSets?.() ?? rejectOpEdIpc('list op-eds', 'listOpEdSets'),
-  loadOpEdSet: (id) => opEdIpc().loadOpEdSet?.(id) ?? rejectOpEdIpc('load an op-ed', 'loadOpEdSet'),
-  saveOpEdSet: (set) => opEdIpc().saveOpEdSet?.(set) ?? rejectOpEdIpc('save an op-ed', 'saveOpEdSet'),
-  deleteOpEdSet: (id) => opEdIpc().deleteOpEdSet?.(id) ?? rejectOpEdIpc('delete an op-ed', 'deleteOpEdSet'),
-  createOpEdSet: (payload) => opEdIpc().createOpEdSet?.(payload) ?? rejectOpEdIpc('create an op-ed', 'createOpEdSet'),
-  cancelOpEdSet: (setId) => { opEdIpc().cancelOpEdSet?.(setId); },
-  onOpEdProgress: (cb) => opEdIpc().onOpEdProgress?.(cb) ?? (() => {}),
+  // Op-Ed Studio (t/2576) — persistence landed with t/2575, declared on ElectronAPI (t/3532).
+  listOpEdSets: () => window.electronAPI.listOpEdSets(),
+  loadOpEdSet: (id) => window.electronAPI.loadOpEdSet(id),
+  saveOpEdSet: (set) => window.electronAPI.saveOpEdSet(set),
+  deleteOpEdSet: (id) => window.electronAPI.deleteOpEdSet(id),
+  createOpEdSet: (payload) => window.electronAPI.createOpEdSet(payload),
+  cancelOpEdSet: (setId) => { window.electronAPI.cancelOpEdSet(setId); },
+  onOpEdProgress: (cb) => window.electronAPI.onOpEdProgress(cb),
   // t/2728: op-ed public sharing is a hosted-web feature (needs the public server route);
   // desktop has no public URL, so reject with the standard web-only actionable error.
   shareOpEdSet: () => rejectOpEdIpc('share an op-ed', 'shareOpEdSet'),

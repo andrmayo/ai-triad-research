@@ -224,23 +224,22 @@ const ENV_KEY_NAMES: Record<AIBackend, string> = {
 // Imported after AIBackend is defined (keyStore depends on the type).
 import { getKeyStore, type KeyRotationResult } from './security/keyStore.js';
 import { getCurrentUserId } from './security/userContext.js';
+import { resolveGenericFallbackKey, assertKeyForBackend, isKeyRoutingRefusal, LISTING_WARN, GENERIC_FALLBACK_ENV, GENERIC_FALLBACK_BACKEND } from '../../../lib/ai-client/apiKeyFallback.js';
 
-/**
- * Resolve an API key for the given backend.
- * Priority: backend-specific env var → keyStore (local file or Azure KV) → AI_API_KEY fallback.
- *
- * In Azure (AZURE_KEYVAULT_URL set), keys are partitioned per authenticated
- * user via getCurrentUserId(). Locally, a single shared key is used per backend.
- */
-export async function getApiKey(backend: AIBackend = 'gemini'): Promise<string | null> {
+/** The backend's OWN key: its env var, then the keyStore. Never the AI_API_KEY fallback. */
+async function ownApiKey(backend: AIBackend): Promise<string | null> {
   const envKey = process.env[ENV_KEY_NAMES[backend]];
   if (envKey) return envKey;
 
   try {
     // t/835: stored value may be a JSON array of keys — take the first.
     const stored = await getKeyStore(getStateRoot).getKeys(backend, getCurrentUserId());
-    if (stored.length > 0) return stored[0];
+    if (stored.length > 0) {
+      assertKeyForBackend(stored[0], backend, 'stored'); // t/4105 C5: another backend's credential is refused
+      return stored[0];
+    }
   } catch (err) {
+    if (isKeyRoutingRefusal(err)) throw err; // a refusal is not a key-store failure; never swallow it
     getGlobalRecorder()?.record({
       type: 'system.error',
       component: 'server-config',
@@ -250,16 +249,42 @@ export async function getApiKey(backend: AIBackend = 'gemini'): Promise<string |
     });
     log.server.warn({ backend, err }, 'getApiKey failed');
   }
-
-  if (process.env.AI_API_KEY) return process.env.AI_API_KEY;
-
   return null;
+}
+
+/**
+ * Resolve an API key for the given backend, at CALL time.
+ * Priority: backend-specific env var → keyStore (local file or Azure KV) → AI_API_KEY fallback, gemini ONLY (t/4105).
+ * For any other backend a set AI_API_KEY throws an ActionableError naming that backend's own variable.
+ * Listing contexts (key presence, discovery loops) use {@link getApiKeyForListing}, which softens only that refusal.
+ *
+ * In Azure (AZURE_KEYVAULT_URL set), keys are partitioned per authenticated
+ * user via getCurrentUserId(). Locally, a single shared key is used per backend.
+ */
+export async function getApiKey(backend: AIBackend = 'gemini'): Promise<string | null> {
+  return (await ownApiKey(backend)) ?? resolveGenericFallbackKey(backend) ?? null;
+}
+
+/**
+ * The key for a LISTING context (status, key presence, discovery loops): same sources as getApiKey, but a
+ * non-gemini backend with only AI_API_KEY set reports null ("not configured") instead of throwing
+ * (SO e/284#2 cond 1). An operator with only AI_API_KEY then sees gemini configured and nothing fails.
+ */
+export async function getApiKeyForListing(backend: AIBackend = 'gemini'): Promise<string | null> {
+  try {
+    return await getApiKey(backend);
+  } catch (err) {
+    // Soften ONLY the gemini-only refusal, keyed on its kind (SO e/284#10). A foreign-credential refusal surfaces.
+    if (!isKeyRoutingRefusal(err, 'AIApiKeyGeminiOnlyRefused')) throw err;
+    log.server.warn({ backend }, `${LISTING_WARN}: reporting '${backend}' as not configured`);
+    return null;
+  }
 }
 
 /**
  * All API keys for a backend (t/835), in rotation order. Precedence mirrors
  * getApiKey: a configured env key (platform/free, single) wins; otherwise the
- * user's stored BYOK key list; otherwise the AI_API_KEY fallback. Returns [] if
+ * user's stored BYOK key list; otherwise the AI_API_KEY fallback (gemini only, t/4105). Returns [] if
  * none. Used by the key rotator for round-robin selection.
  */
 export async function getApiKeys(backend: AIBackend = 'gemini'): Promise<string[]> {
@@ -268,8 +293,12 @@ export async function getApiKeys(backend: AIBackend = 'gemini'): Promise<string[
 
   try {
     const stored = await getKeyStore(getStateRoot).getKeys(backend, getCurrentUserId());
-    if (stored.length > 0) return stored;
+    if (stored.length > 0) {
+      for (const k of stored) assertKeyForBackend(k, backend, 'stored'); // t/4105 C5
+      return stored;
+    }
   } catch (err) {
+    if (isKeyRoutingRefusal(err)) throw err; // a refusal is not a key-store failure; never swallow it
     getGlobalRecorder()?.record({
       type: 'system.error',
       component: 'server-config',
@@ -280,8 +309,37 @@ export async function getApiKeys(backend: AIBackend = 'gemini'): Promise<string[
     log.server.warn({ backend, err }, 'getApiKeys failed');
   }
 
-  if (process.env.AI_API_KEY) return [process.env.AI_API_KEY];
-  return [];
+  const fallback = resolveGenericFallbackKey(backend); // gemini only (t/4105); throws for any other backend
+  return fallback ? [fallback] : [];
+}
+
+/**
+ * Determine the KeySource string for a backend without returning key material (t/4088).
+ * Uses the same priority as getApiKey: env var → key store → AI_API_KEY fallback.
+ * Returns a value from the closed KeySource vocabulary (see tests/fixtures/ai-call-log/README.md).
+ */
+export async function getApiKeySource(backend: AIBackend): Promise<string> {
+  // Keyless backends (ollama has ENV_KEY_NAMES[backend] === '' which is falsy)
+  if (!ENV_KEY_NAMES[backend]) return 'none';
+  // Own env var
+  const envVarName = ENV_KEY_NAMES[backend];
+  if (process.env[envVarName]) return `env:${envVarName}`;
+  // Key store (local file or Azure Key Vault)
+  try {
+    const stored = await getKeyStore(getStateRoot).getKeys(backend, getCurrentUserId());
+    if (stored.length > 0) {
+      return process.env.AZURE_KEYVAULT_URL ? 'keyvault' : 'store';
+    }
+  } catch (err) {
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'server-config', level: 'warn',
+      message: 'getApiKeySource: key store unavailable — treating source as unknown',
+      error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+    });
+  }
+  // AI_API_KEY fallback (gemini only, t/4102)
+  if (backend === GENERIC_FALLBACK_BACKEND && process.env[GENERIC_FALLBACK_ENV]) return `fallback:${GENERIC_FALLBACK_ENV}`;
+  return '';
 }
 
 /** The user's stored BYOK keys for a backend (t/835) — excludes env/platform
@@ -300,8 +358,9 @@ export async function removeApiKey(index: number, backend: AIBackend = 'gemini')
   return getKeyStore(getStateRoot).removeKey(backend, getCurrentUserId(), index);
 }
 
+/** Key PRESENCE (a listing context): never throws, so a non-gemini backend with only AI_API_KEY reads false. */
 export async function hasApiKey(backend: AIBackend = 'gemini'): Promise<boolean> {
-  return (await getApiKey(backend)) !== null;
+  return (await getApiKeyForListing(backend)) !== null;
 }
 
 export async function storeApiKey(key: string, backend: AIBackend = 'gemini'): Promise<void> {
@@ -376,18 +435,56 @@ export const STORAGE_MODE: StorageMode =
     ? process.env.STORAGE_MODE
     : (process.env.NODE_ENV === 'production' ? 'github-api' : 'filesystem');
 
-// t/2061: fall back to AI_TRIAD_DATA_ROOT (the same data root getDataRoot() uses)
-// before the homedir default. The container sets AI_TRIAD_DATA_ROOT but not
-// TAXONOMY_CACHE_DIR, so CACHE_DIR was defaulting to ~/.cache/taxonomy while the
+/**
+ * t/4229 (t/4167 part B, TL p/522#390) / t/4234 (SO e/334#4): STORAGE_MODE alone fails OPEN
+ * during the prod rollback runbook, which can set STORAGE_MODE=filesystem on HOSTED prod —
+ * NODE_ENV pins this to genuine desktop/local-server use. Shared predicate for any gate that
+ * means "this is actually someone's desktop or a local dev server," not just "mode happens to
+ * be filesystem right now." (routes/taxonomy.ts's isPovTagsGateExempt() and this module's own
+ * callers should converge on this rather than re-deriving the two-part check.)
+ */
+export function isLocalDeployment(): boolean {
+  return STORAGE_MODE === 'filesystem' && process.env.NODE_ENV !== 'production';
+}
+
+// t/2061: in FILESYSTEM mode, fall back to AI_TRIAD_DATA_ROOT (the same data root
+// getDataRoot() uses) before the homedir default. The container sets AI_TRIAD_DATA_ROOT
+// but not TAXONOMY_CACHE_DIR, so CACHE_DIR was defaulting to ~/.cache/taxonomy while the
 // data lived at AI_TRIAD_DATA_ROOT — toRepoPath() then couldn't strip the prefix,
 // listDirectory returned empty, and isDataAvailable was always false. Keying the
 // cache off the data root keeps the two aligned even if the Dockerfile drifts.
+//
+// t/4299/t/4300: that same fallback is wrong for GITHUB-API mode specifically — it put
+// the disk cache ON the shared data root (`/mnt/shared`), so any direct writer to that
+// root (reconcile_grounding.py --apply, PS cmdlets) silently became what prod serves,
+// with no check against GitHub (t/4298). github-api's own unset-TAXONOMY_CACHE_DIR
+// default is now a dedicated homedir subdir — never the data root — so the cache can
+// only ever be populated by this process's own GitHub reads.
+//
+// TL-approved (t/4299, p/538#77): the cache is now EPHEMERAL on a cold start (new
+// revision / scale-from-zero) in github-api mode — every manifest-known path re-fetches
+// from GitHub instead of reading a warm local cache. Cost arithmetic at the point of
+// use, re-done (t/4300#19, #25) from a real prod measurement after this was live: the
+// ~110-calls-per-cold-start estimate (the manifest's typical file count) assumed every
+// manifest path re-fetches on boot, but most reads go through session-branch or
+// uninstrumented paths that don't round-trip GitHub per file — the observed boot cost
+// was 21 GitHub calls (getRequestMetrics(), prod revision ...6qtd6, t/4300#25), against
+// a ~5000/hr authenticated rate-limit budget — about 0.4% of the budget per cold start.
+// At prod's observed ~1 cold start/hour (t/4258's scale-to-zero cooldown), that's a
+// steady ~0.4% of the budget, not a multiplying cost.
+// RECHECK TRIGGER: if the scale-to-zero cooldown or polling cadence changes (t/4258's
+// work), or cold-start frequency measurably increases, re-verify this math still holds
+// before assuming it's still ~0.4%.
+//
 // The final homedir default stays a user-private dir (not world-writable /tmp) to
 // avoid symlink-race vulns (CodeQL js/insecure-temporary-file); AI_TRIAD_DATA_ROOT
 // is an explicit operator-set env var (already resolved at line 80), not a
 // hardcoded tmp default, so this fallback does not reintroduce that concern.
-export const CACHE_DIR =
-  process.env.TAXONOMY_CACHE_DIR || process.env.AI_TRIAD_DATA_ROOT || path.join(os.homedir(), '.cache', 'taxonomy');
+export const CACHE_DIR = process.env.TAXONOMY_CACHE_DIR || (
+  STORAGE_MODE === 'github-api'
+    ? path.join(os.homedir(), '.cache', 'taxonomy-github-api')
+    : (process.env.AI_TRIAD_DATA_ROOT || path.join(os.homedir(), '.cache', 'taxonomy'))
+);
 
 // ── Server settings ──
 
@@ -420,6 +517,19 @@ export function isEmbeddingWorkerOffloadEnabled(): boolean {
  *  oversubscribe the main event loop. A non-positive/NaN env → 1. */
 export function getEmbeddingWorkerPoolSize(): number {
   const n = Number.parseInt(process.env.EMBEDDING_WORKER_POOL_SIZE ?? '', 10);
+  return Number.isFinite(n) && n >= 1 ? n : 1;
+}
+
+/** t/4177 (scale to N replicas): each replica runs its own in-process RpmLimiter, so the pool's
+ *  Gemini RPM must be divided by replica count or N replicas collectively allow N×RPM. DEFAULT 1 —
+ *  behavior is unchanged until DevOps sets this alongside the real replica count (t/4181).
+ *  TRADE-OFF (TL t/4177#3): dividing at MAX_REPLICAS protects the pool at peak load, but under-uses
+ *  it when fewer replicas are actually live — at MAX_REPLICAS=10 with one live replica, that replica
+ *  gets RPM/10, so a single user's debate runs ~10× slower than today. Accepted for now (quota safety
+ *  over speed; 429 retries soften it). A shared counter (Redis / Durable Object) is the real fix if
+ *  this bites — a follow-up, not this ticket. A non-positive/NaN env → 1. */
+export function getMaxReplicas(): number {
+  const n = Number.parseInt(process.env.MAX_REPLICAS ?? '', 10);
   return Number.isFinite(n) && n >= 1 ? n : 1;
 }
 

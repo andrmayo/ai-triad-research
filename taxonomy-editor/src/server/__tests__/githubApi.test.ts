@@ -18,8 +18,17 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Agent } from 'undici';
-import { assertUndiciMajorInvariant } from '../storage/undiciInvariant.js';
+import { assertUndiciMajorInvariant, isUndiciMajorAlignedWithRuntime } from '../storage/undiciInvariant.js';
+import { log } from '../logger.js';
 import type { FlightRecorder, RecordInput } from '../../../../lib/flight-recorder/index';
+
+// t/3444: every describe below that constructs a GitHubAPIBackend/SessionBranchManager
+// is gated on this — on a local Node whose bundled undici major skews from the userland
+// pin, GitHubRestClient's constructor throws deterministically (assertUndiciMajorInvariant),
+// masking real local failures behind 75 always-red tests. CI's Dockerfile pins node:22.23.2
+// so these always run there. `sanitizeBranchName` and `assertUndiciMajorInvariant` below
+// test pure functions with no backend construction — they stay ungated.
+const UNDICI_ALIGNED = isUndiciMajorAlignedWithRuntime();
 
 // ── Mock setup ──────────────────────────────────────────────────────────
 
@@ -293,7 +302,7 @@ async function createSessionManager(backend?: Awaited<ReturnType<typeof createBa
 // INTEGRATION TESTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe('GitHubAPIBackend — integration', () => {
+describe.skipIf(!UNDICI_ALIGNED)('GitHubAPIBackend — integration', () => {
   it('initializes and fetches the repo tree', async () => {
     const recorder = createTestRecorder();
     const backend = await createBackend(recorder);
@@ -312,6 +321,36 @@ describe('GitHubAPIBackend — integration', () => {
     const content = await backend.readFile('/taxonomy/nodes.json');
     // Our mock returns base64-encoded '{"test": true}'
     expect(content).toBe('{"test": true}');
+
+    backend.shutdown();
+  });
+
+  // t/4298/t/4299/t/4300: ServerAPI's per-boot cold-start-cache-miss log
+  // (TL condition #2, p/538#77) reads this counter — it must increment
+  // exactly once per main-cache miss, never on a hit. This suite's fs/promises
+  // mock always ENOENTs reads (line 39), so a real disk-cache hit can't be
+  // observed through readFile() here — stub readFromDiskCache directly to
+  // control hit/miss instead of fighting that global mock.
+  it('getColdCacheMissCount increments once per main-cache miss, not on a hit', async () => {
+    const backend = await createBackend();
+    expect(backend.getColdCacheMissCount()).toBe(0);
+
+    const readSpy = vi.spyOn(
+      backend as unknown as { readFromDiskCache(p: string): Promise<string | null> },
+      'readFromDiskCache',
+    );
+
+    readSpy.mockResolvedValueOnce(null); // miss
+    await backend.readFile('/taxonomy/nodes.json');
+    expect(backend.getColdCacheMissCount()).toBe(1);
+
+    readSpy.mockResolvedValueOnce('{"cached": true}'); // hit
+    await backend.readFile('/taxonomy/nodes.json');
+    expect(backend.getColdCacheMissCount()).toBe(1);
+
+    readSpy.mockResolvedValueOnce(null); // another miss
+    await backend.readFile('/dictionary/terms.json');
+    expect(backend.getColdCacheMissCount()).toBe(2);
 
     backend.shutdown();
   });
@@ -345,53 +384,9 @@ describe('GitHubAPIBackend — integration', () => {
     backend.shutdown();
   });
 
-  it('retries once on 409 SHA conflict with fresh SHA (direct write mode)', async () => {
-    const recorder = createTestRecorder();
-    const backend = await createBackend(recorder);
-    // No session context → writeFile uses Contents API directly
-
-    let putCount = 0;
-    apiHandlers.push((url, init) => {
-      const method = init?.method ?? 'GET';
-      if (method === 'PUT' && url.includes('/contents/')) {
-        putCount++;
-        if (putCount === 1) {
-          // First PUT → 409 conflict
-          return { status: 409, body: { message: 'sha does not match' } };
-        }
-        // Second PUT → success
-        return { status: 200, body: { content: { sha: 'new-blob-sha-retry' } } };
-      }
-      return null!;
-    });
-
-    await backend.writeFile('/taxonomy/nodes.json', '{"retry": true}');
-
-    expect(putCount).toBe(2);
-    // Verify flight recorder logged the conflict
-    const conflictEvent = recorder.events.find(e => e.type === 'github.api.conflict');
-    expect(conflictEvent).toBeDefined();
-    expect(conflictEvent!.data).toMatchObject({ path: 'taxonomy/nodes.json' });
-
-    backend.shutdown();
-  });
-
-  it('throws on second 409 (no infinite retry, direct write mode)', async () => {
-    const backend = await createBackend();
-    // No session context → writeFile uses Contents API directly
-
-    apiHandlers.push((url, init) => {
-      const method = init?.method ?? 'GET';
-      if (method === 'PUT' && url.includes('/contents/')) {
-        return { status: 409, body: { message: 'sha does not match' } };
-      }
-      return null!;
-    });
-
-    await expect(backend.writeFile('/taxonomy/nodes.json', '{}')).rejects.toThrow(/409/);
-
-    backend.shutdown();
-  });
+  // t/4184/t/4187 direct-write-mode 409 handling and readFileWithVersion
+  // atomicity tests moved to githubApiWriteConflict.test.ts (p/775#36) —
+  // see that file for the split-on-budget rationale (ADR-007).
 
   it('rejects path traversal attempts', async () => {
     const backend = await createBackend();
@@ -562,7 +557,7 @@ describe('GitHubAPIBackend — integration', () => {
 // SESSION BRANCH MANAGER — INTEGRATION
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe('SessionBranchManager — integration', () => {
+describe.skipIf(!UNDICI_ALIGNED)('SessionBranchManager — integration', () => {
   it('creates a session branch lazily on ensureBranch', async () => {
     // Mock branch not found initially, then found after creation
     const createdBranches = new Set<string>();
@@ -757,7 +752,7 @@ describe('SessionBranchManager — integration', () => {
 // MULTI-USER ISOLATION
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe('SessionBranchManager — multi-user isolation', () => {
+describe.skipIf(!UNDICI_ALIGNED)('SessionBranchManager — multi-user isolation', () => {
   it('maintains separate branches for different users', async () => {
     const createdBranches = new Set<string>();
     apiHandlers.push((url, init) => {
@@ -870,7 +865,7 @@ describe('sanitizeBranchName', () => {
 // CHAOS TESTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe('GitHubAPIBackend — chaos: rate limit exhaustion', () => {
+describe.skipIf(!UNDICI_ALIGNED)('GitHubAPIBackend — chaos: rate limit exhaustion', () => {
   it('retries on 429 with Retry-After header', async () => {
     let callCount = 0;
     apiHandlers.push((url, init) => {
@@ -909,9 +904,61 @@ describe('GitHubAPIBackend — chaos: rate limit exhaustion', () => {
 
     backend.shutdown();
   });
+
+  it('retries immediately on 403 with Retry-After: 0 and logs its headers via Pino (t/4202 SO C1/C2)', async () => {
+    // SO C2 (bug, confirmed): a prior `retryAfterSec && attempt < MAX_RETRIES` check
+    // treated Retry-After: 0 ("retry immediately" per spec) as falsy and skipped the
+    // retry. This test's retry-after:0 value exercises exactly that branch — expecting
+    // callCount===2 (the retry DID happen) catches a regression back to the falsy check.
+    let callCount = 0;
+    apiHandlers.push((url, init) => {
+      if (url.includes('/contents/') && init.method === 'GET') {
+        callCount++;
+        if (callCount === 1) {
+          return {
+            status: 403,
+            body: { message: 'You have exceeded a secondary rate limit' },
+            headers: {
+              ...defaultRateLimitHeaders,
+              'retry-after': '0',
+            },
+          };
+        }
+        return {
+          status: 200,
+          body: { content: Buffer.from('recovered').toString('base64'), encoding: 'base64', sha: 'x' },
+        };
+      }
+      return null!;
+    });
+
+    // SO C1: pin the alert-github-api-refused match string (main.bicep) to its real
+    // emitter. deps.record()'s FlightRecorder event (asserted below) never reaches
+    // console output — only this Pino call does (t/3300#2 precedent: assert the real
+    // stdout sink, not just the ring buffer).
+    const githubWarnSpy = vi.spyOn(log.github, 'warn');
+
+    const recorder = createTestRecorder();
+    const backend = await createBackend(recorder);
+    const content = await backend.readFile('/taxonomy/nodes.json');
+
+    expect(content).toBe('recovered');
+    expect(callCount).toBe(2);
+
+    const refusedEvents = recorder.events.filter(e => e.type === 'github.api.refused');
+    expect(refusedEvents.length).toBeGreaterThan(0);
+    expect(refusedEvents[0].data).toMatchObject({ retryAfterSec: 0 });
+
+    const refusalLogCall = githubWarnSpy.mock.calls.find(([, msg]) => msg === 'github-api-refused-403');
+    expect(refusalLogCall).toBeDefined();
+    expect(refusalLogCall?.[0]).toMatchObject({ retryAfterSec: 0 });
+
+    githubWarnSpy.mockRestore();
+    backend.shutdown();
+  });
 });
 
-describe('GitHubAPIBackend — chaos: circuit breaker', () => {
+describe.skipIf(!UNDICI_ALIGNED)('GitHubAPIBackend — chaos: circuit breaker', () => {
   it('opens after 5 consecutive failures and blocks requests', async () => {
     let failCount = 0;
     apiHandlers.push((url, init) => {
@@ -975,7 +1022,7 @@ describe('GitHubAPIBackend — chaos: circuit breaker', () => {
   });
 });
 
-describe('GitHubAPIBackend — chaos: GitHub outage (5xx)', () => {
+describe.skipIf(!UNDICI_ALIGNED)('GitHubAPIBackend — chaos: GitHub outage (5xx)', () => {
   it('retries on 500 with exponential backoff', async () => {
     let callCount = 0;
     apiHandlers.push((url, init) => {
@@ -1019,7 +1066,7 @@ describe('GitHubAPIBackend — chaos: GitHub outage (5xx)', () => {
   });
 });
 
-describe('GitHubAPIBackend — chaos: token expiry mid-batch', () => {
+describe.skipIf(!UNDICI_ALIGNED)('GitHubAPIBackend — chaos: token expiry mid-batch', () => {
   it('refreshes credentials on 401 and retries', async () => {
     let attempt = 0;
     apiHandlers.push((url, init) => {
@@ -1083,7 +1130,7 @@ describe('GitHubAPIBackend — chaos: token expiry mid-batch', () => {
 // listDirectory's circuit guard is only reachable when repoTree is empty (normally
 // populated by initialize()), so it is a mechanical-only substitution not independently
 // characterized here — flagged, not forced (t/1698 escape hatch).
-describe('GitHubAPIBackend — circuit-open short-circuit per method (t/1698)', () => {
+describe.skipIf(!UNDICI_ALIGNED)('GitHubAPIBackend — circuit-open short-circuit per method (t/1698)', () => {
   const openCircuit = async (backend: Awaited<ReturnType<typeof createBackend>>) => {
     apiHandlers.push((url, init) => {
       if (url.includes('/contents/') && init.method === 'GET') {
@@ -1133,7 +1180,7 @@ describe('GitHubAPIBackend — circuit-open short-circuit per method (t/1698)', 
   });
 });
 
-describe('GitHubAPIBackend — chaos: force push on main', () => {
+describe.skipIf(!UNDICI_ALIGNED)('GitHubAPIBackend — chaos: force push on main', () => {
   it('triggers full cache invalidation on 404 compare', async () => {
     apiHandlers.push((url) => {
       // Compare returns 404 when cached SHA no longer in history
@@ -1176,7 +1223,7 @@ describe('GitHubAPIBackend — chaos: force push on main', () => {
   });
 });
 
-describe('GitHubAPIBackend — chaos: network errors', () => {
+describe.skipIf(!UNDICI_ALIGNED)('GitHubAPIBackend — chaos: network errors', () => {
   it('retries and recovers from transient network errors', async () => {
     let callCount = 0;
     apiHandlers.push((url, init) => {
@@ -1203,7 +1250,7 @@ describe('GitHubAPIBackend — chaos: network errors', () => {
   });
 });
 
-describe('SessionBranchManager — chaos: multi-tab race', () => {
+describe.skipIf(!UNDICI_ALIGNED)('SessionBranchManager — chaos: multi-tab race', () => {
   it('serializes concurrent commits from same user via mutex', async () => {
     const { manager, backend } = await createSessionManager();
     backend.setSessionContext({ userId: 'alice', branchName: 'api-session/alice' });
@@ -1257,7 +1304,7 @@ describe('SessionBranchManager — chaos: multi-tab race', () => {
   });
 });
 
-describe('GitHubAPIBackend — chaos: missing credentials', () => {
+describe.skipIf(!UNDICI_ALIGNED)('GitHubAPIBackend — chaos: missing credentials', () => {
   it('initializes in fallback mode with no credentials', async () => {
     const { getCredentials } = await import('../security/githubAppAuth');
     (getCredentials as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
@@ -1304,7 +1351,7 @@ describe('GitHubAPIBackend — chaos: missing credentials', () => {
 // CACHE BEHAVIOR
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe('GitHubAPIBackend — cache behavior', () => {
+describe.skipIf(!UNDICI_ALIGNED)('GitHubAPIBackend — cache behavior', () => {
   it('serves from session overlay on cache hit', async () => {
     const recorder = createTestRecorder();
     const backend = await createBackend(recorder);
@@ -1354,7 +1401,7 @@ describe('GitHubAPIBackend — cache behavior', () => {
 // listDirectory OVERLAY MERGE (t/681 — admin review queue fix)
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe('GitHubAPIBackend — listDirectory overlay merge (t/681)', () => {
+describe.skipIf(!UNDICI_ALIGNED)('GitHubAPIBackend — listDirectory overlay merge (t/681)', () => {
   it('includes files written to the session overlay but not yet committed', async () => {
     // Repro of the admin-review bug: submissions written to the overlay were
     // invisible to listDirectory() until the overlay was flushed on commit.
@@ -1451,7 +1498,7 @@ describe('GitHubAPIBackend — listDirectory overlay merge (t/681)', () => {
 // DIAGNOSTIC ACCESSORS
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe('GitHubAPIBackend — diagnostic accessors', () => {
+describe.skipIf(!UNDICI_ALIGNED)('GitHubAPIBackend — diagnostic accessors', () => {
   it('exposes rate limit info', async () => {
     const backend = await createBackend();
 
@@ -1520,8 +1567,20 @@ describe('GitHubAPIBackend — diagnostic accessors', () => {
 // MANIFEST MUTEX (t/479 — RMW race fix)
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe('GitHubAPIBackend — manifest mutex', () => {
-  it('concurrent readFile cache misses preserve all manifest entries', async () => {
+describe.skipIf(!UNDICI_ALIGNED)('GitHubAPIBackend — manifest mutex', () => {
+  // t/4219 (same class as t/3444's validateDataRoot.test.ts precedent): this
+  // fixture constructs read paths by prefixing the literal POSIX string
+  // '/var/cache/taxonomy-test' (cacheDir), relying on toRepoPath()'s
+  // getDataRoot()-prefix strip to recover the repo-relative path. On Windows,
+  // getDataRoot() runs that same literal through path.resolve(), which
+  // rewrites it to a drive-prefixed backslash path (e.g. 'C:\var\cache\...')
+  // — so the prefix no longer matches the fixture's POSIX string, the strip
+  // never fires, and every mocked content fetch misses its handler and falls
+  // through to the generic default body. Passes on Linux (CI) and non-Windows
+  // local dev — gate, don't fix, since path.resolve()'s platform-dependent
+  // behavior here is correct for each platform; this server backend only
+  // ever runs on Linux in production anyway.
+  it.skipIf(process.platform === 'win32')('concurrent readFile cache misses preserve all manifest entries', async () => {
     // Simulate the Phase 2 loadAll() pattern: 3 concurrent readFile() calls
     // that all miss cache, each fetching from GitHub and writing to manifest.
     // Before the mutex fix, the shared .tmp file would corrupt concurrent saves.
@@ -1627,7 +1686,7 @@ describe('GitHubAPIBackend — manifest mutex', () => {
 // SESSION OVERLAY MEMORY CAP (t/727)
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe('GitHubAPIBackend — session overlay memory cap (t/727)', () => {
+describe.skipIf(!UNDICI_ALIGNED)('GitHubAPIBackend — session overlay memory cap (t/727)', () => {
   async function cappedBackend(capBytes: number) {
     const { GitHubAPIBackend } = await import('../storage/githubAPIBackend');
     const b = new GitHubAPIBackend({
@@ -1681,7 +1740,7 @@ describe('GitHubAPIBackend — session overlay memory cap (t/727)', () => {
 // OPTIONAL 404 LOG LEVEL (t/1339)
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe('GitHubAPIBackend — optional 404 log level', () => {
+describe.skipIf(!UNDICI_ALIGNED)('GitHubAPIBackend — optional 404 log level', () => {
   it('logs non-optional 404 at error level with github.api.error type', async () => {
     apiHandlers.push((url, init) => {
       if ((init?.method ?? 'GET') === 'GET' && url.includes('/contents/')) {
@@ -1738,7 +1797,7 @@ describe('GitHubAPIBackend — optional 404 log level', () => {
 // t/2053 regression: undici dispatcher ownership + data-load status
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe('GitHubAPIBackend — undici dispatcher (t/2053)', () => {
+describe.skipIf(!UNDICI_ALIGNED)('GitHubAPIBackend — undici dispatcher (t/2053)', () => {
   it('passes explicit dispatcher on every fetch call', async () => {
     await createBackend();
 
@@ -1790,7 +1849,7 @@ describe('GitHubAPIBackend — undici dispatcher (t/2053)', () => {
 // mount must not 404 all github-api reads.
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe('toRepoPath strips getDataRoot() not cacheDir (t/2670)', () => {
+describe.skipIf(!UNDICI_ALIGNED)('toRepoPath strips getDataRoot() not cacheDir (t/2670)', () => {
   // Simulate a staging deployment where TAXONOMY_CACHE_DIR != AI_TRIAD_DATA_ROOT.
   // cacheDir comes from createBackend() = '/var/cache/taxonomy-test'.
   // getDataRoot() reads AI_TRIAD_DATA_ROOT; stub it to a distinct value.
@@ -1799,7 +1858,16 @@ describe('toRepoPath strips getDataRoot() not cacheDir (t/2670)', () => {
   beforeEach(() => { vi.stubEnv('AI_TRIAD_DATA_ROOT', FAKE_DATA_ROOT); });
   afterEach(() => { vi.unstubAllEnvs(); });
 
-  it('resolves a getDataRoot()-prefixed absolute path to a repo-relative path when cacheDir differs', async () => {
+  // t/4219 (same class as t/3444's validateDataRoot.test.ts precedent):
+  // FAKE_DATA_ROOT is a POSIX-style literal; on Windows, getDataRoot() runs
+  // it through path.resolve(), which rewrites it to a drive-prefixed
+  // backslash path, so the fixture's literal-string prefix check this test
+  // exists to verify (toRepoPath's getDataRoot()-prefix strip) never
+  // matches. Passes on Linux (CI) and non-Windows local dev — gate, don't
+  // fix, since path.resolve()'s platform-dependent behavior here is correct
+  // for each platform; this server backend only ever runs on Linux in
+  // production anyway.
+  it.skipIf(process.platform === 'win32')('resolves a getDataRoot()-prefixed absolute path to a repo-relative path when cacheDir differs', async () => {
     const backend = await createBackend(); // cacheDir = /var/cache/taxonomy-test
 
     // File path as fileIO.ts constructs it: absolute, rooted at getDataRoot().
@@ -1841,5 +1909,62 @@ describe('assertUndiciMajorInvariant', () => {
 
   it('passes when bundled version is undefined (node <22 without bundled undici)', () => {
     expect(() => assertUndiciMajorInvariant('6.28.0', undefined)).not.toThrow();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// t/4201 — a cache-hit start must load repoTree, so listings and /healthz never hit the Contents API.
+// Before the fix, every listDirectory after a cache-hit start called GitHub (the 10-13 outage, t/4176).
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe.skipIf(!UNDICI_ALIGNED)('GitHubAPIBackend — cache-hit start loads the repo tree (t/4201)', () => {
+  const manifest = {
+    version: 1, generation: 1, lastCommitSha: MAIN_SHA, lastUpdated: '2026-10-15T00:00:00Z',
+    files: {
+      'taxonomy/accelerationist.json': { sha: 'm-blob-acc', etag: '', cachedAt: '2026-10-15T00:00:00Z' },
+      'taxonomy/skeptic.json': { sha: 'm-blob-skp', etag: '', cachedAt: '2026-10-15T00:00:00Z' },
+    },
+  };
+
+  async function withManifestOnDisk<T>(fn: () => Promise<T>): Promise<T> {
+    const fsp = (await import('fs/promises')).default as unknown as { readFile: ReturnType<typeof vi.fn> };
+    fsp.readFile.mockImplementation(async (p: string) => {
+      if (String(p).endsWith('manifest.json')) return JSON.stringify(manifest);
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+    try { return await fn(); } finally {
+      fsp.readFile.mockImplementation(async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); });
+    }
+  }
+
+  const contentsCalls = () => fetchCalls.filter(c => c.method === 'GET' && c.url.includes('/contents/'));
+
+  it('loads the tree with one fetch, then N listings make zero Contents API calls', async () => {
+    await withManifestOnDisk(async () => {
+      const backend = await createBackend();
+      const before = contentsCalls().length;
+      for (let i = 0; i < 10; i++) {
+        const entries = await backend.listDirectory('/taxonomy');
+        expect(entries).toEqual(expect.arrayContaining(['nodes.json', 'edges.json']));
+      }
+      expect(contentsCalls().length - before).toBe(0);
+      expect(fetchCalls.filter(c => c.url.includes('/git/trees/')).length).toBe(1);
+      backend.shutdown();
+    });
+  });
+
+  it('seeds the tree from the manifest (with a warn) when the tree fetch fails, and still lists without GitHub', async () => {
+    await withManifestOnDisk(async () => {
+      apiHandlers.push((url, init) =>
+        (init.method ?? 'GET') === 'GET' && /\/git\/commits\/[a-f0-9]/.test(url) ? { status: 500, body: { message: 'boom' } } : (undefined as never));
+      const recorder = createTestRecorder();
+      const backend = await createBackend(recorder);
+      const before = contentsCalls().length;
+      const entries = await backend.listDirectory('/taxonomy');
+      expect(entries).toEqual(expect.arrayContaining(['accelerationist.json', 'skeptic.json']));
+      expect(contentsCalls().length - before).toBe(0);
+      expect(recorder.events.some(e => e.level === 'warn' && String(e.message).includes('seeded repoTree from the manifest'))).toBe(true);
+      backend.shutdown();
+    });
   });
 });

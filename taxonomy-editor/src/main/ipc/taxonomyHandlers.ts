@@ -8,6 +8,7 @@
 
 import { ipcMain, BrowserWindow } from 'electron';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import {
   readTaxonomyFile,
@@ -24,7 +25,13 @@ import {
   setActiveTaxonomyDir,
   buildNodeSourceIndex,
   buildPolicySourceIndex,
+  getNodeSources,
   readPolicyRegistry,
+  acquirePolicyRegistryLock,
+  releasePolicyRegistryLock,
+  writePolicyRegistryRaw,
+  readPovTagProposals,
+  writePovTagProposals,
   readAggregatedCruxes,
   readLineageCategories,
   readLineageEnrichments,
@@ -34,23 +41,38 @@ import {
   getDataRootPath,
   loadDataConfig,
 } from '../fileIO.js';
-import { ActionableError } from '../../../../lib/debate/errors.js';
+import { parsePovTagProposals, applyProposalDecision, type ProposalDecision, type ProposalStatus } from '../../../../lib/schema/povTagProposals.js';
+import { ActionableError, errorMessage } from '../../../../lib/debate/errors.js';
+import { findSituationBdiViolations, validateBdiFields, type SituationNode } from '../../../../lib/debate/taxonomyTypes.js';
 import { mergeEdgesPreservingRationale, ABSENT_BASELINE, type EdgesData, type EdgeMergeWarn } from '../../../../lib/edges/mergeEdgesPreservingRationale.js';
 import { renameSyncWithRetry } from '../../../../lib/debate/persistence.js';
 import { recordLockHolder } from '../../../../lib/debate/lockHolder.js';
 import { stampNodeAuthorship } from '../../server/storage/editMeta.js';
 import { getGlobalRecorder } from '../../../../lib/flight-recorder/index.js';
-import { VALID_POV } from '../ipcSchemas.js';
+import { VALID_POV, NodeDeleteLogEntrySchema } from '../ipcSchemas.js';
 import {
   assembleNodeEmbeddings,
   selectRelevantTaxonomy,
   type ANClaimInput,
   type SelectRelevantTaxonomyInput,
 } from '../../../../lib/debate/relevanceSelection.js';
-import { POVER_INFO } from '../../../../lib/debate/poverInfo.js';
+import { getPovDoctrinalBoundaries } from '../../../../lib/debate/poverInfo.js';
+import { resolvePoverInfo } from '../../../../lib/debate/soulDocLoader.js';
+import type { TagSelection } from '../../../../lib/debate/types/session.js';
+import type { SpeakerId } from '../../../../lib/debate/types/phase.js';
 import { computeEmbeddings, computeQueryEmbedding } from '../embeddings.js';
 import { computeClaimTaxonomyAttribution } from '../../../../lib/debate/argumentNetwork/attribution.js';
 import type { ArgumentNetworkNode, ClaimTaxonomyAttribution } from '../../../../lib/debate/types.js';
+import { writeNodeDeleteLogEntry } from '../nodeDeleteLog.js';
+import {
+  recountPolicyMembers,
+  serializePolicyRegistry,
+  type PolicyRegistry,
+  type PolicyPovFile,
+  type PolicyPovFileData,
+  type PolicyPovFiles,
+  type RecountPolicyMembersResult,
+} from '../../../../lib/policy/registryRecount.js';
 
 // Recorder-backed sink for the rationale re-merge's "baseline twin matched no incoming edge"
 // case: a real rationale isn't written, logged so a systematic tie-break mismatch is
@@ -62,31 +84,50 @@ const onEdgeMergeWarn: EdgeMergeWarn = (e) =>
   });
 
 /**
+ * Read the on-disk nodes for `pov` before a save — the one read shared by authorship
+ * diffing (stampSaveNodes, below) and the situations BDI save-gate (t/3891). Classifies the
+ * outcome rather than reacting to it: each caller decides how a missing vs. unreadable
+ * baseline should behave, because they have different risk profiles (losing edit-history
+ * attribution is low-stakes; silently accepting a non-BDI situation write is not).
+ */
+function readOldNodesForDiff(pov: string): { status: 'ok'; nodes: unknown[] } | { status: 'missing' } | { status: 'corrupt'; err: unknown } {
+  try {
+    const existing = readTaxonomyFile(pov);
+    // Existing file may also be either shape — extract nodes from either.
+    const nodes = Array.isArray(existing)
+      ? existing
+      : ((existing as { nodes?: unknown[] })?.nodes ?? []);
+    return { status: 'ok', nodes };
+  } catch (err) {
+    // ENOENT (missing file, first write) is not logged — it's the normal, benign case, not a
+    // degraded fallback. Anything else is a genuine read/parse failure; record it here (ADR-003
+    // requires the record() call stay literally in the catch) so both callers' reactions to
+    // 'corrupt' are covered by one entry, not a duplicate per caller.
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return { status: 'missing' };
+    getGlobalRecorder()?.record({
+      type: 'system.error',
+      component: 'ipc-save-taxonomy',
+      level: 'warn',
+      message: `Could not read existing ${pov} taxonomy file for save-time diffing`,
+      error: { name: (err as Error)?.name ?? 'Error', message: errorMessage(err), stack: (err as Error)?.stack },
+    });
+    return { status: 'corrupt', err };
+  }
+}
+
+/**
  * Stamp _edit_meta / _edit_history authorship onto a save's nodes (mirroring the server's
  * PUT /api/taxonomy/:pov), preserving on-disk metadata for nodes this save did NOT change
  * (t/828) and recording the save.stamp observability event. Returns the stamped node list.
  * Extracted verbatim from the save-taxonomy-file handler (t/1914 complexity split).
  */
 function stampSaveNodes(pov: string, newNodes: unknown[]): unknown[] {
-  let oldNodes: unknown[] = [];
-  try {
-    const existing = readTaxonomyFile(pov);
-    // Existing file may also be either shape — extract nodes from either.
-    oldNodes = Array.isArray(existing)
-      ? existing
-      : ((existing as { nodes?: unknown[] })?.nodes ?? []);
-  } catch (err) {
-    // Missing file on first write is benign (ENOENT); a corrupt existing file means we
-    // can't diff for history — record it but still save against an empty baseline so the
-    // edit is never blocked.
-    getGlobalRecorder()?.record({
-      type: 'system.error',
-      component: 'ipc-save-taxonomy',
-      level: 'warn',
-      message: 'Could not read existing taxonomy for edit-history diff; stamping against empty baseline',
-      error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
-    });
-  }
+  // readOldNodesForDiff already records a WARN for a genuine read failure ('corrupt'); here we
+  // just fall back to an empty baseline so the edit-history stamp is never what blocks the edit
+  // (unlike the BDI gate below, losing authorship attribution is recoverable; the data itself
+  // isn't at risk).
+  const diff = readOldNodesForDiff(pov);
+  const oldNodes: unknown[] = diff.status === 'ok' ? diff.nodes : [];
   const stamped = stampNodeAuthorship(
     oldNodes as Parameters<typeof stampNodeAuthorship>[0],
     newNodes as Parameters<typeof stampNodeAuthorship>[1],
@@ -124,6 +165,112 @@ function stampSaveNodes(pov: string, newNodes: unknown[]): unknown[] {
   return stamped;
 }
 
+// ── Situations BDI save-gate (t/3891, boundary guard for t/3888 — recurrence #5 class) ──
+//
+// The rule itself lives in ONE place — findSituationBdiViolations/validateBdiFields in
+// lib/debate/taxonomyTypes.ts (t/3889), pinned to the PowerShell classifier
+// Test-SituationBdiDecomposition by a parity test. This section only decides WHICH situations
+// to check (changed-only, SO e/244#2 Q1) and formats the refusal — mirrors the renderer's
+// utils/situationBdiGate.ts (t/3888) for the same reasoning, duplicated per-writer by design
+// (route table, t/3888#5): the diffing wrapper is per-host, the rule is not.
+
+/** Order-independent key of a node's interpretations — the deep compare behind changed-only.
+ *  Mirrors renderer utils/situationBdiGate.ts's interpretationsKey exactly. */
+function interpretationsKey(interpretations: unknown): string {
+  return JSON.stringify(interpretations, (_key, value: unknown) => {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const obj = value as Record<string, unknown>;
+      return Object.fromEntries(Object.keys(obj).sort().map(k => [k, obj[k]]));
+    }
+    return value;
+  });
+}
+
+/** Situations whose interpretations changed vs `baseline`. A node absent from the baseline
+ *  (new, or renamed) counts as changed (SO Q1 condition 2). Other field edits don't count —
+ *  "changed" is defined over `interpretations` only (SO Q1 condition 1). */
+function changedSituations(nodes: SituationNode[], baseline: Record<string, string>): SituationNode[] {
+  return nodes.filter(n => baseline[n.id] !== interpretationsKey(n.interpretations));
+}
+
+/** Every failing B/D/I field of one interpretation, found by probing the shared rule one field
+ *  at a time — so the error can name all of them without re-encoding the rule itself. */
+function failingBdiFields(interp: unknown): string[] {
+  if (typeof interp !== 'object' || interp === null) return ['belief', 'desire', 'intention'];
+  const obj = interp as Record<string, unknown>;
+  const valid = { belief: 'ok', desire: 'ok', intention: 'ok' };
+  return (['belief', 'desire', 'intention'] as const).filter(f => validateBdiFields({ ...valid, [f]: obj[f] }) !== null);
+}
+
+/**
+ * Refuse a situations save that writes a non-BDI-compliant interpretation on a CHANGED node.
+ * Fail-closed per TL/SO (t/3888#2, t/3888#4): a missing baseline (ENOENT — first write) means
+ * every node is new, so validate all of them and let the save proceed if they're compliant; an
+ * UNREADABLE baseline (corrupt file, permission error, anything else) refuses the save outright
+ * rather than silently treating "couldn't diff" as "nothing changed." Writes nothing on refusal.
+ */
+function guardSituationsBdiSave(newNodes: unknown[]): void {
+  const diff = readOldNodesForDiff('situations');
+  if (diff.status === 'corrupt') {
+    throw new ActionableError({
+      goal: 'Save the situations taxonomy file',
+      problem: `Could not read the existing situations file to determine which situations changed: ${errorMessage(diff.err)}`,
+      location: 'ipc/taxonomyHandlers.ts → save-taxonomy-file (situations BDI gate)',
+      nextSteps: [
+        'Inspect situations.json (or cross-cutting.json) for corruption',
+        'Restore the file from backup or git history',
+        'Retry the save once the existing file is readable',
+      ],
+      innerError: diff.err,
+    });
+  }
+  const oldNodes = (diff.status === 'ok' ? diff.nodes : []) as SituationNode[];
+  const baseline = Object.fromEntries(oldNodes.map(n => [n.id, interpretationsKey(n.interpretations)]));
+  const changed = changedSituations(newNodes as SituationNode[], baseline);
+  const violations = findSituationBdiViolations(changed);
+  if (violations.length === 0) return;
+
+  const byId = new Map((newNodes as SituationNode[]).map(n => [n.id, n]));
+  const lines = violations.map(v => {
+    const node = byId.get(v.id);
+    const fields = failingBdiFields(node?.interpretations[v.pov as keyof SituationNode['interpretations']]);
+    const problem = fields.length > 0
+      ? `${fields.join(', ')} ${fields.length === 1 ? 'is' : 'are'} empty or a placeholder (N/A, TBD, none…)`
+      : 'is not broken into belief, desire and intention';
+    return `${v.id} "${node?.label || '(no label)'}" — ${v.pov}: ${problem}`;
+  });
+
+  getGlobalRecorder()?.record({
+    type: 'system.error',
+    component: 'ipc-save-taxonomy',
+    level: 'warn',
+    message: 'save-taxonomy-file (situations): refused — non-BDI interpretation on a changed node',
+    data: { violations },
+  });
+
+  throw new ActionableError({
+    goal: 'Save the situations taxonomy file',
+    problem: `${violations.length} changed interpretation${violations.length === 1 ? '' : 's'} aren't fully broken into belief, desire and intention:\n`
+      + lines.map(l => `• ${l}`).join('\n'),
+    location: 'ipc/taxonomyHandlers.ts → save-taxonomy-file (situations BDI gate)',
+    nextSteps: ['Complete the listed belief/desire/intention fields, or delete the situation', 'Retry the save'],
+  });
+}
+
+/** t/4369 gap 3 (this handler's caller leg): relevanceSelection.ts's per-camp label dedup
+ *  writes injectionManifest.label_dedup but — same gap on the server route — nothing logged
+ *  it, so a dropped twin was invisible outside a manual diff. Mirrors the analogous WARN the
+ *  server's Pino-based route must add on its own leg. */
+function warnOnLabelDedup(injectionManifest: Record<string, unknown> | undefined): void {
+  const labelDedup = injectionManifest?.label_dedup;
+  if (!Array.isArray(labelDedup) || labelDedup.length === 0) return;
+  getGlobalRecorder()?.record({
+    type: 'system.error', component: 'ipc-handlers', level: 'warn',
+    message: `fetch-relevant-nodes: ${labelDedup.length} label-duplicate node(s) skipped (t/4369)`,
+    data: { labelDedup },
+  });
+}
+
 export function registerTaxonomyHandlers(): void {
   ipcMain.handle('get-taxonomy-dirs', () => {
     return getTaxonomyDirs();
@@ -151,6 +298,9 @@ export function registerTaxonomyHandlers(): void {
     const newNodes: unknown[] | null = Array.isArray(incoming.nodes)
       ? incoming.nodes
       : Array.isArray(data) ? (data as unknown[]) : null;
+    // t/3891: boundary guard for recurrence #5 (t/3888) — refuse a non-BDI situation
+    // interpretation on a changed node before anything is written. Writes nothing on refusal.
+    if (parsed.data === 'situations' && newNodes) guardSituationsBdiSave(newNodes);
     let toWrite: unknown = data;
     if (newNodes) {
       const stamped = stampSaveNodes(parsed.data, newNodes);
@@ -171,6 +321,96 @@ export function registerTaxonomyHandlers(): void {
 
   ipcMain.handle('load-policy-registry', () => {
     return readPolicyRegistry();
+  });
+
+  // t/4052/t/4054: review queue for pov-tag-proposals.json. Returns the FILE itself (or null when
+  // absent) — never parsePovTagProposals's { ok, file } wrapper (Rosetta Stone, p/546#62). A parse
+  // failure is a genuine error (the file exists and is broken), so it throws rather than returning
+  // null, which is reserved for "no file yet".
+  ipcMain.handle('load-pov-tag-proposals', () => {
+    const raw = readPovTagProposals();
+    if (raw === null) return null;
+    const parsed = parsePovTagProposals(raw);
+    if (!parsed.ok) {
+      throw new ActionableError({
+        goal: 'Load the POV-tag proposal review queue',
+        problem: `pov-tag-proposals.json is malformed: ${parsed.problems.join('; ')}`,
+        location: 'ipc/taxonomyHandlers.ts → load-pov-tag-proposals',
+        nextSteps: ['Inspect pov-tag-proposals.json for corruption', 'Restore the file from git history'],
+      });
+    }
+    return parsed.file;
+  });
+
+  // Review one decision. A refusal (conflict/invalid) is returned as a VALUE — never thrown — per
+  // the p/546#62 contract; nothing is written on refusal. reviewedBy is the local desktop user
+  // (os.userInfo, mirrors nodeDeleteLog.ts's local-identity fallback) — there is no server-side
+  // authenticated identity on Electron.
+  ipcMain.handle('review-pov-tag-proposal', (_event, nodeId: string, decision: ProposalDecision, expectedStatus: ProposalStatus) => {
+    const raw = readPovTagProposals();
+    if (raw === null) {
+      throw new ActionableError({
+        goal: 'Review a POV-tag proposal',
+        problem: 'pov-tag-proposals.json does not exist — there is nothing to review',
+        location: 'ipc/taxonomyHandlers.ts → review-pov-tag-proposal',
+        nextSteps: ['Run the proposal-generation step (t/3962) before opening the review queue'],
+      });
+    }
+    const parsed = parsePovTagProposals(raw);
+    if (!parsed.ok) {
+      throw new ActionableError({
+        goal: 'Review a POV-tag proposal',
+        problem: `pov-tag-proposals.json is malformed: ${parsed.problems.join('; ')}`,
+        location: 'ipc/taxonomyHandlers.ts → review-pov-tag-proposal',
+        nextSteps: ['Inspect pov-tag-proposals.json for corruption', 'Restore the file from git history'],
+      });
+    }
+    const reviewedBy = os.userInfo().username;
+    const reviewedAt = new Date().toISOString();
+    const result = applyProposalDecision(parsed.file, nodeId, decision, reviewedBy, reviewedAt, expectedStatus);
+    if ('refused' in result) return result;
+    writePovTagProposals(result.file);
+    return result;
+  });
+
+  // t/4034/t/4038: recount member_count/source_povs for the given policy ids after an editor
+  // edit adds/removes a node's policy action from the registry picker (t/4034 description).
+  // PI ruling e/264#29 (option a): the editor's recount never refuses on an uncommitted registry
+  // — only the lock can refuse. Flow (t/4038#4, minus the dropped dirty-tree step): acquire
+  // policy_actions.lock -> read registry + 4 POV files -> recountPolicyMembers -> `unchanged`
+  // before any write -> write via the one serializer -> release the lock in `finally`.
+  ipcMain.handle('recount-policy-members', async (_event, ids: string[]): Promise<RecountPolicyMembersResult> => {
+    const handle = await acquirePolicyRegistryLock();
+    if (!handle) {
+      return { status: 'refused', reason: 'locked', updated: [] };
+    }
+    try {
+      const rawRegistry = readPolicyRegistry();
+      if (rawRegistry === null) {
+        throw new ActionableError({
+          goal: 'Recount policy registry member counts',
+          problem: 'policy_actions.json does not exist — there is nothing to recount',
+          location: 'ipc/taxonomyHandlers.ts → recount-policy-members',
+          nextSteps: ['Create policy_actions.json before adding policy actions to a node'],
+        });
+      }
+      // All four files, read in order; the PolicyPovFiles type makes a missing key a compile error (t/4034, #3050).
+      const read = (pov: PolicyPovFile): PolicyPovFileData => readTaxonomyFile(pov) as PolicyPovFileData;
+      const povFiles: PolicyPovFiles = {
+        accelerationist: read('accelerationist'),
+        safetyist: read('safetyist'),
+        skeptic: read('skeptic'),
+        situations: read('situations'),
+      };
+      const { registry, updated, changed } = recountPolicyMembers(rawRegistry as PolicyRegistry, povFiles, ids);
+      if (!changed) {
+        return { status: 'unchanged', updated: [] };
+      }
+      writePolicyRegistryRaw(serializePolicyRegistry(registry));
+      return { status: 'written', updated };
+    } finally {
+      releasePolicyRegistryLock(handle);
+    }
   });
 
   ipcMain.handle('load-lineage-categories', () => {
@@ -311,6 +551,12 @@ export function registerTaxonomyHandlers(): void {
 
   ipcMain.handle('build-policy-source-index', () => {
     return buildPolicySourceIndex();
+  });
+
+  // t/4342 — Electron leg of the per-node source-index transport trio (t/4335).
+  // Matches the server's GET /api/node-source-index/:nodeId (ServerAPI, PR #3512).
+  ipcMain.handle('get-node-sources', (_event, nodeId: string) => {
+    return getNodeSources(nodeId);
   });
 
   ipcMain.handle('load-edges', () => {
@@ -515,6 +761,7 @@ export function registerTaxonomyHandlers(): void {
         excludeGreatestHits?: boolean;
         greatestHitsList?: string[];
       };
+      tagSelection?: TagSelection;
     };
     const { pov, topic, recentTranscript } = b;
     if (!POV_FILE_KEYS.has(pov)) throw new Error(`Invalid or missing pov (expected accelerationist|safetyist|skeptic), got: ${String(pov)}`);
@@ -528,17 +775,23 @@ export function registerTaxonomyHandlers(): void {
       Promise.all(texts.map(t => computeQueryEmbedding(t)));
 
     const povFile = readTaxonomyFile(pov) as { nodes?: SelectRelevantTaxonomyInput['povNodes'] };
-    const povNodes = povFile?.nodes ?? [];
+    // t/4432: exclude superseded nodes — these are offered to the model as new selection
+    // candidates (SO C1, t/4355; same rule lib/debate/taxonomyLoader.ts's loadTaxonomy applies).
+    // Kept local rather than a shared lib export (p/815#5) — a cross-role contract is T1, and
+    // a 1-line filter duplicated in 2 files doesn't need its own abstraction.
+    const povNodes = (povFile?.nodes ?? []).filter(n => !n.superseded_by);
     const sitFile = readTaxonomyFile('situations') as { nodes?: SelectRelevantTaxonomyInput['situationNodes'] };
     const situationNodes = sitFile?.nodes ?? [];
     const policyRaw = readPolicyRegistry() as { policies?: { id: string; action: string; source_povs?: string[] }[] } | null;
     const policyRegistry = (policyRaw?.policies ?? []).map(p => ({ id: p.id, action: p.action, source_povs: p.source_povs }));
     const lineageRaw = readLineageCategories() as { mapping?: Record<string, { l2: string }> } | null;
     const lineageMapping = lineageRaw?.mapping;
-    const povInfo = Object.values(POVER_INFO).find(i => (i as { pov?: string }).pov === pov) as { doctrinal_boundaries?: string[] } | undefined;
-    const doctrinalBoundaries = (povInfo?.doctrinal_boundaries?.length ?? 0) > 0
-      ? { strings: povInfo!.doctrinal_boundaries ?? [] }
-      : undefined;
+    // t/3977: resolvePoverInfo returns the tag soul WHOLE when a POV tag is selected (it replaces
+    // the general soul, not merges into it — t/3957#5 condition A) and falls back to the static
+    // POVER_INFO entry when no tag is selected (byte-identical to today). getPovDoctrinalBoundaries
+    // maps whichever soul's `boundaries.{hardcoded,softcoded}` shape (t/3966).
+    const { soul } = resolvePoverInfo(pov as Exclude<SpeakerId, 'user'>, b.tagSelection);
+    const doctrinalBoundaries = getPovDoctrinalBoundaries(soul);
 
     // Map loadSyntheticEmbeddings() ({pov,vectors}) → {nodeId: vectors[][]} for assembleNodeEmbeddings.
     const synthRaw = loadSyntheticEmbeddings();
@@ -556,12 +809,14 @@ export function registerTaxonomyHandlers(): void {
       greatestHitsList: b.session?.greatestHitsList,
     };
 
-    return selectRelevantTaxonomy({
+    const result = await selectRelevantTaxonomy({
       povNodes, situationNodes, policyRegistry, nodeEmbeddings, lineageMapping, doctrinalBoundaries,
       session,
-      params: { pov, topic, recentTranscript, threshold: b.threshold },
+      params: { pov, topic, recentTranscript, threshold: b.threshold, tagSelection: b.tagSelection },
       embed: queryEmbed,
     });
+    warnOnLabelDedup(result.injectionManifest);
+    return result;
   });
 
   // t/3322: compute-attribution — main-process mirror of server routes/attribution.ts.
@@ -584,7 +839,11 @@ export function registerTaxonomyHandlers(): void {
       computeEmbeddings(texts, ids);
 
     const povFile = readTaxonomyFile(pov) as { nodes?: SelectRelevantTaxonomyInput['povNodes'] };
-    const povNodes = povFile?.nodes ?? [];
+    // t/4432: exclude superseded nodes — a claim must attribute to a live node, not a
+    // historical one (SO C1, t/4355; same rule lib/debate/taxonomyLoader.ts's loadTaxonomy
+    // applies). Kept local rather than a shared lib export (p/815#5) — a cross-role contract
+    // is T1, and a 1-line filter duplicated in 2 files doesn't need its own abstraction.
+    const povNodes = (povFile?.nodes ?? []).filter(n => !n.superseded_by);
     const sitFile = readTaxonomyFile('situations') as { nodes?: SelectRelevantTaxonomyInput['situationNodes'] };
     const situationNodes = sitFile?.nodes ?? [];
     const synthRaw = loadSyntheticEmbeddings();
@@ -619,5 +878,24 @@ export function registerTaxonomyHandlers(): void {
         decisions: summary.decisions,
       },
     };
+  });
+
+  // t/3859 (Part D of t/3852): durable local audit record for a node deletion — the renderer
+  // calls this right after confirm, fail-safe on its side (see electron-bridge.ts's
+  // logNodeDeletion wrapper), so a write failure here must never surface as a rejected delete.
+  // Validated at the IPC boundary (structural only — see NodeDeleteLogEntrySchema) rather than
+  // trusting the renderer-supplied shape; a malformed payload is WARN-recorded and dropped, not
+  // written as a corrupt record (this writer has no other caller, so the renderer IS the boundary).
+  ipcMain.handle('log-node-deletion', (_event, entry: unknown) => {
+    const parsed = NodeDeleteLogEntrySchema.safeParse(entry);
+    if (!parsed.success) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'node-delete-log', level: 'warn',
+        message: 'log-node-deletion received a malformed entry — dropped, not written',
+        data: { error: parsed.error.message },
+      });
+      return;
+    }
+    writeNodeDeleteLogEntry(parsed.data);
   });
 }

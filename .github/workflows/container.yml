@@ -7,6 +7,11 @@
 #         For production, manually trigger the Deploy to Azure workflow.
 
 name: Container Image
+# t/4129: the run name carries the BUILT commit. Auto-Deploy to Staging (workflow_run) reads it back
+# via operations/devops/Get-BuiltShaFromRunName.ps1, because workflow_run.head_sha is the DISPATCH
+# ref tip, not the commit built from inputs.sha. Keep this expression IDENTICAL to the per-SHA tag
+# (`type=raw,value=sha-...`), BUILD_SHA and the checkout `ref:` below; the staging parser expects `(sha-<hex>)`.
+run-name: Container Image (sha-${{ inputs.sha || github.sha }})
 
 on:
   push:
@@ -34,7 +39,7 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/taxonomy-editor
+  IMAGE_NAME: ai-rosetta-stone/taxonomy-editor
 
 jobs:
   ci-gate:
@@ -111,7 +116,10 @@ jobs:
           # has been validated by prior successful runs. test-powershell failures do not
           # block container builds.
           for JOB in test-container; do
-            STATUS=$(gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs" \
+            # --paginate + per_page=100: the jobs API returns 30 per page by default and CI has
+            # more than 30 jobs (35 on 2026-10-06), so an unpaginated lookup could not see
+            # test-container and refused every build as "not found".
+            STATUS=$(gh api --paginate "repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100" \
               --jq ".jobs[] | select(.name == \"${JOB}\") | .conclusion // .status" 2>/dev/null || echo "")
             if [ "$STATUS" = "success" ] || [ "$STATUS" = "skipped" ]; then
               echo "  ${JOB}: ${STATUS}"
@@ -163,14 +171,14 @@ jobs:
 
       - name: Verify base image exists
         run: |
-          BASE_TAG=$(grep -oP 'FROM ghcr\.io/jpsnover/ai-triad-base:\K[^@ ]+' taxonomy-editor/Dockerfile | head -1)
+          BASE_TAG=$(grep -oP 'FROM ghcr\.io/ai-rosetta-stone/ai-triad-base:\K[^@ ]+' taxonomy-editor/Dockerfile | head -1)
           echo "Base image tag: $BASE_TAG"
           if [ "$BASE_TAG" = "latest" ]; then
             echo "Using :latest — checking it exists..."
           fi
-          TAGS=$(gh api user/packages/container/ai-triad-base/versions --jq '.[].metadata.container.tags[]' 2>/dev/null || echo "")
+          TAGS=$(gh api orgs/ai-rosetta-stone/packages/container/ai-triad-base/versions --jq '.[].metadata.container.tags[]' 2>/dev/null || echo "")
           if echo "$TAGS" | grep -qx "$BASE_TAG"; then
-            echo "Base image ghcr.io/jpsnover/ai-triad-base:$BASE_TAG exists"
+            echo "Base image ghcr.io/ai-rosetta-stone/ai-triad-base:$BASE_TAG exists"
           else
             echo "::error::Base image tag '$BASE_TAG' not found in GHCR. Available tags: $(echo $TAGS | tr '\n' ', ')"
             echo "Run the base-image workflow first, or update the Dockerfile to use an existing tag."
@@ -192,7 +200,7 @@ jobs:
           done
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           driver-opts: image=moby/buildkit:buildx-stable-1
 
@@ -211,7 +219,35 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            # Publish :latest on BOTH v* release tags AND main-branch dispatch builds
+            # (t/3522). The old `{{is_default_branch}}` fired only on main dispatch, so
+            # `v*` releases never refreshed :latest — leaving a stale tag that deploy.ps1
+            # / main.bicep default to (silent prod-deploy staleness). Adding the tag ref
+            # keeps :latest = newest of {last release, last main dispatch}; the main-branch
+            # clause is load-bearing for the Invoke-ContainerBuild dispatch -> deploy path.
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
+            # ── Per-SHA tag (t/3679 deploy-by-digest, condition 1) ───────────────────────
+            # A PERMANENT, deploy-pinnable tag naming the BUILT commit. deploy-azure.yml and
+            # deploy-staging.yml resolve `sha-<commit>` -> the immutable @sha256:<digest> and pin
+            # the ACA revision to that digest, so a pod recycle re-pulls IDENTICAL bytes — never a
+            # mutated :latest (the t/3679 recycle-swap hazard).
+            #
+            # WHY type=raw, NOT type=sha: docker/metadata-action's `type=sha` reads the git context
+            # (github.sha) = the DISPATCH ref HEAD. On a workflow_dispatch build with an explicit
+            # `sha`, the checkout builds `inputs.sha` (see BUILD_SHA at :279-285), so `type=sha`
+            # would tag the image with a commit it does NOT contain (t/3278 wrong-SHA / t/3110
+            # misleading-marker sink). The value below is IDENTICAL to BUILD_SHA and to `ref:`.
+            #
+            # GHCR-CLEANUP COUPLING — SYNC WITH operations/devops/Remove-StaleContainerImages.ps1:
+            # this tag is PERMANENT by design. ghcr-cleanup deletes only UNTAGGED images (>30d,
+            # keep 5 newest) — so a sha-tagged image is PRESERVED, which is what keeps a pinned
+            # digest pullable on a recycle indefinitely (the outage-preventer, t/3679#8 SO finding 1;
+            # also fixes t/3756 rollback-anchor expiry going forward). Tradeoff ACCEPTED: sha- tags
+            # accumulate (never auto-pruned) — modest manifest storage; a bounded-retention policy is
+            # a future call, not this change. TRAP: GHCR also lists `sha256-<digest>` COSIGN /
+            # attestation tags — those are NOT per-SHA image tags and do NOT preserve the image
+            # (t/3679#9 §4); do not mistake them for this tag.
+            type=raw,value=sha-${{ inputs.sha || github.sha }}
 
       - name: Fetch taxonomy snapshot for fallback
         id: snapshot
@@ -262,7 +298,7 @@ jobs:
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7
         with:
           context: .
           file: taxonomy-editor/Dockerfile
@@ -280,11 +316,60 @@ jobs:
           cache-from: type=gha,scope=shared-docker
           cache-to: type=gha,scope=shared-docker,mode=min
 
+      # t/4129: fail the BUILD, not a later deploy, if the per-SHA tag the deploys resolve is absent
+      # from the registry after the push. Reads the registry (authoritative), not metadata-action output.
+      - name: Verify per-SHA tag exists in GHCR after push (t/4129)
+        if: steps.push_mode.outputs.push == 'true'
+        env:
+          BUILT_SHA: ${{ inputs.sha || github.sha }}
+        run: |
+          ref="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${BUILT_SHA}"
+          for attempt in 1 2 3; do
+            if docker buildx imagetools inspect "$ref" > /dev/null 2>&1; then
+              echo "Per-SHA tag present: $ref"; exit 0
+            fi
+            echo "::warning::$ref not visible yet (attempt $attempt/3), retrying in 10s (registry propagation)"
+            sleep 10
+          done
+          echo "::error::Per-SHA tag $ref is missing from GHCR after push. Deploys resolve this tag (Resolve-ImageDigest.ps1) and would fail with ImageTagNotFound. Check the metadata-action tags and the push step."
+          exit 1
+
       - name: Install Trivy
         uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567  # v0.3.1
+        with:
+          # C4 (t/3520): pin the trivy BINARY. Actions are SHA-pinned already; the binary
+          # floated to `latest`, so DB-schema / severity-mapping / fixed-version-detection /
+          # .trivyignore-parsing semantics could change with no repo diff. Pin so gate
+          # behaviour changes only by an explicit PR. (Verify on the next build's
+          # "Install Trivy" log; re-pin deliberately when bumping.)
+          version: v0.74.0
+
+      # C3 (t/3520): DB warm-up with retry — makes an INFRA failure (Trivy-DB registry
+      # unreachable / rate-limited) distinct from a FINDING failure (the gate step's
+      # exit-code 1 on a fixable CVE). It runs BEFORE the scan/gate steps, so a transient
+      # ghcr/OCI DB flake fails HERE, visibly labelled infra, and the run stops before the
+      # gate evaluates findings. The scan + gate steps set TRIVY_SKIP_DB_UPDATE so they
+      # reuse this warmed DB and can only fail on findings — never on a DB download.
+      - name: Warm Trivy vuln DB (infra step — a failure here is DB/registry, NOT a CVE finding)
+        shell: bash
+        env:
+          TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
+        run: |
+          for attempt in 1 2 3; do
+            if trivy image --download-db-only --cache-dir "$TRIVY_CACHE_DIR"; then
+              echo "Trivy DB ready (attempt $attempt)"; exit 0
+            fi
+            echo "::warning::Trivy DB download failed (attempt $attempt/3) — retrying in 15s"
+            sleep 15
+          done
+          echo "::error::Trivy DB download failed after 3 attempts — INFRA failure (DB registry unreachable/rate-limited), NOT a vulnerability finding. Re-run; if persistent, check ghcr.io/aquasecurity/trivy-db availability."
+          exit 1
 
       - name: Scan image with Trivy
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        env:
+          TRIVY_SKIP_DB_UPDATE: 'true'     # reuse the warmed DB; DB flakes already surfaced as infra above
+          TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           format: 'sarif'
@@ -294,10 +379,69 @@ jobs:
           skip-setup-trivy: true
 
       - name: Upload Trivy scan results
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938  # v4
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2  # v4
         if: always() && hashFiles('trivy-results.sarif') != ''
         with:
           sarif_file: 'trivy-results.sarif'
+
+      # ── Trivy blocking gate — fixable high/critical (t/3520) ────────────────────
+      # NEW blocking gate (a promotion — there was previously NO build-failing Trivy
+      # step; the scan above is report-only SARIF). Fails CI on a FIXABLE high/critical
+      # so a patchable CVE can't ship unnoticed. `ignore-unfixed: true` means no-fix
+      # trixie residuals do NOT fail here — those stay governed by the annotated
+      # .trivyignore (report step above, t/2006 no-silent-suppression) + the weekly
+      # base rebuild that auto-retires them. So: hard floor on fixable, full visibility
+      # on the rest.
+      #
+      # ── UNBLOCK PLAYBOOK (SO condition 2, t/3520) — READ WHEN THIS GATE GOES RED ──
+      # OWNER: DevOps. SCOPE: Option A — this scans EVERY IMAGE BUILT VIA THE DISPATCH PATH.
+      # `container.yml`'s `push: tags: ['v*']` trigger exists but never fires — there are no
+      # `v*` tags on origin (t/3520#11/#12), so the only build path is `workflow_dispatch`
+      # (Invoke-ContainerBuild). A red here blocks that dispatched build/ship, not a PR merge;
+      # merge-time coverage is deliberately out of scope (t/3520#3 Finding 1). ("Release gate"
+      # is a misnomer while no tag-based release flow exists — it's a build-path gate.)
+      #
+      # EXOGENOUS RED — this gate can go red with ZERO repo change: the trivy vuln DB
+      # refreshes nightly, so a CVE can be reclassified, or one of the annotated no-fix
+      # .trivyignore residuals can gain an upstream fix — either flips a build red with no
+      # code change. Expected, and release-scoped (an attended event, not a PR wall).
+      #
+      # DECISION RULE when red:
+      #   1. VERIFY AGAINST THE REGISTRY, NOT THE YAML — read the actual Trivy finding
+      #      (package + "Fixed Version"); don't reason from config (t/3520 / t/3522 lesson).
+      #   2. FIXABLE (a patched version exists) -> BUMP THE FIX: OS pkg -> base rebuild
+      #      (base-image.yml); npm dep -> pnpm-workspace.yaml override + regen both lockfiles.
+      #   3. GENUINELY NO UPSTREAM FIX -> add an annotated `.trivyignore` entry (CVE + package
+      #      + "no upstream fix as of <date>" + reachability note + REVISIT trigger, t/2006).
+      #      A `.trivyignore` diff is a blocking-gate surface now — review it like a workflow diff.
+      #   NEVER an ad-hoc skip. Emergency bypass = the EXISTING merge-guard override path
+      #   (disable the feedback rule / `--no-verify` per the commit-guard pattern), recorded.
+      #
+      # STALENESS (Part 1b, 4-week rule): the deployed image is scanned out-of-band by
+      # `deployed-image-scan.yml` (weekly, report-only) against `:latest` — the real deployed
+      # artifact, since no `v*` tags exist. That workflow's freshness guard fails RED if
+      # `:latest` is older than the 4-week window, so a stale deployed image can't report
+      # false-clean. This gate here covers the freshly-built image at dispatch time.
+      #
+      # BLOCKING (flipped t/3520 after: Arm-A red proof run 35645266261 [__run_4 outcome=failure
+      # on a fixable HIGH] + warn-cycle green run 35646605903 [__run_4 outcome=success, 0
+      # findings] + Second Opinion Recommendation + TL sign-off). A fixable high/critical now
+      # FAILS the dispatched build. TO REVERT to non-blocking in an emergency (self-buggy gate
+      # downing builds), re-add `continue-on-error: true` to this step — same spirit as the
+      # commit-guard `--no-verify` / merge-guard disable path; record the revert on t/3520.
+      - name: Trivy blocking gate (fixable high/critical) — BLOCKING
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        env:
+          TRIVY_SKIP_DB_UPDATE: 'true'     # C3: reuse the warmed DB — a red here is a FINDING, never a DB flake
+          TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '1'
+          trivyignores: '.trivyignore'
+          skip-setup-trivy: true
 
       - name: Generate SBOM
         continue-on-error: true

@@ -39,7 +39,10 @@ function Invoke-IterativeExtraction {
     .PARAMETER MaxApiCalls
         Maximum total API calls per invocation. Default: 25.
     .PARAMETER ConfidenceThreshold
-        Minimum confidence to accept a claim without iteration. Default: 0.7.
+        Minimum confidence to accept a claim without iteration. Default: 0.7. Reported back as
+        FireStats.confidence_threshold, which Finalize-Summary records (t/4079).
+    .PARAMETER MaxTokens
+        Output budget for the initial extraction call. Default: 32768.
     #>
     [CmdletBinding()]
     param(
@@ -64,7 +67,9 @@ function Invoke-IterativeExtraction {
 
         [int]$MaxApiCalls = 25,
 
-        [double]$ConfidenceThreshold = 0.7
+        [double]$ConfidenceThreshold = 0.7,
+
+        [int]$MaxTokens = 32768
     )
 
     Set-StrictMode -Version Latest
@@ -75,7 +80,7 @@ function Invoke-IterativeExtraction {
 
     # ── Phase 1: Initial extraction (same as single-shot) ─────────────────────
     Write-Verbose "FIRE Phase 1: Initial extraction"
-    Write-Verbose "  Model: $Model | Temperature: $Temperature | MaxTokens: 32768"
+    Write-Verbose "  Model: $Model | Temperature: $Temperature | MaxTokens: $MaxTokens"
     Write-Verbose "  Guardrails: max $MaxIterPerClaim iter/claim, $MaxIterPerDoc iter/doc, ${WallClockSeconds}s wall-clock, $MaxApiCalls API calls"
     Write-Verbose "  Confidence threshold: $ConfidenceThreshold"
     $TotalApiCalls++
@@ -87,7 +92,7 @@ function Invoke-IterativeExtraction {
         -Model       $Model `
         -ApiKey      $ApiKey `
         -Temperature $Temperature `
-        -MaxTokens   32768 `
+        -MaxTokens   $MaxTokens `
         -JsonMode `
         -TimeoutSec  600
 
@@ -121,15 +126,17 @@ function Invoke-IterativeExtraction {
         }
         if ($null -eq $Summary) {
             Write-Verbose "  Phase 1 FAILED — JSON parse error: $ParseErr"
+            # The full stats shape (t/4172): no claim was parsed, so every claim count is 0.
+            $FailedStats = New-FireStats -ConfidenceThreshold $ConfidenceThreshold -TotalApiCalls 1 `
+                -ElapsedSeconds $Stopwatch.Elapsed.TotalSeconds -TerminationReason 'parse_failed' `
+                -MaxIterPerClaim $MaxIterPerClaim -MaxIterPerDoc $MaxIterPerDoc -WallClockSeconds $WallClockSeconds -MaxApiCalls $MaxApiCalls
+            $FailedStats['phase1_only'] = $true
+            $FailedStats['parse_failed'] = $true
             return @{
                 Summary    = $null
                 RawText    = $InitialResult.Text
                 Backend    = $InitialResult.Backend
-                FireStats  = @{
-                    mode = 'fire'; phase1_only = $true; parse_failed = $true
-                    total_iterations = 0; total_api_calls = 1
-                    elapsed_seconds = [Math]::Round($Stopwatch.Elapsed.TotalSeconds, 1)
-                }
+                FireStats  = $FailedStats
             }
         }
     }
@@ -142,12 +149,9 @@ function Invoke-IterativeExtraction {
             Summary   = $Summary
             RawText   = $InitialResult.Text
             Backend   = $InitialResult.Backend
-            FireStats = @{
-                mode = 'fire'; total_iterations = 0; total_api_calls = 1
-                claims_confident = 0; claims_iterated = 0; claims_total = 0
-                elapsed_seconds = [Math]::Round($Stopwatch.Elapsed.TotalSeconds, 1)
-                termination_reason = 'no_claims'
-            }
+            FireStats = New-FireStats -ConfidenceThreshold $ConfidenceThreshold -TotalApiCalls 1 `
+                -ElapsedSeconds $Stopwatch.Elapsed.TotalSeconds -TerminationReason 'no_claims' `
+                -MaxIterPerClaim $MaxIterPerClaim -MaxIterPerDoc $MaxIterPerDoc -WallClockSeconds $WallClockSeconds -MaxApiCalls $MaxApiCalls
         }
     }
 
@@ -158,6 +162,12 @@ function Invoke-IterativeExtraction {
     $TerminationReason = 'all_confident'
 
     $DriftChecks = [System.Collections.Generic.List[PSObject]]::new()
+    # t/4509: a claim whose own verification step says "verified: false" is a statement that the
+    # source does NOT contain the claim — not a factual claim at all. Index tracked here (not
+    # removed mid-loop, since DriftChecks below also indexes into $Claims); the set is filtered out
+    # of $Summary.factual_claims right before return.
+    $DroppedIndices = [System.Collections.Generic.HashSet[int]]::new()
+    $ClaimsDroppedVerification = 0
 
     Write-Verbose "FIRE Phase 2-3: Assessing $($Claims.Count) claims..."
 
@@ -319,19 +329,27 @@ Return JSON: {"claim_label": "$ClaimLabel", "verified": true/false, "refined_cla
                             }
                         }
 
+                        # t/4509: verified=false means the claim is NOT in the source — drop the
+                        # candidate entirely, before applying $Refined.refined_claim. The model's
+                        # "refined_claim" on a failed verification is typically its explanation of
+                        # the absence ("The source document does not contain...") rather than a
+                        # corrected claim, and writing that into $Claim.claim is exactly the bug:
+                        # a statement of absence persisted to the corpus as if it were a claim.
+                        if ($Refined.PSObject.Properties['verified'] -and -not $Refined.verified) {
+                            $Claim.fire_confidence = 0.1
+                            $Confidence = 0.1
+                            [void]$DroppedIndices.Add($i)
+                            $ClaimsDroppedVerification++
+                            Write-Warning "FIRE: $ClaimLabel failed verification against the source — dropped, not written as a factual claim."
+                            Write-Verbose "${Indent}iter $ClaimIter/$MaxIterPerClaim`: verified=false → dropped"
+                            break
+                        }
+
                         # Update claim text if refined
                         if ($Refined.PSObject.Properties['refined_claim'] -and $Refined.refined_claim -and $Refined.refined_claim -ne $ClaimText) {
                             $Claim.claim = $Refined.refined_claim
                             $ClaimText = $Refined.refined_claim
                             $Changes.Add('refined')
-                        }
-
-                        # If verified=false, mark as low confidence and stop
-                        if ($Refined.PSObject.Properties['verified'] -and -not $Refined.verified) {
-                            $Claim.fire_confidence = 0.1
-                            $Confidence = 0.1
-                            Write-Verbose "${Indent}iter $ClaimIter/$MaxIterPerClaim`: verified=false → 0.10, stopped"
-                            break
                         }
 
                         # Log iteration result
@@ -448,8 +466,21 @@ Return JSON: {"claim_label": "$ClaimLabel", "verified": true/false, "refined_cla
         }
     }
 
+    # ── Drop candidates that failed verification (t/4509) ────────────────────
+    # claims_total (below) still counts every candidate the loop considered, so the drop is visible
+    # alongside claims_dropped_verification rather than silently shrinking the total.
+    $OriginalClaimsCount = $Claims.Count
+    if ($DroppedIndices.Count -gt 0) {
+        $KeptClaims = [System.Collections.Generic.List[object]]::new()
+        for ($k = 0; $k -lt $Claims.Count; $k++) {
+            if (-not $DroppedIndices.Contains($k)) { $KeptClaims.Add($Claims[$k]) }
+        }
+        $Claims = $KeptClaims.ToArray()
+        $Summary.factual_claims = $Claims
+    }
+
     # ── Final summary log ─────────────────────────────────────────────────────
-    Write-Verbose "FIRE complete: $($Claims.Count) claims | $ClaimsConfident confident | $ClaimsIterated iterated | $TotalIter total iterations | $TotalApiCalls API calls | $([Math]::Round($Stopwatch.Elapsed.TotalSeconds, 1))s"
+    Write-Verbose "FIRE complete: $OriginalClaimsCount claims | $ClaimsConfident confident | $ClaimsIterated iterated | $ClaimsDroppedVerification dropped (failed verification) | $TotalIter total iterations | $TotalApiCalls API calls | $([Math]::Round($Stopwatch.Elapsed.TotalSeconds, 1))s"
     Write-Verbose "  Termination: $TerminationReason"
     Write-Verbose "  Guardrails: max_iter_per_claim=$MaxIterPerClaim, max_iter_per_doc=$MaxIterPerDoc, wall_clock=${WallClockSeconds}s, max_api_calls=$MaxApiCalls"
     if ($ClaimsExhausted -gt 0) {
@@ -464,22 +495,50 @@ Return JSON: {"claim_label": "$ClaimLabel", "verified": true/false, "refined_cla
         Summary   = $Summary
         RawText   = $InitialResult.Text
         Backend   = $InitialResult.Backend
-        FireStats = @{
-            mode                = 'fire'
-            total_iterations    = $TotalIter
-            total_api_calls     = $TotalApiCalls
-            claims_total        = $Claims.Count
-            claims_confident    = $ClaimsConfident
-            claims_iterated     = $ClaimsIterated
-            claims_drifted      = $DriftCount
-            elapsed_seconds     = [Math]::Round($Stopwatch.Elapsed.TotalSeconds, 1)
-            termination_reason  = $TerminationReason
-            guardrails          = [ordered]@{
-                max_iter_per_claim = $MaxIterPerClaim
-                max_iter_per_doc   = $MaxIterPerDoc
-                wall_clock_seconds = $WallClockSeconds
-                max_api_calls      = $MaxApiCalls
-            }
+        FireStats = New-FireStats -ConfidenceThreshold $ConfidenceThreshold -TotalIterations $TotalIter `
+            -TotalApiCalls $TotalApiCalls -ClaimsTotal $OriginalClaimsCount -ClaimsConfident $ClaimsConfident `
+            -ClaimsIterated $ClaimsIterated -ClaimsDrifted $DriftCount -ClaimsDroppedVerification $ClaimsDroppedVerification `
+            -ElapsedSeconds $Stopwatch.Elapsed.TotalSeconds `
+            -TerminationReason $TerminationReason `
+            -MaxIterPerClaim $MaxIterPerClaim -MaxIterPerDoc $MaxIterPerDoc -WallClockSeconds $WallClockSeconds -MaxApiCalls $MaxApiCalls
+    }
+}
+
+function New-FireStats {
+    <#
+    .SYNOPSIS
+        Invoke-IterativeExtraction's FireStats hashtable, in the one shape every return path shares.
+    .DESCRIPTION
+        New-SummaryModelInfo and Get-POVSummaryModelInfo read claims_total, claims_confident,
+        claims_iterated and termination_reason, which throws under StrictMode on a hashtable without
+        the key. The parse-failure path used to omit them, and the no-claims path omitted
+        claims_drifted and guardrails (t/4172). The claim counts default to 0: a path that parsed no
+        claims processed none.
+    #>
+    param(
+        [double]$ConfidenceThreshold, [int]$TotalIterations = 0, [int]$TotalApiCalls = 0,
+        [int]$ClaimsTotal = 0, [int]$ClaimsConfident = 0, [int]$ClaimsIterated = 0, [int]$ClaimsDrifted = 0,
+        [int]$ClaimsDroppedVerification = 0,
+        [double]$ElapsedSeconds = 0, [string]$TerminationReason,
+        [int]$MaxIterPerClaim, [int]$MaxIterPerDoc, [int]$WallClockSeconds, [int]$MaxApiCalls
+    )
+    @{
+        mode                        = 'fire'
+        confidence_threshold        = $ConfidenceThreshold
+        total_iterations            = $TotalIterations
+        total_api_calls             = $TotalApiCalls
+        claims_total                = $ClaimsTotal
+        claims_confident             = $ClaimsConfident
+        claims_iterated             = $ClaimsIterated
+        claims_drifted              = $ClaimsDrifted
+        claims_dropped_verification = $ClaimsDroppedVerification
+        elapsed_seconds             = [Math]::Round($ElapsedSeconds, 1)
+        termination_reason          = $TerminationReason
+        guardrails                  = [ordered]@{
+            max_iter_per_claim = $MaxIterPerClaim
+            max_iter_per_doc   = $MaxIterPerDoc
+            wall_clock_seconds = $WallClockSeconds
+            max_api_calls      = $MaxApiCalls
         }
     }
 }

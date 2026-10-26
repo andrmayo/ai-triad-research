@@ -35,7 +35,8 @@ function Assert-DockerAvailable {
                 'Install Docker Desktop from https://www.docker.com/products/docker-desktop/'
                 'Ensure Docker Desktop is running'
                 'Run Show-TaxonomyEditor again'
-            ))
+            ) `
+            -AsErrorRecord)
     }
 
     # Check that the daemon is responsive
@@ -54,7 +55,8 @@ function Assert-DockerAvailable {
                 'Start Docker Desktop'
                 'Wait for the Docker icon to show "running"'
                 'Run Show-TaxonomyEditor again'
-            ))
+            ) `
+            -AsErrorRecord)
     }
 }
 
@@ -76,7 +78,7 @@ function Pull-TaxonomyEditorImage {
         Pulls the latest Taxonomy Editor Docker image.
     #>
     [CmdletBinding()]
-    param([string]$ImageName = 'ghcr.io/jpsnover/taxonomy-editor:latest')
+    param([string]$ImageName = 'ghcr.io/ai-rosetta-stone/taxonomy-editor:latest')
 
     Write-Step "Pulling Taxonomy Editor image ($ImageName)"
     Write-Info 'This is a one-time download (~1.4 GB). Subsequent starts are instant.'
@@ -89,9 +91,10 @@ function Pull-TaxonomyEditorImage {
             -NextSteps @(
                 'Check your internet connection'
                 'Verify Docker is working: docker pull hello-world'
-                'Verify GHCR is accessible: docker pull ghcr.io/jpsnover/taxonomy-editor:latest'
+                'Verify GHCR is accessible: docker pull ghcr.io/ai-rosetta-stone/taxonomy-editor:latest'
                 'If behind a proxy, configure Docker proxy settings'
-            ))
+            ) `
+            -AsErrorRecord)
     }
     Write-OK 'Image pulled successfully.'
 }

@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See LICENSE file in the project root.
 
 import type { PovKey } from '../debate/types.js';
+import type { TagMode, TagSelection, AppliedTag } from '../schema/povTags.js';
 
 export type { PovKey };
 
@@ -14,6 +15,20 @@ export interface OpEdParams {
   thesis?: string;
   authorBio?: string;
   model: string;
+  /** POV tag for ONE member (t/3960). The member whose `pov` matches gets the tag soul and the tag
+   *  filter; every other member runs exactly as untagged. Absent: an untagged set, as before. */
+  tagSelection?: TagSelection;
+}
+
+/** Which soul file voiced a member (t/3960; t/4007). `file` is soul-docs-relative (e.g. "skeptic.soul.json");
+ *  `hash` is "fnv1a64:" + 16 hex chars from soulDocHash(). Pre-t/4007 entries carry `sha` (first 16 hex of
+ *  SHA-256, no prefix) — the schema normalises both to `hash` on read. Internal provenance: EXCLUDED from
+ *  the public share (TL e/254#4), same class as `debateId`. */
+export interface OpEdSoulProvenance {
+  file: string;
+  /** Absent when neither `hash` nor `sha` was present in the stored record (legacy sets pre-t/4007 that
+   *  had no provenance). `compareSoulProvenance` returns `unknown` for any absent or malformed hash. */
+  hash?: string;
 }
 
 // ── Grounding reference (op-ed shape — node + editorial context) ──────────────
@@ -51,6 +66,48 @@ export interface OpEdMember {
   claims?: { text: string; paragraph: number }[];
   /** Set when FABRICATED_LEDE_GUARD matched the lede on an empty-newsHook run (t/2730). */
   fabricated_lede?: true;
+  /** Observability for the readability edit pass (t/3707). Absent when the edit pass was skipped
+   *  (body already met targets). NO consumer should branch on this field; exemption lapses if one does. */
+  editing_meta?: EditingMeta;
+  /** Observability for the logical-coherence pass (t/3826). Absent when pass was skipped (no flags).
+   *  NO consumer should branch on this field; exemption lapses if one does. */
+  coherence_meta?: CoherenceMeta;
+  /** What the tag actually did for THIS member (t/3960; SO e/252 cond 3 / e/254#6). Present only on the
+   *  tagged member. Count meanings per mode: `APPLIED_TAG_COUNT_MEANING` (lib/schema/povTags.ts). */
+  tag?: AppliedTag;
+  /** Which soul file voiced this member. Set on every generated member, base or tag soul. */
+  soul?: OpEdSoulProvenance;
+}
+
+/** Outcome record for the readability edit pass (t/3707). Written for CL validation tooling; log-only. */
+export interface EditingMeta {
+  /** Whether the body was actually replaced by the edit (false = skipped / reverted / error). */
+  edited: boolean;
+  fk_before: number;
+  fk_after: number;
+  /** Names of checks that still failed after the edit (empty = all passed). */
+  checks_failed_after: string[];
+  /** Populated when the edit was reverted: reason string. */
+  reverted_reason?: string;
+}
+
+/** Outcome record for the logical-coherence pass (t/3826). Written for CL validation tooling; log-only. */
+export interface CoherenceMeta {
+  any_flagged: boolean;
+  /** check_ids that produced valid (both-spans-quoted) flags on the original body. */
+  checks_fired: string[];
+  /** The valid flags verbatim — spans are non-negotiable for CL's false-positive study. */
+  flags: Array<{ check_id: string; span_a: string; span_b: string; why: string }>;
+  /** Model the coherence judge ran on — required for CL's evaluator-sensitivity study (t/3826#4). */
+  judge_model: string;
+  body_length_before: number;
+  /** Populated when the body was replaced by the coherence rewrite. */
+  body_length_after?: number;
+  rewritten: boolean;
+  /** check_ids that still flagged after an accepted rewrite (empty = all resolved). */
+  checks_still_flagged_after?: string[];
+  /** Populated when the rewrite was reverted. */
+  reverted_reason?: string;
 }
 
 // ── Set wrapper (e/91#2 conditions 2 & 4) ────────────────────────────────────
@@ -105,4 +162,7 @@ export interface OpEdCommunityEntry {
   community_metadata: unknown;
   /** t/2993: forwarded from the stored op-ed's params.outlet at index-build time. */
   outlet?: string;
+  /** The tagged member's scope, so a list row never labels a one-wing essay as the whole camp's (TL
+   *  t/3960#3 cond 2). `label` is the wing name from the tag registry. Absent for untagged sets. */
+  tag?: { pov: PovKey; tag: string; mode: TagMode; label: string };
 }

@@ -27,6 +27,7 @@ import type { RunControlRecord, VoiceState } from '../storage/opedRunStore.js';
 import { log } from '../logger.js';
 import { listOpedSets, loadOpedSet, deleteOpedSet, getOpedSetsQuotaStatus, finalizeOpedSet } from '../storage/opedStore.js';
 import type { OpEdSet, OpEdMember, OpEdParams, PovKey } from '../../../../lib/oped/types.js';
+import { parseOpEdRequest } from '../../../../lib/oped/schemas.js';
 import type { GenerateOpEdRequest, OpEdGeneratorDeps, OpEdProgressEvent } from '../../../../lib/oped/generate.js';
 import { getStorageUserId, isAnonymousUser } from '../security/userContext.js';
 import { checkRate } from '../security/rateLimiter.js';
@@ -36,6 +37,7 @@ import { resolveBackend, isRegisteredModel } from '../ai/aiBackends.js';
 import { DEFAULT_MODEL } from '../../../../lib/ai-client/index.js';
 import { getProjectRoot } from '../config.js';
 import { createWebOpEdAdapter } from '../ai/opedAdapter.js';
+import { OUTLET_BANDS } from '../../../../lib/oped/outletBands.js';
 import { randomUUID } from 'crypto';
 import path from 'path';
 
@@ -53,12 +55,21 @@ const MAX_TOPIC_LEN = 2000;
 // is gone. Completion stays authoritative via the durable finalized set (opedStore), NOT this
 // store — a cross-replica reconnect / replica recycle recovers via the sets GET (TL Q2, t/2610#3).
 // The store lazy-expires stale 'running' blobs (crashed-A protection); no local sweep needed.
-// The @INMEMORY_JOB_STORE marker is removed — this ticket IS that migration.
+// The in-memory job-store marker is removed — this ticket IS that migration.
 const MAX_CONCURRENT_OPED_RUNS = 1;          // per user, P1 (TL Q1)
 const OPED_HEARTBEAT_MS = 15_000;
 
 // ── create-request parsing (FromTopic + FromSource-URL) ──
 interface ParsedOpEdCreate { topic: string; povs: string[]; params: OpEdParams; url?: string }
+
+// t/3858: outlet is OPTIONAL (absent/empty → band default), but if supplied it must be a known key.
+// Extracted to keep parseOpEdCreate under the complexity budget.
+function validateOutlet(outlet: string | undefined): string | null {
+  if (!outlet) return null;
+  if (OUTLET_BANDS[outlet]) return null;
+  return `params.outlet "${outlet}" is not a known outlet. Valid: ${Object.keys(OUTLET_BANDS).join(', ')}`;
+}
+
 function parseOpEdCreate(body: unknown): { ok: true; value: ParsedOpEdCreate } | { ok: false; status: number; message: string } {
   const b = (body ?? {}) as { topic?: unknown; params?: OpEdParams; povs?: unknown; url?: unknown; source?: unknown };
   // t/2807: `url` sources are now supported on web — fetched via the SSRF-hardened
@@ -73,6 +84,8 @@ function parseOpEdCreate(body: unknown): { ok: true; value: ParsedOpEdCreate } |
   if (!topic || topic.length > MAX_TOPIC_LEN) return { ok: false, status: 400, message: 'topic is required (non-empty, ≤2000 chars)' };
   if (povs.length === 0) return { ok: false, status: 400, message: 'at least one voice (pov) is required' };
   if (!params || typeof params.model !== 'string') return { ok: false, status: 400, message: 'params.model is required' };
+  const outletError = validateOutlet(params.outlet);
+  if (outletError) return { ok: false, status: 400, message: outletError };
   // wordCount is OPTIONAL — the outlet band supplies the default (lib/oped/generate.ts resolveOutletBand;
   // New-OpEd.ps1 derives length from the outlet). A default create ("Use outlet band") sends no wordCount,
   // so requiring it 400'd every default web op-ed (t/2685). Coerce absent/invalid/≤0 to the band sentinel 0
@@ -103,7 +116,10 @@ function applyEventToRun(run: RunControlRecord, event: OpEdProgressEvent, comple
 function logVoiceFailure(event: OpEdProgressEvent, model: string): void {
   if (event.type !== 'voice_failed') return;
   const evt = event as { pov: string; error?: string };
-  const backend = resolveBackend(model || DEFAULT_MODEL);
+  // t/4196 Stage 1 (AC3, log-only): null, not the real registry — this module is mocked
+  // (partial factory, no getModelRegistry) across many route-level test suites, and this value
+  // only ever reaches a diagnostic log line, never a routing decision. Prefix-only, acknowledged.
+  const backend = resolveBackend(model || DEFAULT_MODEL, null);
   getGlobalRecorder()?.record({
     type: 'system.error', component: 'oped', level: 'error',
     message: `Op-ed voice failed to generate (pov=${evt.pov}, model=${model}, backend=${backend})`,
@@ -187,6 +203,23 @@ async function driveOpEdRun(
   }
 }
 
+/** t/3993: validate tagSelection before SSE commits. Logs and returns the client-safe
+ *  error message on failure, null on success. Extracted to keep the POST handler under
+ *  the complexity budget (same pattern as validateOutlet). */
+function tagSelectionError(body: unknown): string | null {
+  try {
+    parseOpEdRequest(body);
+    return null;
+  } catch (err) {
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'oped', level: 'warn',
+      message: 'Op-ed generate request rejected: invalid tagSelection',
+      error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+    });
+    return err instanceof ActionableError ? err.problem : clientSafeMessage(String(err));
+  }
+}
+
 /** set_id validation at the route boundary (the audit class — t/2526 shared
  *  validator): reject a traversal/unsafe id with 400 before the store read. The
  *  store funcs also assertSafeId (defense-in-depth), but pre-validating here maps
@@ -221,6 +254,9 @@ export function registerOpedRoutes(r: Router, _ctx: ServerCtx): void {
     // pinned to a registered model, so this only rejects a caller-chosen unregistered id.
     if (!isRegisteredModel(model)) { error(res, `Model '${model}' is not available — choose another model in Settings.`, 400); return; }
     if (enforceBackendAllowed(res, tier, backend)) return;
+    // t/3993: validate tagSelection at the server boundary — unknown tag → 400 before SSE commits.
+    const tagErr = tagSelectionError(body);
+    if (tagErr) { error(res, tagErr, 400); return; }
 
     const userId = getStorageUserId();
     const quota = await getOpedSetsQuotaStatus();

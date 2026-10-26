@@ -9,7 +9,7 @@ import type {
   ProcessRewardEntry,
   EntailmentRepairEvent,
 } from '../types.js';
-import { POVER_INFO } from '../types.js';
+import { POVER_INFO, POV_KEYS } from '../types.js';
 import type { PovKey } from '../types.js';
 
 import { generateId, nowISO, parseJsonRobust, wordOverlap } from '../helpers.js';
@@ -41,7 +41,7 @@ export async function extractClaims(
   speaker: Exclude<SpeakerId, 'user'>,
   entryId: string,
   taxonomyRefIds: string[],
-  debaterClaims?: { claim: string; targets: string[] }[],
+  debaterClaims?: { claim: string; targets: string[]; steelman_of?: string }[],
 ): Promise<void> {
   const an = ctx.session.argument_network!;
   // Include all prior claims but cap at last 30 to keep the prompt manageable.
@@ -55,9 +55,9 @@ export async function extractClaims(
 
   let prompt: string;
   if (debaterClaims && debaterClaims.length > 0) {
-    prompt = classifyClaimsPrompt(statement, POVER_INFO[speaker].label, debaterClaims, priorClaims, ctx.session.audience);
+    prompt = classifyClaimsPrompt(statement, POVER_INFO[speaker].label, debaterClaims, priorClaims, ctx.session.audience, ctx.session.phase === 'opening');
   } else {
-    prompt = extractClaimsPrompt(statement, POVER_INFO[speaker].label, priorClaims, ctx.session.audience, ctx.session.topic.final);
+    prompt = extractClaimsPrompt(statement, POVER_INFO[speaker].label, priorClaims, ctx.session.audience, ctx.session.topic.final, ctx.session.phase === 'opening');
   }
 
   const anNodeCountBefore = an.nodes.length;
@@ -141,7 +141,7 @@ export async function extractClaims(
   }
 
   const overlapThreshold = (debaterClaims && debaterClaims.length > 0) ? 0.1 : 0.15;
-  const claimsResult = processExtractedClaims(
+  const claimsResult = await processExtractedClaims(
     {
       claims,
       statement,
@@ -154,6 +154,7 @@ export async function extractClaims(
       startNodeId: an.nodes.length + 1,
       taxonomyEdges: ctx.taxonomy.edges?.edges,
       knownNodeIds: ctx.getKnownNodeIds(),
+      resolveRef: ctx.resolveRef,
       activatedSituations: ctx.getActivatedSituations().length > 0 ? ctx.getActivatedSituations() : undefined,
       audience: ctx.session.audience,
     },
@@ -161,6 +162,7 @@ export async function extractClaims(
       groundingOverlapThreshold: overlapThreshold,
       isClassifyPath: !!(debaterClaims && debaterClaims.length > 0),
       colloquialTerms: ctx.config.vocabulary?.colloquialTerms,
+      adapter: ctx.adapter,
     },
   );
 
@@ -225,9 +227,15 @@ export async function extractClaims(
     const speakerPov = POVER_INFO[speaker as Exclude<SpeakerId, 'user'>]?.pov;
     if (speakerPov) {
       const povNodes = ctx.taxonomy[speakerPov as PovKey]?.nodes ?? [];
-      const allPovNodeIds = new Set(povNodes.map(n => n.id));
+      // Include all-POV node IDs so steelman nodes can be attributed to the steelmanned camp.
+      const allCandidateNodeIds = new Set<string>();
+      for (const pov of POV_KEYS) {
+        for (const n of ctx.taxonomy[pov as PovKey]?.nodes ?? []) {
+          allCandidateNodeIds.add(n.id);
+        }
+      }
       const attrResult = computeClaimTaxonomyAttribution(
-        claimsResult.newNodes, speakerPov, ctx.taxonomy.embeddings, allPovNodeIds,
+        claimsResult.newNodes, speakerPov, ctx.taxonomy.embeddings, allCandidateNodeIds,
       );
       trace.attribution_attributed = attrResult.attributed;
       trace.attribution_unattributed = attrResult.unattributed;

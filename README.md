@@ -13,11 +13,11 @@ detects factual conflicts across viewpoints.
 
 This project uses three repositories:
 
-| Repository                                                                         | Contents                                                                  |
-| ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| **[ai-triad-research](https://github.com/jpsnover/ai-triad-research)** (this repo) | PowerShell module, shared TypeScript lib, Electron apps, prompts, schemas |
-| **[ai-triad-data](https://github.com/jpsnover/ai-triad-data)**                     | Taxonomy, summaries, conflicts, debates                                   |
-| **ai-triad-sources**                                                               | Ingested source documents (~680 documents: PDFs, snapshots)               |
+| Repository | Contents |
+|-----------|----------|
+| **[ai-triad-research](https://github.com/AI-Rosetta-Stone/ai-triad-research)** (this repo) | PowerShell module, shared TypeScript lib, Electron apps, prompts, schemas |
+| **[ai-triad-data](https://github.com/AI-Rosetta-Stone/ai-triad-data)** | Taxonomy, summaries, conflicts, debates |
+| **ai-triad-sources** | Ingested source documents (~680 documents: PDFs, snapshots) |
 
 ```
 ai-triad-research/              CODE REPO
@@ -67,8 +67,8 @@ For development, there are two ways to do spin up the platform.
 ```powershell
 # 1. Clone the repos as siblings (sources repo optional unless ingesting)
 cd ~/source/repos
-git clone https://github.com/jpsnover/ai-triad-research.git
-git clone https://github.com/jpsnover/ai-triad-data.git
+git clone https://github.com/AI-Rosetta-Stone/ai-triad-research.git
+git clone https://github.com/AI-Rosetta-Stone/ai-triad-data.git
 
 # 2. Load the module
 cd ai-triad-research
@@ -269,15 +269,15 @@ Show-AITriadHelp
 
 ## Environment Variables
 
-| Variable             | Required      | Description                           |
-| -------------------- | ------------- | ------------------------------------- |
-| `GEMINI_API_KEY`     | Yes (primary) | Google Gemini API key                 |
-| `ANTHROPIC_API_KEY`  | No            | Anthropic Claude API key              |
-| `GROQ_API_KEY`       | No            | Groq API key                          |
-| `AI_API_KEY`         | No            | Universal fallback key                |
-| `AI_MODEL`           | No            | Default model override                |
-| `AI_TRIAD_DATA_ROOT` | No            | Override data directory path          |
-| `NEO4J_PASSWORD`     | No            | Neo4j password (default: aitriad2026) |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `GEMINI_API_KEY` | Yes (primary) | Google Gemini API key |
+| `ANTHROPIC_API_KEY` | No | Anthropic Claude API key |
+| `GROQ_API_KEY` | No | Groq API key |
+| `AI_API_KEY` | No | Fallback key. PowerShell uses it for gemini models only; other backends need their own variable (t/4102) |
+| `AI_MODEL` | No | Default model override |
+| `AI_TRIAD_DATA_ROOT` | No | Override data directory path |
+| `NEO4J_PASSWORD` | No | Neo4j password (default: aitriad2026) |
 
 Use `Register-AIBackend` to configure keys via a GUI, or set them manually.
 Settings are persisted to `~/.aitriad-env` — add `. ~/.aitriad-env` to your

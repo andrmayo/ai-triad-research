@@ -24,7 +24,7 @@ import type { ServerCtx } from '../routes/context.js';
 vi.mock('../ai/aiBackends.js', () => ({
   generateTextByUsage: vi.fn(async (_id: string, _vals: unknown, _overrides: unknown, onRetry: ((p: unknown) => void) | undefined) => {
     onRetry?.({ attempt: 1, maxRetries: 3, backoffSeconds: 5, limitType: 'rpm', limitMessage: 'rate limited' });
-    return { text: 'ok', tokenUsage: null };
+    return { text: 'ok', tokenUsage: null, servedModel: 'gemini-3.5-flash-lite' };
   }),
   generateTextWithSearchByUsage: vi.fn(),
   generateText: vi.fn(),
@@ -44,7 +44,7 @@ vi.mock('../ai/proxyTiers.js', () => ({
   })),
   isBackendAllowed: vi.fn(() => true),
   parseFreeTierKeys: vi.fn(() => []),
-  byokGeminiFallbackKey: vi.fn(() => undefined),
+  byokGeminiFallbackApplies: vi.fn(() => false),
 }));
 
 vi.mock('../security/rateLimiter.js', () => ({
@@ -68,6 +68,13 @@ vi.mock('../security/accessControl.js', () => ({
 vi.mock('../config.js', () => ({
   hasApiKey: vi.fn(async () => true),
   getPaidGeminiFallbackKey: vi.fn(async () => null),
+}));
+
+// t/3498: /api/ai/generate now consults the allowlist store when no explicit
+// key is present + backend is gemini (both true in this test's fixture) —
+// mock it out so this pre-existing suite doesn't load the real module.
+vi.mock('../storage/allowlistStore.js', () => ({
+  isAllowlisted: vi.fn(() => false),
 }));
 
 vi.mock('../logger.js', () => ({

@@ -231,7 +231,7 @@ describe('/api/oped-sets routes (t/2573)', () => {
 // through TL (gate-integrity, real http.Server + aborted fetch).
 describe('POST /api/oped-sets create pre-start gate (t/2610)', () => {
   let handlers: Record<string, Handler>;
-  const validBody = { topic: 'AI safety', params: { model: 'gemini-2.5-flash', wordCount: 800 }, povs: ['acc', 'saf'] };
+  const validBody = { topic: 'AI safety', params: { model: 'gemini-2.5-flash', wordCount: 800 }, povs: ['accelerationist', 'safetyist'] };
   beforeEach(() => {
     isAnonymousUser.mockReset().mockReturnValue(false);
     getStorageUserId.mockReset().mockReturnValue('user-1');
@@ -353,7 +353,7 @@ describe('POST /api/oped-sets create pre-start gate (t/2610)', () => {
 
   it('400 when params.model is missing', async () => {
     const res = fakeRes();
-    await handlers['POST /api/oped-sets'](fakeReq('/api/oped-sets'), res, { topic: 'x', povs: ['acc'], params: { wordCount: 800 } });
+    await handlers['POST /api/oped-sets'](fakeReq('/api/oped-sets'), res, { topic: 'x', povs: ['accelerationist'], params: { wordCount: 800 } });
     expect(res._status).toBe(400);
   });
 
@@ -363,7 +363,7 @@ describe('POST /api/oped-sets create pre-start gate (t/2610)', () => {
     // if wordCount were still required this would 400 BEFORE quota is ever checked.
     getOpedSetsQuotaStatus.mockResolvedValue({ allowed: false, resource: 'opeds', current: 15, limit: 15 });
     const res = fakeRes();
-    await handlers['POST /api/oped-sets'](fakeReq('/api/oped-sets'), res, { topic: 'x', povs: ['acc'], params: { model: 'gemini-2.5-flash' } });
+    await handlers['POST /api/oped-sets'](fakeReq('/api/oped-sets'), res, { topic: 'x', povs: ['accelerationist'], params: { model: 'gemini-2.5-flash' } });
     expect(res._status).toBe(429);
     expect(JSON.parse(res._body!).error).toBe('quota_exceeded');
   });
@@ -375,6 +375,60 @@ describe('POST /api/oped-sets create pre-start gate (t/2610)', () => {
     expect(res._status).toBe(429);
     expect(JSON.parse(res._body!).error).toBe('quota_exceeded');
     expect(finalizeOpedSet).not.toHaveBeenCalled();
+  });
+
+  // t/3858: outlet validation — unknown value → 400 before the run starts; absent/known → valid
+  it('400 when params.outlet is an unrecognised value (typo stops before the run, not after) (t/3858)', async () => {
+    const res = fakeRes();
+    await handlers['POST /api/oped-sets'](fakeReq('/api/oped-sets'), res, {
+      ...validBody, params: { ...validBody.params, outlet: 'TechPolicyPres' },
+    });
+    expect(res._status).toBe(400);
+    const body = JSON.parse(res._body!);
+    expect(body.error).toContain('TechPolicyPres');
+    expect(body.error).toContain('Valid:');
+    expect(finalizeOpedSet).not.toHaveBeenCalled();
+  });
+
+  it('absent outlet passes validation — band default applies, not a 400 (t/3858 AC: absent is valid)', async () => {
+    // The common case: a default create sends no outlet. This MUST pass the outlet check
+    // and advance to the quota gate. A strict implementation that rejects absent is the AC's
+    // named failure mode, so gate on the quota 429 (not just "not 400").
+    getOpedSetsQuotaStatus.mockResolvedValue({ allowed: false, resource: 'opeds', current: 15, limit: 15 });
+    const res = fakeRes();
+    await handlers['POST /api/oped-sets'](fakeReq('/api/oped-sets'), res, {
+      topic: 'x', povs: ['accelerationist'], params: { model: 'gemini-2.5-flash' },
+    });
+    expect(res._status).toBe(429);
+  });
+
+  it('known outlet passes validation (t/3858)', async () => {
+    getOpedSetsQuotaStatus.mockResolvedValue({ allowed: false, resource: 'opeds', current: 15, limit: 15 });
+    const res = fakeRes();
+    await handlers['POST /api/oped-sets'](fakeReq('/api/oped-sets'), res, {
+      ...validBody, params: { ...validBody.params, outlet: 'WashingtonPost' },
+    });
+    expect(res._status).toBe(429); // reached quota ⇒ outlet validation passed
+  });
+
+  // t/3993: parseOpEdRequest gate — unknown tag (pov not in povs → always fails regardless of registry)
+  it('400 when tagSelection.pov is not in the requested povs — rejected before quota (t/3993)', async () => {
+    const res = fakeRes();
+    await handlers['POST /api/oped-sets'](fakeReq('/api/oped-sets'), res, {
+      ...validBody, // povs: ['accelerationist', 'safetyist']
+      params: { ...validBody.params, tagSelection: { pov: 'skeptic', tag: 'critical', mode: 'scope' } },
+    });
+    expect(res._status).toBe(400);
+    expect(getOpedSetsQuotaStatus).not.toHaveBeenCalled(); // gated before quota
+  });
+
+  it('untagged request passes parseOpEdRequest unchanged — advances to quota gate (t/3993)', async () => {
+    // No tagSelection → parseOpEdRequest is a no-op; prove it passes by reaching the quota 429.
+    getOpedSetsQuotaStatus.mockResolvedValue({ allowed: false, resource: 'opeds', current: 15, limit: 15 });
+    const res = fakeRes();
+    await handlers['POST /api/oped-sets'](fakeReq('/api/oped-sets'), res, validBody);
+    expect(res._status).toBe(429);
+    expect(JSON.parse(res._body!).error).toBe('quota_exceeded');
   });
 
   it('GET /api/oped-runs/:runId returns 404 for an unknown run', async () => {

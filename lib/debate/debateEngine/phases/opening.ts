@@ -6,17 +6,23 @@ import path from 'path';
 import { POVER_INFO } from '../../types.js';
 import { formatVocabularyContext } from '../../vocabularyContext.js';
 import { getGlobalRecorder } from '../../../flight-recorder/index.js';
-import { runOpeningPipeline, assembleOpeningPipelineResult, getOpeningRepairHints, type OpeningPipelineInput } from '../../turnPipeline.js';
+import { runOpeningPipelineWithRepair, assembleOpeningPipelineResult, type OpeningPipelineInput } from '../../turnPipeline.js';
+import { getModelMinTimeout } from '../../../ai-client/index.js';
 import { resolveModelForSpeaker } from '../modelResolution.js';
 import { accumulateContextManifest } from '../adaptiveStaging.js';
 import { enrichTaxonomyRefs, getRelevantTaxonomyContext, formatDebaterEdgeContext } from '../taxonomyContext.js';
 import { getCommitmentContext, getEstablishedPointsContext } from '../context.js';
 import { EMBEDDING_DIM } from '../../constants.js';
+import { narrativeBlockForDebater, extractNarrativeCheck } from '../../narrativeVoicing.js';
+import { runNarrativeVoicing, finalizeNarrativeReference } from './narrativeVoicing.js';
 
 // ── Phase: Opening statements ──────────────────────────────
 
 export async function runOpeningStatements(engine: DebateEngineInternals): Promise<void> {
   engine.session.phase = 'opening';
+
+  // h3: moderator voices each camp's story before any argument (flag-gated, idempotent)
+  await runNarrativeVoicing(engine);
 
   // Shuffle opening order (Fisher-Yates)
   const order = [...engine.config.activePovers];
@@ -27,13 +33,32 @@ export async function runOpeningStatements(engine: DebateEngineInternals): Promi
 
   const priorStatements: { speaker: string; pov: string; poverId: string; statement: string; summary: string }[] = [];
 
+  // Rehydrate prior openings from transcript so resumed runs get correct steelman context (t/3770).
+  // Iterate transcript in delivery order so priorStatements matches the sequence each speaker saw.
+  for (const entry of engine.session.transcript) {
+    if (entry.type === 'opening') {
+      const priorInfo = POVER_INFO[entry.speaker as keyof typeof POVER_INFO];
+      if (priorInfo) {
+        priorStatements.push({
+          speaker: priorInfo.label,
+          pov: priorInfo.pov,
+          poverId: entry.speaker,
+          statement: entry.content,
+          summary: entry.content.split('\n')[0].slice(0, 150) + '...',
+        });
+      } else {
+        getGlobalRecorder()?.record({ type: 'system.error', component: 'debate-engine', level: 'warn', debate_id: engine.session?.id, message: `opening rehydration: unknown speaker '${entry.speaker}' in transcript — skipped`, data: { speaker: entry.speaker } });
+      }
+    }
+  }
+
   for (const poverId of order) {
     // Per-iteration idempotency: skip speakers who already have an opening (t/919)
     if (engine.session.transcript.some(e => e.type === 'opening' && e.speaker === poverId)) {
       continue;
     }
 
-    const info = POVER_INFO[poverId];
+    const info = engine.getSoulForSpeaker(poverId);
     engine.progress('opening', poverId, `${info.label} preparing opening statement`);
 
     const taxonomyContext = await getRelevantTaxonomyContext(engine, info.pov);
@@ -91,6 +116,7 @@ export async function runOpeningStatements(engine: DebateEngineInternals): Promi
       taxonomyContext: fullContext,
       priorStatements: priorBlock,
       isFirst: priorStatements.length === 0,
+      priorSpeakerLabels: priorStatements.length > 0 ? priorStatements.map(ps => ps.speaker) : undefined,
       sourceContent: engine.session.document_analysis ? undefined : engine.config.sourceContent,
       documentAnalysis: engine.session.document_analysis,
       audience: engine.config.audience,
@@ -103,6 +129,14 @@ export async function runOpeningStatements(engine: DebateEngineInternals): Promi
       availablePovNodeIds: [...engine.getKnownNodeIds()],
       briefTimeoutMs: engine.config.briefTimeoutMs,
       briefMaxRetries: engine.config.briefMaxRetries,
+      registry: engine.adapter.registry,
+      narrativeVoicing: engine.session.narrative_voicing
+        ? narrativeBlockForDebater(engine.session.narrative_voicing.narratives, poverId)
+        : undefined,
+      soul: info,
+      opponentSouls: Object.fromEntries(
+        order.filter(id => id !== poverId).map(id => [id, engine.getSoulForSpeaker(id)]),
+      ),
       ...(engine.config.temperature != null ? {
         stageTemperatures: {
           brief_temperature: engine.config.temperature,
@@ -131,34 +165,27 @@ export async function runOpeningStatements(engine: DebateEngineInternals): Promi
     };
 
     let pipelineResult = await engine.executeWithModelFailover(poverId, async (model) => {
-      const input = { ...pipelineInput, model };
-      let result = await runOpeningPipeline(
-        input,
+      return runOpeningPipelineWithRepair(
+        { ...pipelineInput, model },
         engine.stageGenerate.bind(engine),
         (_stage, label) => engine.progress('opening', poverId, label),
         onBriefEvent,
+        // t/3614: the floor fn is imported (pure); the registry is the adapter's host-loaded data.
+        (model: string) => getModelMinTimeout(model, engine.adapter.registry),
       );
-
-      const repairHints = getOpeningRepairHints(result);
-      if (repairHints.length > 0) {
-        engine.progress('opening', poverId, `${info.label} retrying (${repairHints.length} issue${repairHints.length > 1 ? 's' : ''})`);
-        try {
-          result = await runOpeningPipeline(
-            { ...input, repairHints },
-            engine.stageGenerate.bind(engine),
-            (_stage, label) => engine.progress('opening', poverId, label),
-            onBriefEvent,
-          );
-        } catch (err) {
-          getGlobalRecorder()?.record({ type: 'system.error', component: 'debate-engine', level: 'warn', debate_id: engine.session?.id, message: 'Opening retry failed', error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } });
-          engine.warn('Opening retry', err, 'Using first attempt');
-        }
-      }
-      return result;
     });
 
     const { statement, taxonomyRefs, meta } = assembleOpeningPipelineResult(pipelineResult, engine.getKnownNodeIds());
     enrichTaxonomyRefs(engine, taxonomyRefs);
+
+    // h3: record the debater's affirm/amend check of its own camp's narrative
+    const ownNarrative = engine.session.narrative_voicing?.narratives.find(n => n.speaker === poverId);
+    if (ownNarrative) {
+      ownNarrative.acknowledgment = extractNarrativeCheck(pipelineResult.draft);
+      if (!ownNarrative.acknowledgment) {
+        getGlobalRecorder()?.record({ type: 'system.error', component: 'debate-engine', level: 'warn', debate_id: engine.session?.id, message: `${info.label} opening returned no usable narrative_check — narrative reference uses the moderator's account unamended`, data: { speaker: poverId, narrative_check: pipelineResult.draft?.narrative_check ?? null } });
+      }
+    }
 
     const speakerModel = resolveModelForSpeaker(engine, poverId);
     const entry = engine.addEntry({
@@ -168,6 +195,7 @@ export async function runOpeningStatements(engine: DebateEngineInternals): Promi
       taxonomy_refs: taxonomyRefs,
       policy_refs: meta.policy_refs,
       model: engine.config.speakerModels ? speakerModel : undefined,
+      provider_model: engine.adapter.lastProviderModel,
       metadata: {
         key_assumptions: meta.key_assumptions,
         my_claims: meta.my_claims,
@@ -238,6 +266,9 @@ export async function runOpeningStatements(engine: DebateEngineInternals): Promi
       summary: statement.split('\n')[0].slice(0, 150) + '...',
     });
   }
+
+  // h3: embed each camp's (possibly amended) narrative as its drift reference; score the openings
+  await finalizeNarrativeReference(engine);
 
   engine.session.phase = 'debate';
 }

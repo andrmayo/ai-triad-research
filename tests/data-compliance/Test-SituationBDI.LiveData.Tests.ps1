@@ -29,7 +29,24 @@
     - 440->442 (t/3009): sit-476/477 added by pipeline sync (78c943cf) with flat-string
       interpretations; CL-authored per-POV BDI decomposition (t/3009#1). Recurring
       pipeline gap tracked as t/3011 (decompose-on-emit).
-    When this trip-wire fires, run the backfill on the flagged ids, then bump the count.
+    - 442->450 (t/3673): corpus grew by 8 non-deprecated situations, sit-478..485, all
+      added with flat-string interpretations. sit-478 was decomposed the same day
+      (e0c34cc3); the remaining SEVEN (sit-479..485, from fdf393b3 "+39 nodes ... sit 7")
+      sat non-decomposed and red-ed this trip-wire for 4 days before anyone noticed.
+      Decomposed via enrichment.situation-bdi-decomposition (CL, data ffacb957);
+      TL second-verified on the committed tree (450/450, Fail=0).
+      FOURTH occurrence of the class. The boundary gate (t/3011) DID detect it on push
+      and was not heard: job green via continue-on-error, alert idempotent onto an
+      already-open issue, scheduled check red and unwatched. Enforcement + alerting
+      fixes tracked as t/3671; scheduled-run visibility as t/3672.
+    - 450->454 (t/3886): sit-486..489 added with flat-string interpretations. They
+      entered main via f9cb8ef4 (workflow-app committing the dirty shared tree, 09-29:
+      sit-486/487) and 7fee2c54 (a hand-composed agent commit, 10-01: sit-488/489); the
+      process that WROTE them flat is not established. Decomposed via
+      enrichment.situation-bdi-decomposition (CL, data db332c7f; TL delegation t/3886#3).
+      FIFTH occurrence. The push gate flagged both pushes on data issue #6 and the
+      scheduled check went red; neither was acted on until 10-04, because the alert path
+      was still warn-only. Producer fix tracked as t/3894.
 #>
 
 BeforeAll {
@@ -48,9 +65,9 @@ Describe 'Situation BDI-decomposition live-data baseline (t/1312, relocated t/23
         $script:BdiCheck | Should -Not -BeNullOrEmpty
     }
 
-    It 'Live-data baseline: 442 / 442 non-deprecated situations pass, 1 exempt (post-t/3009 backfill)' {
+    It 'Live-data baseline: 454 / 454 non-deprecated situations pass, 1 exempt (post-t/3886 backfill)' {
         $script:BdiCheck.Status | Should -Be 'pass'
-        $script:BdiCheck.Detail | Should -Match '442 / 442'
+        $script:BdiCheck.Detail | Should -Match '454 / 454'
         $script:BdiCheck.Detail | Should -Match '1 exempt via \[DEPRECATED\] prefix'
     }
 

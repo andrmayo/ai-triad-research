@@ -1,16 +1,16 @@
-# `logical_form` Schema — Neo-Davidsonian Event Frames on Claims
+# `logical_form` Schema: Neo-Davidsonian Event Frames on Claims
 
 **Ticket:** t/3126 (T6). **Depends on:** t/3124 (entity_refs resolution, Done).
 **Design of record:** `claims-entity-fol-recommendations.md` §7.2 (Phase 1), §7.3 (reification), §7.4 (ownership).
 **Owner:** CL (schema + prompt); PowerShell implements the formalization pass. Mandatory-review surface.
-**Status:** Landed — schema + prompt + golden seed (PR #1778); prompt sort-fix (`90ce0d3e`); pass built (t/3215, PR #1792/#1814). `about[]` adopted (TL p/571 / t/3126#6) and its superset convention **pinned by the D3b measurement** (`formalization_accuracy` = 0.803, n=10).
+**Status:** Landed. Schema + prompt + golden seed (PR #1778); prompt sort-fix (`90ce0d3e`); pass built (t/3215, PR #1792/#1814). `about[]` adopted (TL p/571 / t/3126#6) and its superset convention **pinned by the D3b measurement** (`formalization_accuracy` = 0.803, n=10).
 
 ## Purpose
 
 A derived, structured proposition layer on claims (`key_points` / `factual_claims` in the summaries
 schema; lazily on node `canonical_proposition` equivalents). It is the prerequisite for the FOL track
 (§7.2 Phase 1): TPTP export (t/3127) and edge verification (t/3128) consume it. It is produced by an
-LLM formalization pass with its own golden set + calibration gate — nothing downstream trusts a
+LLM formalization pass with its own golden set + calibration gate. Nothing downstream trusts a
 `logical_form` until `formalization_accuracy` is measured.
 
 Design rule it inherits: **the prover is only as sound as the logical form** (§8.1). A wrong
@@ -31,7 +31,7 @@ live claim shape (summaries, post-t/3124):
 
 The formalization pass reads the proposition from `canonical_proposition` (register-normalized) for
 BDI claims, and from `point`/`verbatim` for `factual_claims` (whose `canonical_proposition` is empty
-for 100% of them — D3a); `category` for the attitude, the camp for the holder, and `entity_refs[]`
+for 100% of them, D3a); `category` for the attitude, the camp for the holder, and `entity_refs[]`
 for both the argument bindings and the `about[]` projection. It never re-extracts entities.
 
 ## Schema
@@ -64,7 +64,8 @@ for both the argument bindings and the `about[]` projection. It never re-extract
 | `args[].ref` | string | **MUST be an `ent-*` id drawn from this claim's `entity_refs[].ref`** — never a re-invented id (t/2294). If the participant is not a registered entity, use a literal `lit:"…"` or an event var; record `sort` regardless. |
 | `args[].sort` | enum | The entity's DOLCE-lite sort, **pinned to the register's `DolceCategory` closed set** (`lib/entities/types.ts`): `agentive-physical-object \| non-agentive-functional-artifact \| perdurant \| normative-description \| non-agentive-social-object`. Copied verbatim from the referenced entity's `dolce_category`; for a `lit:`/event arg, CL-assigned from the same 5-value set. Copy-not-judge (rule 2). A `term:*` **concept** ref (node `logical_form`) instead takes sort **`universal`** — the 6th arg-slot sort for kinds, distinct from the 5 particular values (t/3251). |
 | `args[].match_level` | enum | Copied verbatim from the entity_ref: `exact \| instance_of \| subclass \| superclass \| related`. Load-bearing for the prover — a claim about a superclass matched to an instance is a different assertion (§6, R4). **⚠️ Exact-only in practice (t/3238):** the resolver (`ClaimEntityResolution.ps1`) hardcodes `match_level="exact"` and surface-matches only — **540/540** entity_refs corpus-wide are `exact`. The non-exact values are an **aspirational vocabulary** until a hierarchical/taxonomic resolver exists; the prover's match_level-sensitivity (§6/R4) and the t/3127/t/3128 axiom modules are therefore **untested on real data** and testable only via constructed golden cases (`analyses/logical-form-golden/` con-2..con-5). Making resolution ontology-aware is a separate resolution-strategy initiative, out of the FOL-track scope. |
-| `about[]` | array | **Topical grounding (additive, optional):** `[{ref, match_level}]` — the `ent-*` ids the claim is *about* (its topical subject). **Superset convention (pinned, D3b):** `about[]` is the **complete** topical index — every resolved entity the claim is about, **including** those that also fill an `args[]` role (a participant that is topical appears in *both*). Same ids as the claim's `entity_refs[]` (a logical-form projection, **no new resolution**). Governed by the `about[]` conditions below. |
+| `about[]` | array | **Topical grounding (additive, optional):** `[{ref, match_level}]` — the `ent-*` ids the claim is *about* (its topical subject). **Superset convention (pinned, D3b):** `about[]` is the **complete** topical index — every resolved entity the claim is about, **including** those that also fill an `args[]` role (a participant that is topical appears in *both*). Same ids as the claim's `entity_refs[]` (a logical-form projection, **no new resolution**). **`ent-*` only** (Option C, t/3389 — the mixed convention that also held `term:*` fell back). Governed by the `about[]` conditions below. |
+| `topical_candidates` | object \| absent | **Concept topical layer (Option C, t/3389).** `{validated:false, generator, golden_ref, blind_golden_precision, refs:[{ref, match_level}]}` — the `term:*` concept refs the claim is topically about, homed separately from `about[]` because the concept-anchored selection MISSED its pre-committed floor (0.636 < 0.80, t/3381). Quality-marked so a consumer sees the unvalidated status from the data. **Absent (not null)** when the claim has no concept refs. See §`topical_candidates` below. |
 | `polarity` | enum | `positive \| negative`. Negation of the core predication (`¬acquire(e1)`), not attitude negation. |
 | `modality` | object \| null | **`null` for `factual_claims`** (unattributed fact). Present for BDI/POV claims. |
 | `modality.holder` | enum | `camp:acc \| camp:saf \| camp:skp` (the attributing camp). Derived from the claim's POV/`stance`. |
@@ -87,7 +88,7 @@ holds(camp_acc, belief, p1) ∧ about(p1, ent_055) ∧ acquire(e1) ∧ agent(e1,
 
 - The proposition `p1` is a first-class object (DOLCE non-physical endurant / D&S description).
 - `factual_claims` (`modality: null`) assert the frame directly, without the `holds(...)` wrapper.
-- **No belief-closure axiom** — camps are deliberately not logically omniscient (that non-omniscience
+- **No belief-closure axiom.** Camps are deliberately not logically omniscient (that non-omniscience
   is half the research interest). The t/3127 axiom module must exclude closure and document the
   exclusion; this schema encodes nothing that presumes it.
 - Cross-camp queries this enables: "which propositions does acc believe and saf reject?" =
@@ -100,9 +101,9 @@ holds(camp_acc, belief, p1) ∧ about(p1, ent_055) ∧ acquire(e1) ∧ agent(e1,
    `lit:"…"` and are flagged, not invented (t/2294 / R6 symbol-is-identity).
 2. **`match_level` and `sort` are copied, not judged.** They come from the entity_ref / the entity
    register's `dolce_category`; the pass does not re-derive DOLCE typing per claim (keeps one identity
-   model across resolution, formalization, and the future re-merge — the §7.4/t/2946 one-identity rule).
-3. **`attitude` follows `category`; `holder` follows POV** — mechanical, not re-judged from prose.
-4. **`unspecified`/`null`/`proposed` are first-class**, never silent omissions — an absent field is a
+   model across resolution, formalization, and the future re-merge, the §7.4/t/2946 one-identity rule).
+3. **`attitude` follows `category`; `holder` follows POV**, mechanical, not re-judged from prose.
+4. **`unspecified`/`null`/`proposed` are first-class**, never silent omissions. An absent field is a
    formalization bug; an explicit `unspecified` is a valid reading (the same "timeout is a result"
    discipline §7.2 Phase 2 applies to the prover).
 
@@ -118,36 +119,50 @@ holds(camp_acc, belief, p1) ∧ about(p1, ent_055) ∧ acquire(e1) ∧ agent(e1,
   alone. A ref may also appear in `about[]` only (topical non-participant). It is **never a
   "couldn't-formalize" dumping bucket.** *(Pinned by the D3b measurement: leaving participants out of
   `about[]` was an unpinned-convention ambiguity that deflated scored agreement by ~0.12 with no semantic
-  content — see `analyses/logical-form-golden/D3b-findings.md`.)*
+  content; see `analyses/logical-form-golden/D3b-findings.md`.)*
 - **(c) Non-substitute.** A cleanly-formalizable claim still populates `args[]`; `about[]` is never an
   excuse to skip formalization.
 - **(d) Earns its place on the non-formalizable majority.** With 54% of claims carrying an empty
   `canonical_proposition` (100% of factual) and 71% of BDI props meta-descriptive (D3a), `about[]`
-  MUST be populated there — that is its whole value. Empty-there = not earning the field.
+  MUST be populated there. That is its whole value. Empty-there = not earning the field.
 - **(e) Reconciles with the `summary:*` entity_mention layer (t/3160).** `about[]` is the *logical-form
-  projection of the claim's already-resolved `entity_refs[]`* — same `ent-` ids, no new resolution —
+  projection of the claim's already-resolved `entity_refs[]`* (same `ent-` ids, no new resolution),
   so it does NOT double-ground what the mention-index layer captures. Different layer (LF topical
   grounding vs mention occurrences), same identities.
 
+### `topical_candidates` — the Option-C concept layer (t/3389; SO+TL e/145#13-#16)
+
+Option A (a mixed `about[]` holding both `ent-*` and `term:*`) was ratified **conditionally** on a
+re-measure; it **fell back to Option C** when the concept-anchored `about[]`-component scored
+**0.636 < the pre-committed 0.80 floor** (t/3381, blind golden — a *precision* failure: the generator
+over-attaches concepts). So `about[]` stays **`ent-*` only** (its validated convention, above) and the
+`term:*` concept refs move to `topical_candidates`:
+
+- **Shape:** `{validated:false, generator, golden_ref:"t/3381", blind_golden_precision:0.54, refs:[{ref, match_level}]}`. `refs[].ref` matches **`^(term:|ent-)`** (entities are hyphenated `ent-NNN`, not `ent:`); `match_level` is enum-clamped but **not** load-bearing in this layer.
+- **In-artifact quality marking (hard requirement, joint TL+SO):** the `validated:false` flag + the blind-golden precision live IN the data, so a consumer sees this is the unvalidated generator layer (~0.54 precision) without reading the register. The field name says "candidates," not "index."
+- **Fallback-in-effect, NOT endpoint:** the failure is fixable generator precision (t/3390). A repaired generator re-measured **≥0.80** on the same blind-golden methodology **reopens Option A** as a new decision — `topical_candidates` must not ossify into "the convention."
+- **Provenance lifecycle:** when a repaired generator regenerates a node, it MUST either update the provenance block (generator/golden_ref/precision) or revalidate-and-move the refs into `about[]` — **never fresh refs under stale `0.54` metadata** (the marking cuts both ways).
+- **Land order (never enforcement-before-data):** phase 1 additive-schema (all ports *accept* `topical_candidates`, `about[]` still tolerant of `term:`) → phase 2 /data-mutation migration of the corpus → phase 3 tighten `about[].ref` enforcement to `^ent-` last.
+
 ## Calibration + provenance (deliverable 3 preview)
 
-- **Metric:** `formalization_accuracy` — golden-set agreement between the pass's `logical_form` and the
+- **Metric:** `formalization_accuracy`, the golden-set agreement between the pass's `logical_form` and the
   CL-labelled reference, scored per component (predicate / args+roles / polarity / modality / temporal)
   so a partial-credit profile shows *which* component the pass gets wrong (predicate vs role vs
   temporal have different downstream costs).
 - **Golden set:** labelled claim→logical_form pairs, **empirically reproduced** by running the actual
-  pass on real claims (t/2294) — not authored from the doc example. Stratified across `category`
+  pass on real claims (t/2294), not authored from the doc example. Stratified across `category`
   (B/D/I + factual) and `match_level` so accuracy is readable where it matters (superclass/related
   args are where formalization error concentrates).
 - **Provenance:** register entry class **stipulated → measured (seed, D3b)**: `formalization_accuracy` =
   **0.803** (n=10, convention-pinned; 0.686 as-first-authored pre-`about[]`-pin) on the t/3215 batch
   (`ai-triad-data` `853b2938`). Mechanical fields (polarity/modality/temporal/about) = 1.00; residual weak
-  axis is `predicate` = 0.50, concentrated on multi-clause meta-descriptive BDI. Not yet `derived` — needs
+  axis is `predicate` = 0.50, concentrated on multi-clause meta-descriptive BDI. Not yet `derived`; it needs
   n≥30 with match_level diversity and the bias-free D3a rows. `formalization_confidence` is a pass self-rating
   (stipulated) until correlated with golden-set correctness. Full analysis:
   `analyses/logical-form-golden/D3b-findings.md`.
 
-## Prompt-port coupling — one shape across two runtimes (t/3250)
+## Prompt-port coupling: one shape across two runtimes (t/3250)
 
 `logical_form` is produced by **two ports of a single prompt** and validated by **one canonical Zod
 schema**. All four artifacts must agree; a change to the frame shape updates all four in lockstep or
@@ -166,7 +181,7 @@ two prompt ports (#3a/#3b) are *implementations* that must conform to them, neve
 
 **Change protocol.** Any change to the frame shape (new field, vocabulary change, added role) touches
 **#1 (spec) + #4 (Zod) first**, then BOTH ports (#3a PS + #3b Py) which share prompt #2. Never change one
-port's output without the other — node and claim frames must stay the same shape (that is the whole point
+port's output without the other. Node and claim frames must stay the same shape (that is the whole point
 of one schema). Port-specific behavior that does NOT change the shape:
 
 - The **node port (#3b)** forces `modality.holder` = camp (from the node-id prefix) and `attitude` =
@@ -181,8 +196,8 @@ Both emit the identical field set in §Schema; the Zod (#4) is the mechanical gu
 
 ## Open items (post-review)
 
-- [x] `args[].sort` enum pinned to the live register `DolceCategory` set (`lib/entities/types.ts`) — the 5 values above.
+- [x] `args[].sort` enum pinned to the live register `DolceCategory` set (`lib/entities/types.ts`), the 5 values above.
 - [x] `about[]` adopted as a first-class field with conditions (a)–(e) (TL p/571 / t/3126#6; CL review #1778 issue 2).
 - [ ] **PowerShell contract** (handed off): persistence slot (derived field on the claim objects, same pass-slot family as `Invoke-RetrievalConfidencePass`); `{{ENTITY_REFS}}` must join `dolce_category`→`sort`; the factual arm reads `point`/`verbatim`.
-- [ ] `event_ref` scope (per-claim vs per-summary) — reconcile with the t/3127 TPTP generator.
+- [ ] `event_ref` scope (per-claim vs per-summary), to be reconciled with the t/3127 TPTP generator.
 - [ ] `holds/3` cross-role interface question deferred to t/3127 (TPTP export), per CL review.

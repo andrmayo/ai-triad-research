@@ -2,6 +2,8 @@
 // Licensed under the MIT License. See LICENSE file in the project root.
 
 import type { StateCreator } from 'zustand';
+import { sessionModelFingerprint } from '../shared/sessionFingerprint';
+import { latchUnobservedHistory } from '../shared/failoverTracking';
 import type { DebateStore } from '../types';
 import type {
   DebateSession,
@@ -9,6 +11,7 @@ import type {
   DebateSourceType,
   DebateAudience,
   SpeakerId,
+  SeatTag,
   TranscriptEntry,
   EntryDiagnostics,
 } from '../../../types/debate';
@@ -17,24 +20,40 @@ import { api, setActiveDebateId, isElectronMode } from '@bridge';
 import { isCircuitOpenError, getCircuitCooldownMs } from '../../../bridge/resilience';
 import { buildDebateDelta } from './buildDebateDelta';
 import { getDocTitles } from '../shared/docTitles';
+import { enterClarificationOrBegin } from '../shared/clarificationGuard';
+import { getRemoteRunLeaseHolder, notifyDebateSaved } from '../shared/debateRunLease';
 import type { DocMetaMap } from '@lib/debate/evidenceFromSummaries';
 import { getGlobalRecorder } from '@lib/flight-recorder/index';
 import { trackDebateAbandon, trackDebateStart } from '../../../lib/analyticsEmitter';
 import { useTaxonomyStore } from '../../useTaxonomyStore';
+import { resolveNode } from '../../useTaxonomyStore/superseded'; // t/4355
 import { usePromptConfigStore } from '../../usePromptConfigStore';
 import { mapErrorToUserMessage } from '../../../utils/errorMessages';
-import { formatSituationDebateContext } from '../../../prompts/debate';
+import { formatSituationDebateContext, situationTopicSynthesisPrompt } from '../../../prompts/debate';
+import type { SituationTopicSynthesisResult } from '../../../prompts/debate';
 import { normalizeBdiLayer } from '@lib/debate';
 import { interpretationText } from '@lib/debate/taxonomyTypes';
 import { generateId, nowISO } from '@lib/debate/helpers';
 import type { MoveAnnotation } from '@lib/debate/helpers';
-import { getMoveName } from '@lib/debate/helpers';
+import { getMoveName, parseAIJson } from '@lib/debate/helpers';
 import { disambiguateTerms } from '@lib/debate/vocabularyDisambiguation';
 import type { CampOrigin, StandardizedTerm, ColloquialTerm } from '@lib/dictionary/types';
 import { resetDoctrinalAnchoringCache } from '../shared/taxonomyContext';
 import { resetNeutralMapping } from '../shared/neutralCheckpoint';
 import { resetSignalHistory, resetGapInjectionCount, setGapInjectionCount } from '../shared/diagnostics';
 import { isStateAhead } from '../shared/phaseOrder';
+
+/** Viewer-save skips already logged, one per (debate, holder run), so auto-save ticks don't flood the recorder. */
+const _viewerSaveSkipLogged = new Set<string>();
+/** Automatic saves a viewer skips quietly (t/3917): timers, coalescing/retry, background
+ *  compression, load recovery, and run-internal saves. Any OTHER caller is a user edit, and the
+ *  user is told it wasn't saved; the next refresh from the holder would otherwise silently undo
+ *  it. The live run caught compressOldTranscript missing from an earlier version of this list,
+ *  which would have shown a false "your change wasn't saved" notice. */
+const BACKGROUND_SAVE_CALLERS = new Set(['auto-save', 'DebateWorkspace:autoSave', 'coalesced-followup', 'breaker-cooldown-retry', 'compressOldTranscript', 'loadDebate:interrupted_turn_recovery', 'news-report-save-retry', 'synthesis-complete', 'updatePhase']);
+const BACKGROUND_SAVE_PREFIXES = ['crossRespond:', 'runOpeningStatements:', 'extractClaimsAndUpdateAN', 'extractTopicScope'];
+const isBackgroundSave = (caller: string): boolean =>
+  BACKGROUND_SAVE_CALLERS.has(caller) || BACKGROUND_SAVE_PREFIXES.some(p => caller.startsWith(p));
 
 declare const __APP_VERSION__: string;
 
@@ -46,8 +65,19 @@ export interface SessionSlice {
   debateLoading: boolean;
 
   loadSessions: () => Promise<void>;
-  createDebate: (topic: string, povers: SpeakerId[], userIsPover: boolean, sourceType?: DebateSourceType, sourceRef?: string, sourceContent?: string, debateModel?: string, protocolId?: string, debateTemperature?: number, debateAudience?: DebateAudience, options?: { title?: string; evaluatorModel?: string; pacing?: string; useAdaptiveStaging?: boolean; phaseBoundsOverride?: { maxConfrontationRounds?: number; maxArgumentationRounds?: number; maxConcludingRounds?: number }; speakerModels?: Record<string, string>; modelTier?: 'basic' | 'advanced'; stepMode?: boolean; stageModels?: { brief?: string; plan?: string; cite?: string }; background?: string; excludeGreatestHits?: boolean }) => Promise<string>;
-  createSituationDebate: (ccNodeId: string) => Promise<string>;
+  createDebate: (topic: string, povers: SpeakerId[], userIsPover: boolean, sourceType?: DebateSourceType, sourceRef?: string, sourceContent?: string, debateModel?: string, protocolId?: string, debateTemperature?: number, debateAudience?: DebateAudience, options?: { title?: string; evaluatorModel?: string; pacing?: string; useAdaptiveStaging?: boolean; phaseBoundsOverride?: { maxConfrontationRounds?: number; maxArgumentationRounds?: number; maxConcludingRounds?: number }; speakerModels?: Record<string, string>; modelTier?: 'basic' | 'advanced'; /** t/4046: backends eligible for a multi-provider run; keys model_pool (t/4044). */ eligibleBackends?: string[]; stepMode?: boolean; stageModels?: { brief?: string; plan?: string; cite?: string }; background?: string; excludeGreatestHits?: boolean; narrativeVoicing?: boolean; /** t/3958: absent ⇒ every seat untagged. Never pass `{}` — t/3975's seatSouls treats any key presence as "tagged". */ seatTags?: Partial<Record<SpeakerId, SeatTag>> }) => Promise<string>;
+  // Config is threaded into createDebate's existing options param at creation time (t/3783) —
+  // never patched onto the session afterward. A post-creation mutate-then-save races every
+  // concurrent `set({ activeDebate: { ...fresh } })` in the opening/clarification pipeline,
+  // which discards an in-place mutation the store never saw via set().
+  createSituationDebate: (ccNodeId: string, config?: {
+    effectiveModel?: string; pacing?: string; useAdaptiveStaging?: boolean;
+    temperature?: number; audience?: DebateAudience; protocolId?: string;
+    /** t/3929: passed through to createDebate unchanged, so the engine sees the same
+     *  adaptive config from a situation debate as from a normal one (t/3882, PI: mirror
+     *  the normal path). Same field and shape as createDebate's option. */
+    phaseBoundsOverride?: NonNullable<Parameters<SessionSlice['createDebate']>[10]>['phaseBoundsOverride'];
+  }) => Promise<string>;
   createConflictDebate: (claimId: string) => Promise<string>;
   loadDebate: (id: string) => Promise<void>;
   loadDebateFromData: (raw: unknown, opts?: { readOnly?: boolean }) => void;
@@ -330,7 +360,7 @@ function computeSaveErrorState(err: unknown, activeDebate: DebateSession): { isD
   if (isAuthQuotaFailure) {
     debateError = `Save failed: the server rejected this save (HTTP ${httpStatus}). ${atRiskTurns} ${atRiskTurns === 1 ? 'turn is' : 'turns are'} at risk of being lost. Check your API key and account status in Settings.`;
   } else if (isDiskLoss) {
-    debateError = `Save failed: this debate couldn't be written to disk — a file lock (often antivirus or a file indexer) is holding the file. ${atRiskTurns} ${atRiskTurns === 1 ? 'turn is' : 'turns are'} at risk. A recovery copy was preserved on disk; retry the save once the lock clears, and don't close the app before it succeeds.`;
+    debateError = `Save failed: this debate couldn't be written to disk — another process (the app itself, antivirus, or a file indexer) is holding the file open. ${atRiskTurns} ${atRiskTurns === 1 ? 'turn is' : 'turns are'} at risk. A recovery copy was preserved on disk; retry the save once the lock clears, and don't close the app before it succeeds.`;
   } else if (isBreakerBlocked) {
     debateError = `Saving is paused while the server recovers. ${atRiskTurns} ${atRiskTurns === 1 ? 'turn is' : 'turns are'} not yet saved — this will retry automatically. Keep the app open.`;
   } else {
@@ -412,6 +442,38 @@ function applyVocabularyResolutions(
   }
 }
 
+// t/3958: kept out of createDebate's own body so it doesn't push that method past the
+// ESLint complexity-budget baseline (t/3821). Returns a spreadable fragment, not a bare
+// value — `seat_tags: undefined` would still leave the KEY present on the session object
+// (JSON.stringify drops it, but in-memory `'seat_tags' in session` would be true); spreading
+// `{}` keeps the key genuinely absent when every seat is untagged (p/521#34, Rosetta Stone).
+function normalizeSeatTags(options?: { seatTags?: Partial<Record<SpeakerId, SeatTag>> }): { seat_tags?: Partial<Record<SpeakerId, SeatTag>> } {
+  const t = options?.seatTags;
+  return t && Object.keys(t).length > 0 ? { seat_tags: t } : {};
+}
+
+// t/4120: the view setup BOTH load paths need once a session is active. loadDebateFromData (the
+// community popout) used to skip it, so Analysis → Terms showed raw sense IDs (no dictionary), the
+// analysis views ran with the previous debate's prompt config, and the diagnostics popout showed stale
+// state. Deliberately excludes loadDebate's write-side setup (setActiveDebateId, setDebateTemperature):
+// a read-only community view must not change the user's active debate or backend temperature.
+function applyLoadedSessionSetup(get: SessionGet, set: SessionSet, session: DebateSession, caller: string): void {
+  const id = session.id;
+  if (!get().vocabularyTerms) {
+    api.loadDictionary().then(dict => {
+      if (dict.standardized.length > 0 && get().activeDebateId === id) {
+        set({ vocabularyTerms: { standardized: dict.standardized as StandardizedTerm[], colloquial: dict.colloquial as ColloquialTerm[] } });
+      }
+    }).catch((err: unknown) => {
+      getGlobalRecorder()?.record({ type: 'system.error', debate_id: id, component: 'debate-store', level: 'warn', message: `Dictionary load failed (${caller}, non-critical)`, error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } });
+    });
+  }
+  usePromptConfigStore.getState().loadSessionConfig(
+    (session as unknown as Record<string, unknown>).prompt_config as Record<string, number | boolean | string> | undefined
+  );
+  try { api.sendDiagnosticsState({ debate: session, selectedEntry: null }); } catch (e) { getGlobalRecorder()?.record({ type: 'system.error', debate_id: id, component: 'debate-store', level: 'warn', message: `Diagnostics broadcast to popout failed (${caller})`, error: { name: (e as Error).name ?? 'Error', message: String(e), stack: (e as Error).stack } }); }
+}
+
 export const createSessionSlice: StateCreator<DebateStore, [], [], SessionSlice> = (set, get) => ({
   sessions: [],
   sessionsLoading: false,
@@ -491,6 +553,8 @@ export const createSessionSlice: StateCreator<DebateStore, [], [], SessionSlice>
       speaker_models: options?.speakerModels || undefined,
       stage_models: options?.stageModels ? { ...options.stageModels } as Record<string, string> : undefined,
       model_tier: options?.modelTier || undefined,
+      // t/4044: calibration model fingerprint, computed here at creation and never on save.
+      ...sessionModelFingerprint(effectiveModel, options),
       protocol_id: protocolId || 'structured',
       // Greatest-hits exclusion toggle (t/1980, parent t/1979; engine rescope t/1438).
       // Store is the single writer for app-created debates (which orchestrate via
@@ -498,6 +562,11 @@ export const createSessionSlice: StateCreator<DebateStore, [], [], SessionSlice>
       // t/1779); the CLI engine writes it for CLI-created sessions. Persisted here so
       // it round-trips via save/load; absent on old debates ⇒ readers coalesce to false.
       exclude_greatest_hits: options?.excludeGreatestHits ?? false,
+      // h3 opening narrative voicing (experiment). Absent ⇒ off.
+      ...(options?.narrativeVoicing ? { narrative_voicing_enabled: true } : {}),
+      // Per-seat POV tag (t/3958). Threaded through unchanged — buildDebateOptions already
+      // normalizes {} to undefined, but coalesce again here so no caller can regress it.
+      ...normalizeSeatTags(options),
       debate_temperature: debateTemperature ?? undefined,
       adaptive_staging: options?.useAdaptiveStaging
         ? { enabled: true, pacing: (options.pacing as 'tight' | 'moderate' | 'thorough') ?? 'moderate', phase_bounds_override: options.phaseBoundsOverride, step_mode: options.stepMode || undefined }
@@ -523,20 +592,19 @@ export const createSessionSlice: StateCreator<DebateStore, [], [], SessionSlice>
     return id;
   },
 
-  createSituationDebate: async (ccNodeId: string) => {
+  createSituationDebate: async (ccNodeId: string, config) => {
     const taxState = useTaxonomyStore.getState();
     const ccNode = taxState.situations?.nodes.find(n => n.id === ccNodeId);
     if (!ccNode) throw new Error(`Situation node ${ccNodeId} not found`);
 
     const linkedNodeDescriptions: string[] = [];
+    // New debate context: a superseded link is given to the model as its survivor (t/4355), once.
+    const seenLinked = new Set<string>();
     for (const linkedId of ccNode.linked_nodes) {
-      for (const pov of POV_KEYS) {
-        const file = taxState[pov];
-        const node = file?.nodes.find(n => n.id === linkedId);
-        if (node) {
-          linkedNodeDescriptions.push(`[${node.id}] ${node.label}: ${node.description}`);
-          break;
-        }
+      const node = resolveNode(taxState, linkedId);
+      if (node && !seenLinked.has(node.id)) {
+        seenLinked.add(node.id);
+        linkedNodeDescriptions.push(`[${node.id}] ${node.label}: ${node.description}`);
       }
     }
 
@@ -566,12 +634,54 @@ export const createSessionSlice: StateCreator<DebateStore, [], [], SessionSlice>
       conflictSummaries,
     });
 
-    const topic = ccNode.label;
+    // Best-effort: synthesize a contestable proposition as the topic. Any failure — thrown
+    // error, unparseable response, or an empty/missing proposition — falls back to the
+    // situation label with a WARN (Fallback-Path Logging, root AGENTS.md); synthesis never
+    // blocks debate creation.
+    let proposition: string | undefined;
+    try {
+      const prompt = situationTopicSynthesisPrompt({
+        label: ccNode.label,
+        description: ccNode.description,
+        interpretations: ccNode.interpretations,
+        disagreementType: ccNode.disagreement_type,
+        assumes: attrs?.assumes as string[] | undefined,
+        conflictSummaries,
+      }, get().audience);
+      const model = useTaxonomyStore.getState().geminiModel;
+      const { text } = await api.generateText(prompt, model);
+      const parsed = parseAIJson<SituationTopicSynthesisResult>(text);
+      if (parsed?.proposition && parsed.proposition.trim().length > 0) {
+        proposition = parsed.proposition.trim();
+      } else {
+        getGlobalRecorder()?.record({
+          type: 'system.error',
+          component: 'debate-store',
+          level: 'warn',
+          message: 'Situation topic synthesis failed — falling back to situation label',
+          error: { name: 'SituationTopicSynthesisFallback', message: 'empty or malformed synthesis response', stack: undefined },
+        });
+      }
+    } catch (err) {
+      getGlobalRecorder()?.record({
+        type: 'system.error',
+        component: 'debate-store',
+        level: 'warn',
+        message: 'Situation topic synthesis failed — falling back to situation label',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+    }
+
+    const topic = proposition ?? ccNode.label;
     const allPovers = [...AI_POVERS] as SpeakerId[];
 
-    const id = await get().createDebate(topic, allPovers, false, 'situations', ccNodeId, sourceContent);
+    const id = await get().createDebate(
+      topic, allPovers, false, 'situations', ccNodeId, sourceContent,
+      config?.effectiveModel, config?.protocolId, config?.temperature, config?.audience,
+      { title: ccNode.label, useAdaptiveStaging: config?.useAdaptiveStaging, pacing: config?.pacing, phaseBoundsOverride: config?.phaseBoundsOverride },
+    );
     await get().loadDebate(id);
-    get().updatePhase('clarification');
+    await enterClarificationOrBegin(get);
     await get().saveDebate('createSituationDebate');
     return id;
   },
@@ -625,7 +735,7 @@ export const createSessionSlice: StateCreator<DebateStore, [], [], SessionSlice>
     const allPovers = [...AI_POVERS] as SpeakerId[];
 
     const id = await get().createDebate(topic, allPovers, false, 'topic', claimId, sourceContent);
-    get().updatePhase('clarification');
+    await enterClarificationOrBegin(get);
     await get().saveDebate('createConflictDebate');
     return id;
   },
@@ -688,25 +798,15 @@ export const createSessionSlice: StateCreator<DebateStore, [], [], SessionSlice>
           set({ debateLoading: false });
           return;
         }
+        // t/4044 (SO e/281#2 condition 1): a session saved before per-turn tracking can't be promoted.
+        Object.assign(session, latchUnobservedHistory(session));
         const runId = generateId();
         session.run_id = runId;
         set({ activeDebateId: id, activeDebate: session, debateLoading: false, debateModel: session.debate_model || null, debateTemperature: session.debate_temperature ?? null, audience: session.audience ?? 'policymakers', openingOrder: session.opening_order ?? [], selectedDiagEntry: null, _lastSyncedVersion: session._saveVersion ?? 0, _lastSyncedSnapshot: structuredClone(session) });
         setActiveDebateId(id);
         setGapInjectionCount(session.gap_injections?.length ?? 0);
-        if (!get().vocabularyTerms) {
-          api.loadDictionary().then(dict => {
-            if (dict.standardized.length > 0 && get().activeDebateId === id) {
-              set({ vocabularyTerms: { standardized: dict.standardized as StandardizedTerm[], colloquial: dict.colloquial as ColloquialTerm[] } });
-            }
-          }).catch((err: unknown) => {
-            getGlobalRecorder()?.record({ type: 'system.error', debate_id: id, component: 'debate-store', level: 'warn', message: 'Dictionary load failed on debate resume (non-critical)', error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } });
-          });
-        }
-        usePromptConfigStore.getState().loadSessionConfig(
-          (session as unknown as Record<string, unknown>).prompt_config as Record<string, number | boolean | string> | undefined
-        );
+        applyLoadedSessionSetup(get, set, session, 'loadDebate');
         api.setDebateTemperature(session.debate_temperature ?? null).catch((err: unknown) => { getGlobalRecorder()?.record({ type: 'system.error', component: 'debate-store', level: 'warn', message: 'setDebateTemperature failed (non-critical)', error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } }); });
-        try { api.sendDiagnosticsState({ debate: session, selectedEntry: null }); } catch (e) { getGlobalRecorder()?.record({ type: 'system.error', debate_id: id, component: 'debate-store', level: 'warn', message: 'Diagnostics broadcast to popout failed (loadDebate)', error: { name: (e as Error).name ?? 'Error', message: String(e), stack: (e as Error).stack } }); }
         getGlobalRecorder()?.setEventContext({ debate_id: id, run_id: runId });
         getGlobalRecorder()?.record({ type: 'state.load', component: 'debate-store', level: 'info', debate_id: id, run_id: runId, message: 'Debate loaded', data: { phase: session.phase, transcript_length: session.transcript.length, an_nodes: (session as unknown as Record<string, unknown>).argument_network ? ((session as unknown as Record<string, unknown>).argument_network as { nodes?: unknown[] }).nodes?.length ?? 0 : 0 } });
         getGlobalRecorder()?.record({ type: 'debate.phase', component: 'debate-store', level: 'info', debate_id: id, run_id: runId, message: 'debate.start', data: { phase: session.phase, topic: session.topic.final, povers: session.active_povers, protocol: session.protocol_id, model: session.debate_model, transcript_length: session.transcript.length, resumed: true } });
@@ -807,6 +907,7 @@ export const createSessionSlice: StateCreator<DebateStore, [], [], SessionSlice>
         }
       }
     }
+    Object.assign(session, latchUnobservedHistory(session)); // t/4044 condition 1, as in loadDebate
     const runId = generateId();
     session.run_id = runId;
     set({
@@ -830,6 +931,7 @@ export const createSessionSlice: StateCreator<DebateStore, [], [], SessionSlice>
       _lastSyncedSnapshot: structuredClone(session),
     });
     setGapInjectionCount(session.gap_injections?.length ?? 0);
+    applyLoadedSessionSetup(get, set, session, 'loadDebateFromData');
     getGlobalRecorder()?.setEventContext({ debate_id: session.id, run_id: runId });
     getGlobalRecorder()?.record({ type: 'state.load', component: 'debate-store', level: 'info', debate_id: session.id, run_id: runId, message: 'Debate loaded from data', data: { phase: session.phase, transcript_length: session.transcript.length, readOnly: opts?.readOnly ?? true } });
   },
@@ -1086,6 +1188,10 @@ export const createSessionSlice: StateCreator<DebateStore, [], [], SessionSlice>
     const prev = activeDebate.adaptive_staging.phase_state.current_phase;
     if (prev === phase) return;
     const newPhaseState = { ...activeDebate.adaptive_staging.phase_state, current_phase: phase, rounds_in_phase: 0 };
+    // `current_phase`/`rounds_in_phase` below are sibling copies of the same fields inside
+    // `phase_state` above. getCurrentPhase(session) (lib/debate/phaseTransitions.ts) is the
+    // authoritative read path and only looks at `phase_state`; these siblings are written
+    // here but read nowhere (t/3761#8 condition 4) — forensics, not a second source of truth.
     const asObj = { ...activeDebate.adaptive_staging, phase_state: newPhaseState, current_phase: phase, rounds_in_phase: 0 };
     const newDebate = { ...activeDebate, adaptive_staging: asObj, updated_at: nowISO() };
     set({ activeDebate: newDebate });
@@ -1106,6 +1212,23 @@ export const createSessionSlice: StateCreator<DebateStore, [], [], SessionSlice>
     // guard, but component-level callers (the DebateWorkspace auto-save timer, ClarificationPanel)
     // bypass the subscriber — so the single source of truth lives here in the action.
     if (communityReadOnly) return;
+
+    // t/3917: one writer per running debate. While another window holds this debate's run
+    // lease, this window is a viewer whose copy trails the holder's, so its (auto-)save
+    // would roll the file back. In the 09-30 dump a pop-out auto-save wrote phase=opening /
+    // transcript 3 over the main window's debate / 6. The viewer refreshes from the holder's
+    // saves instead.
+    const runHolder = getRemoteRunLeaseHolder(activeDebate.id);
+    if (runHolder) {
+      const userEdit = !isBackgroundSave(caller);
+      const key = `${activeDebate.id}:${runHolder.windowId}:${runHolder.startedAt}`;
+      if (userEdit || !_viewerSaveSkipLogged.has(key)) {
+        _viewerSaveSkipLogged.add(key);
+        getGlobalRecorder()?.record({ type: 'state.save', component: 'debate-store', level: 'warn', debate_id: activeDebate.id, message: 'Save skipped — another window holds this debate\'s run lease (viewer)', data: { caller, user_edit: userEdit, holder: { window: runHolder.windowId, caller: runHolder.caller } } });
+      }
+      if (userEdit) set({ debateError: 'This debate is running in another window, so this change wasn\'t saved. Make it in that window, or after the run finishes.' });
+      return;
+    }
 
     if (_saveInFlight) {
       set({ _saveDirty: true });
@@ -1130,6 +1253,8 @@ export const createSessionSlice: StateCreator<DebateStore, [], [], SessionSlice>
       const saveDiag = buildSaveDiag(activeDebate, caller);
       // Save-path selection + post-save bookkeeping (t/1637) — see persistDebateToServer.
       await persistDebateToServer(activeDebate, saveDiag, get, set);
+      // Viewers of this run refresh from it; also a heartbeat (t/3917). No-op unless we hold the lease.
+      notifyDebateSaved(activeDebate.id);
       // Save reached the server: clear any breaker-retry degradation left by prior
       // blocked attempts (t/3073). Only touch debateError when we were actually retrying,
       // so a successful save never clobbers an unrelated error.

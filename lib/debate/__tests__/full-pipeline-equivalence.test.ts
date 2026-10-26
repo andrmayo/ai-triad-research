@@ -18,6 +18,7 @@ function createMockAdapter(): ExtendedAIAdapter {
     async generateText(_prompt: string, _model: string, _options?: GenerateOptions) {
       return '{"response": "mock"}';
     },
+    registry: { backends: [], models: [] },
   };
 }
 
@@ -44,6 +45,9 @@ function createMinimalTaxonomy(): LoadedTaxonomy {
     edges: null,
     embeddings: {},
     policyRegistry: [],
+    allNodesById: new Map(),
+    resolveNode: (_id: string) => undefined,
+    allEdges: null,
   };
 }
 

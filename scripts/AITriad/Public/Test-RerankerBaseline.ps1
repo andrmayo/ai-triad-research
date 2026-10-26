@@ -22,7 +22,7 @@ function Test-RerankerBaseline {
         Test-RerankerBaseline
         # Evaluates with default settings (top-10, ms-marco reranker).
     .EXAMPLE
-        Test-RerankerBaseline -TopK 20 -RerankerModel 'cross-encoder/ms-marco-MiniLM-L-12-v2'
+        Test-RerankerBaseline -TopK 20 -RerankerModel 'cross-encoder/ms-marco-MiniLM-L-12-v2'  # model-lint:allow-pin reranker cross-encoder model, not an ai-models.json LLM backend
     .LINK
         Show-AITriadHelp
     .LINK
@@ -41,7 +41,7 @@ function Test-RerankerBaseline {
         [ValidateRange(1, 100)]
         [int]$TopK = 10,
 
-        [string]$RerankerModel = 'cross-encoder/ms-marco-MiniLM-L-6-v2',
+        [string]$RerankerModel = 'cross-encoder/ms-marco-MiniLM-L-6-v2',  # model-lint:allow-pin reranker cross-encoder model, not an ai-models.json LLM backend
 
         [string]$GoldenSetPath
     )
@@ -54,7 +54,7 @@ function Test-RerankerBaseline {
         $GoldenSetPath = Join-Path $script:RepoRoot 'research/comp-linguist/_golden_test_set.json'
     }
     if (-not (Test-Path $GoldenSetPath)) {
-        throw (New-ActionableError `
+        throw (New-ActionableError -AsErrorRecord `
             -Goal    'Run reranker baseline evaluation' `
             -Problem "Golden test set not found: $GoldenSetPath" `
             -Location 'Test-RerankerBaseline' `
@@ -63,7 +63,7 @@ function Test-RerankerBaseline {
 
     $EvalScript = Join-Path $script:RepoRoot 'scripts/evaluate_embeddings.py'
     if (-not (Test-Path $EvalScript)) {
-        throw (New-ActionableError `
+        throw (New-ActionableError -AsErrorRecord `
             -Goal    'Run reranker baseline evaluation' `
             -Problem "evaluate_embeddings.py not found at $EvalScript" `
             -Location 'Test-RerankerBaseline' `
@@ -92,7 +92,7 @@ function Test-RerankerBaseline {
     if ($StdErr) { $StdErr | ForEach-Object { Write-Host $_ -ForegroundColor DarkGray } }
 
     if ($LASTEXITCODE -ne 0) {
-        throw (New-ActionableError `
+        throw (New-ActionableError -AsErrorRecord `
             -Goal    'Run reranker baseline evaluation' `
             -Problem "evaluate_embeddings.py failed (exit code $LASTEXITCODE)" `
             -Location 'Test-RerankerBaseline' `

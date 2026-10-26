@@ -4,6 +4,7 @@
 import type { StateCreator } from 'zustand';
 import type { DebateStore } from '../types';
 import { buildClarificationPrompt, buildSynthesisPrompt } from '../shared/prompts';
+import { seatSouls } from '../shared/seatSouls';
 import type {
   DebateSession,
   SpeakerId,
@@ -31,18 +32,35 @@ import {
 import { critiqueTopicPrompt, parseTopicCritique } from '@lib/debate/topicCritique';
 import { decomposeResolutionPrompt, topicScopeExtractionPrompt, setTopicScope } from '@lib/debate/prompts';
 import { documentAnalysisPrompt, buildTaxonomySample } from '@lib/debate/documentAnalysis';
-import { runOpeningPipeline, assembleOpeningPipelineResult, getOpeningRepairHints } from '@lib/debate/turnPipeline';
-import { loadProvisionalWeights } from '@lib/debate/phaseTransitions';
+import { runOpeningPipelineWithRepair, assembleOpeningPipelineResult } from '@lib/debate/turnPipeline';
+import { getModelMinTimeout, getDefaultTimeout } from '@lib/ai-client/index';
+import type { ModelRegistry } from '@lib/ai-client/registry';
+import aiModelsRegistry from '../../../../../../ai-models.json';
+import { loadProvisionalWeights, effectiveRoundCap, maxTurnCeiling } from '@lib/debate/phaseTransitions';
+import type { PhaseTransitionConfig } from '@lib/debate/types';
 import { useTaxonomyStore } from '../../useTaxonomyStore';
 import { mapErrorToUserMessage } from '../../../utils/errorMessages';
 import { isLineageDataLoaded } from '../../../data/lineageCategories';
 import { getConfiguredModel, getSpeakerModel, resolveBriefModel } from '../shared/modelConfig';
-import { generateTextWithProgress, summarizeTranscriptEntry, makeStageGenerate } from '../shared/generation';
+import { generateTextWithProgress, summarizeTranscriptEntry, makeStageGenerate, servedTurnRecorder } from '../shared/generation';
 import { createDebateGuard, newAbortController, _abortController, claimDebateDriver, releaseDebateDriver, isDailyLimitError, DAILY_LIMIT_MESSAGE, isCancellationError } from '../shared/guards';
+import type { RunLease } from '../shared/debateRunLease';
+import { isCompressionDue } from '../shared/compressionTrigger';
 import { pushWarning, recordDiagnostic } from '../shared/diagnostics';
 import { runNeutralCheckpoint } from '../shared/neutralCheckpoint';
-import { buildLineageContext, getRelevantTaxonomyContext, formatDebaterEdgeContext, enrichPolicyRefs, serializeNodeSourceMap, getAllKnownNodeIds } from '../shared/taxonomyContext';
+import { runNarrativeVoicing, recordNarrativeCheck, finalizeNarrativeReference } from '../shared/narrativeVoicing';
+import { narrativeBlockForDebater } from '@lib/debate/narrativeVoicing';
+import { buildLineageContext, getRelevantTaxonomyContext, formatDebaterEdgeContext, enrichPolicyRefs, serializeNodeSourceMap, getAllKnownNodeIds, getSelectableNodeIds } from '../shared/taxonomyContext';
 import { extractClaimsAndUpdateAN } from '../shared/argumentNetwork';
+
+/** The AI's clarification response is spec'd as `questions: string[]`, but some models return
+ *  structured items (`{ question, options }`) instead — normalize to a display string rather
+ *  than let template interpolation produce "[object Object]" (t/3753). */
+function normalizeClarificationQuestion(q: unknown): string {
+  if (typeof q === 'string') return q;
+  if (q !== null && typeof q === 'object' && 'question' in q) return String((q as Record<string, unknown>).question);
+  return String(q);
+}
 
 export interface ClarificationSlice {
   runClarification: () => Promise<void>;
@@ -51,7 +69,14 @@ export interface ClarificationSlice {
   updateClaim: (claimId: string, newText: string) => void;
   deleteClaim: (claimId: string) => void;
   proceedToOpening: () => void;
-  runOpeningStatements: () => Promise<void>;
+  /**
+   * Openings, then the auto cross-respond loop, as ONE run under the debate's run lease
+   * (t/3917). `caller` names the trigger in the flight recorder. A second call while a run
+   * owns the debate is refused. `supersedeLocal` replaces this window's own run (model-switch retry).
+   */
+  runOpeningStatements: (caller?: string, opts?: { supersedeLocal?: boolean }) => Promise<void>;
+  /** Internal — the unguarded openings+loop body. Call `runOpeningStatements`, never this. */
+  _runOpeningStatementsLeased: (lease: RunLease) => Promise<void>;
   submitUserOpening: (statement: string) => Promise<void>;
 }
 
@@ -138,21 +163,89 @@ async function cacheOpeningEmbeddings(get: () => DebateStore, set: (partial: any
     } catch (e) { getGlobalRecorder()?.record({ type: 'system.error', debate_id: get().activeDebate?.id, component: 'debate-store', level: 'warn', message: 'Opening embeddings caching failed', error: { name: (e as Error).name ?? 'Error', message: String(e), stack: (e as Error).stack } }); }
 }
 
-async function runInitialCrossRespondRounds(get: () => DebateStore, set: (partial: any) => void, activeDebate: DebateSession): Promise<void> {
+/** Ceiling for the non-adaptive watch-only auto-run loop (t/3760) — matches the adaptive
+ *  branch's default 'moderate' maxTotalRounds and the round count observed completing a
+ *  full situation debate. Separate from `initialCrossRespondRounds`, which is also read
+ *  elsewhere as a phase-labeling divisor and must stay small for that purpose. */
+const WATCH_ONLY_MAX_CROSS_RESPOND_ROUNDS = 12;
+
+/** The user-configurable opening order (randomized at proceedToOpening).
+ *  Priority: Zustand state > persisted on the debate object > default order. */
+function resolveOpeningOrder(openingOrder: readonly string[], debate: DebateSession): readonly string[] {
+  if (openingOrder.length > 0) return openingOrder;
+  if (debate.opening_order && debate.opening_order.length > 0) return debate.opening_order;
+  return AI_POVERS;
+}
+
+/** t/3937: the adaptive loop's caps, in turns. `effectiveCap` is the engine's round cap
+ *  (Σ phase bounds × speakers when a phaseBoundsOverride is set, else the preset).
+ *  `turnCeiling` adds the scaled minimum concluding rounds, so a debate force-transitioned
+ *  into concluding at the cap can still finish it. It's the engine's real terminate point
+ *  and the loop's iteration limit. Normal endings come from phase_terminated. */
+function resolveLoopCaps(
+  presetMax: number,
+  phaseBoundsOverride: PhaseTransitionConfig['phaseBoundsOverride'],
+  debate: DebateSession | null | undefined,
+): { presetMax: number; effectiveCap: number; turnCeiling: number; speakers: number } {
+  const speakers = (debate?.active_povers ?? []).filter(p => (AI_POVERS as readonly string[]).includes(p)).length;
+  const config = { maxTotalRounds: presetMax, phaseBoundsOverride } as PhaseTransitionConfig; // the only fields the cap functions read
+  return { presetMax, effectiveCap: effectiveRoundCap(config, speakers), turnCeiling: maxTurnCeiling(config, speakers), speakers };
+}
+
+/** t/3917: an openings run is valid only while BOTH its abort guard and its run lease hold.
+ *  A superseded lease then stops the run at every existing isStillValid() check: after
+ *  voicing, after a retry backoff, and after each speaker's pipeline, before delivery. Without
+ *  it, a superseded run re-delivers an opening and re-completes the openings phase alongside
+ *  its replacement, the dump's duplicate-opening shape. */
+function guardWithLease(debateGuard: () => boolean, lease: RunLease): () => boolean {
+  return () => debateGuard() && lease.isValid();
+}
+
+/** t/3917: during an automatic run, the lease holder compresses between rounds. The UI effect
+ *  stands down while a run lease exists, and the owner window may not even mount the workspace
+ *  (a popped-out debate is driven by the main window under Option A), so without this a
+ *  popped-out run would produce no context summaries. Live run 2 showed exactly that. */
+async function compressIfDue(get: () => DebateStore, lease: RunLease): Promise<void> {
+  const d = get().activeDebate;
+  if (!d || !lease.isValid() || get().debateGenerating || !isCompressionDue(d)) return;
+  await get().compressOldTranscript();
+}
+
+/** Runs under the caller's run lease (t/3917): every turn is passed `lease`, and the loop
+ *  exits `lease_lost` the moment the lease is superseded or lost to another window. */
+async function runInitialCrossRespondRounds(get: () => DebateStore, set: (partial: any) => void, activeDebate: DebateSession, lease: RunLease): Promise<void> {
     // Auto-run initial cross-respond rounds if configured
     const { initialCrossRespondRounds } = get();
     if (!activeDebate.user_is_pover) {
       const freshDebate = get().activeDebate;
       if (freshDebate?.protocol_id === 'socratic') return; // user-driven (ask/probe/summarize); no auto cross-respond loop
-      const adaptive = freshDebate?.adaptive_staging;
+
+      // t/3782: back-compat for the legacy boolean shape (`adaptive_staging = true`) written
+      // by SituationDebatePanel before its fix — coerce rather than treat as malformed, so an
+      // existing broken session isn't left silently stuck on the dead non-adaptive path even
+      // after the write-site fix lands (TL ruling, t/3782#2). Retire this once no persisted
+      // session carries the boolean form.
+      if (freshDebate && (freshDebate.adaptive_staging as unknown) === true) {
+        getGlobalRecorder()?.record({ type: 'system.error', component: 'debate-store', level: 'warn', debate_id: freshDebate.id, message: 'adaptive_staging was the legacy boolean form — coercing to {enabled:true, pacing:"moderate"}' });
+        set({ activeDebate: { ...freshDebate, adaptive_staging: { enabled: true, pacing: 'moderate' } } });
+      }
+
+      const resolvedDebate = get().activeDebate;
+      const adaptive = resolvedDebate?.adaptive_staging;
+      // t/3782 AC: record the resolved adaptive config at debate start so a report of this
+      // shape (a config setting that appeared to have no effect) is answerable from the dump.
+      getGlobalRecorder()?.record({ type: 'debate.lifecycle', component: 'debate-store', level: 'info', debate_id: resolvedDebate?.id, message: 'Resolved adaptive config at debate start', data: { enabled: !!adaptive?.enabled, pacing: adaptive?.pacing ?? null, initial_cross_respond_rounds: initialCrossRespondRounds } });
+
       if (adaptive?.enabled) {
         // Adaptive: run until phase transitions signal termination (up to maxTotalRounds)
         const weights = loadProvisionalWeights();
         const pacingPresetName = adaptive.pacing ?? 'moderate';
         const pacingPreset = weights.pacing_presets[pacingPresetName] ?? weights.pacing_presets.moderate;
-        const maxRounds = pacingPreset?.maxTotalRounds ?? 12;
+        // t/3937: loop to the engine's real terminate point (turns), not the pacing preset.
+        const caps = resolveLoopCaps(pacingPreset?.maxTotalRounds ?? 12, adaptive.phase_bounds_override, resolvedDebate);
+        const maxRounds = caps.turnCeiling;
         const loopDebateId = freshDebate?.id;
-        getGlobalRecorder()?.record({ type: 'debate.lifecycle', component: 'adaptive-loop', level: 'info', debate_id: loopDebateId, message: 'Adaptive loop started', data: { pacing: pacingPresetName, maxTotalRounds: maxRounds, argumentationExit: pacingPreset?.argumentationExit, concludingExit: pacingPreset?.concludingExit } });
+        getGlobalRecorder()?.record({ type: 'debate.lifecycle', component: 'adaptive-loop', level: 'info', debate_id: loopDebateId, message: 'Adaptive loop started', data: { pacing: pacingPresetName, maxTotalRounds: caps.presetMax, effectiveCap: caps.effectiveCap, turnCeiling: caps.turnCeiling, speakers: caps.speakers, argumentationExit: pacingPreset?.argumentationExit, concludingExit: pacingPreset?.concludingExit } });
         let loopExitReason = 'maxRounds_exhausted';
         let loopIterations = 0;
         let consecutiveNoStatement = 0;
@@ -160,11 +253,12 @@ async function runInitialCrossRespondRounds(get: () => DebateStore, set: (partia
           loopIterations = i + 1;
           const d = get().activeDebate;
           if (!d) { loopExitReason = 'debate_null'; break; }
+          if (!lease.isValid()) { loopExitReason = 'lease_lost'; break; }
           // Stop if phase reached termination
           if (d.adaptive_staging?.phase_state?.current_phase === 'terminated') { loopExitReason = 'phase_terminated'; break; }
           const preLen = d.transcript.length;
           try {
-            await get().crossRespond();
+            await get().crossRespond({ lease, caller: 'adaptive-loop' });
           } catch (loopErr) {
             console.error(`[debate] Adaptive loop iteration ${i} failed:`, loopErr);
             getGlobalRecorder()?.record({ type: 'system.error', component: 'debate-store', level: 'error', debate_id: d.id, message: `Adaptive loop failed at iteration ${i}`, data: { iteration: i, error: String(loopErr), stack: (loopErr as Error).stack?.slice(0, 500) } });
@@ -201,6 +295,7 @@ async function runInitialCrossRespondRounds(get: () => DebateStore, set: (partia
             continue;
           }
           consecutiveNoStatement = 0;
+          await compressIfDue(get, lease);
         }
         // Log loop completion with full context
         const finalDebate = get().activeDebate;
@@ -218,11 +313,20 @@ async function runInitialCrossRespondRounds(get: () => DebateStore, set: (partia
           await get().requestSynthesis();
         }
       } else if (initialCrossRespondRounds > 0) {
-        for (let i = 0; i < initialCrossRespondRounds; i++) {
+        // t/3760: a watch-only debate has no user to click "Cross-respond" again, so this
+        // must not stop after a small fixed count — loop up to a much higher ceiling
+        // instead of the small initialCrossRespondRounds count (which is also used
+        // elsewhere as a phase-labeling divisor and must stay small for that purpose).
+        // Exit checks below (daily-limit pause / no transcript growth / no debater
+        // statement) are the same three this branch already had; NOT porting the adaptive
+        // branch's `phase_state?.current_phase === 'terminated'` exit — non-adaptive
+        // debates have no adaptive_staging.phase_state, so that check would be a dead
+        // optional-chain-to-undefined here, not a fourth working exit (TL, p/336#517).
+        for (let i = 0; i < WATCH_ONLY_MAX_CROSS_RESPOND_ROUNDS; i++) {
           const d = get().activeDebate;
-          if (!d || get().dailyLimitPaused) break;
+          if (!d || get().dailyLimitPaused || !lease.isValid()) break;
           const preLen = d.transcript.length;
-          await get().crossRespond();
+          await get().crossRespond({ lease, caller: 'watch-only-loop' });
           if (get().dailyLimitPaused) break;
           const post = get().activeDebate;
           if (!post || post.transcript.length === preLen) break;
@@ -274,11 +378,11 @@ export const createClarificationSlice: StateCreator<DebateStore, [], [], Clarifi
       const { text } = await generateTextWithProgress(prompt, model, `Generating clarifying questions (${model})`, set);
       if (!isStillValid()) { getGlobalRecorder()?.record({ type: 'debate.lifecycle', component: 'debate-store', level: 'warn', debate_id: activeDebate?.id, message: 'runClarification aborted: guard failed after question generation' }); return; }
       let questions: string[];
-      const clarParsed = parseAIJson<{ questions?: string[] } | string[]>(text);
+      const clarParsed = parseAIJson<{ questions?: unknown[] } | unknown[]>(text);
       if (clarParsed && typeof clarParsed === 'object' && 'questions' in clarParsed && Array.isArray(clarParsed.questions)) {
-        questions = clarParsed.questions.slice(0, 3);
+        questions = clarParsed.questions.slice(0, 3).map(normalizeClarificationQuestion);
       } else if (Array.isArray(clarParsed)) {
-        questions = clarParsed.slice(0, 3);
+        questions = clarParsed.slice(0, 3).map(normalizeClarificationQuestion);
       } else {
         questions = [text.trim()];
       }
@@ -854,7 +958,16 @@ export const createClarificationSlice: StateCreator<DebateStore, [], [], Clarifi
 
   // ── Phase 3: Opening Statements ─────────────────────────
 
-  runOpeningStatements: async () => {
+  runOpeningStatements: async (caller = 'unspecified', opts) => {
+    if (!get().activeDebate) { getGlobalRecorder()?.record({ type: 'debate.lifecycle', component: 'debate-store', level: 'warn', message: 'runOpeningStatements called with no activeDebate', data: { caller } }); return; }
+    // t/3917: the lease covers openings AND the loop. The 09-30 dump had two concurrent
+    // openings runs in one window (a double press on "Resume Opening Statements" while
+    // the openings were really running in the main window); each fell into its own loop.
+    // A loop-only lease would have let both reach the loop.
+    await get().runUnderDebateLease(`runOpeningStatements:${caller}`, lease => get()._runOpeningStatementsLeased(lease), opts);
+  },
+
+  _runOpeningStatementsLeased: async (lease) => {
     const { activeDebate, addTranscriptEntry, saveDebate } = get();
     if (!activeDebate) { getGlobalRecorder()?.record({ type: 'debate.lifecycle', component: 'debate-store', level: 'warn', message: 'runOpeningStatements called with no activeDebate' }); return; }
     if (get().debateGenerating) { getGlobalRecorder()?.record({ type: 'debate.lifecycle', component: 'debate-store', level: 'warn', debate_id: activeDebate.id, message: 'runOpeningStatements skipped — already generating' }); return; }
@@ -865,21 +978,21 @@ export const createClarificationSlice: StateCreator<DebateStore, [], [], Clarifi
     }
 
     newAbortController();
-    const isStillValid = createDebateGuard(get);
+    const isStillValid = guardWithLease(createDebateGuard(get), lease);
     set({ debateError: null, debateWarnings: [] });
     const model = getConfiguredModel();
     const topic = activeDebate.topic.final;
 
     await extractTopicScope(get, set, activeDebate, model, topic);
 
-    // Use the user-configurable opening order (randomized at proceedToOpening).
-    // Priority: Zustand state > persisted on debate object > default order.
-    const { openingOrder } = get();
-    const resolvedOrder = openingOrder.length > 0
-      ? openingOrder
-      : (activeDebate.opening_order && activeDebate.opening_order.length > 0)
-        ? activeDebate.opening_order
-        : AI_POVERS;
+    // h3: moderator voices each camp's story before any argument (flag-gated, idempotent)
+    await runNarrativeVoicing(get, set, addTranscriptEntry, model);
+    if (!isStillValid()) {
+      getGlobalRecorder()?.record({ type: 'debate.lifecycle', component: 'debate-store', level: 'info', debate_id: activeDebate.id, message: 'runOpeningStatements aborted after narrative voicing' });
+      return;
+    }
+
+    const resolvedOrder = resolveOpeningOrder(get().openingOrder, activeDebate);
     const aiPovers = (resolvedOrder as readonly (typeof AI_POVERS[number])[]).filter(
       (p) => activeDebate.active_povers.includes(p),
     );
@@ -933,6 +1046,11 @@ export const createClarificationSlice: StateCreator<DebateStore, [], [], Clarifi
       hasRetryableFailure = false;
 
     for (const poverId of aiPovers) {
+      if (!lease.isValid()) {
+        // Superseded between speakers: start no new pipeline (and no AI spend) for a dead run.
+        getGlobalRecorder()?.record({ type: 'debate.lifecycle', component: 'debate-store', level: 'info', debate_id: activeDebate.id, message: 'runOpeningStatements stopped — run lease no longer valid', data: { next_speaker: poverId } });
+        return;
+      }
       const freshTranscript = get().activeDebate?.transcript ?? [];
       if (freshTranscript.some(e => isDeliveredOpening(e) && e.speaker === poverId)) {
         console.log(`[debate-store] Skipping ${poverId} — already has a delivered opening (live check)`);
@@ -945,14 +1063,15 @@ export const createClarificationSlice: StateCreator<DebateStore, [], [], Clarifi
       }
 
       set({ debateGenerating: poverId, debateStepStartedAt: Date.now() });
-      const info = POVER_INFO[poverId];
+      const openingSouls = seatSouls(activeDebate, poverId); // t/3975
+      const info = openingSouls.soul;
       // Slot-first (t/2907): insert (or reuse) this speaker's opening panel NOW in
       // 'generating' state, so the transcript shows ONE card that mutates through
       // retrying/error/done — instead of a fresh card + a system retry-toast per pass.
       const slotId = get().upsertTranscriptEntry({ type: 'opening', speaker: poverId, status: 'generating', content: '', taxonomy_refs: [] });
 
       try {
-        const stageGenerate = makeStageGenerate(set as (partial: Record<string, unknown>) => void, getSpeakerModel(activeDebate, poverId, model));
+        const stageGenerate = makeStageGenerate(set as (partial: Record<string, unknown>) => void, getSpeakerModel(activeDebate, poverId, model), servedTurnRecorder(get, set, poverId));
         const recentText = priorStatements.map(ps => ps.statement).join('\n').slice(-500);
         const ctx = await getRelevantTaxonomyContext(info.pov, topic, recentText);
         const speakerClaims = (get().activeDebate?.argument_network?.nodes || []).filter(n => n.speaker === poverId);
@@ -985,35 +1104,65 @@ export const createClarificationSlice: StateCreator<DebateStore, [], [], Clarifi
           .filter(n => n.speaker === 'user' && n.id.startsWith('user-seed-'))
           .map(n => ({ id: n.id, text: n.text, bdi_category: n.bdi_category }));
 
+        // This is the SAME model the brief actually runs with (stage override, else
+        // speaker/base model) — used below for the timeout toast/dialog.
+        const resolvedBriefModel = resolveBriefModel(activeDebate, poverId, model);
+
+        const speakerModel = getSpeakerModel(activeDebate, poverId, model);
         const pipelineInput: OpeningPipelineInput = {
           label: info.label,
           pov: info.pov,
           personality: info.personality,
+          soul: openingSouls.soul,
+          opponentSouls: openingSouls.opponentSouls,
           topic,
           taxonomyContext: taxonomyBlock,
           priorStatements: priorBlock,
           isFirst: priorStatements.length === 0,
+          // t/3755: must mirror debateEngine/phases/opening.ts. The field is OPTIONAL, so
+          // omitting it here compiles clean and silently falls back to a single
+          // '<prior speaker>' example — the desktop path would keep the exact bug t/3755 fixes.
+          priorSpeakerLabels: priorStatements.length > 0 ? priorStatements.map(ps => ps.speaker) : undefined,
           sourceContent: docAnalysis ? undefined : (activeDebate.source_content || undefined),
           documentAnalysis: docAnalysis,
           audience: activeDebate.audience,
-          model: getSpeakerModel(activeDebate, poverId, model),
+          model: speakerModel,
+          draftModel: activeDebate.stage_models?.draft || undefined,
           briefModel: activeDebate.stage_models?.brief || undefined,
           planModel: activeDebate.stage_models?.plan || undefined,
           citeModel: activeDebate.stage_models?.cite || undefined,
           userSeedClaims: userSeeds.length > 0 ? userSeeds : undefined,
-          availablePovNodeIds: [...getAllKnownNodeIds()],
+          availablePovNodeIds: [...getSelectableNodeIds()], // t/4355: offer selectable ids only
           background: activeDebate.topic?.background || undefined,
+          narrativeVoicing: (() => {
+            const voicing = get().activeDebate?.narrative_voicing;
+            return voicing ? narrativeBlockForDebater(voicing.narratives, poverId) : undefined;
+          })(),
+          // t/3521: briefTimeoutMs floor is no longer computed here — runOpeningPipelineWithRepair
+          // applies Math.max(DEFAULT_BRIEF_TIMEOUT_MS, getMinTimeout(model)) internally, the single
+          // source of truth shared with the engine path (t/3518's escape was this floor computed
+          // independently in two places and drifting).
+          // t/3612: plan/draft/cite floor. Computed HERE (not left to the pipeline's getMinTimeout
+          // callback) because on desktop that callback resolves to electronAIAdapter's stubbed
+          // getModelMinTimeout => 0 (t/3612#2/#4) — the renderer is the only desktop call site with
+          // the real registry, same reason briefTimeoutMs already works this way. Raise semantics
+          // (Math.max with the real adapter default), not a replacement — a floor below the backend
+          // base must never lower the timeout (t/3612#4).
+          stageTimeoutMs: Math.max(
+            getDefaultTimeout(speakerModel, aiModelsRegistry as unknown as ModelRegistry),
+            getModelMinTimeout(speakerModel, aiModelsRegistry as unknown as ModelRegistry),
+          ),
         };
 
         // Emit on the renderer-local brief-timeout bus (t/2307). Both builds: the
         // opening pipeline runs in this renderer, so emit and the same-window toast
         // consumer share @bridge's bus — no IPC. Previously web-only; the Electron
         // path routed through an unfed IPC channel and never fired.
-        // The model the brief actually runs with (stage override, else speaker/base model) —
-        // this is what the timeout toast/dialog must display so "Switch model" is an informed
-        // choice (t/2504). onBriefEvent is created per-speaker inside the aiPovers loop, so
-        // poverId/model already resolve the timed-out speaker (data.agent).
-        const resolvedBriefModel = resolveBriefModel(activeDebate, poverId, model);
+        // resolvedBriefModel (computed above) is what the brief actually runs with (stage
+        // override, else speaker/base model) — what the timeout toast/dialog must display so
+        // "Switch model" is an informed choice (t/2504). onBriefEvent is created per-speaker
+        // inside the aiPovers loop, so poverId/model already resolve the timed-out speaker
+        // (data.agent).
         const onBriefEvent: BriefEventFn = (phase, data) => {
           if (phase === 'brief.timeout' || phase === 'brief.retrying') {
             emitBriefTimeout({ debateId: activeDebate.id, speaker: data.agent, attempt: data.attempt, maxAttempts: data.maxRetries, currentModel: resolvedBriefModel });
@@ -1022,48 +1171,23 @@ export const createClarificationSlice: StateCreator<DebateStore, [], [], Clarifi
           }
         };
 
-        let pipelineResult = await runOpeningPipeline(
+        // t/3521: floor computation + repair-retry sequence now live in one place
+        // (turnPipeline/opening.ts's runOpeningPipelineWithRepair), shared with the engine
+        // path — the exact seam that caused t/3518's escape. onProgress fires the same
+        // 'retrying (N issues)' message before the internal repair retry that this call
+        // site used to set manually, so debateActivity keeps updating during repairs.
+        const pipelineResult = await runOpeningPipelineWithRepair(
           pipelineInput,
           stageGenerate,
           (_stage, label) => set({ debateActivity: label }),
           onBriefEvent,
+          (m) => getModelMinTimeout(m, aiModelsRegistry as unknown as ModelRegistry),
         );
         if (!isStillValid()) {
           console.warn(`[debate-store] Debate state changed after ${info.label} opening pipeline — remaining speakers will be skipped. activeDebateId: ${get().activeDebateId}, aborted: ${_abortController?.signal.aborted}`);
           addTranscriptEntry({ type: 'system', speaker: 'system', content: `Opening generation interrupted after ${info.label} — superseded by a model switch or a debate change.`, taxonomy_refs: [] });
           getGlobalRecorder()?.record({ type: 'debate.lifecycle', component: 'debate-store', level: 'info', debate_id: activeDebate?.id, message: 'runOpeningStatements aborted post-pipeline', data: { speaker: info.label } });
           return;
-        }
-
-        // Opening retry: if per-stage validation found errors, retry once with repair hints.
-        const openingRepairHints = getOpeningRepairHints(pipelineResult);
-        if (openingRepairHints.length > 0) {
-          console.log(`[debate-store] Opening retry for ${info.label}: ${openingRepairHints.length} issue(s)`);
-          set({ debateActivity: `${info.label} retrying (${openingRepairHints.length} issue${openingRepairHints.length > 1 ? 's' : ''})` });
-          try {
-            pipelineResult = await runOpeningPipeline(
-              { ...pipelineInput, repairHints: openingRepairHints },
-              stageGenerate,
-              (_stage, label) => set({ debateActivity: label }),
-              onBriefEvent,
-            );
-          } catch (err) {
-            getGlobalRecorder()?.record({
-              type: 'system.error',
-              debate_id: activeDebate?.id,
-              component: 'debate-store',
-              level: 'warn',
-              message: `Opening retry failed for ${info.label}`,
-              error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
-            });
-            console.warn(`[debate-store] Opening retry failed for ${info.label}:`, err);
-          }
-          if (!isStillValid()) {
-            console.warn(`[debate-store] Debate state changed after ${info.label} opening retry — remaining speakers will be skipped. activeDebateId: ${get().activeDebateId}, aborted: ${_abortController?.signal.aborted}`);
-            addTranscriptEntry({ type: 'system', speaker: 'system', content: `Opening generation interrupted after ${info.label} retry — superseded by a model switch or a debate change.`, taxonomy_refs: [] });
-            getGlobalRecorder()?.record({ type: 'debate.lifecycle', component: 'debate-store', level: 'info', debate_id: activeDebate?.id, message: 'runOpeningStatements aborted post-retry', data: { speaker: info.label } });
-            return;
-          }
         }
 
         const knownNodeIds = getAllKnownNodeIds();
@@ -1074,6 +1198,9 @@ export const createClarificationSlice: StateCreator<DebateStore, [], [], Clarifi
           console.error(`[debate] ${info.label} opening produced empty/trivial statement (${statement.length} chars) — treating as failure`);
           throw new Error(`Opening statement was empty or too short (${statement.trim().length} chars). The AI may have returned only structural metadata without prose content.`);
         }
+
+        // h3: record this debater's affirm/amend check of its own camp's narrative
+        recordNarrativeCheck(get, set, poverId, pipelineResult.draft as unknown as Record<string, unknown>);
 
         // Enrich policy refs with per-policy relevance from draft stage
         meta.policy_refs = enrichPolicyRefs(meta.policy_refs, pipelineResult.draft as unknown as Record<string, unknown>);
@@ -1104,6 +1231,21 @@ export const createClarificationSlice: StateCreator<DebateStore, [], [], Clarifi
             turn_symbols: meta.turn_symbols,
             relevance_sources: relevanceSources,
             injection_manifest: ctx.injectionManifest,
+          },
+        });
+        // t/3762: the sessionSlice.addTranscriptEntry `debate.opening_added` event fires at
+        // slot-creation (upsertTranscriptEntry, t/2907) — before the pipeline runs, so it can
+        // never carry prior_steelmans data. Emit the enriched event here instead, where the
+        // draft is actually known, so a dump answers "did steelmans fire?" in one event read
+        // rather than a 2881-line grep for the field name.
+        getGlobalRecorder()?.record({
+          type: 'debate.opening_added', component: 'debate-store', level: 'info',
+          debate_id: activeDebate.id,
+          message: `Opening delivered for ${info.label}`,
+          data: {
+            speaker: poverId, entryId: slotId,
+            prior_steelmans_count: pipelineResult.draft.prior_steelmans?.length ?? 0,
+            is_first_speaker: priorStatements.length === 0,
           },
         });
         // Key diagnostics/summary/claim-extraction off the SLOT id, not slice(-1):
@@ -1246,13 +1388,14 @@ export const createClarificationSlice: StateCreator<DebateStore, [], [], Clarifi
     }
 
     await cacheOpeningEmbeddings(get, set);
+    await finalizeNarrativeReference(get, set);
 
     // Neutral evaluation: baseline checkpoint (after openings, before cross-respond)
     void runNeutralCheckpoint('baseline', get, set as any, addTranscriptEntry as Parameters<typeof runNeutralCheckpoint>[3]);
 
     await saveDebate('runOpeningStatements:end');
 
-    await runInitialCrossRespondRounds(get, set, activeDebate);
+    await runInitialCrossRespondRounds(get, set, activeDebate, lease);
   },
 
   submitUserOpening: async (statement: string) => {

@@ -6,7 +6,7 @@ import type { DraftQualityGateResult } from './diagnostics.js';
 
 // ── Turn pipeline types ──────────────────────────────
 
-export type TurnStageId = 'brief' | 'plan' | 'draft' | 'postDraft' | 'draft_quality' | 'evidence' | 'cite' | 'micro-fix';
+export type TurnStageId = 'brief' | 'plan' | 'draft' | 'postDraft' | 'draft_quality' | 'evidence' | 'cite' | 'micro-fix' | 'repair';
 
 export interface TurnStageConfig {
   brief_temperature?: number;
@@ -106,7 +106,9 @@ export interface DraftWorkProduct {
   [key: string]: unknown;
   statement: string;
   turn_symbols: TurnSymbol[];
-  claim_sketches: { claim: string; targets: string[] }[];
+  claim_sketches: { claim: string; targets: string[]; steelman_of?: string }[];
+  /** Non-first-speaker openings: one entry per prior speaker, strongest version in their own terms. */
+  prior_steelmans?: { speaker: string; steelman_claim: string }[];
   key_assumptions: { assumption: string; if_wrong: string }[];
   disagreement_type: string;
   position_update?: string;
@@ -128,6 +130,14 @@ export interface CiteWorkProduct {
   grounding_confidence: number;
 }
 
+export interface EditingMeta {
+  edited: boolean;
+  fk_before: number;
+  fk_after: number;
+  checks_failed_after: boolean;
+  edit_notes?: string;
+}
+
 export interface TurnPipelineResult {
   brief: BriefWorkProduct;
   plan: PlanWorkProduct;
@@ -139,6 +149,7 @@ export interface TurnPipelineResult {
   ignoredEvidenceDocIds?: string[];
   stage_diagnostics: StageDiagnostics[];
   total_time_ms: number;
+  editing_meta?: EditingMeta;
   /** Topic alignment result from draft quality gate (t/341). */
   topicAlignmentResult?: {
     topic_aligned: boolean;
@@ -197,4 +208,5 @@ export interface OpeningPipelineResult {
     post_repair?: DraftQualityGateResult;
     repair_outcome?: 'fixed' | 'partial' | 'unchanged';
   };
+  editing_meta?: EditingMeta;
 }

@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
+# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 # Licensed under the MIT License. See LICENSE file in the project root.
 
 function Invoke-EdgeWeightEvaluation {
@@ -50,7 +50,7 @@ function Invoke-EdgeWeightEvaluation {
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
-        [string]$Model = 'gemini-3.5-flash-lite',
+        [string]$Model = (Get-AITierModel -Tier basic),
 
         [int]$BatchSize = 30,
 
@@ -122,8 +122,10 @@ function Invoke-EdgeWeightEvaluation {
 
     # ── Filter to edges needing weight ──
     $Candidates = [System.Collections.Generic.List[PSObject]]::new()
+    $Superseded = Get-SupersededNodeIdSet   # no AI call for an edge with a retired endpoint; the file keeps it (t/4356)
     for ($i = 0; $i -lt $AllEdges.Count; $i++) {
         $E = $AllEdges[$i]
+        if ($Superseded.Contains([string]$E.source) -or $Superseded.Contains([string]$E.target)) { continue }
         if ($Status -and $E.status -ne $Status) { continue }
         if (-not $Force -and $E.PSObject.Properties['weight'] -and $null -ne $E.weight) { continue }
         $Candidates.Add([PSCustomObject]@{ Index = $i; Edge = $E })
@@ -138,10 +140,10 @@ function Invoke-EdgeWeightEvaluation {
     }
 
     # ── Resolve API key ──
-    $Backend = if ($Model -match '^gemini') { 'gemini' } elseif ($Model -match '^claude') { 'claude' } else { 'groq' }
-    $ResolvedKey = Resolve-AIApiKey -ExplicitKey $ApiKey -Backend $Backend
-    if ([string]::IsNullOrWhiteSpace($ResolvedKey)) {
-        Write-Fail "No API key found for $Backend. Set `$env:$($Backend.ToUpper())_API_KEY."
+    # Backend from ai-models.json, never guessed; only the user's -ApiKey is forwarded (t/4087).
+    $KeyStatus = Get-AIModelKeyStatus -Model $Model -ApiKey $ApiKey
+    if (-not $KeyStatus.HasKey) {
+        Write-Fail "No API key found for $($KeyStatus.Backend). Set `$env:$($KeyStatus.EnvHint)."
         return
     }
 
@@ -185,7 +187,7 @@ function Invoke-EdgeWeightEvaluation {
             $Response = Invoke-AIApi `
                 -Prompt     $FullPrompt `
                 -Model      $Model `
-                -ApiKey     $ResolvedKey `
+                -ApiKey     $ApiKey `
                 -Temperature 0.2 `
                 -MaxTokens  4096
 

@@ -7,51 +7,50 @@ import './SituationDebatePanel.css';
 import type { SituationNode } from '../../types/taxonomy';
 import { useDebateStore } from '../../hooks/useDebateStore';
 import { useTaxonomyStore, MODELS_BY_BACKEND } from '../../hooks/useTaxonomyStore';
-import { useShallow } from 'zustand/react/shallow';
 import { POVER_INFO, DEBATE_AUDIENCES } from '../../types/debate';
 import type { SpeakerId, DebateAudience } from '../../types/debate';
 import { AI_POVERS } from '@lib/debate/types';
-import type { DebateSession } from '../../types/debate';
 import { DEBATE_PROTOCOLS } from '../../data/debateProtocols';
+import { api } from '@bridge';
+import { subscribeToSituationDebateStart } from './waitForSituationDebateStart';
+import { PRESET_DEFAULTS } from './NewDebateDialog';
 
 type DebatePacing = 'tight' | 'moderate' | 'thorough';
 
+// t/3928 (PI decision, t/3882#4): situation pacing maps to the SAME per-phase round bounds
+// as the normal debate presets — TIGHT=Quick, MODERATE=Deep, THOROUGH=Socratic's bounds —
+// reusing the constants (not copying the numbers) so the two paths can't drift apart.
+const PACING_TO_PRESET: Record<DebatePacing, 'quick' | 'deep' | 'socratic'> = {
+  tight: 'quick',
+  moderate: 'deep',
+  thorough: 'socratic',
+};
+
+function phaseBoundsForPacing(pacing: DebatePacing) {
+  const p = PRESET_DEFAULTS[PACING_TO_PRESET[pacing]];
+  return {
+    maxConfrontationRounds: p.confrontationRounds,
+    maxArgumentationRounds: p.argumentationRounds,
+    maxConcludingRounds: p.concludingRounds,
+  };
+}
+
+function totalRounds(pacing: DebatePacing): number {
+  const p = PRESET_DEFAULTS[PACING_TO_PRESET[pacing]];
+  return p.confrontationRounds + p.argumentationRounds + p.concludingRounds;
+}
+
 const PACING_PRESETS: { id: DebatePacing; label: string; desc: string }[] = [
-  { id: 'tight', label: 'Tight', desc: 'Shorter, focused exchanges.' },
-  { id: 'moderate', label: 'Moderate', desc: 'Balanced depth.' },
-  { id: 'thorough', label: 'Thorough', desc: 'Deep dive, longer exploration.' },
+  { id: 'tight', label: 'Tight', desc: `${totalRounds('tight')} rounds, focused exchanges.` },
+  { id: 'moderate', label: 'Moderate', desc: `${totalRounds('moderate')} rounds, balanced depth.` },
+  { id: 'thorough', label: 'Thorough', desc: `${totalRounds('thorough')} rounds, deep dive, longer exploration.` },
 ];
-
-interface SituationDebateConfig {
-  effectiveModel?: string;
-  pacing: DebatePacing;
-  useAdaptiveStaging: boolean;
-  temperature: number;
-  audience: DebateAudience;
-  protocolId: string;
-}
-
-// Apply the panel's non-default config onto a freshly created session (t/1915:
-// extracted from handleLaunch to keep that handler under the complexity ceiling).
-// Mirrors the original inline order exactly; only non-default values are written.
-function applySituationDebateConfig(session: DebateSession, cfg: SituationDebateConfig) {
-  if (cfg.effectiveModel) session.debate_model = cfg.effectiveModel;
-  if (cfg.pacing !== 'moderate') (session as unknown as Record<string, unknown>).pacing = cfg.pacing;
-  if (cfg.useAdaptiveStaging) (session as unknown as Record<string, unknown>).adaptive_staging = true;
-  if (cfg.temperature !== 0.7) (session as unknown as Record<string, unknown>).temperature = cfg.temperature;
-  if (cfg.audience !== 'policymakers') (session as unknown as Record<string, unknown>).audience = cfg.audience;
-  if (cfg.protocolId !== 'structured') (session as unknown as Record<string, unknown>).protocol_id = cfg.protocolId;
-}
 
 interface SituationDebatePanelProps {
   node: SituationNode;
-  onLaunched: () => void;
 }
 
-export function SituationDebatePanel({ node, onLaunched }: SituationDebatePanelProps) {
-  const { createDebate, loadDebate } = useDebateStore(
-    useShallow(s => ({ createDebate: s.createDebate, loadDebate: s.loadDebate }))
-  );
+export function SituationDebatePanel({ node }: SituationDebatePanelProps) {
   const createSituationDebate = useDebateStore(s => s.createSituationDebate);
   const { geminiModel, setActiveTab } = useTaxonomyStore();
 
@@ -69,9 +68,12 @@ export function SituationDebatePanel({ node, onLaunched }: SituationDebatePanelP
   const [pacing, setPacing] = useState<DebatePacing>('moderate');
   const [temperature, setTemperature] = useState(0.7);
   const [audience, setAudience] = useState<DebateAudience>('policymakers');
-  const [useAdaptiveStaging, setUseAdaptiveStaging] = useState(false);
+  // t/3783: always on — matches NewDebateDialog's unconditional useAdaptiveStaging
+  // default; there's no meaningful "pacing without adaptive staging" state to offer.
+  const useAdaptiveStaging = true;
   const [launching, setLaunching] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [launchError, setLaunchError] = useState<string | null>(null);
 
   const toggle = (id: SpeakerId) => {
     const next = new Set(selected);
@@ -82,35 +84,64 @@ export function SituationDebatePanel({ node, onLaunched }: SituationDebatePanelP
 
   const canStart = selected.size >= 2;
 
-  const handleLaunch = async () => {
+  const handleLaunch = () => {
     if (!canStart || launching) return;
     setLaunching(true);
-    try {
-      const povers = Array.from(selected);
-      if (userIsPover && !povers.includes('user')) povers.push('user');
-      const effectiveModel = useCustomModel ? customModel : undefined;
+    setLaunchError(null);
 
-      // Use createSituationDebate for the enrichment, but we need to pass config.
-      // Since createSituationDebate doesn't accept config, call createDebate directly
-      // with the situation context built the same way.
-      const id = await createSituationDebate(node.id);
+    const povers = Array.from(selected);
+    if (userIsPover && !povers.includes('user')) povers.push('user');
+    const effectiveModel = useCustomModel ? customModel : undefined;
 
-      // Update the session with custom config if non-default
-      const store = useDebateStore.getState();
-      const session = store.activeDebate;
-      if (session) {
-        applySituationDebateConfig(session, { effectiveModel, pacing, useAdaptiveStaging, temperature, audience, protocolId });
-        await store.saveDebate('SituationDebatePanel:applyConfig');
+    // t/3749: setActiveTab alone only lands on the Debate tab's summary card
+    // (a manual "Open in Window" button) — open the popout directly, mirroring
+    // NewDebateDialog's working path, so Start actually takes the user somewhere.
+    const openAndNavigate = async (id: string) => {
+      try {
+        const result = await api.openDebateWindow(id);
+        if (result && 'atCap' in result && result.atCap) {
+          setLaunchError('Close a debate window — max 5 open — then open this one from the Debates list.');
+        }
+      } catch (openErr) {
+        getGlobalRecorder()?.record({
+          type: 'system.error',
+          component: 'situation-debate',
+          level: 'warn',
+          debate_id: id,
+          message: 'Failed to open debate popout window after situation debate launch',
+          error: { name: (openErr as Error).name ?? 'Error', message: String(openErr), stack: (openErr as Error).stack },
+        });
+        setLaunchError('Debate created but the window failed to open — find it in the Debates list.');
       }
-
-      void store.runClarification();
       setActiveTab('debate');
-      onLaunched();
-    } catch (err) {
-      getGlobalRecorder()?.record({ type: 'system.error', component: 'situation-debate', level: 'error', message: 'debate launch failed', error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } });
-    } finally {
       setLaunching(false);
-    }
+    };
+
+    // t/3752: navigate as soon as the debate record exists (fires inside
+    // createSituationDebate's createDebate() call) instead of blocking on the
+    // full watch-only opening round (enterClarificationOrBegin, t/3629 — don't touch).
+    const unsubscribe = subscribeToSituationDebateStart(node.id, (id) => {
+      unsubscribe();
+      void openAndNavigate(id);
+    });
+
+    // t/3783: config is threaded into createSituationDebate so adaptive_staging
+    // (and the rest) exist at creation time, not patched onto activeDebate
+    // afterward — a post-creation mutate-then-save was silently discarded by
+    // clarificationSlice's concurrent `set({ activeDebate: { ...fresh } })`
+    // replacements during the opening/clarification pipeline (TL diagnosis, t/3783#4).
+    createSituationDebate(node.id, { effectiveModel, pacing, useAdaptiveStaging, temperature, audience, protocolId, phaseBoundsOverride: phaseBoundsForPacing(pacing) })
+      .then(() => {
+        setLaunching(false);
+      })
+      .catch((err) => {
+        getGlobalRecorder()?.record({ type: 'system.error', component: 'situation-debate', level: 'error', message: 'debate launch failed', error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } });
+        setLaunchError(err instanceof Error ? err.message : 'Failed to start debate. Please try again.');
+        setLaunching(false);
+      })
+      .finally(() => {
+        unsubscribe();
+      });
   };
 
   // Past debates linked to this situation
@@ -204,13 +235,6 @@ export function SituationDebatePanel({ node, onLaunched }: SituationDebatePanelP
           )}
         </div>
 
-        {/* Adaptive staging */}
-        <label className="sit-debate-adaptive">
-          <input type="checkbox" checked={useAdaptiveStaging} onChange={(e) => setUseAdaptiveStaging(e.target.checked)} />
-          Adaptive staging
-          {useAdaptiveStaging && <span className="sit-debate-badge">Experimental</span>}
-        </label>
-
         {/* Advanced */}
         <button className="sit-debate-advanced-toggle" onClick={() => setShowAdvanced(!showAdvanced)}>
           {showAdvanced ? 'Hide advanced ▲' : 'Advanced ▼'}
@@ -236,6 +260,13 @@ export function SituationDebatePanel({ node, onLaunched }: SituationDebatePanelP
         >
           {launching ? 'Starting...' : 'Start Situation Debate'}
         </button>
+
+        {launchError && (
+          <div className="sit-debate-launch-error" role="alert">
+            {launchError}
+            <button type="button" className="sit-debate-launch-retry" onClick={handleLaunch}>Retry</button>
+          </div>
+        )}
       </div>
     </div>
   );

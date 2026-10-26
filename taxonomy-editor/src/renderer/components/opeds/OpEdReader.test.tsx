@@ -60,7 +60,9 @@ describe('OpEdReader — single voice', () => {
       grounding: [{ node_id: 'saf-belief-014', label: 'A belief', category: 'Belief', pov: 'safetyist', relevance: '0.82', how_reflected: 'Grounds the claim' }],
     })])} />);
     expect(screen.queryByText(/Written from voice alone/i)).toBeNull();
-    expect(screen.getByRole('button', { name: 'saf-belief-014' })).toBeTruthy();
+    const btn = screen.getByRole('button', { name: 'A belief' });
+    expect(btn).toBeTruthy();
+    expect(btn.getAttribute('title')).toBe('saf-belief-014');
     expect(screen.getByText('Grounds the claim')).toBeTruthy();
   });
 
@@ -74,14 +76,14 @@ describe('OpEdReader — single voice', () => {
     // Type column is gone (Element / Relevance / Reflected only).
     expect(screen.queryByRole('columnheader', { name: 'Type' })).toBeNull();
     // The used row shows; the 'not directly used' row is hidden by default.
-    expect(screen.getByRole('button', { name: 'saf-belief-014' })).toBeTruthy();
-    expect(screen.queryByRole('button', { name: 'acc-belief-001' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Used' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Unused' })).toBeNull();
     // The toggle reveals the hidden row…
     fireEvent.click(screen.getByRole('button', { name: /show 1 unused element/i }));
-    expect(screen.getByRole('button', { name: 'acc-belief-001' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Unused' })).toBeTruthy();
     // …and toggling again re-hides it.
     fireEvent.click(screen.getByRole('button', { name: /hide 1 unused element/i }));
-    expect(screen.queryByRole('button', { name: 'acc-belief-001' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Unused' })).toBeNull();
   });
 
   it('shows no unused-toggle when every element is reflected (t/2703)', () => {
@@ -95,7 +97,7 @@ describe('OpEdReader — single voice', () => {
     render(<OpEdReader set={makeSet([member({
       grounding: [{ node_id: 'saf-belief-014', label: 'A belief', category: 'Belief', pov: 'safetyist', relevance: '0.82', how_reflected: 'Grounds the claim', document_claims: ['Safety incidents doubled last year', 'Only 3 labs share proactively'] }],
     })])} />);
-    fireEvent.click(screen.getByRole('button', { name: 'saf-belief-014' }));
+    fireEvent.click(screen.getByRole('button', { name: 'A belief' }));
     expect(screen.getByText('Addresses these source claims:')).toBeTruthy();
     expect(screen.getByText('Safety incidents doubled last year')).toBeTruthy();
     expect(screen.getByText('Only 3 labs share proactively')).toBeTruthy();
@@ -105,7 +107,7 @@ describe('OpEdReader — single voice', () => {
     render(<OpEdReader set={makeSet([member({
       grounding: [{ node_id: 'saf-belief-014', label: 'A belief', category: 'Belief', pov: 'safetyist', relevance: '0.82', how_reflected: 'Grounds the claim' }],
     })])} />);
-    fireEvent.click(screen.getByRole('button', { name: 'saf-belief-014' }));
+    fireEvent.click(screen.getByRole('button', { name: 'A belief' }));
     expect(screen.queryByText('Addresses these source claims:')).toBeNull();
   });
 });
@@ -161,6 +163,32 @@ describe('OpEdReader — multi-voice set', () => {
     render(<OpEdReader set={set} />);
     expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
   });
+
+  // t/3486: deep-linkable in-app URLs — the reader seeds its starting tab from a route
+  // restore and reports tab changes back so the URL can track the active camp.
+  it('t/3486: initialPov seeds the starting active tab', () => {
+    render(<OpEdReader set={set} initialPov="safetyist" />);
+    const tabs = screen.getAllByRole('tab');
+    expect(tabs[1].getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Safetyist headline');
+  });
+
+  it('t/3486: falls back to the first tab when initialPov matches no member', () => {
+    render(<OpEdReader set={set} initialPov="accelerationist" />);
+    const tabs = screen.getAllByRole('tab');
+    expect(tabs[0].getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('t/3486: onPovChange fires with the newly active pov on click and keyboard nav', () => {
+    const onPovChange = vi.fn();
+    render(<OpEdReader set={set} onPovChange={onPovChange} />);
+    fireEvent.click(screen.getAllByRole('tab')[1]);
+    expect(onPovChange).toHaveBeenCalledWith('safetyist');
+
+    onPovChange.mockClear();
+    fireEvent.keyDown(screen.getAllByRole('tab')[1], { key: 'ArrowRight' });
+    expect(onPovChange).toHaveBeenCalledWith('skeptic');
+  });
 });
 
 describe('OpEdReader — new member fields (t/2849)', () => {
@@ -185,5 +213,32 @@ describe('OpEdReader — new member fields (t/2849)', () => {
   it('omits the closing section and byline when those fields are empty', () => {
     render(<OpEdReader set={makeSet([member({ byline: '', disclosure: '', rhetorical_meta: '' })])} />);
     expect(screen.queryByText('What this op-ed did')).toBeNull();
+  });
+});
+
+// t/3992: a tagged member shows its wing scope. Uses the committed registry's skeptic "critical" tag
+// (t/3956), so the label is the real registry label.
+describe('OpEdReader — wing scope (t/3992)', () => {
+  beforeAll(() => {
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+  const tagged = (mode: 'scope' | 'prioritize', excludedUntagged: number) =>
+    member({ pov: 'skeptic', tag: { pov: 'skeptic', tag: 'critical', mode, included: 12, excludedUntagged } });
+
+  it('Scope shows the wing and how many nodes without its tag were excluded', () => {
+    render(<OpEdReader set={makeSet([tagged('scope', 31)])} />);
+    expect(screen.getByRole('note', { name: '' }).textContent).toBe('Skeptic · Critical wing (scope; 31 not tagged Critical excluded)');
+  });
+
+  it('Prioritize shows no exclusion count (0 by construction would read as full coverage)', () => {
+    render(<OpEdReader set={makeSet([tagged('prioritize', 0)])} />);
+    const line = screen.getByText(/Critical wing/);
+    expect(line.textContent).toBe('Skeptic · Critical wing (prioritized)');
+    expect(line.textContent).not.toMatch(/excluded/);
+  });
+
+  it('an untagged member shows no scope line', () => {
+    render(<OpEdReader set={makeSet([member()])} />);
+    expect(screen.queryByText(/ wing \(/)).toBeNull();
   });
 });

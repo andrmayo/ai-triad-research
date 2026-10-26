@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Jeffrey Snover. All rights reserved.
+﻿// Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 // Licensed under the MIT License. See LICENSE file in the project root.
 
 // Canonical, framework-agnostic taxonomy relevance-selection pipeline (t/3248 / t/3257,
@@ -20,6 +20,8 @@
 //     fallback. The corpus `nodeEmbeddings` is pre-built by the caller.
 
 import type { PovNode, SituationNode } from './taxonomyTypes.js';
+import type { TagSelection } from './types/session.js';
+import { TAG_BOOST_INCREMENT, TAG_SCOPE_MINIMUM_NODES } from './debateConfig.js';
 import { cosineSimilarity } from '../embeddings/similarity.js';
 import {
   scoreNodesViaAN,
@@ -27,6 +29,8 @@ import {
   buildRelevanceQuery,
   selectRelevantNodes,
   selectRelevantSituationNodes,
+  excludeWellTestedModeOptions,
+  summarizeTestingSelection,
   type ANClaimEmbedding,
   type RelevanceOptions,
   type ScoredPovNode,
@@ -119,6 +123,58 @@ export interface DoctrinalAdjustment {
   evidentialConfidence: number;
 }
 
+/**
+ * Pure pre-flight: check how many POV nodes are in-scope for a given tag.
+ * Never throws at runtime — callers act on `sufficient` + `reason`.
+ *
+ * Sufficiency rules (t/3965#13, CL ruling p/736#31, t/4009):
+ *   - `none-tagged`: inScope === 0 (either mode) — nothing to ground on or boost.
+ *   - `below-floor`: Scope mode, 0 < inScope < TAG_SCOPE_MINIMUM_NODES — too thin to answer.
+ *   - null: sufficient.
+ * Prioritize sufficiency floor is 1 (no minimum count — it excludes nothing).
+ * Scope sufficiency floor is TAG_SCOPE_MINIMUM_NODES.
+ *
+ * When `embeddedIds` is provided (t/4009), the floor counts only groundable nodes
+ * (tagged AND embedded). `unembeddedTaggedCount` reports how many tagged nodes were
+ * excluded from the count due to missing embeddings — callers should WARN on > 0.
+ */
+export function checkTagScope(
+  povNodes: PovNode[],
+  tagSelection: TagSelection,
+  embeddedIds?: Set<string>,
+): { inScope: PovNode[]; excluded: PovNode[]; sufficient: boolean; reason: 'none-tagged' | 'below-floor' | null; unembeddedTaggedCount: number } {
+  const tagged = povNodes.filter(n => (n.pov_tags ?? []).includes(tagSelection.tag));
+  const excluded = povNodes.filter(n => !(n.pov_tags ?? []).includes(tagSelection.tag));
+  const inScope = embeddedIds ? tagged.filter(n => embeddedIds.has(n.id)) : tagged;
+  const unembeddedTaggedCount = tagged.length - inScope.length;
+  if (inScope.length === 0) {
+    return { inScope, excluded, sufficient: false, reason: 'none-tagged', unembeddedTaggedCount };
+  }
+  if (tagSelection.mode === 'scope' && inScope.length < TAG_SCOPE_MINIMUM_NODES) {
+    return { inScope, excluded, sufficient: false, reason: 'below-floor', unembeddedTaggedCount };
+  }
+  return { inScope, excluded, sufficient: true, reason: null, unembeddedTaggedCount };
+}
+
+/**
+ * Apply tag selection to a POV node set (pure).
+ * SCOPE mode: returns only tagged nodes; boostIds is empty.
+ * PRIORITIZE mode: returns all nodes; boostIds lists the tagged node IDs to boost.
+ */
+export function applyTagSelection(
+  povNodes: PovNode[],
+  tagSelection: TagSelection,
+): { filteredNodes: PovNode[]; excludedCount: number; boostIds: string[] } {
+  if (tagSelection.mode === 'scope') {
+    const tagged = povNodes.filter(n => (n.pov_tags ?? []).includes(tagSelection.tag));
+    return { filteredNodes: tagged, excludedCount: povNodes.length - tagged.length, boostIds: [] };
+  }
+  const boostIds = povNodes
+    .filter(n => (n.pov_tags ?? []).includes(tagSelection.tag))
+    .map(n => n.id);
+  return { filteredNodes: povNodes, excludedCount: 0, boostIds };
+}
+
 export interface SelectRelevantTaxonomyInput {
   // ── static (server-derivable; the client passes them from its store) ──
   povNodes: PovNode[];
@@ -150,6 +206,8 @@ export interface SelectRelevantTaxonomyInput {
     maxTotal?: number;       // default 35
     topN?: number;           // mean-top-N for multi-vector nodes; default 3
     scoringMode?: 'embedding' | 'lexical';
+    /** POV tag selection: SCOPE filters to tagged nodes only; PRIORITIZE boosts tagged nodes (t/3957). */
+    tagSelection?: TagSelection;
     // NOTE: `minPerPov` is deliberately NOT a param — selectRelevantNodes reads `opts.minPerPov ?? 2`,
     // so leaving it unset keeps BOTH callers at the default 2 (ServerAPI parity note, t/3257#15).
   };
@@ -321,9 +379,38 @@ function buildManifest(
       promotedNodeIds: lb.promotedNodeIds.slice(0, 20),
     };
   }
+  const testingSelection = summarizeTestingSelection(scoredPov);
+  if (testingSelection) manifest.testing_selection = testingSelection;
   return manifest;
 }
 
+/** Per-camp label deduplicate: keep highest-scored node per (camp, normalised-label) pair (t/4369).
+ *  Ordered by first occurrence in `nodes` to preserve selectRelevantNodes input order (W3). */
+function deduplicateByLabel(
+  nodes: PovNode[],
+  scores: Map<string, number>,
+): { dedupedNodes: PovNode[]; skipped: Array<{ skippedId: string; keptId: string; label: string }> } {
+  const bestPerKey = new Map<string, { nodeId: string; score: number }>();
+  for (const node of nodes) {
+    const camp = node.id.split('-')[0];
+    const key = `${camp}\x00${node.label.trim().toLowerCase()}`;
+    const score = scores.get(node.id) ?? 0;
+    const existing = bestPerKey.get(key);
+    if (!existing || score > existing.score) bestPerKey.set(key, { nodeId: node.id, score });
+  }
+  const dedupedNodes: PovNode[] = [];
+  const skipped: Array<{ skippedId: string; keptId: string; label: string }> = [];
+  for (const node of nodes) {
+    const camp = node.id.split('-')[0];
+    const key = `${camp}\x00${node.label.trim().toLowerCase()}`;
+    if (bestPerKey.get(key)?.nodeId === node.id) {
+      dedupedNodes.push(node);
+    } else {
+      skipped.push({ skippedId: node.id, keptId: bestPerKey.get(key)!.nodeId, label: node.label });
+    }
+  }
+  return { dedupedNodes, skipped };
+}
 /**
  * The single relevance-selection pipeline. Deterministic given its inputs; the T2 parity fixture
  * asserts server selection === today's client selection (same nodes, same ORDER, same
@@ -333,29 +420,70 @@ export async function selectRelevantTaxonomy(input: SelectRelevantTaxonomyInput)
   const { povNodes, situationNodes, policyRegistry, nodeEmbeddings, lineageMapping, doctrinalBoundaries, session, params, embed } = input;
   const threshold = params.threshold ?? 0.45;
 
-  // 1. Doctrinal anchoring (read-only in; adjustments out — W2).
-  const anchoring = await computeAnchoringAdjustments(povNodes, nodeEmbeddings, doctrinalBoundaries, embed);
-
-  // 2. Relevance scores + per-node provenance (AN-primary, topic-query fallback).
-  const allNodeIds = [...povNodes.map(n => n.id), ...situationNodes.map(n => n.id)];
-  const { scores, nodeSourceMap } = await computeScores(session.anClaimEmbeddings, nodeEmbeddings, allNodeIds, params, embed);
-
-  // 3. Selection options (+ lineage boost) and greatest-hits exclusion (pure — list passed in).
-  const opts = buildOptions(threshold, params, povNodes, session.lineageFrame, lineageMapping);
-  if (session.excludeGreatestHits && session.greatestHitsList && session.greatestHitsList.length > 0) {
-    opts.greatestHitsExclude = new Set(session.greatestHitsList);
+  // 0. Tag selection: SCOPE filters povNodes before scoring; PRIORITIZE keeps all and collects boost targets.
+  let effectivePovNodes = povNodes;
+  let tagBoostIds: string[] = [];
+  let tagExcludedCount = 0;
+  if (params.tagSelection) {
+    const applied = applyTagSelection(povNodes, params.tagSelection);
+    effectivePovNodes = applied.filteredNodes;
+    tagBoostIds = applied.boostIds;
+    tagExcludedCount = applied.excludedCount;
   }
 
-  // 4. Order-preserving selection (W3).
-  const scoredPov = selectRelevantNodes(povNodes, scores, opts);
+  // 1. Doctrinal anchoring on the full povNodes (not filtered — anchoring is pre-selection, W2).
+  const anchoring = await computeAnchoringAdjustments(povNodes, nodeEmbeddings, doctrinalBoundaries, embed);
+
+  // 2. Relevance scores on the effective (possibly filtered) pov set + all situation nodes.
+  const allNodeIds = [...effectivePovNodes.map(n => n.id), ...situationNodes.map(n => n.id)];
+  const { scores, nodeSourceMap } = await computeScores(session.anClaimEmbeddings, nodeEmbeddings, allNodeIds, params, embed);
+
+  // Apply tag boost for PRIORITIZE mode (after base scores are computed).
+  for (const id of tagBoostIds) {
+    const existing = scores.get(id) ?? 0;
+    scores.set(id, existing + TAG_BOOST_INCREMENT);
+  }
+
+  // 3. Selection options (+ lineage boost) and the exclude-well-tested mode.
+  const opts = buildOptions(threshold, params, effectivePovNodes, session.lineageFrame, lineageMapping);
+  if (session.excludeGreatestHits) {
+    Object.assign(opts, excludeWellTestedModeOptions());
+    if (session.greatestHitsList && session.greatestHitsList.length > 0) {
+      opts.greatestHitsExclude = new Set(session.greatestHitsList);
+    }
+  }
+
+  // Pre-deduplicate by normalized label per camp before floor-backfill (t/4369).
+  const { dedupedNodes: dedupedPovNodes, skipped: labelDupSkipped } = deduplicateByLabel(effectivePovNodes, scores);
+
+  // 4. Order-preserving selection (W3) on the deduplicated candidate pool.
+  const scoredPov = selectRelevantNodes(dedupedPovNodes, scores, opts);
   const scoredCC = selectRelevantSituationNodes(situationNodes, scores, threshold, 3, 15);
+
+  const manifest = buildManifest(scoredPov, scoredCC, threshold);
+  if (labelDupSkipped.length > 0) {
+    // Callers must WARN when label_dedup is non-empty (t/4369): client FR in taxonomyContext.ts
+    // (next to logLineageBoostResult), server Pino in relevantNodes.ts.
+    manifest.label_dedup = labelDupSkipped.map(d => `${d.skippedId} (dup of ${d.keptId}: "${d.label}")`);
+  }
+  if (params.tagSelection) {
+    const taggedSelectedCount = scoredPov.filter(s =>
+      (s.node.pov_tags ?? []).includes(params.tagSelection!.tag),
+    ).length;
+    manifest.tag_selection = {
+      tag: params.tagSelection.tag,
+      mode: params.tagSelection.mode,
+      excluded_untagged: tagExcludedCount,
+      tagged_selected: taggedSelectedCount,
+    };
+  }
 
   return {
     povNodes: scoredPov.map(s => ({ nodeId: s.node.id, score: s.score })),
     situationNodes: scoredCC.map(s => ({ nodeId: s.node.id, score: s.score })),
     policyRegistry,
     nodeSourceMap,
-    injectionManifest: buildManifest(scoredPov, scoredCC, threshold),
+    injectionManifest: manifest,
     anchoring,
   };
 }

@@ -56,20 +56,13 @@
     ]
   },
   "enrichment.crux-question-form": {
-    "description": "Rewrite a crux's declarative statement into its canonical neutral question form (t/1507). CL-owned. The question is the crux read as an open pivot: answerable either way, presupposing neither side.",
+    "description": "Rewrite a crux's declarative statement into its canonical neutral question form (t/1507). CL-owned. The question is the crux read as an open pivot: answerable either way, presupposing neither side. responseSchema removed — Gemini HTTP 400: ConvertTo-GeminiSchema drops nested properties on PSCustomObject coerce (root-cause: t/3494); prompt enforces output contract; downstream parse is defensive.",
     "model": "claude-sonnet-4-6",
     "temperature": 0.2,
     "maxTokens": 200,
     "timeoutMs": 45000,
     "jsonMode": true,
-    "responseSchema": {
-      "type": "object",
-      "properties": {
-        "question": { "type": "string" }
-      },
-      "required": ["question"]
-    },
-    "systemMessage": "You convert cruxes from AI-policy debates into canonical open questions. A crux is a pivotal contested claim: the point that, if resolved, would change positions. Rewrite the given crux statement as ONE neutral question. Rules: (1) Neutrality is the prime constraint: the question must be answerable in either direction and must not presuppose the statement's own answer, its framing verbs, or its loaded adjectives. (2) Steer the interrogative by crux type: empirical asks whether something is true, how much, or under what conditions; values asks what should be prioritized or which consideration outweighs which; definitional asks what counts as the contested term or where its boundary lies. (3) Preserve the statement's specific content: do not generalize it into a vaguer question. (4) One question only, maximum 35 words, ending with a question mark. Output raw JSON matching the schema. Do not wrap the response in markdown code fences.",
+    "systemMessage": "You convert cruxes from AI-policy debates into canonical open questions. A crux is a pivotal contested claim: the point that, if resolved, would change positions. Rewrite the given crux statement as ONE neutral question. Rules: (1) Neutrality is the prime constraint: the question must be answerable in either direction and must not presuppose the statement's own answer, its framing verbs, or its loaded adjectives. (2) Steer the interrogative by crux type: empirical asks whether something is true, how much, or under what conditions; values asks what should be prioritized or which consideration outweighs which; definitional asks what counts as the contested term or where its boundary lies. (3) Preserve the statement's specific content: do not generalize it into a vaguer question. (4) One question only, maximum 35 words, ending with a question mark. Output raw JSON with a single field: {\"question\": \"…\"}. Do not wrap the response in markdown code fences.",
     "messageTemplate": "Crux type: {{type}}\nCrux statement: {{statement}}",
     "tags": [
       "enrichment",
@@ -293,7 +286,7 @@
   },
   "server.chat-response": {
     "description": "Server-side AI text generation (/api/ai/generate)",
-    "model": "gemini-flash-lite-latest",
+    "model": "gemini-3.5-flash-lite",
     "temperature": 0.7,
     "timeoutMs": 120000,
     "messageTemplate": "{{prompt}}",
@@ -308,7 +301,7 @@
   },
   "server.chat-stream": {
     "description": "Server-side multi-turn SSE streaming chat (/api/ai/chat-stream, t/2457)",
-    "model": "gemini-flash-lite-latest",
+    "model": "gemini-3.5-flash-lite",
     "temperature": 0.7,
     "timeoutMs": 120000,
     "tags": [
@@ -319,7 +312,7 @@
   },
   "server.search": {
     "description": "Server-side AI search via Gemini grounding or Tavily augmentation",
-    "model": "gemini-flash-lite-latest",
+    "model": "gemini-3.5-flash-lite",
     "messageTemplate": "{{prompt}}",
     "tags": [
       "server",
@@ -328,7 +321,7 @@
   },
   "server.news-report": {
     "description": "Generate a news article from a completed debate synthesis",
-    "model": "gemini-flash-lite-latest",
+    "model": "gemini-3.5-flash-lite",
     "temperature": 0.7,
     "messageTemplate": "{{prompt}}",
     "tags": [
@@ -338,7 +331,7 @@
   },
   "server.nli-classify-fallback": {
     "description": "Hosted-LLM fallback for NLI pair classification when the local Python cross-encoder is unavailable (t/1641); preserves the 384-dim MiniLM path's 3-label + score contract",
-    "model": "gemini-flash-lite-latest",
+    "model": "gemini-3.5-flash-lite",
     "temperature": 0,
     "timeoutMs": 60000,
     "messageTemplate": "You are a natural-language-inference (NLI) classifier. For each pair, treat text_a as the premise and text_b as the hypothesis, and decide the relationship of the hypothesis to the premise:\n- \"entailment\": the premise supports or implies the hypothesis.\n- \"contradiction\": the premise contradicts or is inconsistent with the hypothesis.\n- \"neutral\": neither — the hypothesis is unrelated to, or not determinable from, the premise.\n\nFor each pair output three probabilities in [0,1] that sum to ~1 (nli_entailment, nli_neutral, nli_contradiction) and the winning label as nli_label.\n\nRespond with ONLY a JSON object of the form {\"results\": [ ... ]} — no prose, no markdown fences. Each element must be {\"index\": <the pair's index>, \"nli_label\": \"entailment\"|\"neutral\"|\"contradiction\", \"nli_entailment\": <number>, \"nli_neutral\": <number>, \"nli_contradiction\": <number>}. Return exactly one element per input pair, preserving each pair's index.\n\nPairs:\n{{pairs}}",
@@ -507,7 +500,7 @@
   },
   "po.analysis-segmentation": {
     "description": "POViewer stage-1: segment source text into key points",
-    "model": "gemini-flash-lite-latest",
+    "model": "gemini-3.5-flash-lite",
     "temperature": 0.1,
     "timeoutMs": 60000,
     "jsonMode": true,
@@ -550,6 +543,20 @@
       "qbaf"
     ]
   },
+  "enrichment.contradiction-classify": {
+    "description": "Fork-B semantic-opposition (t/3302): classify the logical relation (contradict|entail|neutral) of within-conflict assertion pairs. Per-conflict batch via invoke-contradiction-classifier.ps1; temperature pinned 0 for determinism. CALIBRATION-PROVISIONAL until CL scores the frozen golden (P>=0.85 / R>=0.50).",
+    "model": "gemini-3.5-flash-lite",
+    "temperature": 0,
+    "maxTokens": 2000,
+    "timeoutMs": 60000,
+    "jsonMode": true,
+    "messageTemplate": "{{prompt}}",
+    "tags": [
+      "enrichment",
+      "qbaf",
+      "fork-b"
+    ]
+  },
   "enrichment.logical-form-formalization": {
     "description": "Formalize one claim's proposition into a neo-Davidsonian first-order logical form (t/3126 schema, t/3215 pass). CL owns the schema + prompt (research/comp-linguist/docs/logical-form-schema.md); PowerShell's Invoke-LogicalFormPass renders logical-form-formalization.prompt per claim and runs this over claims carrying entity_refs[]. jsonMode WITHOUT responseSchema — the nested args[]/about[] object tripped Gemini structured-output HTTP 400s (same failure as enrichment.org-stance-extraction); the prompt enforces a single strict-JSON object and the pass parses + validates + grounds defensively. model/temperature are CALIBRATION-PROVISIONAL until CL's D3b formalization_accuracy run against the golden set.",
     "model": "claude-sonnet-4-6",
@@ -563,6 +570,34 @@
       "enrichment",
       "logical-form",
       "fol"
+    ]
+  },
+  "enrichment.fol-clause-classify": {
+    "description": "Classify a batch of debate clauses into the closed 5-type FOL-on-debate taxonomy (assertoric-factual/causal, normative-deontic, speech-act-belief-revision-meta, rhetorical-evaluative) + the attribution/anaphora_dependency/polarity attributes (t/3354 design §3, CL-authoritative). Offline research eval ONLY (read-only over debates; no in-loop path). run-fol-debate-eval.ps1 renders fol-clause-classify.prompt with the clause batch and passes it as {{prompt}}. jsonMode WITHOUT responseSchema (the nested attribute object risks the same Gemini structured-output HTTP 400 as enrichment.logical-form-formalization; the prompt enforces one strict-JSON {results:[...]} object and the stage extracts it robustly — fence-strip + bare-array/alt-key tolerance via ConvertFrom-FolResultsJson). temperature pinned 0 for determinism. MODEL: claude-sonnet-4-6 — gemini-3.5-flash-lite proved unreliable at returning the {results:[...]} contract for this multi-item schema (~20/21 batches non-conformant, t/3354#29), starving the eval; claude-sonnet-4-6 (the logical-form stage's model) returns the contract cleanly. INSTRUMENT-PROVISIONAL: labels anchor no conclusion until spot-validated against CL's blind gold set fol-eval-classifier-gold.jsonl (design §5, t/3342).",
+    "model": "claude-sonnet-4-6",
+    "temperature": 0,
+    "maxTokens": 2000,
+    "timeoutMs": 60000,
+    "jsonMode": true,
+    "messageTemplate": "{{prompt}}",
+    "tags": [
+      "enrichment",
+      "fol",
+      "debate-eval"
+    ]
+  },
+  "enrichment.fol-clause-coref": {
+    "description": "Resolve cross-turn referential dependencies (demonstratives / topic ellipsis / attributed restatements) in the assertoric debate-clause subset against the debate context, rewriting each clause into a self-contained proposition for FOL extraction (t/3354 design §6, the hard prerequisite). Offline research eval ONLY (read-only over debates; no in-loop path). run-fol-debate-eval.ps1 renders fol-clause-coref.prompt with the prior-turn context + clause batch and passes it as {{prompt}}. jsonMode WITHOUT responseSchema (prompt enforces one strict-JSON {results:[...]} object; the stage extracts it robustly via ConvertFrom-FolResultsJson). temperature pinned 0 for determinism. MODEL: claude-sonnet-4-6 — moved off gemini-3.5-flash-lite for the same {results:[...]} contract-reliability reason as the classifier (t/3354#29). INSTRUMENT-PROVISIONAL: resolutions are measurement inputs, not ground truth — coverage loss is reported, and no number anchors a conclusion until double-annotated (design §11).",
+    "model": "claude-sonnet-4-6",
+    "temperature": 0,
+    "maxTokens": 2000,
+    "timeoutMs": 60000,
+    "jsonMode": true,
+    "messageTemplate": "{{prompt}}",
+    "tags": [
+      "enrichment",
+      "fol",
+      "debate-eval"
     ]
   }
 }

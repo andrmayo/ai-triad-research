@@ -10,9 +10,53 @@ import { nowISO } from '@lib/debate/helpers';
 import { computeStructuralScore, critiqueTopicPrompt, parseTopicCritique, formatStructuralContext, computeLineageDistribution, formatLineageContext } from '@lib/debate/topicCritique';
 import type { LineageFrameEntry } from '@lib/debate/topicCritique';
 import { useTaxonomyStore } from '../../useTaxonomyStore';
-import { getConfiguredModel } from '../shared/modelConfig';
+import { getConfiguredModel, getCritiqueModel } from '../shared/modelConfig';
 import { generateTextWithProgress } from '../shared/generation';
+import { getGreatestHits } from '../shared/getGreatestHits';
 import { getLineageMapping, getL2Categories, isLineageDataLoaded } from '../../../data/lineageCategories';
+
+// t/3392: the same corpus-narrowing the per-turn taxonomy relevance path applies (t/1998,
+// taxonomyContext.ts) must also apply to topic-critique framing, or "exclude greatest hits" only
+// prunes the debater shortlist while the frame prompt still sees the full corpus. Fetches the
+// exclusion list once per critique call; returns undefined when the toggle is off OR the list is
+// requested-but-unavailable — callers get the unfiltered (today's) behavior in both cases, with a
+// WARN on the latter so a missing calibration file degrades loudly, not silently (fallback-path
+// logging convention, docs/error-handling.md).
+async function getFramingExclusionSet(excludeFlag: boolean | undefined, debateId: string): Promise<Set<string> | undefined> {
+  if (!excludeFlag) return undefined;
+  const ids = await getGreatestHits();
+  if (ids && ids.length > 0) return new Set(ids);
+  getGlobalRecorder()?.record({
+    type: 'system.error',
+    debate_id: debateId,
+    component: 'debate-store',
+    level: 'warn',
+    message: 'Greatest-hits exclusion is On but the exclusion list is unavailable — topic-critique framing NOT filtered (t/3392)',
+    data: { reason: ids ? 'empty_list' : 'list_unavailable' },
+  });
+  return undefined;
+}
+
+/** Drop excluded node ids from the pov/situation node lists and the embeddings map fed to
+ *  computeStructuralScore — the exclusion must apply to ALL THREE consistently (t/3392), since
+ *  computeStructuralScore looks up the pov node for an activated embedding by id. */
+function applyFramingExclusion<P extends { id: string }, S extends { id: string }>(
+  povNodes: P[],
+  situationNodes: S[],
+  nodeEmbeddings: Record<string, { pov: string; vector: number[] }>,
+  exclude: Set<string> | undefined,
+): { povNodes: P[]; situationNodes: S[]; nodeEmbeddings: Record<string, { pov: string; vector: number[] }> } {
+  if (!exclude || exclude.size === 0) return { povNodes, situationNodes, nodeEmbeddings };
+  const filteredEmbeddings: Record<string, { pov: string; vector: number[] }> = {};
+  for (const [id, entry] of Object.entries(nodeEmbeddings)) {
+    if (!exclude.has(id)) filteredEmbeddings[id] = entry;
+  }
+  return {
+    povNodes: povNodes.filter(n => !exclude.has(n.id)),
+    situationNodes: situationNodes.filter(n => !exclude.has(n.id)),
+    nodeEmbeddings: filteredEmbeddings,
+  };
+}
 
 export interface TopicCritiqueSlice {
   topicCritiqueLoading: boolean;
@@ -33,8 +77,12 @@ export const createTopicCritiqueSlice: StateCreator<DebateStore, [], [], TopicCr
 
     set({ topicCritiqueLoading: true, debateError: null });
     const model = getConfiguredModel();
+    // t/3722: topic critique is a scored-JSON call, not debate reasoning — route it to a fast
+    // model regardless of what the debate itself uses. Measured 90-120s -> ~3s end-to-end with
+    // no loss of parseable output.
+    const critiqueModel = getCritiqueModel(model);
     const topic = activeDebate.topic.final;
-    getGlobalRecorder()?.record({ type: 'topic.critique', component: 'debate-store', level: 'info', debate_id: activeDebate.id, message: 'topicCritique.started', data: { phase: activeDebate.phase, transcript_length: activeDebate.transcript.length, model } });
+    getGlobalRecorder()?.record({ type: 'topic.critique', component: 'debate-store', level: 'info', debate_id: activeDebate.id, message: 'topicCritique.started', data: { phase: activeDebate.phase, transcript_length: activeDebate.transcript.length, model, critique_model: critiqueModel } });
 
     try {
       // t/1567: force-reload taxonomy from disk so topic-critique scores against
@@ -76,11 +124,16 @@ export const createTopicCritiqueSlice: StateCreator<DebateStore, [], [], TopicCr
         nodeEmbeddings[allNodeIds[i]] = { pov: povNode?.pov ?? 'situations', vector: nodeVectors[i] };
       }
 
+      // t/3392: apply the debate's greatest-hits exclusion to framing, same as the per-turn path.
+      const exclusionSet = await getFramingExclusionSet(activeDebate.exclude_greatest_hits, activeDebate.id);
+      const framingSituationNodes = sitNodes.map(n => ({ id: n.id }));
+      const filtered = applyFramingExclusion(allPovNodes, framingSituationNodes, nodeEmbeddings, exclusionSet);
+
       const structuralScore = computeStructuralScore({
         topicEmbedding,
-        povNodes: allPovNodes,
-        situationNodes: sitNodes.map(n => ({ id: n.id })),
-        embeddings: nodeEmbeddings,
+        povNodes: filtered.povNodes,
+        situationNodes: filtered.situationNodes,
+        embeddings: filtered.nodeEmbeddings,
       });
 
       let lineageFrame: LineageFrameEntry[] = [];
@@ -123,7 +176,7 @@ export const createTopicCritiqueSlice: StateCreator<DebateStore, [], [], TopicCr
         structuralContext += '\n' + formatLineageContext(lineageFrame);
       }
       const prompt = critiqueTopicPrompt(topic, structuralContext);
-      const { text } = await generateTextWithProgress(prompt, model, `Evaluating topic quality (${model})`, set);
+      const { text } = await generateTextWithProgress(prompt, critiqueModel, `Evaluating topic quality (${critiqueModel})`, set);
       const critique = parseTopicCritique(text, structuralScore);
 
       if (lineageFrame.length > 0) {
@@ -134,14 +187,16 @@ export const createTopicCritiqueSlice: StateCreator<DebateStore, [], [], TopicCr
       if (critique.rewritten_topic && critique.rewritten_topic !== topic) {
         try {
           const { vector: suggestedEmbedding } = await api.computeQueryEmbedding(critique.rewritten_topic);
+          // t/3392: same filtered set as the original-topic score above — the composite-score
+          // comparison a few lines down must compare apples to apples under the same exclusion.
           const suggestedStructural = computeStructuralScore({
             topicEmbedding: suggestedEmbedding,
-            povNodes: allPovNodes,
-            situationNodes: sitNodes.map(n => ({ id: n.id })),
-            embeddings: nodeEmbeddings,
+            povNodes: filtered.povNodes,
+            situationNodes: filtered.situationNodes,
+            embeddings: filtered.nodeEmbeddings,
           });
           const suggestedPrompt = critiqueTopicPrompt(critique.rewritten_topic, formatStructuralContext(suggestedStructural));
-          const { text: suggestedText } = await generateTextWithProgress(suggestedPrompt, model, `Scoring suggested topic (${model})`, set);
+          const { text: suggestedText } = await generateTextWithProgress(suggestedPrompt, critiqueModel, `Scoring suggested topic (${critiqueModel})`, set);
           const parsed = parseTopicCritique(suggestedText, suggestedStructural);
           if (parsed.composite_score >= critique.composite_score) {
             suggestedCritique = parsed;
@@ -204,7 +259,9 @@ export const createTopicCritiqueSlice: StateCreator<DebateStore, [], [], TopicCr
 
     set({ topicCritiqueLoading: true, debateError: null });
     const model = getConfiguredModel();
-    getGlobalRecorder()?.record({ type: 'topic.critique', component: 'debate-store', level: 'info', debate_id: activeDebate.id, message: 'reEvaluateSuggestedTopic.started', data: { phase: activeDebate.phase, transcript_length: activeDebate.transcript.length, model } });
+    // t/3722: same scored-JSON call shape as runTopicCritique — same fast-model routing.
+    const critiqueModel = getCritiqueModel(model);
+    getGlobalRecorder()?.record({ type: 'topic.critique', component: 'debate-store', level: 'info', debate_id: activeDebate.id, message: 'reEvaluateSuggestedTopic.started', data: { phase: activeDebate.phase, transcript_length: activeDebate.transcript.length, model, critique_model: critiqueModel } });
 
     try {
       const taxState = useTaxonomyStore.getState();
@@ -238,15 +295,20 @@ export const createTopicCritiqueSlice: StateCreator<DebateStore, [], [], TopicCr
         nodeEmbeddings[allNodeIds[i]] = { pov: povNode?.pov ?? 'situations', vector: nodeVectors[i] };
       }
 
+      // t/3392: same exclusion as runTopicCritique — re-evaluation must frame under the same
+      // corpus the original critique + the debate itself use.
+      const exclusionSet = await getFramingExclusionSet(activeDebate.exclude_greatest_hits, activeDebate.id);
+      const filtered = applyFramingExclusion(allPovNodes, sitNodes.map(n => ({ id: n.id })), nodeEmbeddings, exclusionSet);
+
       const suggestedStructural = computeStructuralScore({
         topicEmbedding: suggestedEmbedding,
-        povNodes: allPovNodes,
-        situationNodes: sitNodes.map(n => ({ id: n.id })),
-        embeddings: nodeEmbeddings,
+        povNodes: filtered.povNodes,
+        situationNodes: filtered.situationNodes,
+        embeddings: filtered.nodeEmbeddings,
       });
 
       const suggestedPrompt = critiqueTopicPrompt(suggestedText, formatStructuralContext(suggestedStructural));
-      const { text } = await generateTextWithProgress(suggestedPrompt, model, `Re-evaluating suggested topic (${model})`, set);
+      const { text } = await generateTextWithProgress(suggestedPrompt, critiqueModel, `Re-evaluating suggested topic (${critiqueModel})`, set);
       const suggestedCritique = parseTopicCritique(text, suggestedStructural);
 
       const freshDebate = get().activeDebate;

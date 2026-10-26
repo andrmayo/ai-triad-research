@@ -13,6 +13,7 @@
 
 import { getGlobalRecorder } from '@lib/flight-recorder/index';
 import { trackAICall } from '../lib/analyticsEmitter';
+import { utf8ByteLength } from '@lib/ai-client/index';
 import type { AppAPI } from './types';
 
 /** Truncate an argument for logging. Keeps strings short, summarizes objects. */
@@ -62,11 +63,88 @@ function embeddingBatchData(method: string, args: unknown[]): { batch_size?: num
   return {};
 }
 
+/**
+ * Bidirectional type equality — true only when `A` and `B` are mutually assignable. Unlike
+ * `A extends B`, which is one-way and would accept a *widened* `B`, this catches a widening in
+ * either direction. Standard TS type-level-equals trick (distributes over a bare function-type
+ * comparison to dodge variance quirks a plain conditional would miss).
+ */
+type _Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
+
+/**
+ * Compile-time pin on `AppAPI.generateText`'s parameter shape (t/3528, TL ruling t/3528#5). The
+ * positional reads in `aiCallMeta` below (`args[1]`, `args[2]`, `args[4]`) assume this exact
+ * order and these exact types. Runtime `unknown[]` args can't self-verify that, so a reorder
+ * (or a param swapping type, e.g. two adjacent `number | undefined`s) used to misattribute
+ * model/timeoutMs/maxTokens in the very ai.request/ai.response/ai.error telemetry added (t/3519)
+ * to diagnose incidents — silently, with no test catching it (t/3518 traced an incident partly
+ * blind because of exactly this class of gap). This assertion turns that into a build failure:
+ * if `AppAPI['generateText']`'s params ever change shape, `_Equal<...>` evaluates to `false` and
+ * `satisfies true` below stops compiling. `Parameters<>` narrowing was considered and rejected
+ * (t/3528#5) — a same-typed adjacent-param swap (e.g. model↔timeoutMs) still type-checks under
+ * narrowing and would silently yield `undefined` forever.
+ */
+type _PinnedGenerateTextParams = Parameters<AppAPI['generateText']>;
+type _ExpectedGenerateTextParams = [
+  prompt: string,
+  model?: string,
+  timeoutMs?: number,
+  temperature?: number,
+  opts?: import('./types').GenerateTextOptions,
+];
+true satisfies _Equal<_PinnedGenerateTextParams, _ExpectedGenerateTextParams>;
+
+/**
+ * `model`/`timeoutMs`/`purpose`/`maxTokens`/`promptBytes` for the ai.request/ai.response/ai.error
+ * FR events (t/3519, maxTokens added t/3524, promptBytes added t/3568). The t/3518 triage found
+ * all 20 ai.error/ai.request events for a PI debate failure carried only
+ * `{method, category, _origin}` — the model had to be inferred from unrelated debate.lifecycle
+ * events, and the decisive fact (60s budget vs 180s expected) only surfaced because the thrown
+ * ActionableError happened to mention elapsed ms. maxTokens joins the same event for the analogous
+ * reason: t/3524's Fable 5 truncation was diagnosable only via a raw FR field (discarded_tail),
+ * with no first-class record of the ceiling that caused it. promptBytes closes the same gap on
+ * the REQUEST side: `extractResultMeta`'s `prompt_chars` only fires on the response path, so a
+ * timed-out call (no response) lost prompt size exactly when it mattered — t/3568 found this after
+ * t/3566's instrumentation landed in `lib/debate/aiAdapter.ts` (the Node/CLI path) while every
+ * `ai.*` FR event for a desktop debate is emitted here instead. This is a positional read of each
+ * AI method's PARAMETER LIST — pinned to the current `AppAPI` (bridge/types.ts) signatures below.
+ *   generateText(prompt, model, timeoutMs, temperature, opts: GenerateTextOptions) — pinned above;
+ *     a reorder or type change fails the build (t/3528).
+ *   generateTextWithSearch(prompt, model)
+ *   startChatStream(systemInstruction, messages, model, temperature, urlContext, context)
+ * All other "ai"-category methods (computeEmbeddings, computeQueryEmbedding, updateNodeEmbeddings,
+ * nliClassify) call a fixed server-side model with no per-call selection — nothing to extract.
+ */
+function aiCallMeta(method: string, args: unknown[]): { model?: string; timeoutMs?: number; purpose?: string; maxTokens?: number; promptBytes?: number } {
+  if (method === 'generateText') {
+    const opts = args[4] as { purpose?: string; maxTokens?: number } | undefined;
+    return {
+      model: typeof args[1] === 'string' ? args[1] : undefined,
+      timeoutMs: typeof args[2] === 'number' ? args[2] : undefined,
+      purpose: typeof opts?.purpose === 'string' ? opts.purpose : undefined,
+      maxTokens: typeof opts?.maxTokens === 'number' ? opts.maxTokens : undefined,
+      // t/3568: on the ai.request emit specifically — a timeout has no response, so
+      // prompt_chars (extractResultMeta, response-path only) is lost exactly when this is
+      // needed most. Byte length (not .length) to match the provider-side promptBytes/
+      // requestBytes fields from t/3566 and be correct for multi-byte content.
+      promptBytes: typeof args[0] === 'string' ? utf8ByteLength(args[0]) : undefined,
+    };
+  }
+  if (method === 'generateTextWithSearch') {
+    return { model: typeof args[1] === 'string' ? args[1] : undefined };
+  }
+  if (method === 'startChatStream') {
+    return { model: typeof args[2] === 'string' ? args[2] : undefined };
+  }
+  return {};
+}
+
 /** Extract result metadata for data-loading methods to enrich completion events. */
 function extractResultMeta(method: string, args: unknown[], value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== 'object') return undefined;
   const v = value as Record<string, unknown>;
-  if (method === 'loadTaxonomyFile') {
+  if (method.startsWith('loadTaxonomyFile')) { // + loadTaxonomyFileForEdit (t/4187); one branch for the complexity budget
     const nodes = v.nodes;
     return { pov: args[0], node_count: Array.isArray(nodes) ? nodes.length : undefined };
   }
@@ -116,10 +194,23 @@ function extractResultMeta(method: string, args: unknown[], value: unknown): Rec
       meta.response_chars = text.length;
       meta.response_preview = text.slice(0, 300) + (text.length > 300 ? '…' : '');
     }
+    // t/3544: prompt length reveals whether the context window (not the response cap) is the
+    // binding constraint — the maxTokens half of this picture already rides aiCallMeta (t/3524).
+    if (typeof args[0] === 'string') {
+      meta.prompt_chars = args[0].length;
+    }
     const usage = v.tokenUsage as Record<string, unknown> | undefined;
     if (usage) {
       meta.input_tokens = usage.inputTokens;
       meta.output_tokens = usage.outputTokens;
+    }
+    // t/3568 item 2: provider diagnostics (requestBytes/httpStatus/headersMs/bodyReadMs/
+    // responseBytes, +ttftMs/e2eMs on xAI) threaded across IPC by t/3569. Only rides the
+    // SUCCESS path — see the doc comment on AppAPI['generateText'] (bridge/types.ts) for why
+    // there is nothing to attach here on a rejected call yet.
+    const diagnostics = v.diagnostics;
+    if (diagnostics && typeof diagnostics === 'object') {
+      meta.diagnostics = diagnostics;
     }
     return Object.keys(meta).length > 0 ? meta : undefined;
   }
@@ -221,6 +312,9 @@ export function instrumentBridge(raw: AppAPI): AppAPI {
       const startTs = performance.now();
 
       const isAI = category === 'ai';
+      // Self-gating by method name (see aiCallMeta doc) — returns {} for any non-AI method, so no
+      // extra isAI branch is needed here (keeps this closure's complexity flat).
+      const aiMeta = aiCallMeta(key, args);
 
       // Record call start (only if recorder is initialized)
       recorder?.record({
@@ -228,7 +322,7 @@ export function instrumentBridge(raw: AppAPI): AppAPI {
         component: recorder.intern('component', 'bridge') as string | number,
         level: 'debug',
         message: `bridge.${key}`,
-        data: { method: key, category, arg_count: args.length, args: summarizeArgs(args, key), ...embeddingBatchData(key, args) },
+        data: { method: key, category, arg_count: args.length, args: summarizeArgs(args, key), ...embeddingBatchData(key, args), ...aiMeta },
       });
 
       let result: unknown;
@@ -249,7 +343,7 @@ export function instrumentBridge(raw: AppAPI): AppAPI {
           message: expected ? `bridge.${key} expected ${httpStatus} (sync)` : `bridge.${key} failed (sync)`,
           duration_ms,
           error: normalizeError(err),
-          data: { method: key, category, ...(httpStatus !== undefined && { http_status: httpStatus }), ...(retryAfterS !== undefined && { retry_after_s: retryAfterS }), ...rateLimitFieldsFromError(err, httpStatus) },
+          data: { method: key, category, ...(httpStatus !== undefined && { http_status: httpStatus }), ...(retryAfterS !== undefined && { retry_after_s: retryAfterS }), ...rateLimitFieldsFromError(err, httpStatus), ...aiMeta },
         });
         throw err;
       }
@@ -270,7 +364,7 @@ export function instrumentBridge(raw: AppAPI): AppAPI {
             level: 'info',
             message: `bridge.${key} ok`,
             duration_ms,
-            data: { method: key, category, ...resultMeta },
+            data: { method: key, category, ...resultMeta, ...aiMeta },
           });
           if (isAI) {
             const model = typeof args[1] === 'string' ? args[1] : 'unknown';
@@ -295,7 +389,7 @@ export function instrumentBridge(raw: AppAPI): AppAPI {
             message: expected ? `bridge.${key} expected ${httpStatus}` : `bridge.${key} failed`,
             duration_ms,
             error: normalizeError(err),
-            data: { method: key, category, ...(httpStatus !== undefined && { http_status: httpStatus }), ...(retryAfterS !== undefined && { retry_after_s: retryAfterS }), ...rateLimitFieldsFromError(err, httpStatus) },
+            data: { method: key, category, ...(httpStatus !== undefined && { http_status: httpStatus }), ...(retryAfterS !== undefined && { retry_after_s: retryAfterS }), ...rateLimitFieldsFromError(err, httpStatus), ...aiMeta },
           });
           throw err;
         },

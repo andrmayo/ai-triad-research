@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
+# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 # Licensed under the MIT License. See LICENSE file in the project root.
 
 function Invoke-AttributeExtraction {
@@ -23,7 +23,7 @@ function Invoke-AttributeExtraction {
     .PARAMETER Model
         AI model to use. Defaults to 'gemini-3.5-flash-lite'.
     .PARAMETER ApiKey
-        AI API key. If omitted, resolved via backend-specific env var or AI_API_KEY.
+        AI API key. If omitted, resolved via the backend-specific env var (AI_API_KEY is a fallback for gemini models only).
     .PARAMETER Temperature
         Sampling temperature (0.0-1.0). Default: 0.2 (precise analytical output).
     .PARAMETER DryRun
@@ -57,7 +57,7 @@ function Invoke-AttributeExtraction {
 
         [ValidateScript({ Test-AIModelId $_ })]
         [ArgumentCompleter({ param($cmd, $param, $word) $script:ValidModelIds | Where-Object { $_ -like "$word*" } })]
-        [string]$Model = 'gemini-3.5-flash-lite',
+        [string]$Model = (Get-AITierModel -Tier basic),
 
         [string]$ApiKey = '',
 
@@ -89,13 +89,10 @@ function Invoke-AttributeExtraction {
     }
 
     if (-not $DryRun) {
-        $Backend = if     ($Model -match '^gemini') { 'gemini' }
-                   elseif ($Model -match '^claude') { 'claude' }
-                   elseif ($Model -match '^groq')   { 'groq'   }
-                   else                             { 'gemini'  }
-        $ResolvedKey = Resolve-AIApiKey -ExplicitKey $ApiKey -Backend $Backend
-        if ([string]::IsNullOrWhiteSpace($ResolvedKey)) {
-            Write-Fail 'No API key found. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or AI_API_KEY.'
+        # Backend from ai-models.json, never guessed; only the user's -ApiKey is forwarded (t/4087).
+        $KeyStatus = Get-AIModelKeyStatus -Model $Model -ApiKey $ApiKey
+        if (-not $KeyStatus.HasKey) {
+            Write-Fail "No API key found for the $($KeyStatus.Backend) backend. Set $($KeyStatus.EnvHint), or pass -ApiKey."
             throw 'No API key configured'
         }
     }
@@ -116,8 +113,13 @@ function Invoke-AttributeExtraction {
     $TotalProcessed = 0
     $TotalSkipped   = 0
     $TotalFailed    = 0
+    # t/4004: nodes actually written, and the policy ids they held before the merge, for registration.
+    $WrittenNodeIds = [System.Collections.Generic.List[string]]::new()
+    $PriorPolicyIds = [System.Collections.Generic.List[string]]::new()
 
     foreach ($PovKey in $PovFiles) {
+        $FileNodeIds  = [System.Collections.Generic.List[string]]::new()
+        $FilePriorIds = [System.Collections.Generic.List[string]]::new()
         $FilePath = Join-Path $TaxDir "$PovKey.json"
         if (-not (Test-Path $FilePath)) {
             Write-Warn "File not found, skipping: $FilePath"
@@ -125,10 +127,11 @@ function Invoke-AttributeExtraction {
         }
 
         Write-Step "Loading $PovKey"
-        $FileData = Get-Content -Raw -Path $FilePath | ConvertFrom-Json
+        $FileData = Read-PovTaxonomyFile -Path $FilePath   # shape-preserving read for the canonical write (t/4356)
 
-        # Identify nodes needing attributes
-        $AllNodes = @($FileData.nodes)
+        # Identify nodes needing attributes. Work list only: superseded nodes get no AI call;
+        # $FileData (the written file) keeps them (t/4356).
+        $AllNodes = @(Select-SelectableTaxonomyNode -Nodes @($FileData.nodes) -Pov $PovKey)
         if ($Force) {
             $NodesToProcess = $AllNodes
         } else {
@@ -160,6 +163,16 @@ function Invoke-AttributeExtraction {
         }
 
         Write-Info "$($Batches.Count) batch(es) of up to $BatchSize nodes"
+
+        # Single shared list (t/3964 condition 1): used both to validate the
+        # model's response AND as the merge-ownership contract in
+        # Merge-NodeGraphAttributes, so the two can never drift apart.
+        $OwnedFields = @(
+            'epistemic_type', 'rhetorical_strategy', 'assumes',
+            'falsifiability', 'audience', 'emotional_register',
+            'policy_actions', 'intellectual_lineage',
+            'steelman_vulnerability', 'possible_fallacies'
+        )
 
         $BatchNum = 0
         foreach ($Batch in $Batches) {
@@ -228,7 +241,7 @@ $SchemaPrompt
                 $Result = Invoke-AIApi `
                     -Prompt $FullPrompt `
                     -Model $Model `
-                    -ApiKey $ResolvedKey `
+                    -ApiKey $ApiKey `
                     -Temperature $Temperature `
                     -MaxTokens 16384 `
                     -JsonMode
@@ -265,13 +278,7 @@ $SchemaPrompt
                     $AttrObj = $Attributes.$NodeId
 
                     # Validate required fields
-                    $RequiredFields = @(
-                        'epistemic_type', 'rhetorical_strategy', 'assumes',
-                        'falsifiability', 'audience', 'emotional_register',
-                        'policy_actions', 'intellectual_lineage',
-                        'steelman_vulnerability', 'possible_fallacies'
-                    )
-                    $Missing = @($RequiredFields | Where-Object {
+                    $Missing = @($OwnedFields | Where-Object {
                         -not $AttrObj.PSObject.Properties[$_]
                     })
                     if ($Missing.Count -gt 0) {
@@ -281,10 +288,17 @@ $SchemaPrompt
                     # Find the node in the original file data and set attributes
                     $OrigNode = $FileData.nodes | Where-Object { $_.id -eq $NodeId }
                     if ($OrigNode) {
+                        # t/3964: MERGE, never replace -- a wholesale replace erases
+                        # anything the extraction prompt doesn't regenerate (registry
+                        # policy_id's, debate-harvest fields under graph_attributes).
+                        $ExistingAttrs = if ($OrigNode.PSObject.Properties['graph_attributes']) { $OrigNode.graph_attributes } else { $null }
+                        foreach ($PriorId in (Get-GraphAttributePolicyIds -GraphAttributes $ExistingAttrs)) { $FilePriorIds.Add($PriorId) }
+                        $FileNodeIds.Add([string]$NodeId)
+                        $MergedAttrs = Merge-NodeGraphAttributes -Existing $ExistingAttrs -New $AttrObj -OwnedFields $OwnedFields -NodeId $NodeId
                         if ($OrigNode.PSObject.Properties['graph_attributes']) {
-                            $OrigNode.graph_attributes = $AttrObj
+                            $OrigNode.graph_attributes = $MergedAttrs
                         } else {
-                            $OrigNode | Add-Member -NotePropertyName 'graph_attributes' -NotePropertyValue $AttrObj
+                            $OrigNode | Add-Member -NotePropertyName 'graph_attributes' -NotePropertyValue $MergedAttrs
                         }
                         $TotalProcessed++
                         Write-OK "$NodeId"
@@ -301,10 +315,11 @@ $SchemaPrompt
             if ($PSCmdlet.ShouldProcess($FilePath, 'Write updated taxonomy file')) {
                 # Update last_modified
                 $FileData.last_modified = (Get-Date).ToString('yyyy-MM-dd')
-                $Json = $FileData | ConvertTo-Json -Depth 20
                 try {
-                    Write-Utf8NoBom -Path $FilePath -Value $Json 
+                    Write-PovTaxonomyFile -Path $FilePath -Data $FileData   # canonical TS format (t/4356)
                     Write-OK "Saved $PovKey ($FilePath)"
+                    $WrittenNodeIds.AddRange($FileNodeIds)
+                    $PriorPolicyIds.AddRange($FilePriorIds)
                 }
                 catch {
                     Write-Fail "Failed to write $PovKey taxonomy file — $($_.Exception.Message)"
@@ -314,6 +329,10 @@ $SchemaPrompt
             }
         }
     }
+
+    # ── Step 7: Register the written nodes' policy actions (t/4004) ──
+    # Without this, extracted actions kept a null policy_id until an unrelated corpus-wide -Fix.
+    Invoke-NodePolicyRegistration -NodeId $WrittenNodeIds.ToArray() -PriorPolicyIds $PriorPolicyIds.ToArray() -Caller 'Invoke-AttributeExtraction'
 
     # ── Summary ──
     Write-Host ''

@@ -112,6 +112,14 @@ export interface TranscriptEntry {
    *  Surfaced to readers as "Caveats" alongside the statement. */
   caveats?: string[];
   model?: string;
+  /**
+   * Provider's own model string from the response header, if reported (t/4195).
+   * Distinct from `model` (registry id): use for forensic dating of silent provider
+   * model swaps, not for routing or gating.
+   * ADDITIVE-OPTIONAL — NO consumer may branch on this field until the exemption lapses
+   * (the moment a consumer uses it for routing or gating logic, not logging/display).
+   */
+  provider_model?: string;
   /** True when this turn's brief or plan parse retries were exhausted and degraded gracefully (t/2229). */
   degraded?: boolean;
   /**
@@ -123,6 +131,32 @@ export interface TranscriptEntry {
   status?: 'generating' | 'retrying' | 'error' | 'done';
   /** User-facing message shown inline on the card in the 'retrying'/'error' states (t/2907). */
   errorMessage?: string;
+}
+
+/** One camp's story as voiced by the moderator before the openings (h3). */
+export interface CampNarrative {
+  speaker: Exclude<SpeakerId, 'user'>;
+  fears_losing: string;
+  history_carried: string;
+  /** 3-4 sentences in the moderator's conditional first person ("If I were a Safetyist, …"). */
+  narrative: string;
+  /** The debater's own check of this account, taken from its opening DRAFT stage. */
+  acknowledgment?: { verdict: 'affirm' | 'amend'; amendment?: string };
+  /** all-MiniLM-L6-v2 embedding of the narrative plus any amendment. Set after openings. */
+  embedding?: number[];
+}
+
+/** Moderator's opening narrative voicing (h3) and its use as a per-camp drift reference. */
+export interface NarrativeVoicing {
+  /** Transcript entry that displays the voicing (type 'system', speaker 'moderator'). */
+  entry_id: string;
+  model: string;
+  narratives: CampNarrative[];
+  /**
+   * Mean paragraph cosine similarity of each debater turn to that debater's own camp
+   * narrative, keyed by transcript entry id. Openings are the baseline; later turns show drift.
+   */
+  similarity_series?: Record<string, number>;
 }
 
 export type ModelTier = 'basic' | 'advanced';
@@ -265,6 +299,21 @@ export interface TaxonomyGapAnalysis {
   summary: GapSummary;
 }
 
+/** How a seat's POV tag selects POV items (t/3955; spec §4). `scope` = only items carrying the tag
+ *  (untagged items are excluded); `prioritize` = tagged items get a ranking boost. */
+export type TagMode = 'scope' | 'prioritize';
+
+/** One seat's POV tag. `tag_mode` is required whenever a tag is set: there is no default mode. */
+export interface SeatTag {
+  /** A tag id registered for this seat's POV in lib/debate/soul-docs/pov-tags.json. */
+  pov_tag: string;
+  tag_mode: TagMode;
+}
+
+/** Resolved tag selection passed into the selection pipeline (t/3957). Derived from `SeatTag`; the
+ *  pipeline never reads `seat_tags` directly — callers derive this from `session.seat_tags[speaker]`. */
+export type TagSelection = { tag: string; mode: TagMode };
+
 export interface DebateSession {
   id: string;
   /** Execution run — regenerated each time the debate loop starts or resumes. */
@@ -333,6 +382,23 @@ export interface DebateSession {
   /** Evaluator model for claim extraction/classification. Cross-vendor split recommended. */
   evaluator_model?: string;
   speaker_models?: Record<string, string>;
+  /** Speaker model assignments captured at session init — never overwritten by failover (t/4040). Absent on pre-t/4040 sessions. */
+  initial_speaker_models?: Record<string, string>;
+  /** Per-speaker failover history: speaker → final replacement model (t/4040). Absent when no failover occurred. */
+  speaker_model_failovers?: Record<string, string>;
+  /** Multi-provider model pool fingerprint: `"tierName|b1=registryId1:apiModelId1,..."` sorted by backend (t/4040). Absent on single-model runs. */
+  model_pool?: string;
+  /** Single-model run fingerprint: `"registryId:apiModelId"` resolved at run time (t/4040). Absent on multi-provider runs. */
+  model_api_id?: string;
+  /** Whether failover tracking was available: 'tracked' = engine stamped (can observe failovers); 'unavailable' = renderer path (failover below bridge). Absent on pre-t/4040 and legacy rows. */
+  failover_tracking?: 'tracked' | 'unavailable';
+  /** Internal latch for computing failover_tracking. Only the debate store branches on it;
+   *  the calibration gate reads failover_tracking, never this field (SO e/281#2 condition 3).
+   *  Set to true the first time a speaker turn returns without servedModel, or on load for
+   *  a session whose earlier speaker turns were never observed; never cleared.
+   *  Exempt from the SO loop because only the debate store reads it. THE EXEMPTION LAPSES
+   *  the moment any consumer other than the debate store reads this field. */
+  failover_untracked?: boolean;
   /** Fully-resolved per-stage model map (9 keys: brief, plan, draft, cite, evaluator, scope, summary, moderator, crux). */
   stage_models?: Record<string, string>;
   model_tier?: ModelTier;
@@ -340,6 +406,16 @@ export interface DebateSession {
   protocol_id?: string;
   /** Exclude greatest-hits (retread) nodes from selection for this debate (t/1438). Absent ⇒ false. */
   exclude_greatest_hits?: boolean;
+  /** Per-seat POV tag (t/3955; spec §2.3). Absent, or no entry for a seat ⇒ that seat is untagged, so every
+   *  existing saved debate loads unchanged. One map beside `active_povers` rather than parallel optionals. */
+  seat_tags?: Partial<Record<SpeakerId, SeatTag>>;
+  /** Soul file provenance at session start, keyed by SpeakerId string. Set for every active seat (tagged and base).
+   *  Used by the pilot (t/3963) to compare old and new umbrella runs. Absent in pre-t/4007 saved debates (t/4007). */
+  soul_provenance?: Partial<Record<string, import('../soulDocSchema.js').SoulProvenance>>;
+  /** Moderator voices each camp's story before the openings (h3). Absent ⇒ false. */
+  narrative_voicing_enabled?: boolean;
+  /** Result of the h3 narrative voicing. Absent when disabled or when generation failed. */
+  narrative_voicing?: NarrativeVoicing;
   /** Legacy config object from older saved debates. */
   config?: Record<string, unknown>;
   /** AI temperature for this debate (0.0-1.0). Absent uses system default. */
@@ -403,6 +479,8 @@ export interface DebateSession {
   convergence_signals?: ConvergenceSignals[];
   /** Per-turn process reward scores — continuous quality signal computed after convergence signals + turn validation. */
   process_rewards?: ProcessRewardEntry[];
+  /** Per-turn drift telemetry shadow log (t/3603). Observations only — no behaviour change. */
+  drift_telemetry?: DriftTelemetryEntry[];
   /** Cached turn embeddings for semantic recycling detection. Keyed by transcript entry id. */
   turn_embeddings?: Record<string, number[]>;
   /** Frame embeddings indexed by speaker, computed at opening finalization (t/2045). */
@@ -497,6 +575,64 @@ export interface DebateSession {
    * falls back to config-supplied docMeta (or leaves source_authority null).
    */
   doc_meta?: DocMetaMap;
+}
+
+// ── Drift telemetry entry (t/3603) ──────────────────────────
+
+/**
+ * One per completed debater turn. Observations only — all fields are direct reads,
+ * no new computation. Provenance: t/3603#2 (CL-reviewed).
+ */
+export interface DriftTelemetryEntry {
+  round: number;
+  speaker: string;
+  /**
+   * Fixed-rule action taken on this turn's draft.
+   * 'accepted'          — draft passed quality gate on first try (no repair path taken).
+   * 'repair_fixed'      — repair triggered, post-repair gate passed fully.
+   * 'repair_partial'    — repair triggered, post-repair gate improved but not fully fixed.
+   * 'repair_unchanged'  — repair triggered, no gate improvement.
+   * 'no_gate'           — quality gate was not run (skipped or stage not reached).
+   * Source: runTurn.ts qualityGateResult.repair_outcome.
+   */
+  quality_action: 'accepted' | 'repair_fixed' | 'repair_partial' | 'repair_unchanged' | 'no_gate';
+  /**
+   * Whether the draft passed the topic alignment check. Null when no TopicScope was extracted.
+   * Source: runTurn.ts topicAlignmentResult.topic_aligned.
+   */
+  topic_aligned: boolean | null;
+  /**
+   * Whether the alignment-repair path was triggered for this turn.
+   * Source: runTurn.ts topicAlignmentResult.repaired.
+   */
+  alignment_repair_triggered: boolean;
+  /**
+   * Whether this turn engaged a tracked crux. Null when no convergence signal is available.
+   * Source: session.convergence_signals[-1].crux_engagement_rate.used_this_turn (convergenceSignals.ts:254).
+   * Observation (direct read) — no new computation.
+   */
+  crux_engaged: boolean | null;
+  /**
+   * Total tokens consumed across all pipeline stages for this turn (sum of inputTokens +
+   * outputTokens per stage). Null only when ZERO stages reported usage — a silently partial
+   * sum is never emitted as complete (see t/3603#2 q5). Source: stage_diagnostics per-stage
+   * usage fields (ProviderResult.usage.inputTokens + outputTokens).
+   */
+  tokens_total: number | null;
+  /** Wall-clock latency for the full turn pipeline (ms). Source: runTurn.ts total_time_ms. */
+  latency_ms_total: number;
+  /**
+   * Topical state estimate from CL's t/3630 estimator. Null until that estimator ships.
+   * Vocabulary confirmed at t/3603#2: 'core' = on topic, 'adjacent' = related but drifting,
+   * 'drifted' = off-topic. CL owns this field's population via t/3630.
+   */
+  topical_state: 'core' | 'adjacent' | 'drifted' | null;
+  /**
+   * Continuous (threshold-free) topical drift score from CL's t/3630 estimator.
+   * Null until that estimator ships. Lets shadow logging start before t/3630 tunes bands.
+   * Added per CL review t/3603#2 q4.
+   */
+  topical_drift_score: number | null;
 }
 
 // ── Delta / incremental debate save (t/1470; HLD docs/hld-delta-debate-save.md) ──

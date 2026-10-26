@@ -90,7 +90,7 @@ BeforeAll {
         @{ File = 'scripts/AITriad/Private/Invoke-RemoteCheck.ps1';       Function = 'Invoke-RemoteCheck';        Reason = 'health-check utility for our own deployment endpoints ($BaseUrl+$Path; GV-confirmed internal, t/3314#8)' }
 
         # AI-provider APIs (called directly by key, not user-supplied URLs):
-        @{ File = 'scripts/AITriad/Public/Get-AICostReport.ps1';          Function = 'Get-AICostReport';          Reason = 'AI-provider models/pricing endpoint (provider APIs, by key)' }
+        @{ File = 'scripts/AITriad/Private/Test-AIProviderKeyStatus.ps1'; Function = 'Test-AIProviderKeyStatus'; Reason = 'AI-provider models/pricing endpoint (provider APIs, by key) -- relocated from Get-AICostReport by the t/3910 complexity decomposition' }
         @{ File = 'scripts/AITriad/Public/Register-AIBackend.ps1';        Function = 'Register-AIBackend';        Reason = 'AI-provider key-validation probes in Register-AIBackend ($OllamaUrl localhost + $Uri Gemini) — provider APIs by key, not user URLs' }
         @{ File = 'scripts/AITriad/Public/Test-AIApiKey.ps1';             Function = '_Probe-Backend';            Reason = 'AI-provider key-validation probes (provider APIs, by key)' }
 
@@ -98,7 +98,8 @@ BeforeAll {
         @{ File = 'scripts/AITriad/Public/Test-GitHubHealth.ps1';         Function = 'Test-GitHubHealth';         Reason = 'GitHub Actions runs API ($RunsUri from api.github.com — github health, edge c)' }
         @{ File = 'scripts/AITriad/Private/Submit-ToWaybackMachine.ps1';  Function = 'Submit-ToWaybackMachine';   Reason = 'outbound archival POST to web.archive.org — not external-content ingestion (edge a)' }
         @{ File = 'scripts/TalmudicDebate/Initialize-TalmudicCorpus.ps1'; Function = 'Get-SefariaVersion';        Reason = 'www.sefaria.org — a known-good public JSON API on a literal host; GV-confirmed NOT WAF-fetch-class, no migration (t/3327 Done, edge b). Variable-URL (-Uri $uri), so per-site allowlisted under the literal-only guard' }
-        # NOTE: Invoke-DependencyCheck.ps1 L163/180/195 (Gemini/Anthropic/Groq key probes) auto-allow by
+        # NOTE: Test-DepAIApiKeys.ps1 (Gemini/Anthropic/Groq key probes, relocated from
+        # Invoke-DependencyCheck.ps1 by the t/3910 complexity decomposition) auto-allow by
         # host-literal (incl. $Uri var-resolution) — no per-site entry (t/3314#8 Finding 2).
     )
 

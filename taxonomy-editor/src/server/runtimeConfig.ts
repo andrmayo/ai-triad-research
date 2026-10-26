@@ -81,6 +81,15 @@ export interface RuntimeConfig {
     ENGAGED_MIN_MS: number;
     MIN_VISIT_MS: number;
     PULSE_THROTTLE_MS: number;
+    /** t/3420: grace window after the last pulse that still counts as engaged on an idle-close —
+     *  caps the idle-tail bleed into engaged_ms (the idle timer itself fires IDLE_TIMEOUT_MS later). */
+    IDLE_GRACE_MS: number;
+    /** t/3422: each pulse grants engagement credit valid through t + CREDIT_WINDOW_MS. */
+    CREDIT_WINDOW_MS: number;
+    /** t/3423: server-side aggregation only (not shipped to the client) — caps total engaged_ms
+     *  creditable to one subject_id per (user, UTC calendar day). Composes with the per-visit
+     *  ENGAGED_MS_WINSORIZE_CAP in analytics.ts: winsorize bounds one visit, this bounds the day. */
+    SUBJECT_DAILY_CEILING_MS: number;
   };
   flightRecorder: {
     minDumpIntervalMs: number;
@@ -126,6 +135,13 @@ export interface RuntimeConfig {
   };
   generation: {
     opedVoiceTimeoutMs: number;
+  };
+  /** t/4262: the t/4251 renderer poll gate's live switch, read from GET /api/config/client.
+   *  Read by the renderer poll gate (`pollGate.isPollAllowed`, #3388). T0 per TL p/336#614.
+   *  Default false until t/4258 AC2 lands. Flipping the default to true is a TL/PI decision —
+   *  not part of this ticket. */
+  pollGate: {
+    enabled: boolean;
   };
 }
 
@@ -188,6 +204,9 @@ const DEFAULTS: RuntimeConfig = {
     ENGAGED_MIN_MS: 8_000,
     MIN_VISIT_MS: 1_000,
     PULSE_THROTTLE_MS: 5_000,
+    IDLE_GRACE_MS: 10_000,
+    CREDIT_WINDOW_MS: 15_000,
+    SUBJECT_DAILY_CEILING_MS: 1_800_000,
   },
   flightRecorder: {
     minDumpIntervalMs: 10_000,
@@ -234,6 +253,9 @@ const DEFAULTS: RuntimeConfig = {
   generation: {
     opedVoiceTimeoutMs: 360_000, // 6 min; New-OpEd = grounding + full-essay LLM (debate briefs use 330s)
   },
+  pollGate: {
+    enabled: false, // t/4262: off until t/4258 AC2 lands (TL/PI decision, not this ticket)
+  },
 };
 
 // ── Field validation helpers ──
@@ -270,6 +292,15 @@ function vStr(val: unknown, def: string, field: string, errors: string[]): strin
   if (val === undefined) return def;
   if (typeof val !== 'string' || val.length === 0) {
     errors.push(`${field}: expected non-empty string — using default "${def}"`);
+    return def;
+  }
+  return val;
+}
+
+function vBool(val: unknown, def: boolean, field: string, errors: string[]): boolean {
+  if (val === undefined) return def;
+  if (typeof val !== 'boolean') {
+    errors.push(`${field}: expected boolean, got ${typeof val} — using default ${def}`);
     return def;
   }
   return val;
@@ -358,6 +389,7 @@ export function validateAndMerge(raw: unknown, defaults: RuntimeConfig): { confi
   const cache = section(r, 'cache', errors);
   const deb = section(r, 'debate', errors);
   const gen = section(r, 'generation', errors);
+  const pg = section(r, 'pollGate', errors);
 
   let resilience: RuntimeConfig['resilience'] = {
     circuitThreshold: vNum(res.circuitThreshold, defaults.resilience.circuitThreshold, { min: 1, max: 1_000, integer: true }, 'resilience.circuitThreshold', errors),
@@ -416,6 +448,9 @@ export function validateAndMerge(raw: unknown, defaults: RuntimeConfig): { confi
       ENGAGED_MIN_MS: vNum(an.ENGAGED_MIN_MS, defaults.analytics.ENGAGED_MIN_MS, { min: 0, max: DURATION_MAX }, 'analytics.ENGAGED_MIN_MS', errors),
       MIN_VISIT_MS: vNum(an.MIN_VISIT_MS, defaults.analytics.MIN_VISIT_MS, { min: 0, max: DURATION_MAX }, 'analytics.MIN_VISIT_MS', errors),
       PULSE_THROTTLE_MS: vNum(an.PULSE_THROTTLE_MS, defaults.analytics.PULSE_THROTTLE_MS, { min: 0, max: DURATION_MAX }, 'analytics.PULSE_THROTTLE_MS', errors),
+      IDLE_GRACE_MS: vNum(an.IDLE_GRACE_MS, defaults.analytics.IDLE_GRACE_MS, { min: 0, max: DURATION_MAX }, 'analytics.IDLE_GRACE_MS', errors),
+      CREDIT_WINDOW_MS: vNum(an.CREDIT_WINDOW_MS, defaults.analytics.CREDIT_WINDOW_MS, { min: 0, max: DURATION_MAX }, 'analytics.CREDIT_WINDOW_MS', errors),
+      SUBJECT_DAILY_CEILING_MS: vNum(an.SUBJECT_DAILY_CEILING_MS, defaults.analytics.SUBJECT_DAILY_CEILING_MS, { min: 0, max: DURATION_MAX }, 'analytics.SUBJECT_DAILY_CEILING_MS', errors),
     },
     flightRecorder: {
       minDumpIntervalMs: vNum(fr.minDumpIntervalMs, defaults.flightRecorder.minDumpIntervalMs, { min: 0, max: DURATION_MAX }, 'flightRecorder.minDumpIntervalMs', errors),
@@ -461,6 +496,9 @@ export function validateAndMerge(raw: unknown, defaults: RuntimeConfig): { confi
     },
     generation: {
       opedVoiceTimeoutMs: vNum(gen.opedVoiceTimeoutMs, defaults.generation.opedVoiceTimeoutMs, { min: 60_000, max: 3_600_000 }, 'generation.opedVoiceTimeoutMs', errors),
+    },
+    pollGate: {
+      enabled: vBool(pg.enabled, defaults.pollGate.enabled, 'pollGate.enabled', errors),
     },
   };
 
@@ -658,8 +696,9 @@ export function diffFromDefaults(): ConfigDiffEntry[] {
 export interface ClientConfig {
   resilience: RuntimeConfig['resilience'];
   flightRecorder: Pick<RuntimeConfig['flightRecorder'], 'minDumpIntervalMs' | 'maxDumpsPerWindow' | 'dumpWindowMs'>;
-  analytics: Pick<RuntimeConfig['analytics'], 'bufferRequeueLimit' | 'IDLE_TIMEOUT_MS' | 'MAX_ENGAGED_MS' | 'ENGAGED_MIN_MS' | 'MIN_VISIT_MS' | 'PULSE_THROTTLE_MS'>;
+  analytics: Pick<RuntimeConfig['analytics'], 'bufferRequeueLimit' | 'IDLE_TIMEOUT_MS' | 'MAX_ENGAGED_MS' | 'ENGAGED_MIN_MS' | 'MIN_VISIT_MS' | 'PULSE_THROTTLE_MS' | 'IDLE_GRACE_MS' | 'CREDIT_WINDOW_MS'>;
   debate: RuntimeConfig['debate'];
+  pollGate: RuntimeConfig['pollGate'];
 }
 
 /**
@@ -683,7 +722,10 @@ export function getClientConfig(): ClientConfig {
       ENGAGED_MIN_MS: c.analytics.ENGAGED_MIN_MS,
       MIN_VISIT_MS: c.analytics.MIN_VISIT_MS,
       PULSE_THROTTLE_MS: c.analytics.PULSE_THROTTLE_MS,
+      IDLE_GRACE_MS: c.analytics.IDLE_GRACE_MS,
+      CREDIT_WINDOW_MS: c.analytics.CREDIT_WINDOW_MS,
     },
     debate: c.debate,
+    pollGate: c.pollGate,
   };
 }

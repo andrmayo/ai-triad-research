@@ -17,7 +17,7 @@
     },
     {
       "name": "@azure/core-client",
-      "version": "1.11.0",
+      "version": "1.11.1",
       "license": "MIT"
     },
     {
@@ -62,7 +62,7 @@
     },
     {
       "name": "@azure/identity",
-      "version": "4.13.2",
+      "version": "4.14.0",
       "license": "MIT"
     },
     {
@@ -82,22 +82,27 @@
     },
     {
       "name": "@azure/msal-browser",
-      "version": "5.19.0",
+      "version": "5.25.1",
       "license": "MIT"
     },
     {
       "name": "@azure/msal-common",
-      "version": "16.13.0",
+      "version": "16.14.2",
+      "license": "MIT"
+    },
+    {
+      "name": "@azure/msal-common",
+      "version": "16.14.3",
       "license": "MIT"
     },
     {
       "name": "@azure/msal-node",
-      "version": "5.6.0",
+      "version": "7.1.1",
       "license": "MIT"
     },
     {
       "name": "@azure/storage-blob",
-      "version": "12.33.0",
+      "version": "12.34.0",
       "license": "MIT"
     },
     {
@@ -117,22 +122,22 @@
     },
     {
       "name": "@fontsource/source-serif-4",
-      "version": "5.3.0",
+      "version": "5.3.1",
       "license": "Google Inc."
     },
     {
       "name": "@huggingface/jinja",
-      "version": "0.5.9",
+      "version": "0.5.10",
       "license": "MIT"
     },
     {
       "name": "@huggingface/tokenizers",
-      "version": "0.1.3",
+      "version": "0.2.0",
       "license": "Apache-2.0"
     },
     {
       "name": "@huggingface/transformers",
-      "version": "4.2.0",
+      "version": "4.3.1",
       "license": "Apache-2.0"
     },
     {
@@ -142,137 +147,137 @@
     },
     {
       "name": "@img/sharp-darwin-arm64",
-      "version": "0.35.3",
+      "version": "0.35.5",
       "license": "Apache-2.0"
     },
     {
       "name": "@img/sharp-darwin-x64",
-      "version": "0.35.3",
+      "version": "0.35.5",
       "license": "Apache-2.0"
     },
     {
       "name": "@img/sharp-freebsd-wasm32",
-      "version": "0.35.3",
+      "version": "0.35.5",
       "license": "Apache-2.0"
     },
     {
       "name": "@img/sharp-libvips-darwin-arm64",
-      "version": "1.3.2",
+      "version": "1.3.4",
       "license": "LGPL-3.0-or-later"
     },
     {
       "name": "@img/sharp-libvips-darwin-x64",
-      "version": "1.3.2",
+      "version": "1.3.4",
       "license": "LGPL-3.0-or-later"
     },
     {
       "name": "@img/sharp-libvips-linux-arm",
-      "version": "1.3.2",
+      "version": "1.3.4",
       "license": "LGPL-3.0-or-later"
     },
     {
       "name": "@img/sharp-libvips-linux-arm64",
-      "version": "1.3.2",
+      "version": "1.3.4",
       "license": "LGPL-3.0-or-later"
     },
     {
       "name": "@img/sharp-libvips-linux-ppc64",
-      "version": "1.3.2",
+      "version": "1.3.4",
       "license": "LGPL-3.0-or-later"
     },
     {
       "name": "@img/sharp-libvips-linux-riscv64",
-      "version": "1.3.2",
+      "version": "1.3.4",
       "license": "LGPL-3.0-or-later"
     },
     {
       "name": "@img/sharp-libvips-linux-s390x",
-      "version": "1.3.2",
+      "version": "1.3.4",
       "license": "LGPL-3.0-or-later"
     },
     {
       "name": "@img/sharp-libvips-linux-x64",
-      "version": "1.3.2",
+      "version": "1.3.4",
       "license": "LGPL-3.0-or-later"
     },
     {
       "name": "@img/sharp-libvips-linuxmusl-arm64",
-      "version": "1.3.2",
+      "version": "1.3.4",
       "license": "LGPL-3.0-or-later"
     },
     {
       "name": "@img/sharp-libvips-linuxmusl-x64",
-      "version": "1.3.2",
+      "version": "1.3.4",
       "license": "LGPL-3.0-or-later"
     },
     {
       "name": "@img/sharp-linux-arm",
-      "version": "0.35.3",
+      "version": "0.35.5",
       "license": "Apache-2.0"
     },
     {
       "name": "@img/sharp-linux-arm64",
-      "version": "0.35.3",
+      "version": "0.35.5",
       "license": "Apache-2.0"
     },
     {
       "name": "@img/sharp-linux-ppc64",
-      "version": "0.35.3",
+      "version": "0.35.5",
       "license": "Apache-2.0"
     },
     {
       "name": "@img/sharp-linux-riscv64",
-      "version": "0.35.3",
+      "version": "0.35.5",
       "license": "Apache-2.0"
     },
     {
       "name": "@img/sharp-linux-s390x",
-      "version": "0.35.3",
+      "version": "0.35.5",
       "license": "Apache-2.0"
     },
     {
       "name": "@img/sharp-linux-x64",
-      "version": "0.35.3",
+      "version": "0.35.5",
       "license": "Apache-2.0"
     },
     {
       "name": "@img/sharp-linuxmusl-arm64",
-      "version": "0.35.3",
+      "version": "0.35.5",
       "license": "Apache-2.0"
     },
     {
       "name": "@img/sharp-linuxmusl-x64",
-      "version": "0.35.3",
+      "version": "0.35.5",
       "license": "Apache-2.0"
     },
     {
       "name": "@img/sharp-wasm32",
-      "version": "0.35.3",
+      "version": "0.35.5",
       "license": "Apache-2.0"
     },
     {
       "name": "@img/sharp-webcontainers-wasm32",
-      "version": "0.35.3",
+      "version": "0.35.5",
       "license": "Apache-2.0"
     },
     {
       "name": "@img/sharp-win32-arm64",
-      "version": "0.35.3",
+      "version": "0.35.5",
       "license": "Apache-2.0"
     },
     {
       "name": "@img/sharp-win32-ia32",
-      "version": "0.35.3",
+      "version": "0.35.5",
       "license": "Apache-2.0"
     },
     {
       "name": "@img/sharp-win32-x64",
-      "version": "0.35.3",
+      "version": "0.35.5",
       "license": "Apache-2.0"
     },
     {
       "name": "@nodable/entities",
-      "version": "3.0.0",
+      "version": "3.1.0",
       "license": "MIT"
     },
     {
@@ -362,12 +367,22 @@
     },
     {
       "name": "@types/node",
-      "version": "26.4.0",
+      "version": "25.9.9",
+      "license": "MIT"
+    },
+    {
+      "name": "@types/node",
+      "version": "26.6.4",
+      "license": "MIT"
+    },
+    {
+      "name": "@types/node",
+      "version": "26.6.5",
       "license": "MIT"
     },
     {
       "name": "@types/react",
-      "version": "19.2.18",
+      "version": "19.3.0",
       "license": "MIT"
     },
     {
@@ -382,12 +397,17 @@
     },
     {
       "name": "@types/ws",
-      "version": "8.18.1",
+      "version": "8.18.2",
       "license": "MIT"
     },
     {
       "name": "@typespec/ts-http-runtime",
       "version": "0.3.8",
+      "license": "MIT"
+    },
+    {
+      "name": "@typespec/ts-http-runtime",
+      "version": "0.3.9",
       "license": "MIT"
     },
     {
@@ -407,7 +427,7 @@
     },
     {
       "name": "adm-zip",
-      "version": "0.6.0",
+      "version": "0.6.1",
       "license": "MIT"
     },
     {
@@ -436,6 +456,11 @@
       "license": "MIT"
     },
     {
+      "name": "apache-arrow",
+      "version": "21.2.0",
+      "license": "Apache Arrow JavaScript"
+    },
+    {
       "name": "atomic-sleep",
       "version": "1.0.0",
       "license": "MIT"
@@ -446,18 +471,13 @@
       "license": "MIT"
     },
     {
-      "name": "boolean",
-      "version": "3.2.0",
-      "license": "MIT"
-    },
-    {
       "name": "buffer-equal-constant-time",
       "version": "1.0.1",
       "license": "BSD-3-Clause"
     },
     {
       "name": "bundle-name",
-      "version": "4.1.0",
+      "version": "4.1.1",
       "license": "MIT"
     },
     {
@@ -571,11 +591,6 @@
       "license": "Apache-2.0"
     },
     {
-      "name": "detect-node",
-      "version": "2.1.0",
-      "license": "MIT"
-    },
-    {
       "name": "devlop",
       "version": "1.1.0",
       "license": "MIT"
@@ -603,11 +618,6 @@
     {
       "name": "es-errors",
       "version": "1.3.0",
-      "license": "MIT"
-    },
-    {
-      "name": "es6-error",
-      "version": "4.1.1",
       "license": "MIT"
     },
     {
@@ -642,7 +652,7 @@
     },
     {
       "name": "fast-uri",
-      "version": "3.1.7",
+      "version": "3.1.8",
       "license": "BSD-2-Clause"
     },
     {
@@ -652,7 +662,7 @@
     },
     {
       "name": "fast-xml-parser",
-      "version": "5.11.0",
+      "version": "5.11.2",
       "license": "MIT"
     },
     {
@@ -669,11 +679,6 @@
       "name": "get-caller-file",
       "version": "2.0.5",
       "license": "ISC"
-    },
-    {
-      "name": "global-agent",
-      "version": "3.0.0",
-      "license": "BSD-3-Clause"
     },
     {
       "name": "global-agent",
@@ -732,7 +737,7 @@
     },
     {
       "name": "image-size",
-      "version": "2.0.2",
+      "version": "2.0.4",
       "license": "MIT"
     },
     {
@@ -781,6 +786,11 @@
       "license": "MIT"
     },
     {
+      "name": "is-in-ssh",
+      "version": "1.0.0",
+      "license": "MIT"
+    },
+    {
       "name": "is-inside-container",
       "version": "1.0.0",
       "license": "MIT"
@@ -811,9 +821,9 @@
       "license": "MIT"
     },
     {
-      "name": "json-stringify-safe",
-      "version": "5.0.1",
-      "license": "ISC"
+      "name": "json-with-bigint",
+      "version": "3.5.12",
+      "license": "MIT"
     },
     {
       "name": "jsonwebtoken",
@@ -827,7 +837,7 @@
     },
     {
       "name": "jszip",
-      "version": "3.10.1",
+      "version": "3.10.2",
       "license": "MIT"
     },
     {
@@ -897,17 +907,12 @@
     },
     {
       "name": "lucide-react",
-      "version": "1.35.0",
+      "version": "1.61.0",
       "license": "ISC"
     },
     {
       "name": "markdown-table",
       "version": "3.0.4",
-      "license": "MIT"
-    },
-    {
-      "name": "matcher",
-      "version": "3.0.0",
       "license": "MIT"
     },
     {
@@ -1157,37 +1162,27 @@
     },
     {
       "name": "onnxruntime-common",
-      "version": "1.24.0-dev.20251116-b39e144322",
+      "version": "1.30.0",
       "license": "MIT"
     },
     {
       "name": "onnxruntime-common",
-      "version": "1.24.3",
-      "license": "MIT"
-    },
-    {
-      "name": "onnxruntime-common",
-      "version": "1.29.0",
+      "version": "1.31.0-dev.20260911-2a43ec07e",
       "license": "MIT"
     },
     {
       "name": "onnxruntime-node",
-      "version": "1.24.3",
-      "license": "MIT"
-    },
-    {
-      "name": "onnxruntime-node",
-      "version": "1.29.0",
+      "version": "1.30.0",
       "license": "MIT"
     },
     {
       "name": "onnxruntime-web",
-      "version": "1.26.0-dev.20260416-b7804b056c",
+      "version": "1.31.0-dev.20260914-8d85527a0",
       "license": "MIT"
     },
     {
       "name": "open",
-      "version": "10.2.0",
+      "version": "11.0.4",
       "license": "MIT"
     },
     {
@@ -1227,7 +1222,7 @@
     },
     {
       "name": "pino",
-      "version": "10.3.1",
+      "version": "10.4.0",
       "license": "MIT"
     },
     {
@@ -1248,6 +1243,11 @@
     {
       "name": "pngjs",
       "version": "5.0.0",
+      "license": "MIT"
+    },
+    {
+      "name": "powershell-utils",
+      "version": "0.2.1",
       "license": "MIT"
     },
     {
@@ -1287,12 +1287,12 @@
     },
     {
       "name": "react",
-      "version": "19.2.8",
+      "version": "19.3.1",
       "license": "MIT"
     },
     {
       "name": "react-dom",
-      "version": "19.2.8",
+      "version": "19.3.1",
       "license": "MIT"
     },
     {
@@ -1303,11 +1303,6 @@
     {
       "name": "readable-stream",
       "version": "2.3.8",
-      "license": "MIT"
-    },
-    {
-      "name": "real-require",
-      "version": "0.2.0",
       "license": "MIT"
     },
     {
@@ -1351,11 +1346,6 @@
       "license": "ISC"
     },
     {
-      "name": "roarr",
-      "version": "2.15.4",
-      "license": "BSD-3-Clause"
-    },
-    {
       "name": "run-applescript",
       "version": "7.1.0",
       "license": "MIT"
@@ -1377,23 +1367,13 @@
     },
     {
       "name": "scheduler",
-      "version": "0.27.0",
+      "version": "0.28.0",
       "license": "MIT"
     },
     {
       "name": "semver",
       "version": "7.8.5",
       "license": "ISC"
-    },
-    {
-      "name": "semver-compare",
-      "version": "1.0.0",
-      "license": "MIT"
-    },
-    {
-      "name": "serialize-error",
-      "version": "7.0.1",
-      "license": "MIT"
     },
     {
       "name": "serialize-error",
@@ -1412,7 +1392,7 @@
     },
     {
       "name": "sharp",
-      "version": "0.35.3",
+      "version": "0.35.5",
       "license": "Apache-2.0"
     },
     {
@@ -1429,11 +1409,6 @@
       "name": "split2",
       "version": "4.2.0",
       "license": "ISC"
-    },
-    {
-      "name": "sprintf-js",
-      "version": "1.1.3",
-      "license": "BSD-3-Clause"
     },
     {
       "name": "string_decoder",
@@ -1497,17 +1472,12 @@
     },
     {
       "name": "type-fest",
-      "version": "0.13.1",
-      "license": "MIT"
-    },
-    {
-      "name": "type-fest",
       "version": "0.20.2",
       "license": "MIT"
     },
     {
       "name": "undici",
-      "version": "6.28.0",
+      "version": "6.29.1",
       "license": "MIT"
     },
     {
@@ -1517,7 +1487,12 @@
     },
     {
       "name": "undici-types",
-      "version": "8.3.0",
+      "version": "7.24.6",
+      "license": "MIT"
+    },
+    {
+      "name": "undici-types",
+      "version": "8.9.0",
       "license": "MIT"
     },
     {
@@ -1577,12 +1552,12 @@
     },
     {
       "name": "ws",
-      "version": "8.21.3",
+      "version": "8.22.0",
       "license": "MIT"
     },
     {
       "name": "wsl-utils",
-      "version": "0.1.0",
+      "version": "1.0.1",
       "license": "MIT"
     },
     {
@@ -1607,7 +1582,7 @@
     },
     {
       "name": "zod",
-      "version": "4.4.3",
+      "version": "4.6.7",
       "license": "MIT"
     },
     {
@@ -1638,7 +1613,7 @@
         },
         {
           "name": "@azure/core-client",
-          "version": "1.11.0"
+          "version": "1.11.1"
         },
         {
           "name": "@azure/core-http-compat",
@@ -1666,7 +1641,7 @@
         },
         {
           "name": "@azure/identity",
-          "version": "4.13.2"
+          "version": "4.14.0"
         },
         {
           "name": "@azure/keyvault-common",
@@ -1682,11 +1657,15 @@
         },
         {
           "name": "@azure/storage-blob",
-          "version": "12.33.0"
+          "version": "12.34.0"
         },
         {
           "name": "@typespec/ts-http-runtime",
           "version": "0.3.8"
+        },
+        {
+          "name": "@typespec/ts-http-runtime",
+          "version": "0.3.9"
         }
       ],
       "licenseType": "MIT",
@@ -1720,11 +1699,15 @@
       "packages": [
         {
           "name": "@azure/msal-browser",
-          "version": "5.19.0"
+          "version": "5.25.1"
         },
         {
           "name": "@azure/msal-common",
-          "version": "16.13.0"
+          "version": "16.14.2"
+        },
+        {
+          "name": "@azure/msal-common",
+          "version": "16.14.3"
         }
       ],
       "licenseType": "MIT",
@@ -1734,7 +1717,7 @@
       "packages": [
         {
           "name": "@azure/msal-node",
-          "version": "5.6.0"
+          "version": "7.1.1"
         }
       ],
       "licenseType": "MIT",
@@ -1764,7 +1747,7 @@
       "packages": [
         {
           "name": "@fontsource/source-serif-4",
-          "version": "5.3.0"
+          "version": "5.3.1"
         }
       ],
       "licenseType": "Google Inc.",
@@ -1774,7 +1757,7 @@
       "packages": [
         {
           "name": "@huggingface/jinja",
-          "version": "0.5.9"
+          "version": "0.5.10"
         }
       ],
       "licenseType": "MIT",
@@ -1784,75 +1767,75 @@
       "packages": [
         {
           "name": "@huggingface/tokenizers",
-          "version": "0.1.3"
+          "version": "0.2.0"
         },
         {
           "name": "@huggingface/transformers",
-          "version": "4.2.0"
+          "version": "4.3.1"
         },
         {
           "name": "@img/sharp-darwin-arm64",
-          "version": "0.35.3"
+          "version": "0.35.5"
         },
         {
           "name": "@img/sharp-darwin-x64",
-          "version": "0.35.3"
+          "version": "0.35.5"
         },
         {
           "name": "@img/sharp-freebsd-wasm32",
-          "version": "0.35.3"
+          "version": "0.35.5"
         },
         {
           "name": "@img/sharp-linux-arm",
-          "version": "0.35.3"
+          "version": "0.35.5"
         },
         {
           "name": "@img/sharp-linux-arm64",
-          "version": "0.35.3"
+          "version": "0.35.5"
         },
         {
           "name": "@img/sharp-linux-ppc64",
-          "version": "0.35.3"
+          "version": "0.35.5"
         },
         {
           "name": "@img/sharp-linux-riscv64",
-          "version": "0.35.3"
+          "version": "0.35.5"
         },
         {
           "name": "@img/sharp-linux-s390x",
-          "version": "0.35.3"
+          "version": "0.35.5"
         },
         {
           "name": "@img/sharp-linux-x64",
-          "version": "0.35.3"
+          "version": "0.35.5"
         },
         {
           "name": "@img/sharp-linuxmusl-arm64",
-          "version": "0.35.3"
+          "version": "0.35.5"
         },
         {
           "name": "@img/sharp-linuxmusl-x64",
-          "version": "0.35.3"
+          "version": "0.35.5"
         },
         {
           "name": "@img/sharp-wasm32",
-          "version": "0.35.3"
+          "version": "0.35.5"
         },
         {
           "name": "@img/sharp-webcontainers-wasm32",
-          "version": "0.35.3"
+          "version": "0.35.5"
         },
         {
           "name": "@img/sharp-win32-arm64",
-          "version": "0.35.3"
+          "version": "0.35.5"
         },
         {
           "name": "@img/sharp-win32-ia32",
-          "version": "0.35.3"
+          "version": "0.35.5"
         },
         {
           "name": "@img/sharp-win32-x64",
-          "version": "0.35.3"
+          "version": "0.35.5"
         },
         {
           "name": "flatbuffers",
@@ -1880,43 +1863,43 @@
       "packages": [
         {
           "name": "@img/sharp-libvips-darwin-arm64",
-          "version": "1.3.2"
+          "version": "1.3.4"
         },
         {
           "name": "@img/sharp-libvips-darwin-x64",
-          "version": "1.3.2"
+          "version": "1.3.4"
         },
         {
           "name": "@img/sharp-libvips-linux-arm",
-          "version": "1.3.2"
+          "version": "1.3.4"
         },
         {
           "name": "@img/sharp-libvips-linux-arm64",
-          "version": "1.3.2"
+          "version": "1.3.4"
         },
         {
           "name": "@img/sharp-libvips-linux-ppc64",
-          "version": "1.3.2"
+          "version": "1.3.4"
         },
         {
           "name": "@img/sharp-libvips-linux-riscv64",
-          "version": "1.3.2"
+          "version": "1.3.4"
         },
         {
           "name": "@img/sharp-libvips-linux-s390x",
-          "version": "1.3.2"
+          "version": "1.3.4"
         },
         {
           "name": "@img/sharp-libvips-linux-x64",
-          "version": "1.3.2"
+          "version": "1.3.4"
         },
         {
           "name": "@img/sharp-libvips-linuxmusl-arm64",
-          "version": "1.3.2"
+          "version": "1.3.4"
         },
         {
           "name": "@img/sharp-libvips-linuxmusl-x64",
-          "version": "1.3.2"
+          "version": "1.3.4"
         }
       ],
       "licenseType": "LGPL-3.0-or-later",
@@ -1926,7 +1909,7 @@
       "packages": [
         {
           "name": "@nodable/entities",
-          "version": "3.0.0"
+          "version": "3.1.0"
         },
         {
           "name": "emoji-regex",
@@ -1938,27 +1921,19 @@
         },
         {
           "name": "onnxruntime-common",
-          "version": "1.24.0-dev.20251116-b39e144322"
+          "version": "1.30.0"
         },
         {
           "name": "onnxruntime-common",
-          "version": "1.24.3"
-        },
-        {
-          "name": "onnxruntime-common",
-          "version": "1.29.0"
+          "version": "1.31.0-dev.20260911-2a43ec07e"
         },
         {
           "name": "onnxruntime-node",
-          "version": "1.24.3"
-        },
-        {
-          "name": "onnxruntime-node",
-          "version": "1.29.0"
+          "version": "1.30.0"
         },
         {
           "name": "onnxruntime-web",
-          "version": "1.26.0-dev.20260416-b7804b056c"
+          "version": "1.31.0-dev.20260914-8d85527a0"
         }
       ],
       "licenseType": "MIT",
@@ -2048,11 +2023,19 @@
         },
         {
           "name": "@types/node",
-          "version": "26.4.0"
+          "version": "25.9.9"
+        },
+        {
+          "name": "@types/node",
+          "version": "26.6.4"
+        },
+        {
+          "name": "@types/node",
+          "version": "26.6.5"
         },
         {
           "name": "@types/react",
-          "version": "19.2.18"
+          "version": "19.3.0"
         },
         {
           "name": "@types/unist",
@@ -2064,7 +2047,7 @@
         },
         {
           "name": "@types/ws",
-          "version": "8.18.1"
+          "version": "8.18.2"
         }
       ],
       "licenseType": "MIT",
@@ -2104,7 +2087,7 @@
       "packages": [
         {
           "name": "adm-zip",
-          "version": "0.6.0"
+          "version": "0.6.1"
         }
       ],
       "licenseType": "MIT",
@@ -2221,6 +2204,16 @@
     {
       "packages": [
         {
+          "name": "apache-arrow",
+          "version": "21.2.0"
+        }
+      ],
+      "licenseType": "Apache Arrow JavaScript",
+      "licenseText": "Apache Arrow JavaScript\nCopyright 2017-2025 The Apache Software Foundation\n\nThis product includes software developed at\nThe Apache Software Foundation (http://www.apache.org/)."
+    },
+    {
+      "packages": [
+        {
           "name": "atomic-sleep",
           "version": "1.0.0"
         }
@@ -2273,16 +2266,6 @@
     {
       "packages": [
         {
-          "name": "boolean",
-          "version": "3.2.0"
-        }
-      ],
-      "licenseType": "MIT",
-      "licenseText": "The MIT License (MIT)\nCopyright (c) 2014-2022 the native web.\n\nPermission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the \"Software\"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE."
-    },
-    {
-      "packages": [
-        {
           "name": "buffer-equal-constant-time",
           "version": "1.0.1"
         }
@@ -2294,7 +2277,7 @@
       "packages": [
         {
           "name": "bundle-name",
-          "version": "4.1.0"
+          "version": "4.1.1"
         },
         {
           "name": "default-browser-id",
@@ -2321,6 +2304,10 @@
           "version": "3.0.0"
         },
         {
+          "name": "is-in-ssh",
+          "version": "1.0.0"
+        },
+        {
           "name": "is-inside-container",
           "version": "1.0.0"
         },
@@ -2334,23 +2321,19 @@
         },
         {
           "name": "matcher",
-          "version": "3.0.0"
-        },
-        {
-          "name": "matcher",
           "version": "4.0.0"
         },
         {
           "name": "open",
-          "version": "10.2.0"
+          "version": "11.0.4"
+        },
+        {
+          "name": "powershell-utils",
+          "version": "0.2.1"
         },
         {
           "name": "run-applescript",
           "version": "7.1.0"
-        },
-        {
-          "name": "serialize-error",
-          "version": "7.0.1"
         },
         {
           "name": "serialize-error",
@@ -2362,7 +2345,7 @@
         },
         {
           "name": "wsl-utils",
-          "version": "0.1.0"
+          "version": "1.0.1"
         }
       ],
       "licenseType": "MIT",
@@ -2673,16 +2656,6 @@
     {
       "packages": [
         {
-          "name": "detect-node",
-          "version": "2.1.0"
-        }
-      ],
-      "licenseType": "MIT",
-      "licenseText": "MIT License\n\nCopyright (c) 2017 Ilya Kantor\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE."
-    },
-    {
-      "packages": [
-        {
           "name": "devlop",
           "version": "1.1.0"
         }
@@ -2723,16 +2696,6 @@
       ],
       "licenseType": "MIT",
       "licenseText": "MIT License\n\nCopyright (c) 2024 Jordan Harband\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE."
-    },
-    {
-      "packages": [
-        {
-          "name": "es6-error",
-          "version": "4.1.1"
-        }
-      ],
-      "licenseType": "MIT",
-      "licenseText": "The MIT License (MIT)\n\nCopyright (c) 2015 Ben Youngblood\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE."
     },
     {
       "packages": [
@@ -2830,7 +2793,7 @@
       "packages": [
         {
           "name": "fast-uri",
-          "version": "3.1.7"
+          "version": "3.1.8"
         }
       ],
       "licenseType": "BSD-2-Clause",
@@ -2840,7 +2803,7 @@
       "packages": [
         {
           "name": "fast-xml-parser",
-          "version": "5.11.0"
+          "version": "5.11.2"
         }
       ],
       "licenseType": "MIT",
@@ -2855,20 +2818,6 @@
       ],
       "licenseType": "ISC",
       "licenseText": "ISC License (ISC)\nCopyright 2018 Stefan Penner\n\nPermission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright notice and this permission notice appear in all copies.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
-    },
-    {
-      "packages": [
-        {
-          "name": "global-agent",
-          "version": "3.0.0"
-        },
-        {
-          "name": "roarr",
-          "version": "2.15.4"
-        }
-      ],
-      "licenseType": "BSD-3-Clause",
-      "licenseText": "Copyright (c) 2019, Gajus Kuizinas (http://gajus.com/)\nAll rights reserved.\n\nRedistribution and use in source and binary forms, with or without\nmodification, are permitted provided that the following conditions are met:\n    * Redistributions of source code must retain the above copyright\n      notice, this list of conditions and the following disclaimer.\n    * Redistributions in binary form must reproduce the above copyright\n      notice, this list of conditions and the following disclaimer in the\n      documentation and/or other materials provided with the distribution.\n    * Neither the name of the Gajus Kuizinas (http://gajus.com/) nor the\n      names of its contributors may be used to endorse or promote products\n      derived from this software without specific prior written permission.\n\nTHIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\" AND\nANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED\nWARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE\nDISCLAIMED. IN NO EVENT SHALL ANUARY BE LIABLE FOR ANY\nDIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES\n(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;\nLOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND\nON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT\n(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS\nSOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE."
     },
     {
       "packages": [
@@ -2938,7 +2887,7 @@
       "packages": [
         {
           "name": "image-size",
-          "version": "2.0.2"
+          "version": "2.0.4"
         }
       ],
       "licenseType": "MIT",
@@ -2977,16 +2926,12 @@
     {
       "packages": [
         {
-          "name": "json-stringify-safe",
-          "version": "5.0.1"
-        },
-        {
-          "name": "semver",
-          "version": "7.8.5"
+          "name": "json-with-bigint",
+          "version": "3.5.12"
         }
       ],
-      "licenseType": "ISC",
-      "licenseText": "The ISC License\n\nCopyright (c) Isaac Z. Schlueter and Contributors\n\nPermission to use, copy, modify, and/or distribute this software for any\npurpose with or without fee is hereby granted, provided that the above\ncopyright notice and this permission notice appear in all copies.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\" AND THE AUTHOR DISCLAIMS ALL WARRANTIES\nWITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF\nMERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR\nANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES\nWHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN\nACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR\nIN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
+      "licenseType": "MIT",
+      "licenseText": "MIT License\n\nCopyright (c) 2023 Ivan Korolenko\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE."
     },
     {
       "packages": [
@@ -3002,7 +2947,7 @@
       "packages": [
         {
           "name": "jszip",
-          "version": "3.10.1"
+          "version": "3.10.2"
         }
       ],
       "licenseType": "MIT",
@@ -3094,7 +3039,7 @@
       "packages": [
         {
           "name": "lucide-react",
-          "version": "1.35.0"
+          "version": "1.61.0"
         }
       ],
       "licenseType": "ISC",
@@ -3232,11 +3177,11 @@
       "packages": [
         {
           "name": "pino",
-          "version": "10.3.1"
+          "version": "10.4.0"
         }
       ],
       "licenseType": "MIT",
-      "licenseText": "The MIT License (MIT)\n\nCopyright (c) 2016-2025 Matteo Collina, David Mark Clements and the Pino contributors listed at <https://github.com/pinojs/pino#the-team> and in the README file.\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE."
+      "licenseText": "The MIT License (MIT)\n\nCopyright (c) 2016-present Matteo Collina, David Mark Clements and the Pino contributors listed at <https://github.com/pinojs/pino#the-team> and in the README file.\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE."
     },
     {
       "packages": [
@@ -3322,15 +3267,15 @@
       "packages": [
         {
           "name": "react-dom",
-          "version": "19.2.8"
+          "version": "19.3.1"
         },
         {
           "name": "react",
-          "version": "19.2.8"
+          "version": "19.3.1"
         },
         {
           "name": "scheduler",
-          "version": "0.27.0"
+          "version": "0.28.0"
         }
       ],
       "licenseType": "MIT",
@@ -3362,10 +3307,6 @@
     },
     {
       "packages": [
-        {
-          "name": "real-require",
-          "version": "0.2.0"
-        },
         {
           "name": "real-require",
           "version": "1.0.0"
@@ -3453,12 +3394,12 @@
     {
       "packages": [
         {
-          "name": "semver-compare",
-          "version": "1.0.0"
+          "name": "semver",
+          "version": "7.8.5"
         }
       ],
-      "licenseType": "MIT",
-      "licenseText": "This software is released under the MIT license:\n\nPermission is hereby granted, free of charge, to any person obtaining a copy of\nthis software and associated documentation files (the \"Software\"), to deal in\nthe Software without restriction, including without limitation the rights to\nuse, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of\nthe Software, and to permit persons to whom the Software is furnished to do so,\nsubject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS\nFOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR\nCOPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER\nIN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN\nCONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE."
+      "licenseType": "ISC",
+      "licenseText": "The ISC License\n\nCopyright (c) Isaac Z. Schlueter and Contributors\n\nPermission to use, copy, modify, and/or distribute this software for any\npurpose with or without fee is hereby granted, provided that the above\ncopyright notice and this permission notice appear in all copies.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\" AND THE AUTHOR DISCLAIMS ALL WARRANTIES\nWITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF\nMERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR\nANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES\nWHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN\nACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR\nIN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
     },
     {
       "packages": [
@@ -3474,7 +3415,7 @@
       "packages": [
         {
           "name": "sharp",
-          "version": "0.35.3"
+          "version": "0.35.5"
         }
       ],
       "licenseType": "Apache-2.0",
@@ -3499,16 +3440,6 @@
       ],
       "licenseType": "ISC",
       "licenseText": "Copyright (c) 2014-2018, Matteo Collina <hello@matteocollina.com>\n\nPermission to use, copy, modify, and/or distribute this software for any\npurpose with or without fee is hereby granted, provided that the above\ncopyright notice and this permission notice appear in all copies.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\" AND THE AUTHOR DISCLAIMS ALL WARRANTIES\nWITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF\nMERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR\nANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES\nWHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN\nACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR\nIN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
-    },
-    {
-      "packages": [
-        {
-          "name": "sprintf-js",
-          "version": "1.1.3"
-        }
-      ],
-      "licenseType": "BSD-3-Clause",
-      "licenseText": "Copyright (c) 2007-present, Alexandru Mărășteanu <hello@alexei.ro>\nAll rights reserved.\n\nRedistribution and use in source and binary forms, with or without\nmodification, are permitted provided that the following conditions are met:\n* Redistributions of source code must retain the above copyright\n  notice, this list of conditions and the following disclaimer.\n* Redistributions in binary form must reproduce the above copyright\n  notice, this list of conditions and the following disclaimer in the\n  documentation and/or other materials provided with the distribution.\n* Neither the name of this software nor the names of its contributors may be\n  used to endorse or promote products derived from this software without\n  specific prior written permission.\n\nTHIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\" AND\nANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED\nWARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE\nDISCLAIMED. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR\nANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES\n(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;\nLOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND\nON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT\n(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS\nSOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE."
     },
     {
       "packages": [
@@ -3564,10 +3495,6 @@
       "packages": [
         {
           "name": "type-fest",
-          "version": "0.13.1"
-        },
-        {
-          "name": "type-fest",
           "version": "0.20.2"
         }
       ],
@@ -3582,11 +3509,15 @@
         },
         {
           "name": "undici-types",
-          "version": "8.3.0"
+          "version": "7.24.6"
+        },
+        {
+          "name": "undici-types",
+          "version": "8.9.0"
         },
         {
           "name": "undici",
-          "version": "6.28.0"
+          "version": "6.29.1"
         }
       ],
       "licenseType": "MIT",
@@ -3640,7 +3571,7 @@
       "packages": [
         {
           "name": "ws",
-          "version": "8.21.3"
+          "version": "8.22.0"
         }
       ],
       "licenseType": "MIT",
@@ -3670,7 +3601,7 @@
       "packages": [
         {
           "name": "zod",
-          "version": "4.4.3"
+          "version": "4.6.7"
         }
       ],
       "licenseType": "MIT",

@@ -2,9 +2,10 @@
 // Licensed under the MIT License. See LICENSE file in the project root.
 
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
-import { render, screen, fireEvent, within } from '@testing-library/react';
+import { render, screen, fireEvent, within, act } from '@testing-library/react';
 import { DebateWorkspace } from './DebateWorkspace';
 import { usePreferencesStore } from '../../store/preferencesStore';
+import { api } from '@bridge';
 
 // ── Store mocks ───────────────────────────────────────────────
 
@@ -104,6 +105,7 @@ const mockMarkAsPopout = vi.fn(() => {
 vi.mock('../../hooks/useDebateStore/shared/guards', () => ({
   initDebatePopoutCloseHandler: vi.fn(() => vi.fn()),
   markAsPopout: (...args: any[]) => mockMarkAsPopout(...args),
+  isDebatePopoutWindow: vi.fn(() => false),
 }));
 
 vi.mock('@lib/flight-recorder/index', () => ({
@@ -186,7 +188,14 @@ vi.mock('./DebateActionBar', () => ({
   ),
   ProgressIndicator: () => <div data-testid="progress-indicator" />,
   DebaterToggles: () => <div data-testid="debater-toggles" />,
-  DebateActions: () => <div data-testid="debate-actions" />,
+  // Renders real toggle buttons (wired to the setters it's actually given) so tests
+  // can drive showEvaluation/showParamHistory without reimplementing the Tools menu.
+  DebateActions: ({ showEvaluation, setShowEvaluation, showParamHistory, setShowParamHistory }: any) => (
+    <div data-testid="debate-actions">
+      <button type="button" onClick={() => setShowEvaluation(!showEvaluation)}>Evaluation</button>
+      <button type="button" onClick={() => setShowParamHistory(!showParamHistory)}>Calibration</button>
+    </div>
+  ),
 }));
 // Controllable feature-flag mock (default: all flags off — preserves existing flag-off tests).
 const mockFlags: Record<string, boolean> = {};
@@ -204,6 +213,10 @@ vi.mock('./OpeningPanel', () => ({
 }));
 vi.mock('./TaxonomyRefs', () => ({
   CoverageBadge: () => <div data-testid="coverage-badge" />,
+}));
+const mockRequestExplainForSelection = vi.fn(() => false);
+vi.mock('./explainRequestBus', () => ({
+  requestExplainForSelection: (...args: unknown[]) => mockRequestExplainForSelection(...args),
 }));
 vi.mock('./utils', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./utils')>();
@@ -338,6 +351,41 @@ describe('toolbar', () => {
   it('shows exportStatus text when exportStatus prop is provided', () => {
     render(<DebateWorkspace exportStatus="Exporting..." />);
     expect(screen.getByText('Exporting...')).toBeInTheDocument();
+  });
+});
+
+// ── Evaluation panel scroll-trap fix (t/3843) ─────────────────
+// The eval/param-history panels must render INSIDE .debate-scroll-content, not
+// as siblings after it — that's the actual defect (flex scroll-trap), so a test
+// that only checks "renders somewhere" would pass even if a future refactor
+// moved them back out.
+
+describe('evaluation + parameter-history panels (t/3843)', () => {
+  beforeEach(() => {
+    mockStore.debateLoading = false;
+    mockStore.activeDebate = makeDebate({ phase: 'debate', neutral_evaluations: [{ checkpoint: 'final' }] });
+  });
+
+  it('renders the evaluation panel inside .debate-scroll-content once toggled on via the Evaluation action', () => {
+    const { container } = render(<DebateWorkspace />);
+    expect(container.querySelector('[data-testid="eval-panel"]')).toBeNull();
+
+    fireEvent.click(screen.getByText('Evaluation'));
+
+    const scrollContent = container.querySelector('.debate-scroll-content') as HTMLElement;
+    expect(within(scrollContent).getByTestId('eval-panel')).toBeInTheDocument();
+    // Not merely present in the document — specifically a descendant of the scroll column,
+    // which is the structural fix this ticket exists to verify.
+    expect(container.querySelector(':scope > [data-testid="eval-panel"]')).toBeNull();
+  });
+
+  it('renders the parameter-history panel inside .debate-scroll-content once toggled on', () => {
+    const { container } = render(<DebateWorkspace />);
+
+    fireEvent.click(screen.getByText('Calibration'));
+
+    const scrollContent = container.querySelector('.debate-scroll-content') as HTMLElement;
+    expect(within(scrollContent).getByTestId('param-history')).toBeInTheDocument();
   });
 });
 
@@ -738,6 +786,97 @@ describe('find bar', () => {
     fireEvent.keyDown(document, { key: 'f', ctrlKey: true });
     const input = screen.getByPlaceholderText('Find in debate…');
     expect(input).toBeInTheDocument();
+  });
+});
+
+// ── Selection context menu (t/3382 — touch long-press support) ─
+
+describe('selection context menu', () => {
+  const realGetSelection = window.getSelection;
+
+  function mockSelection(text: string) {
+    window.getSelection = vi.fn(() => ({
+      toString: () => text,
+      anchorNode: null,
+      rangeCount: 0,
+    })) as unknown as typeof window.getSelection;
+  }
+
+  beforeEach(() => {
+    mockStore.debateLoading = false;
+    mockStore.activeDebate = makeDebate();
+  });
+
+  afterEach(() => {
+    window.getSelection = realGetSelection;
+    vi.useRealTimers();
+  });
+
+  it('shows the menu on desktop right-click when text is selected', () => {
+    mockSelection('hello world');
+    const { container } = render(<DebateWorkspace />);
+    fireEvent.contextMenu(container.querySelector('.debate-scroll-content')!);
+    expect(container.querySelector('.debate-context-menu')).toBeTruthy();
+  });
+
+  it('does not show the menu on right-click without a selection', () => {
+    mockSelection('');
+    const { container } = render(<DebateWorkspace />);
+    fireEvent.contextMenu(container.querySelector('.debate-scroll-content')!);
+    expect(container.querySelector('.debate-context-menu')).toBeNull();
+  });
+
+  it('shows the menu after touchend when a selection survives the release (t/3382)', () => {
+    vi.useFakeTimers();
+    mockSelection('selected phrase');
+    const { container } = render(<DebateWorkspace />);
+    fireEvent.touchEnd(container.querySelector('.debate-scroll-content')!, {
+      changedTouches: [{ clientX: 50, clientY: 80 }],
+    });
+    act(() => { vi.advanceTimersByTime(60); });
+    expect(container.querySelector('.debate-context-menu')).toBeTruthy();
+  });
+
+  it('does not show the menu after touchend with no selection (native scroll/tap)', () => {
+    vi.useFakeTimers();
+    mockSelection('');
+    const { container } = render(<DebateWorkspace />);
+    fireEvent.touchEnd(container.querySelector('.debate-scroll-content')!, {
+      changedTouches: [{ clientX: 50, clientY: 80 }],
+    });
+    act(() => { vi.advanceTimersByTime(60); });
+    expect(container.querySelector('.debate-context-menu')).toBeNull();
+  });
+
+  // t/4514: right-click "Explain…" routes through the same inline in-app panel the card's
+  // "Explain" button uses, via explainRequestBus — not clipboard+browser directly.
+  describe('"Explain…"', () => {
+    afterEach(() => { mockRequestExplainForSelection.mockClear(); (api.clipboardWriteText as any).mockClear(); (api.openExternal as any).mockClear(); });
+
+    it('when an inline panel is registered for the entry, routes through the bus and does not fall back to Gemini', () => {
+      mockRequestExplainForSelection.mockReturnValue(true);
+      mockSelection('hello world');
+      const { container } = render(<DebateWorkspace />);
+      fireEvent.contextMenu(container.querySelector('.debate-scroll-content')!);
+      fireEvent.click(screen.getByText('Explain…'));
+
+      expect(mockRequestExplainForSelection).toHaveBeenCalledWith('', 'hello world');
+      expect(api.clipboardWriteText).not.toHaveBeenCalled();
+      expect(api.openExternal).not.toHaveBeenCalled();
+      expect(container.querySelector('.debate-context-menu')).toBeNull(); // menu closes either way
+    });
+
+    it('falls back to the Gemini escape hatch when no inline panel is registered for the entry', () => {
+      mockRequestExplainForSelection.mockReturnValue(false);
+      mockSelection('hello world');
+      const { container } = render(<DebateWorkspace />);
+      fireEvent.contextMenu(container.querySelector('.debate-scroll-content')!);
+      fireEvent.click(screen.getByText('Explain…'));
+
+      expect(mockRequestExplainForSelection).toHaveBeenCalledWith('', 'hello world');
+      expect(api.clipboardWriteText).toHaveBeenCalledWith('EXPLAIN: hello world');
+      expect(api.openExternal).toHaveBeenCalledWith('https://gemini.google.com/app');
+    });
   });
 });
 

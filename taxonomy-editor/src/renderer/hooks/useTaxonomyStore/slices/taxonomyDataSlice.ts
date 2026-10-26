@@ -18,9 +18,19 @@ import type {
   ConflictNote,
   TextHistoryEntry,
   TextEditSource,
+  Interpretation,
 } from '../../../types/taxonomy';
 import { interpretationText } from '../../../types/taxonomy';
+import { buildPovTagBaseline, povTagMembership } from '../../../utils/povTagGate';
+import { buildSituationBaseline, checkSituationBdi, type SituationBdiRefusal } from '../../../utils/situationBdiGate';
 import { coerceSituationDivergence } from '../../../bridge/coerceSituationDivergence';
+import { baselineAfterSave, savedPolicyNodes, allPolicyNodes } from './saveBaselines';
+import { EMPTY_HELD, allNodesById, allPovNodeIds, povOfNode, refuseSupersededEdit, splitForState, withSupersededForSave, type HeldByPov } from '../superseded'; // t/4355
+import { cascadeRename } from './renameCascade';
+import { normalizeLoadedPovFile } from './loadNormalize'; // t/4439
+import { runReloadKeepingEdits, type ReloadReport } from './reloadKeepingEdits'; // t/4439
+import { assessValidationFailure, branchEventData, errorKeyNodeId, integrityFailureMessage, markFilesAsBaseline, readBranchContext, schemaFailureMessage, type StaleBranchHint } from './staleBranchHint'; // t/4325
+import { buildPolicyIdBaseline, affectedPolicyIds, runPolicyRecount, mergePolicyCounts, type PolicyRecountNotice } from '../../../utils/policyRecount';
 import {
   povTaxonomyFileSchema,
   crossCuttingFileSchema as situationsFileSchema,
@@ -28,7 +38,6 @@ import {
   extractPovErrors,
   extractConflictErrors,
   ValidationErrors,
-  stripInvalidLogicalForm,
 } from '../../../utils/validation';
 import {
   generatePovNodeId,
@@ -37,7 +46,6 @@ import {
   todayISO,
 } from '../../../utils/idGenerator';
 import { mapErrorToUserMessage } from '../../../utils/errorMessages';
-import { normalizeNodeProperties } from '@lib/debate';
 import { nodeTypeFromId, nodePovFromId } from '@lib/debate/nodeIdUtils';
 import { POV_KEYS } from '@lib/debate/types';
 import { validateTaxonomy } from '@lib/debate/validators';
@@ -45,15 +53,95 @@ import type { ValidationResult, ValidationIssue } from '@lib/debate/validators';
 import { validatePovNodeId } from '@lib/debate/validateNodeId';
 import type { AggregatedCrux as LibAggregatedCrux, CruxSource } from '@lib/debate/types/synthesis';
 import { api } from '@bridge';
+import { saveFailureRecord, saveErrorText } from './saveFailure';
 import { loadLineageCategoriesData } from '../../../data/lineageCategories';
 import { loadLineageInfoData } from '../../../data/lineageLookup';
 import { getGlobalRecorder } from '@lib/flight-recorder/index';
 import { trackNodeMutation } from '../../../lib/analyticsEmitter';
 
+/**
+ * t/3376: re-read the on-disk POV file immediately before a whole-file save and reattach any
+ * `logical_form` that's present on disk but missing in memory — the fix for the t/3375 root bug
+ * (a load-time strip via `stripInvalidLogicalForm`, t/3250, mutates the SAME object living in
+ * store state; a later whole-file save then persists that in-memory deletion back to disk).
+ *
+ * LOAD-BEARING ASSUMPTION: nothing in the renderer edits `logical_form` today (t/3378 confirmed
+ * the field is unconsumed by any UI) — reattaching an on-disk value is therefore always correct,
+ * never a silent revert of a real user edit. If an edit path is ever added, this reattach-on-save
+ * must be replaced by an explicit tombstone (e.g. a `logical_form: null` meaning "intentionally
+ * cleared") so a genuine deletion isn't reverted by this safety net.
+ *
+ * GENERALIZATION SEAM: this is the one choke point all whole-file POV saves pass through — any
+ * future strip-at-load field should reattach HERE, not by loosening the strip itself.
+ *
+ * TOCTOU RESIDUAL: protection is only as strong as this re-read. It reads on-disk state
+ * immediately before write but does not lock against a concurrent writer landing between the
+ * read and the write — whole-file save semantics (last-writer-wins) are otherwise unchanged.
+ */
+async function reattachStrippedLogicalForms(
+  pov: typeof POV_KEYS[number],
+  file: PovTaxonomyFile,
+): Promise<PovTaxonomyFile> {
+  let onDisk: PovTaxonomyFile | null;
+  try {
+    onDisk = await api.loadTaxonomyFile(pov) as PovTaxonomyFile | null;
+  } catch (err) {
+    // Fail-open-but-loud: a re-read failure must not abort the user's save (the whole-file
+    // write itself is unaffected — only the reattach safety net is skipped for this save).
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'taxonomy-store', level: 'warn',
+      message: `logical_form reattach-on-save: re-read of ${pov} failed — skipping reattach for this save (t/3376)`,
+      data: { pov },
+      error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+    });
+    return file;
+  }
+  if (!onDisk?.nodes?.length) {
+    // Fallback-path logging (docs/error-handling.md): a null/empty re-read is also silent
+    // fail-open without this — e.g. the web build's ADR-001 graceful-empty on a fetch miss.
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'taxonomy-store', level: 'warn',
+      message: `logical_form reattach-on-save: re-read of ${pov} returned null/empty — skipping reattach for this save (t/3376)`,
+      data: { pov },
+    });
+    return file;
+  }
+  const onDiskById = new Map(onDisk.nodes.map((n) => [(n as unknown as Record<string, unknown>).id, n]));
+  let reattachedCount = 0;
+  const nodes = file.nodes.map((node) => {
+    const rec = node as unknown as Record<string, unknown>;
+    if (rec.logical_form !== undefined) return node;
+    const diskRec = onDiskById.get(rec.id) as unknown as Record<string, unknown> | undefined;
+    if (diskRec?.logical_form === undefined) return node;
+    reattachedCount++;
+    return { ...node, logical_form: diskRec.logical_form } as PovNode;
+  });
+  if (reattachedCount === 0) return file;
+  getGlobalRecorder()?.record({
+    type: 'system.error',
+    component: 'taxonomy-store',
+    level: 'warn',
+    message: `Reattached ${reattachedCount} logical_form frame(s) stripped in memory before save (t/3376)`,
+    data: { pov, reattachedCount },
+  });
+  return { ...file, nodes };
+}
+
+/** A POV node referencing a policy via its own graph_attributes.policy_actions[] entry (t/3401) —
+ *  "framing" is a per-node field (how THAT node frames the policy), not on the registry entry. */
+export interface PolicyReferencingNode {
+  id: string;
+  label: string;
+  pov: Pov;
+  action?: string;
+  framing?: string;
+}
+
 export type PinnedData =
   | { type: 'pov'; pov: Pov; node: PovNode }
   | { type: 'situations'; node: SituationNode }
-  | { type: 'conflict'; conflict: ConflictFile };
+  | { type: 'conflict'; conflict: ConflictFile }
+  | { type: 'policy'; policy: PolicyRegistryEntry; referencingNodes: PolicyReferencingNode[] };
 
 export interface PolicyRegistryEntry {
   id: string;
@@ -90,11 +178,66 @@ export interface AggregatedCrux extends LibAggregatedCrux {
 
 // ── Slice interface ──
 
+/** Write-API patch for a situation (t/3888). The store holds `RawInterpretation` (flat legacy
+ *  nodes exist on disk), but the editor may only WRITE the strict BDI shape, so a string
+ *  interpretation is a compile error here. Interpretations merge per POV. */
+export type SituationNodeUpdate = Omit<Partial<SituationNode>, 'interpretations'> & {
+  interpretations?: Partial<Record<keyof SituationNode['interpretations'], Interpretation>>;
+};
+
+/** A blank per-POV interpretation in the required BDI shape (t/3888). */
+const emptyBdi = (): Interpretation => ({ belief: '', desire: '', intention: '', summary: '' });
+
+// t/3888 save-gate helpers. Kept at module scope so save() doesn't grow past its
+// complexity-budget baseline; the rule itself lives in lib (findSituationBdiViolations).
+const NO_BDI_REFUSAL: SituationBdiRefusal = { errors: {}, message: '' };
+
+function situationBdiOutcome(nodes: SituationNode[], baseline: Record<string, string>): SituationBdiRefusal {
+  return checkSituationBdi(nodes, baseline) ?? NO_BDI_REFUSAL;
+}
+
+/** What a cross-POV move did to the node's POV tags (t/3972), shown on the moved node. */
+export interface PovMoveReport {
+  fromId: string;
+  toId: string;
+  sourcePov: Pov;
+  targetPov: Pov;
+  strippedTags: string[];
+}
+
+/**
+ * POV tags are POV-scoped (t/3955 spec §2.1), so a tag carried into another POV is always invalid.
+ * Strip them on a cross-POV move and say so (t/3972; CL decision 3, TL t/3955#4 condition 3): the
+ * WARN is the Fallback-Path Logging record, and the returned list feeds the visible move report.
+ * A bare string is the PowerShell one-element unroll; it is reported as one tag, not dropped silently.
+ */
+function stripPovTagsForMove(node: PovNode, toId: string, sourcePov: Pov, targetPov: Pov): { node: PovNode; strippedTags: string[] } {
+  const { pov_tags: carried, ...rest } = node;
+  const strippedTags = Array.isArray(carried) ? carried.map(String) : carried == null ? [] : [String(carried)];
+  if (strippedTags.length > 0) {
+    getGlobalRecorder()?.record({
+      type: 'state.change', component: 'taxonomy-store', level: 'warn',
+      message: 'Cross-POV move stripped POV tags (they do not apply in the target POV)',
+      data: { from_id: node.id, to_id: toId, source_pov: sourcePov, target_pov: targetPov, stripped_tags: strippedTags },
+    });
+  }
+  return { node: rest as PovNode, strippedTags };
+}
+
 export interface TaxonomyDataSlice {
   accelerationist: PovTaxonomyFile | null;
   safetyist: PovTaxonomyFile | null;
   skeptic: PovTaxonomyFile | null;
   situations: SituationsFile | null;
+  /** t/3888: interpretations as last loaded/saved (id → key), so the save gate checks only
+   *  situations whose interpretations changed. See utils/situationBdiGate.ts. */
+  situationsBaseline: Record<string, string>;
+  /** t/3973: pov_tags as last loaded/saved (node id → fingerprint); gates registry membership per node. */
+  povTagsBaseline: Record<string, string>;
+  /** t/4355: superseded POV nodes held out of `<pov>.nodes` (with their file positions); see ../superseded.ts. */
+  supersededNodes: HeldByPov;
+  /** t/4034: each node's policy ids as last loaded/saved; decides which registry counts a save recounts. */
+  policyIdsBaseline: Record<string, string>;
   policyRegistry: PolicyRegistryEntry[] | null;
   conflicts: ConflictFile[];
   aggregatedCruxes: AggregatedCrux[] | null;
@@ -104,12 +247,18 @@ export interface TaxonomyDataSlice {
   dirty: Set<string>;
   validationErrors: ValidationErrors;
   saveError: string | null;
+  /** t/4325: set when the last save failed on untouched nodes while the session branch is behind main. */
+  staleBranchHint: StaleBranchHint | null;
   loadError: string | null;
   // t/2064: the post-save embedding refresh degraded (non-empty staleNodeIds, or the call
   // rejected). Surfaced as a coarse non-blocking banner — NOT a saveError, since the durable
   // file-save itself succeeded; only similarity/related-node results may be temporarily stale.
   embeddingsStale: boolean;
   staleEmbeddingNodeIds: string[];
+  /** t/3984: untouched nodes the last successful save carried with POV tags no longer in the registry. */
+  orphanedTagNodeIds: string[];
+  /** t/4034: the post-save registry recount could not update these policies' counts. */
+  policyRecountNotice: PolicyRecountNotice | null;
   integrityIssues: ValidationIssue[];
   fixIntegrityErrors: () => void;
   loading: boolean;
@@ -129,15 +278,22 @@ export interface TaxonomyDataSlice {
   loadAll: (force?: boolean) => Promise<void>;
   save: () => Promise<void>;
   dismissSaveError: () => void;
+  /** t/4439: re-read the branch and merge, keeping every unsaved edit (for the save-bar Resync). Never throws. */
+  reloadKeepingEdits: () => Promise<ReloadReport>;
   dismissEmbeddingsStale: () => void;
+  dismissOrphanedTagNotice: () => void;
+  dismissPolicyRecountNotice: () => void;
 
   updatePovNode: (pov: Pov, nodeId: string, updates: Partial<PovNode>, editSource?: { source: TextEditSource; debateId?: string; reason?: string }) => void;
   createPovNode: (pov: Pov, category: Category) => string;
   deletePovNode: (pov: Pov, nodeId: string) => void;
-  movePovNodeCategory: (pov: Pov, nodeId: string, newCategory: Category) => void;
+  movePovNodeCategory: (pov: Pov, nodeId: string, newCategory: Category) => string | null;
   movePovNode: (sourcePov: Pov, nodeId: string, targetPov: Pov, targetCategory: Category) => void;
+  /** t/3972: the last cross-POV move's tag report; NodeDetail shows it on the moved node. */
+  lastPovMoveReport: PovMoveReport | null;
+  clearPovMoveReport: () => void;
 
-  updateSituationNode: (nodeId: string, updates: Partial<SituationNode>) => void;
+  updateSituationNode: (nodeId: string, updates: SituationNodeUpdate) => void;
   createSituationNode: () => string;
   deleteSituationNode: (nodeId: string) => void;
 
@@ -185,18 +341,26 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
   safetyist: null,
   skeptic: null,
   situations: null,
+  situationsBaseline: {},
+  povTagsBaseline: {},
+  supersededNodes: EMPTY_HELD,
+  policyIdsBaseline: {},
   policyRegistry: null,
   conflicts: [],
   aggregatedCruxes: null,
 
   activeTab: 'accelerationist',
   selectedNodeId: null,
+  lastPovMoveReport: null,
   dirty: new Set(),
   validationErrors: {},
   saveError: null,
+  staleBranchHint: null,
   loadError: null,
   embeddingsStale: false,
   staleEmbeddingNodeIds: [],
+  orphanedTagNodeIds: [],
+  policyRecountNotice: null,
   integrityIssues: [],
   loading: false,
   backgroundLoading: false,
@@ -255,30 +419,27 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
       });
 
     try {
-      const acc = await track(steps[0], api.loadTaxonomyFile('accelerationist'));
-      const accFile = acc as PovTaxonomyFile;
-      if (accFile?.nodes) {
-        for (const node of accFile.nodes) {
-          const rec = node as unknown as Record<string, unknown>;
-          normalizeNodeProperties(rec);
-          // t/3250: graceful-degrade a malformed proposed logical_form (WARN + omit, never drop the node).
-          const lf = stripInvalidLogicalForm(rec);
-          if (lf.removed) getGlobalRecorder()?.record({ type: 'system.error', component: 'taxonomy-store', level: 'warn', message: 'Stripped malformed node.logical_form (t/3250)', data: { pov: 'accelerationist', node_id: rec.id, issue: lf.issue } });
-        }
-      }
+      // t/4187: an editor load — sets the bridge's version cell so save() can carry If-Match.
+      // The pre-save re-read in reattachStrippedLogicalForms below must stay on plain
+      // loadTaxonomyFile (never touch the cell) or the precondition would always pass.
+      const acc = await track(steps[0], api.loadTaxonomyFileForEdit('accelerationist'));
+      const accFile = normalizeLoadedPovFile(acc as PovTaxonomyFile, 'accelerationist') as PovTaxonomyFile;
       set({
-        accelerationist: accFile,
+        ...splitForState(get(), { accelerationist: accFile }), // t/4355: superseded nodes held out of selection
+        povTagsBaseline: buildPovTagBaseline((accFile as PovTaxonomyFile | null)?.nodes ?? []),
+        policyIdsBaseline: buildPolicyIdBaseline((accFile as PovTaxonomyFile | null)?.nodes ?? []),
         loading: false,
         backgroundLoading: true,
         dirty: new Set(),
         embeddingCache: new Map(),
         embeddingDirty: true,
       });
+      markFilesAsBaseline([accFile]);
 
       const [saf, skp, cc, polReg] = await Promise.all([
-        track(steps[1], api.loadTaxonomyFile('safetyist')),
-        track(steps[2], api.loadTaxonomyFile('skeptic')),
-        track(steps[3], api.loadTaxonomyFile('situations')),
+        track(steps[1], api.loadTaxonomyFileForEdit('safetyist')),
+        track(steps[2], api.loadTaxonomyFileForEdit('skeptic')),
+        track(steps[3], api.loadTaxonomyFileForEdit('situations')),
         track(steps[4], api.loadPolicyRegistry()),
       ]);
       // Defer conflict file load — on cold starts this triggers 1,242 individual
@@ -306,25 +467,19 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
       void loadLineageCategoriesData();
       void loadLineageInfoData();
       const regData = polReg as { policies: PolicyRegistryEntry[] } | null;
-      for (const povFile of [saf, skp] as PovTaxonomyFile[]) {
-        if (povFile?.nodes) {
-          for (const node of povFile.nodes) {
-            const rec = node as unknown as Record<string, unknown>;
-            normalizeNodeProperties(rec);
-            // t/3250: graceful-degrade a malformed proposed logical_form (WARN + omit, never drop the node).
-            const lf = stripInvalidLogicalForm(rec);
-            if (lf.removed) getGlobalRecorder()?.record({ type: 'system.error', component: 'taxonomy-store', level: 'warn', message: 'Stripped malformed node.logical_form (t/3250)', data: { pov: povFile.pov, node_id: rec.id, issue: lf.issue } });
-          }
-        }
-      }
+      for (const povFile of [saf, skp] as PovTaxonomyFile[]) normalizeLoadedPovFile(povFile, povFile?.pov);
+      const situationsFile = coerceSituationDivergence(cc) as SituationsFile; // t/3002: guard interpretation_divergence type at load
       set({
-        safetyist: saf as PovTaxonomyFile,
-        skeptic: skp as PovTaxonomyFile,
-        situations: coerceSituationDivergence(cc) as SituationsFile, // t/3002: guard interpretation_divergence type at load
+        ...splitForState(get(), { safetyist: saf as PovTaxonomyFile, skeptic: skp as PovTaxonomyFile }),
+        situations: situationsFile,
+        situationsBaseline: buildSituationBaseline(situationsFile?.nodes ?? []),
+        povTagsBaseline: { ...get().povTagsBaseline, ...buildPovTagBaseline([...((saf as PovTaxonomyFile | null)?.nodes ?? []), ...((skp as PovTaxonomyFile | null)?.nodes ?? [])]) },
+        policyIdsBaseline: { ...get().policyIdsBaseline, ...buildPolicyIdBaseline([...((saf as PovTaxonomyFile | null)?.nodes ?? []), ...((skp as PovTaxonomyFile | null)?.nodes ?? []), ...(situationsFile?.nodes ?? [])]) },
         policyRegistry: regData?.policies ?? null,
         backgroundLoading: false,
         embeddingDirty: true,
       });
+      markFilesAsBaseline([saf as PovTaxonomyFile, skp as PovTaxonomyFile, situationsFile]);
     } catch (err) {
       getGlobalRecorder()?.record({ type: 'system.error', component: 'taxonomy-store', level: 'error', message: 'Failed to load taxonomy data', error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } });
       const msg = mapErrorToUserMessage(err);
@@ -332,8 +487,11 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
     }
   },
 
-  dismissSaveError: () => set({ saveError: null, integrityIssues: [] }),
+  dismissSaveError: () => set({ saveError: null, staleBranchHint: null, integrityIssues: [] }),
+  reloadKeepingEdits: () => runReloadKeepingEdits(get, set),
   dismissEmbeddingsStale: () => set({ embeddingsStale: false, staleEmbeddingNodeIds: [] }),
+  dismissOrphanedTagNotice: () => set({ orphanedTagNodeIds: [] }),
+  dismissPolicyRecountNotice: () => set({ policyRecountNotice: null }),
 
   fixIntegrityErrors: () => {
     const state = get();
@@ -344,12 +502,9 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
     const povKeys = ['accelerationist', 'safetyist', 'skeptic'] as const;
 
     // Valid edge endpoints / reference targets = all POV nodes + all situation nodes
-    // (mirrors checkReferentialIntegrity's allIds set in validators.ts).
-    const validNodeIds = new Set<string>();
-    for (const p of povKeys) {
-      const f = state[p] as PovTaxonomyFile | null;
-      if (f) for (const n of f.nodes) validNodeIds.add(n.id);
-    }
+    // (mirrors checkReferentialIntegrity's allIds set in validators.ts). t/4355: superseded nodes still
+    // exist, so an edge or reference to one is not dangling and must not be removed.
+    const validNodeIds = allPovNodeIds(state);
     const sitIds = new Set(state.situations?.nodes.map(n => n.id) ?? []);
     for (const id of sitIds) validNodeIds.add(id);
 
@@ -400,13 +555,15 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
   },
 
   save: async () => {
-    const state = get();
+    const state = withSupersededForSave(get()); // t/4355: validate and write each POV file whole, superseded nodes in place
     const errors: ValidationErrors = {};
     const dirtyKeys = state.dirty;
     const saveStart = performance.now();
 
     getGlobalRecorder()?.record({ type: 'state.change', component: 'taxonomy-store', level: 'info', message: 'save.called', data: { dirty: [...dirtyKeys] } });
     if (dirtyKeys.size === 0) return;
+    const orphanedTagNodeIds: string[] = []; // t/3984
+    let bdi = NO_BDI_REFUSAL; // t/3888 — set in the situations branch below
 
     for (const key of dirtyKeys) {
       if ((POV_KEYS as readonly string[]).includes(key)) {
@@ -416,6 +573,9 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
         if (!result.success) {
           Object.assign(errors, extractPovErrors(result.error, file.nodes));
         }
+        const membership = povTagMembership(file.nodes, state.povTagsBaseline);
+        Object.assign(errors, membership.errors);
+        orphanedTagNodeIds.push(...membership.orphanedNodeIds); // t/3984: shown after a successful save
       } else if (key === 'situations') {
         const file = state.situations;
         if (!file) continue;
@@ -423,6 +583,11 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
         if (!result.success) {
           Object.assign(errors, extractPovErrors(result.error, file.nodes));
         }
+        // t/3888: BDI gate on situations whose interpretations changed since load/save. The
+        // structural Zod check above stays permissive on purpose (SO e/244#2 Finding 1): flat
+        // legacy nodes exist on disk, so whole-file strictness would block every save.
+        bdi = situationBdiOutcome(file.nodes, state.situationsBaseline);
+        Object.assign(errors, bdi.errors);
       } else if (key.startsWith('conflict-')) {
         const conflict = state.conflicts.find(c => c.claim_id === key);
         if (!conflict) continue;
@@ -434,8 +599,9 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
     }
 
     if (Object.keys(errors).length > 0) {
-      getGlobalRecorder()?.record({ type: 'state.error', component: 'taxonomy-store', level: 'error', message: 'save.validation', data: { stage: 'schema', error_count: Object.keys(errors).length, errors, duration_ms: Math.round(performance.now() - saveStart) } });
-      set({ validationErrors: errors, saveError: 'Validation failed. Fix errors before saving.' });
+      const v = await assessValidationFailure(Object.keys(errors).map(errorKeyNodeId), [state.accelerationist, state.safetyist, state.skeptic, state.situations]);
+      getGlobalRecorder()?.record({ type: 'state.error', component: 'taxonomy-store', level: 'error', message: 'save.validation', data: { stage: 'schema', error_count: Object.keys(errors).length, situation_bdi_error_count: Object.keys(bdi.errors).length, errors, ...branchEventData(v), duration_ms: Math.round(performance.now() - saveStart) } });
+      set({ validationErrors: errors, staleBranchHint: v.hint, saveError: schemaFailureMessage(v, bdi, Object.keys(errors).length) });
       return;
     }
 
@@ -467,21 +633,24 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
           }
         }
         const errorSummary = lines.join('\n');
-        getGlobalRecorder()?.record({ type: 'state.error', component: 'taxonomy-store', level: 'error', message: 'save.validation', data: { stage: 'integrity', error_count: integrityErrors.length, entities: integrityErrors.slice(0, 10).map(i => `${i.code}: ${i.entityId}`), duration_ms: Math.round(performance.now() - saveStart) } });
+        const v = await assessValidationFailure(integrityErrors.map(i => i.entityId), [state.accelerationist, state.safetyist, state.skeptic, state.situations]);
+        getGlobalRecorder()?.record({ type: 'state.error', component: 'taxonomy-store', level: 'error', message: 'save.validation', data: { stage: 'integrity', error_count: integrityErrors.length, entities: integrityErrors.slice(0, 10).map(i => `${i.code}: ${i.entityId}`), ...branchEventData(v), duration_ms: Math.round(performance.now() - saveStart) } });
         set({
           validationErrors: errors,
           integrityIssues: integrityErrors,
-          saveError: `Integrity check failed (${integrityErrors.length} error${integrityErrors.length > 1 ? 's' : ''}):\n${errorSummary}`,
+          staleBranchHint: v.hint,
+          saveError: integrityFailureMessage(v, `Integrity check failed (${integrityErrors.length} error${integrityErrors.length > 1 ? 's' : ''}):\n${errorSummary}`),
         });
         return;
       }
       const integrityWarnings = integrity.issues.filter(i => i.severity === 'warning');
       if (integrityWarnings.length > 0) {
-        getGlobalRecorder()?.record({ type: 'state.change', component: 'taxonomy-store', level: 'warn', message: 'save.validation', data: { stage: 'integrity', warning_count: integrityWarnings.length, entities: integrityWarnings.slice(0, 10).map(i => `${i.code}: ${i.entityId}`) } });
+        // t/4325: the save proceeds, so the branch context is attached when it arrives rather than awaited.
+        void readBranchContext().then(ctx => getGlobalRecorder()?.record({ type: 'state.change', component: 'taxonomy-store', level: 'warn', message: 'save.validation', data: { stage: 'integrity', warning_count: integrityWarnings.length, entities: integrityWarnings.slice(0, 10).map(i => `${i.code}: ${i.entityId}`), ...ctx } }));
       }
     }
 
-    set({ saveError: null, validationErrors: {} });
+    set({ saveError: null, staleBranchHint: null, validationErrors: {} });
 
     try {
       const promises: Promise<void>[] = [];
@@ -490,7 +659,10 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
         if ((POV_KEYS as readonly string[]).includes(key)) {
           const file = state[key as typeof POV_KEYS[number]];
           if (file) {
-            promises.push(api.saveTaxonomyFile(key as typeof POV_KEYS[number], file));
+            const povKey = key as typeof POV_KEYS[number];
+            promises.push(
+              reattachStrippedLogicalForms(povKey, file).then((f) => api.saveTaxonomyFile(povKey, f)),
+            );
           }
         } else if (key === 'situations') {
           const file = state.situations;
@@ -516,6 +688,8 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
       }
 
       await Promise.all(promises);
+      // t/4034: recount the registry for policy ids this save changed, BEFORE the commit so it lands with the edit.
+      const policyRecount = await runPolicyRecount(affectedPolicyIds(savedPolicyNodes(dirtyKeys, state), allPolicyNodes(state), state.policyIdsBaseline), api.recountPolicyMembers, { leavesRegistryUncommitted: import.meta.env.VITE_TARGET !== 'web' });
 
       const commitResult = await api.syncCommit();
       // save.completed = file write + git commit done — the durable save point (`dirty` is
@@ -525,7 +699,9 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
       // BEFORE this event — never after it. (t/1710; the non-fatal boundary is t/1707.)
       getGlobalRecorder()?.record({ type: 'state.change', component: 'taxonomy-store', level: 'info', message: 'save.completed', data: { files_written: promises.length, duration_ms: Math.round(performance.now() - saveStart), commitSha: commitResult.commitSha, filesCommitted: commitResult.filesCommitted } });
       api.trackEvent('taxonomy_save', 'taxonomy', { files: promises.length });
-      set({ dirty: new Set() });
+      // t/3888: the saved snapshot is now what's on disk, so it becomes the gate's baseline.
+      markFilesAsBaseline([state.accelerationist, state.safetyist, state.skeptic, state.situations]); // t/4325: the saved nodes are the new baseline
+      set({ dirty: new Set(), orphanedTagNodeIds, ...baselineAfterSave(dirtyKeys, state), policyRegistry: mergePolicyCounts(get().policyRegistry, policyRecount.updates), policyRecountNotice: policyRecount.notice });
 
       // Post-save embedding refresh — NON-FATAL, own boundary (t/1707).
       // The file write, commit, and `dirty` clear above have already succeeded. A throw
@@ -592,12 +768,13 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
         console.warn('[save] Post-save embedding refresh failed (save itself succeeded):', embedErr);
       }
     } catch (err) {
-      getGlobalRecorder()?.record({ type: 'state.error', component: 'taxonomy-store', level: 'error', message: 'save.failed', data: { error: String(err), duration_ms: Math.round(performance.now() - saveStart) }, error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } });
-      set({ saveError: `Save failed: ${mapErrorToUserMessage(err)}` });
+      getGlobalRecorder()?.record(saveFailureRecord(err, saveStart));
+      set({ saveError: saveErrorText(err) });
     }
   },
 
   updatePovNode: (pov, nodeId, updates, editSource) => {
+    if (refuseSupersededEdit(get(), nodeId, 'updatePovNode')) return; // t/4355: superseded nodes are read-only
     getGlobalRecorder()?.record({ type: 'state.change', component: 'taxonomy-store', level: 'debug', message: 'updatePovNode.called', data: { pov, nodeId, fields: Object.keys(updates), editSource: editSource?.source ?? 'manual' } });
     trackNodeMutation('edit', pov, nodeId);
     if (updates.category) {
@@ -644,8 +821,7 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
       getGlobalRecorder()?.record({ type: 'state.error', component: 'taxonomy-store', level: 'warn', message: 'createPovNode: POV file not loaded', data: { pov, category } });
       return '';
     }
-    const existingIds = file.nodes.map(n => n.id);
-    const newId = generatePovNodeId(pov, category, existingIds);
+    const newId = generatePovNodeId(pov, category, [...allPovNodeIds(state)]); // t/4355: never reuse a superseded id
     const validation = validatePovNodeId(newId, category);
     if (!validation.valid) {
       console.error(`[taxonomy-store] createPovNode rejected: ${validation.error}`);
@@ -674,6 +850,7 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
   },
 
   deletePovNode: (pov, nodeId) => {
+    if (refuseSupersededEdit(get(), nodeId, 'deletePovNode')) return; // t/4355: superseded nodes are read-only
     trackNodeMutation('delete', pov, nodeId);
     set((state) => {
       const file = state[pov];
@@ -696,6 +873,8 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
   },
 
   movePovNodeCategory: (pov, nodeId, newCategory) => {
+    let resultId: string | null = null;
+    if (refuseSupersededEdit(get(), nodeId, 'movePovNodeCategory')) return null; // t/4355: cited ids never rename
     set((state) => {
       const file = state[pov];
       if (!file) return state;
@@ -703,13 +882,13 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
       if (!oldNode) return state;
 
       const oldId = oldNode.id;
-      const existingIds = file.nodes.map(n => n.id);
-      const newId = generatePovNodeId(pov, newCategory, existingIds);
+      const newId = generatePovNodeId(pov, newCategory, [...allPovNodeIds(state)]); // t/4355: never reuse a superseded id
       const validation = validatePovNodeId(newId, newCategory);
       if (!validation.valid) {
         console.error(`[taxonomy-store] movePovNodeCategory rejected: ${validation.error}`);
         return state;
       }
+      resultId = newId;
 
       const newNode: PovNode = {
         ...oldNode,
@@ -741,50 +920,20 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
 
       const newDirty = new Set(state.dirty);
       newDirty.add(pov);
-
-      let newSituations = state.situations;
-      if (newSituations) {
-        let ccChanged = false;
-        const ccNodes = newSituations.nodes.map(n => {
-          if ((n.linked_nodes ?? []).includes(oldId)) {
-            ccChanged = true;
-            return { ...n, linked_nodes: (n.linked_nodes ?? []).map(replaceId) };
-          }
-          return n;
-        });
-        if (ccChanged) {
-          newSituations = { ...newSituations, last_modified: todayISO(), nodes: ccNodes };
-          newDirty.add('situations');
-        }
-      }
-
-      let newConflicts = state.conflicts;
-      let conflictsChanged = false;
-      newConflicts = newConflicts.map(c => {
-        if ((c.linked_taxonomy_nodes ?? []).includes(oldId)) {
-          conflictsChanged = true;
-          newDirty.add(c.claim_id);
-          return { ...c, linked_taxonomy_nodes: (c.linked_taxonomy_nodes ?? []).map(replaceId) };
-        }
-        return c;
-      });
-
-      return {
-        [pov]: newFile,
-        situations: newSituations,
-        conflicts: conflictsChanged ? newConflicts : state.conflicts,
-        dirty: newDirty,
-        selectedNodeId: newId,
-        embeddingDirty: true,
-      };
+      // t/4355: situations, conflicts, edges and held superseded nodes (renameCascade.ts).
+      return { [pov]: newFile, ...cascadeRename(state, oldId, newId, newDirty), dirty: newDirty, selectedNodeId: newId, embeddingDirty: true };
     });
+    return resultId;
   },
+
+  clearPovMoveReport: () => set({ lastPovMoveReport: null }),
 
   movePovNode: (sourcePov, nodeId, targetPov, targetCategory) => {
     if (sourcePov === targetPov) {
       get().movePovNodeCategory(sourcePov, nodeId, targetCategory);
       return;
     }
+    if (refuseSupersededEdit(get(), nodeId, 'movePovNode')) return; // t/4355: cited ids never move
 
     set((state) => {
       const sourceFile = state[sourcePov];
@@ -795,21 +944,22 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
       if (!oldNode) return state;
 
       const oldId = oldNode.id;
-      const targetExistingIds = targetFile.nodes.map(n => n.id);
-      const newId = generatePovNodeId(targetPov, targetCategory, targetExistingIds);
+      const newId = generatePovNodeId(targetPov, targetCategory, [...allPovNodeIds(state)]); // t/4355: never reuse a superseded id
       const validation = validatePovNodeId(newId, targetCategory);
       if (!validation.valid) {
         console.error(`[taxonomy-store] movePovNode rejected: ${validation.error}`);
         return state;
       }
 
+      const { node: untagged, strippedTags } = stripPovTagsForMove(oldNode, newId, sourcePov, targetPov);
       const newNode: PovNode = {
-        ...oldNode,
+        ...untagged,
         id: newId,
         category: targetCategory,
         parent_id: null,
         children: [],
       };
+      const lastPovMoveReport: PovMoveReport = { fromId: oldId, toId: newId, sourcePov, targetPov, strippedTags };
 
       const newSourceNodes = sourceFile.nodes
         .filter(n => n.id !== oldId)
@@ -821,66 +971,15 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
 
       const newTargetNodes = [...targetFile.nodes, newNode];
 
-      const replaceId = (id: string) => (id === oldId ? newId : id);
       const newDirty = new Set(state.dirty);
       newDirty.add(sourcePov);
       newDirty.add(targetPov);
 
-      let newSituations = state.situations;
-      if (newSituations) {
-        let ccChanged = false;
-        const ccNodes = newSituations.nodes.map(n => {
-          if ((n.linked_nodes ?? []).includes(oldId)) {
-            ccChanged = true;
-            return { ...n, linked_nodes: (n.linked_nodes ?? []).map(replaceId) };
-          }
-          return n;
-        });
-        if (ccChanged) {
-          newSituations = { ...newSituations, last_modified: todayISO(), nodes: ccNodes };
-          newDirty.add('situations');
-        }
-      }
-
-      let newConflicts = state.conflicts;
-      let conflictsChanged = false;
-      newConflicts = newConflicts.map(c => {
-        if ((c.linked_taxonomy_nodes ?? []).includes(oldId)) {
-          conflictsChanged = true;
-          newDirty.add(c.claim_id);
-          return { ...c, linked_taxonomy_nodes: (c.linked_taxonomy_nodes ?? []).map(replaceId) };
-        }
-        return c;
-      });
-
-      let newEdgesFile = state.edgesFile;
-      if (newEdgesFile) {
-        let edgesChanged = false;
-        const newEdges = newEdgesFile.edges.map(e => {
-          const srcMatch = e.source === oldId;
-          const tgtMatch = e.target === oldId;
-          if (srcMatch || tgtMatch) {
-            edgesChanged = true;
-            return {
-              ...e,
-              source: srcMatch ? newId : e.source,
-              target: tgtMatch ? newId : e.target,
-            };
-          }
-          return e;
-        });
-        if (edgesChanged) {
-          newEdgesFile = { ...newEdgesFile, edges: newEdges };
-          newDirty.add('edges');
-        }
-      }
-
       return {
+        lastPovMoveReport,
         [sourcePov]: { ...sourceFile, last_modified: todayISO(), nodes: newSourceNodes },
         [targetPov]: { ...targetFile, last_modified: todayISO(), nodes: newTargetNodes },
-        situations: newSituations,
-        conflicts: conflictsChanged ? newConflicts : state.conflicts,
-        edgesFile: newEdgesFile,
+        ...cascadeRename(state, oldId, newId, newDirty), // t/4355: situations, conflicts, edges, held superseded nodes
         dirty: newDirty,
         selectedNodeId: newId,
         embeddingDirty: true,
@@ -892,9 +991,14 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
     set((state) => {
       const file = state.situations;
       if (!file) return state;
+      const { interpretations: interpPatch, ...rest } = updates;
       const newNodes = file.nodes.map(n => {
         if (n.id !== nodeId) return n;
-        const patched = { ...n, ...updates };
+        // t/3888: interpretations merge per POV; untouched POVs keep their stored (Raw) value.
+        const patched: SituationNode = {
+          ...n, ...rest,
+          ...(interpPatch ? { interpretations: { ...n.interpretations, ...interpPatch } } : {}),
+        };
         if ('description' in updates && updates.description !== n.description) {
           patched.plain_description = null;
         }
@@ -921,7 +1025,9 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
       id: newId,
       label: '',
       description: '',
-      interpretations: { accelerationist: '', safetyist: '', skeptic: '' },
+      // t/3888: mint the BDI shape so the editor opens its four-field BDI editor. Typed strict:
+      // a string here is a compile error. The save gate refuses it until B/D/I are filled.
+      interpretations: { accelerationist: emptyBdi(), safetyist: emptyBdi(), skeptic: emptyBdi() },
       linked_nodes: [],
       conflict_ids: [],
     };
@@ -1127,14 +1233,7 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
       const conflict = state.conflicts.find(c => c.claim_id === id);
       return conflict?.claim_label || '';
     }
-    for (const pov of POV_KEYS) {
-      const file = state[pov];
-      if (file) {
-        const node = file.nodes.find(n => n.id === id);
-        if (node) return node.label;
-      }
-    }
-    return '';
+    return allNodesById(state).get(id)?.label ?? ''; // t/4355: the exact node, superseded included (cited ids)
   },
 
   getDescriptionForId: (id: string) => {
@@ -1147,14 +1246,7 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
       const node = state.situations?.nodes.find(n => n.id === id);
       return node?.description || '';
     }
-    for (const pov of POV_KEYS) {
-      const file = state[pov];
-      if (file) {
-        const node = file.nodes.find(n => n.id === id);
-        if (node) return node.description;
-      }
-    }
-    return '';
+    return allNodesById(state).get(id)?.description ?? ''; // t/4355: exact node, superseded included
   },
 
   lookupPinnedData: (id: string): PinnedData | null => {
@@ -1169,14 +1261,27 @@ export const createTaxonomyDataSlice: StateCreator<TaxonomyStore, [], [], Taxono
       if (conflict) return { type: 'conflict', conflict: structuredClone(conflict) };
       return null;
     }
-    for (const pov of POV_KEYS) {
-      const file = state[pov];
-      if (file) {
-        const node = file.nodes.find(n => n.id === id);
-        if (node) return { type: 'pov', pov, node: structuredClone(node) };
+    // t/3401: pol-* ids live in policy_actions.json (policyRegistry), not the Perspective files —
+    // the popup previously fell through every branch to "Node not found." Reuses the already-loaded
+    // registry (same source getLabelForId/getDescriptionForId already dispatch on, above).
+    if (id.startsWith('pol-')) {
+      const policy = state.policyRegistry?.find(p => p.id === id);
+      if (!policy) return null;
+      const referencingNodes: PolicyReferencingNode[] = [];
+      for (const pov of POV_KEYS) {
+        const file = state[pov];
+        if (!file?.nodes) continue;
+        for (const n of file.nodes) {
+          const match = n.graph_attributes?.policy_actions?.find(p => p.policy_id === id);
+          if (match) referencingNodes.push({ id: n.id, label: n.label, pov, action: match.action, framing: match.framing });
+        }
       }
+      return { type: 'policy', policy: structuredClone(policy), referencingNodes: structuredClone(referencingNodes) };
     }
-    return null;
+    // t/4355: a pinned id may be cited history, so look it up over the exact-node index (superseded included).
+    const node = allNodesById(state).get(id);
+    const pov = povOfNode(state, id);
+    return node && pov ? { type: 'pov', pov, node: structuredClone(node) } : null;
   },
 
   edgesFile: null,

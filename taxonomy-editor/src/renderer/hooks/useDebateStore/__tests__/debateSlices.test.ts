@@ -15,6 +15,25 @@ import { useDebateStore } from '../../useDebateStore';
 // atomic edges `setState` (node + edges persisted together, t/1773 AC2).
 import { useTaxonomyStore } from '../../useTaxonomyStore';
 import { executeTurnWithRetry, runModeratorSelection } from '@lib/debate/orchestration';
+// t/3392: computeStructuralScore is mocked wholesale in storeTestHarness.ts (fixed canned
+// output — unrelated tests don't exercise real scoring math), so the correct test boundary is
+// the CALL ARGUMENTS it receives, not its output: assert the exclusion filter changed what's
+// passed in, not what the canned mock returns.
+import { computeStructuralScore } from '@lib/debate/topicCritique';
+
+// t/3392: mocked here (not in the shared harness) — only this file's greatest-hits-exclusion
+// tests need it. vi.mock is file-scoped and hoisted regardless of placement.
+const { mockGetGreatestHits } = vi.hoisted(() => ({ mockGetGreatestHits: vi.fn().mockResolvedValue(undefined) }));
+vi.mock('../shared/getGreatestHits', () => ({ getGreatestHits: mockGetGreatestHits }));
+
+// t/3637: only this file's createSituationDebate topic-synthesis tests need to assert on
+// the fallback WARN — not mocked in the shared harness (unmocked elsewhere is a silent no-op,
+// getGlobalRecorder() returns null with nothing registered). setEventContext is stubbed too —
+// createDebate calls it unconditionally and every other test in this file exercises that path.
+const { mockRecordWarn } = vi.hoisted(() => ({ mockRecordWarn: vi.fn() }));
+vi.mock('@lib/flight-recorder/index', () => ({
+  getGlobalRecorder: () => ({ record: mockRecordWarn, setEventContext: vi.fn() }),
+}));
 
 // ── 15. loadSessions ────────────────────────────────────────
 
@@ -162,6 +181,183 @@ describe('createSituationDebate', () => {
     await expect(
       useDebateStore.getState().createSituationDebate('cc-nonexistent'),
     ).rejects.toThrow('not found');
+  });
+
+  // t/3783: config must be threaded into createDebate's options at creation time, not
+  // patched onto the session afterward — a post-creation mutation races the opening
+  // pipeline's own `set({ activeDebate: { ...fresh } })` calls and gets silently discarded.
+  // Asserts the shape actually stored on activeDebate, not just that the call succeeded.
+  it('threads pacing/useAdaptiveStaging into createDebate at creation, producing the real adaptive_staging object shape', async () => {
+    mockTaxonomyState.situations = {
+      nodes: [{
+        id: 'sit-003',
+        label: 'Test Situation',
+        description: 'A test situation',
+        interpretations: {
+          accelerationist: { text: 'acc view' },
+          safetyist: { text: 'saf view' },
+          skeptic: { text: 'skp view' },
+        },
+        linked_nodes: [],
+        conflict_ids: [],
+      }],
+    } as unknown as typeof mockTaxonomyState.situations;
+
+    await useDebateStore.getState().createSituationDebate('sit-003', { useAdaptiveStaging: true, pacing: 'tight' });
+
+    const adaptive = useDebateStore.getState().activeDebate?.adaptive_staging;
+    expect(adaptive).toEqual(expect.objectContaining({ enabled: true, pacing: 'tight' }));
+  });
+
+  // t/3929 (t/3882, PI: mirror the normal path): phaseBoundsOverride reaches the session's
+  // adaptive config exactly as createDebate stores it for a normal debate.
+  it('passes phaseBoundsOverride through to adaptive_staging.phase_bounds_override', async () => {
+    mockTaxonomyState.situations = {
+      nodes: [{
+        id: 'sit-004',
+        label: 'Bounds Situation',
+        description: 'A test situation',
+        interpretations: {
+          accelerationist: { text: 'acc view' },
+          safetyist: { text: 'saf view' },
+          skeptic: { text: 'skp view' },
+        },
+        linked_nodes: [],
+        conflict_ids: [],
+      }],
+    } as unknown as typeof mockTaxonomyState.situations;
+    const bounds = { maxConfrontationRounds: 1, maxArgumentationRounds: 3, maxConcludingRounds: 1 };
+
+    await useDebateStore.getState().createSituationDebate('sit-004', { useAdaptiveStaging: true, pacing: 'moderate', phaseBoundsOverride: bounds });
+
+    expect(useDebateStore.getState().activeDebate?.adaptive_staging?.phase_bounds_override).toEqual(bounds);
+  });
+
+  it('control: without phaseBoundsOverride, none is stored (unchanged behaviour)', async () => {
+    mockTaxonomyState.situations = {
+      nodes: [{
+        id: 'sit-005',
+        label: 'No Bounds Situation',
+        description: 'A test situation',
+        interpretations: {
+          accelerationist: { text: 'acc view' },
+          safetyist: { text: 'saf view' },
+          skeptic: { text: 'skp view' },
+        },
+        linked_nodes: [],
+        conflict_ids: [],
+      }],
+    } as unknown as typeof mockTaxonomyState.situations;
+
+    await useDebateStore.getState().createSituationDebate('sit-005', { useAdaptiveStaging: true, pacing: 'moderate' });
+
+    expect(useDebateStore.getState().activeDebate?.adaptive_staging?.phase_bounds_override).toBeUndefined();
+  });
+
+  // t/3958 (p/521#34, Rosetta Stone): an untagged createDebate must leave `seat_tags` ABSENT,
+  // not `{}` — t/3975's seatSouls derives "this seat is tagged" from key presence in the map,
+  // so a stray empty object would read as every seat tagged.
+  it('control: without seatTags, seat_tags is absent on the session (not {})', async () => {
+    await useDebateStore.getState().createDebate('Topic', ['accelerationist', 'safetyist'], false);
+
+    expect(useDebateStore.getState().activeDebate).not.toHaveProperty('seat_tags');
+  });
+
+  it('threads seatTags into createDebate at creation, producing the real seat_tags map', async () => {
+    const seatTags = { accelerationist: { pov_tag: 'critical', tag_mode: 'scope' as const } };
+
+    await useDebateStore.getState().createDebate('Topic', ['accelerationist', 'safetyist'], false, 'topic', '', '', undefined, undefined, undefined, undefined, { seatTags });
+
+    expect(useDebateStore.getState().activeDebate?.seat_tags).toEqual(seatTags);
+  });
+
+  // t/3629: createSituationDebate always creates with user_is_pover=false (watch-only), so
+  // it must reach opening directly rather than parking in clarification. Asserts the
+  // TERMINAL phase, not that a function was called (a stalled flow could still "call"
+  // beginDebate and hang).
+  it('reaches opening directly for a watch-only situation debate (t/3629)', async () => {
+    mockTaxonomyState.situations = {
+      nodes: [{
+        id: 'sit-001',
+        label: 'Test Situation',
+        description: 'A test situation',
+        interpretations: {
+          accelerationist: { text: 'acc view' },
+          safetyist: { text: 'saf view' },
+          skeptic: { text: 'skp view' },
+        },
+        linked_nodes: [],
+        conflict_ids: [],
+      }],
+    } as unknown as typeof mockTaxonomyState.situations;
+
+    const id = await useDebateStore.getState().createSituationDebate('sit-001');
+
+    expect(id).toBeTruthy();
+    const state = useDebateStore.getState();
+    expect(state.activeDebate).not.toBeNull();
+    expect(state.activeDebate!.phase).toBe('opening');
+  });
+
+  // t/3637: synthesize a contestable proposition as the topic; keep the label as the title.
+  const sitNode = {
+    id: 'sit-002',
+    label: 'Test Situation',
+    description: 'A test situation',
+    interpretations: {
+      accelerationist: { text: 'acc view' },
+      safetyist: { text: 'saf view' },
+      skeptic: { text: 'skp view' },
+    },
+    linked_nodes: [],
+    conflict_ids: [],
+  };
+
+  it('uses the synthesized proposition as the topic, label as the title (t/3637)', async () => {
+    mockTaxonomyState.situations = { nodes: [sitNode] } as unknown as typeof mockTaxonomyState.situations;
+    mockApi.generateText.mockResolvedValueOnce({ text: JSON.stringify({ proposition: 'A contestable resolution.' }) });
+
+    const id = await useDebateStore.getState().createSituationDebate('sit-002');
+
+    expect(id).toBeTruthy();
+    const session = useDebateStore.getState().activeDebate!;
+    expect(session.topic.final).toBe('A contestable resolution.');
+    expect(session.title).toBe('Test Situation');
+    expect(mockRecordWarn).not.toHaveBeenCalledWith(expect.objectContaining({
+      message: expect.stringContaining('Situation topic synthesis failed'),
+    }));
+  });
+
+  it('falls back to the situation label + WARN when synthesis throws (t/3637)', async () => {
+    mockTaxonomyState.situations = { nodes: [sitNode] } as unknown as typeof mockTaxonomyState.situations;
+    mockApi.generateText.mockRejectedValueOnce(new Error('backend unavailable'));
+
+    const id = await useDebateStore.getState().createSituationDebate('sit-002');
+
+    expect(id).toBeTruthy();
+    const session = useDebateStore.getState().activeDebate!;
+    expect(session.topic.final).toBe('Test Situation');
+    expect(session.title).toBe('Test Situation');
+    expect(mockRecordWarn).toHaveBeenCalledWith(expect.objectContaining({
+      level: 'warn',
+      message: expect.stringContaining('Situation topic synthesis failed'),
+    }));
+  });
+
+  it('falls back to the situation label + WARN when synthesis returns an empty proposition (t/3637)', async () => {
+    mockTaxonomyState.situations = { nodes: [sitNode] } as unknown as typeof mockTaxonomyState.situations;
+    mockApi.generateText.mockResolvedValueOnce({ text: 'not json' });
+
+    const id = await useDebateStore.getState().createSituationDebate('sit-002');
+
+    expect(id).toBeTruthy();
+    const session = useDebateStore.getState().activeDebate!;
+    expect(session.topic.final).toBe('Test Situation');
+    expect(session.title).toBe('Test Situation');
+    expect(mockRecordWarn).toHaveBeenCalledWith(expect.objectContaining({
+      level: 'warn',
+      message: expect.stringContaining('Situation topic synthesis failed'),
+    }));
   });
 });
 
@@ -350,7 +546,12 @@ describe('Session slice: createConflictDebate', () => {
     ).rejects.toThrow('not found');
   });
 
-  it('creates a debate from a conflict with all povers', async () => {
+  // t/3629: createConflictDebate always creates with user_is_pover=false (watch-only —
+  // there is no participating-user variant of this entry point), so it must reach
+  // opening directly rather than parking in clarification (which would wait forever
+  // for a user event nothing will ever supply). Asserts the TERMINAL phase, not that
+  // a function was called — a stalled flow could still "call" beginDebate and hang.
+  it('creates a debate from a conflict with all povers and reaches opening directly (watch-only, t/3629)', async () => {
     mockTaxonomyState.conflicts = [{
       claim_id: 'conflict-001',
       claim_label: 'Test Conflict',
@@ -366,7 +567,7 @@ describe('Session slice: createConflictDebate', () => {
     expect(id).toBeTruthy();
     const state = useDebateStore.getState();
     expect(state.activeDebate).not.toBeNull();
-    expect(state.activeDebate!.phase).toBe('clarification');
+    expect(state.activeDebate!.phase).toBe('opening');
     expect(mockApi.saveDebateSession).toHaveBeenCalled();
   });
 });
@@ -471,6 +672,24 @@ describe('Topic critique slice: runTopicCritique', () => {
     expect(mockApi.saveDebateSession).toHaveBeenCalled();
   });
 
+  // t/3722: topic critique is a scored-JSON call, not debate reasoning — it must route to
+  // the fast tier regardless of what heavy model the debate itself is configured with.
+  // Measured live (grok-4.7 vs gemini-3.5-flash-lite): 90-120s -> ~3s, no loss of parseable
+  // output. Asserts the model actually passed to the AI call, not just that it succeeded.
+  it('routes to the fast tier model, not the debate-configured heavy model (t/3722)', async () => {
+    useDebateStore.setState({ activeDebate: makeSession() as any, debateModel: 'xai-grok-4-7' });
+    mockApi.computeQueryEmbedding.mockResolvedValue({ vector: [0.1, 0.2, 0.3] });
+    mockApi.computeEmbeddings.mockResolvedValue({ vectors: [] });
+    mockApi.generateText.mockResolvedValue({ text: '{"rating":"good","frame_score":{"total":6}}' });
+
+    await useDebateStore.getState().runTopicCritique();
+
+    expect(mockApi.generateText).toHaveBeenCalled();
+    const callModel = mockApi.generateText.mock.calls[0][1];
+    expect(callModel).not.toBe('xai-grok-4-7');
+    expect(callModel).toBe('gemini-3.5-flash-lite');
+  });
+
   it('handles critique failure gracefully without setting debateError', async () => {
     useDebateStore.setState({ activeDebate: makeSession() as any });
     mockApi.computeQueryEmbedding.mockRejectedValue(new Error('Embedding unavailable'));
@@ -503,6 +722,62 @@ describe('Topic critique slice: reEvaluateSuggestedTopic', () => {
   });
 });
 
+describe('Topic critique slice: greatest-hits exclusion reshapes framing (t/3392)', () => {
+  afterEach(() => {
+    mockTaxonomyState.accelerationist.nodes = [];
+  });
+
+  function setUpOneNode() {
+    mockTaxonomyState.accelerationist.nodes = [
+      { id: 'acc-test-001', label: 'Test Node', description: 'Excludable test node', category: 'beliefs' },
+    ] as any;
+    mockApi.computeQueryEmbedding.mockResolvedValue({ vector: [1, 0] });
+    mockApi.computeEmbeddings.mockResolvedValue({ vectors: [[1, 0]] });
+  }
+
+  // computeStructuralScore is mocked with a fixed canned return in storeTestHarness.ts, so these
+  // assert on the CALL ARGUMENTS it receives — proving the exclusion filter changed the corpus fed
+  // to structural scoring (which is what would, with the real function, change activated_nodes /
+  // the frame prompt / rewritten_topic). Both-arms per the ticket's AC.
+
+  it('excludes the greatest-hits node from the structural-score input when the toggle is on', async () => {
+    setUpOneNode();
+    mockGetGreatestHits.mockResolvedValue(['acc-test-001']);
+    useDebateStore.setState({ activeDebate: makeSession({ exclude_greatest_hits: true }) as any });
+
+    await useDebateStore.getState().runTopicCritique();
+
+    const call = vi.mocked(computeStructuralScore).mock.calls[0][0];
+    expect(Object.keys(call.embeddings)).not.toContain('acc-test-001');
+    expect(call.povNodes.map(n => n.id)).not.toContain('acc-test-001');
+  });
+
+  it('leaves the node in the structural-score input when the toggle is off (regression guard)', async () => {
+    setUpOneNode();
+    // List is present but the flag is off — must be ignored, proving the toggle (not just list
+    // availability) gates the exclusion.
+    mockGetGreatestHits.mockResolvedValue(['acc-test-001']);
+    useDebateStore.setState({ activeDebate: makeSession({ exclude_greatest_hits: false }) as any });
+
+    await useDebateStore.getState().runTopicCritique();
+
+    const call = vi.mocked(computeStructuralScore).mock.calls[0][0];
+    expect(Object.keys(call.embeddings)).toContain('acc-test-001');
+    expect(call.povNodes.map(n => n.id)).toContain('acc-test-001');
+  });
+
+  it('degrades to unfiltered when the toggle is on but the exclusion list is unavailable', async () => {
+    setUpOneNode();
+    mockGetGreatestHits.mockResolvedValue(undefined);
+    useDebateStore.setState({ activeDebate: makeSession({ exclude_greatest_hits: true }) as any });
+
+    await useDebateStore.getState().runTopicCritique();
+
+    const call = vi.mocked(computeStructuralScore).mock.calls[0][0];
+    expect(Object.keys(call.embeddings)).toContain('acc-test-001');
+  });
+});
+
 // ── P5-4. Clarification Slice ──────────────────────────────
 
 describe('Clarification slice: runClarification happy path', () => {
@@ -519,6 +794,20 @@ describe('Clarification slice: runClarification happy path', () => {
     expect(clarEntry).toBeDefined();
     expect(clarEntry!.content).toContain('What scope?');
     expect(mockApi.saveDebateSession).toHaveBeenCalled();
+  });
+
+  it('normalizes structured {question, options} items instead of interpolating "[object Object]" (t/3753)', async () => {
+    useDebateStore.setState({ activeDebate: makeSession() as any });
+    mockApi.generateText.mockResolvedValue({
+      text: '{"questions":[{"question":"What scope?","options":["Narrow","Broad"]},{"question":"Which stakeholders?"}]}',
+    });
+
+    await useDebateStore.getState().runClarification();
+
+    const clarEntry = useDebateStore.getState().activeDebate!.transcript.find((e: any) => e.type === 'clarification');
+    expect(clarEntry!.content).toContain('What scope?');
+    expect(clarEntry!.content).toContain('Which stakeholders?');
+    expect(clarEntry!.content).not.toContain('[object Object]');
   });
 });
 

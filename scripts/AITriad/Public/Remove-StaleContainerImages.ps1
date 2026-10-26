@@ -19,7 +19,7 @@ function Remove-StaleContainerImages {
         list of deleted version IDs, and any per-version failure messages.
     .PARAMETER Owner
         GitHub owner (user or org) that owns the package. Defaults to the
-        GHCR_OWNER env var, then GITHUB_REPOSITORY_OWNER, then 'jpsnover'.
+        GHCR_OWNER env var, then GITHUB_REPOSITORY_OWNER, then 'ai-rosetta-stone'.
     .PARAMETER Package
         Container package name (e.g. 'taxonomy-editor').
     .PARAMETER OlderThanDays
@@ -73,7 +73,7 @@ function Remove-StaleContainerImages {
     if (-not $Owner) {
         $Owner = if ($env:GHCR_OWNER) { $env:GHCR_OWNER }
                  elseif ($env:GITHUB_REPOSITORY_OWNER) { $env:GITHUB_REPOSITORY_OWNER }
-                 else { 'jpsnover' }
+                 else { 'ai-rosetta-stone' }
     }
 
     $Cutoff = (Get-Date).ToUniversalTime().AddDays(-$OlderThanDays)
@@ -82,7 +82,7 @@ function Remove-StaleContainerImages {
     # ── Paginate versions ────────────────────────────────────────────────
     $AllVersions = [System.Collections.Generic.List[object]]::new()
     for ($Page = 1; $Page -le $MaxPages; $Page++) {
-        $Endpoint = "/users/$Owner/packages/container/$Package/versions?per_page=100&page=$Page"
+        $Endpoint = "/orgs/$Owner/packages/container/$Package/versions?per_page=100&page=$Page"
         $Batch = $null
         try {
             $Batch = Invoke-GitHubApi -Endpoint $Endpoint -Method 'GET' -CallerName 'Remove-StaleContainerImages'
@@ -110,6 +110,18 @@ function Remove-StaleContainerImages {
     }
 
     # ── Filter to untagged, sort newest first ────────────────────────────
+    # DEPLOY-BY-DIGEST COUPLING (t/3679 condition 1) — SYNC WITH the per-SHA tag block in
+    # .github/workflows/container.yml. This filter deletes ONLY untagged versions (tags.Count -eq 0);
+    # a TAGGED version is never a candidate. That is the load-bearing invariant behind deploy-by-digest:
+    # container.yml pushes a PERMANENT `sha-<commit>` tag for every built image, so a digest a deploy has
+    # pinned stays TAGGED -> PRESERVED here -> pullable on a pod recycle indefinitely (the t/3679#8 SO
+    # finding-1 outage-preventer; also why t/3756 rollback anchors survive going forward). The predicate
+    # fails SAFE: a version whose `tags` property is ABSENT is excluded (all three PSObject.Properties
+    # guards must hold), not swept in — verified t/3679#9 §1. TRAP (t/3679#9 §4): GHCR also lists
+    # `sha256-<digest>` COSIGN/attestation versions; those carry that tag so they are `tags.Count -ne 0`
+    # and are likewise preserved — do NOT special-case them here, and do not mistake them for per-SHA
+    # image tags. Consequence ACCEPTED: permanent sha- tags accumulate (never pruned by this cmdlet) —
+    # bounded-retention of old sha- tags is a future decision, not this change.
     $Untagged = @(
         $AllVersions | Where-Object {
             $_.PSObject.Properties['metadata'] -and
@@ -143,7 +155,7 @@ function Remove-StaleContainerImages {
         if ($PSCmdlet.ShouldProcess($Target, "Delete untagged $Package")) {
             try {
                 $null = Invoke-GitHubApi `
-                    -Endpoint "/users/$Owner/packages/container/$Package/versions/$($v.id)" `
+                    -Endpoint "/orgs/$Owner/packages/container/$Package/versions/$($v.id)" `
                     -Method DELETE `
                     -CallerName 'Remove-StaleContainerImages'
                 $DeletedIds.Add([long]$v.id)

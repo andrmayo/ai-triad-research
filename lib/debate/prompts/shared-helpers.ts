@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 // Licensed under the MIT License. See LICENSE file in the project root.
 
-import type { DebateAudience, DebatePhase, VoiceSpec } from '../types.js';
+import type { DebateAudience, DebatePhase, PovInfo, SpeakerId, VoiceSpec } from '../types.js';
 import { POVER_INFO } from '../types.js';
 import {
   getPromptCompact,
@@ -44,9 +44,9 @@ function formatValueHierarchy(hierarchy: string[]): string {
   return `\nVALUE HIERARCHY (resolve internal conflicts top-down):\n${tiers}\nWhen your values conflict, higher tiers override lower tiers. Tier 1 is non-negotiable.\n`;
 }
 
-export function getCharacterBlock(pov: string): string {
-  const info = POVER_INFO[pov as keyof typeof POVER_INFO];
-  if (!info?.voice) return '';
+export function getCharacterBlock(pov: string, soul: PovInfo): string {
+  const info = soul;
+  if (!info.voice) return '';
   const scope = getTopicScope();
   const scopeBlock = hasMeaningfulScope(scope) ? `\n${formatDebateScopeBlock(scope)}\n` : '';
   const valueBlock = formatValueHierarchy(info.value_hierarchy);
@@ -150,22 +150,22 @@ Using the same jargon as other speakers is a voice differentiation failure.\n`;
 }
 
 /** Build a line describing each debater the current speaker is debating against. */
-export function otherDebaters(currentLabel: string): string {
+export function otherDebaters(currentLabel: string, opponentSouls?: Partial<Record<SpeakerId, PovInfo>>): string {
   const others = Object.values(POVER_INFO)
     .filter(c => c.label !== currentLabel)
     .map(c => {
-      const shortDisposition = c.voice.disposition.split('—')[0]?.trim() ?? c.personality;
-      return `- ${c.label}, representing the ${c.pov} perspective (${shortDisposition})`;
+      const soul = opponentSouls?.[c.pov as SpeakerId] ?? c;
+      const shortDisposition = soul.voice.disposition.split('—')[0]?.trim() ?? soul.personality;
+      return `- ${soul.label}, representing the ${soul.pov} perspective (${shortDisposition})`;
     })
     .join('\n');
   return `You are debating:\n${others}`;
 }
 
 /** Format hardcoded/softcoded boundaries as a prompt injection block.
- *  Looks up structured boundaries from POVER_INFO by pov key. */
-export function formatDoctrinalBoundaries(pov?: string): string {
-  if (!pov) return '';
-  const info = POVER_INFO[pov as keyof typeof POVER_INFO];
+ *  Uses the resolved soul when provided; falls back to POVER_INFO by pov key. */
+export function formatDoctrinalBoundaries(pov: string, soul: PovInfo): string {
+  const info = soul;
   if (!info?.boundaries) return '';
   const { hardcoded, softcoded } = info.boundaries;
   const sections: string[] = [];
@@ -191,7 +191,7 @@ ${softcoded.map(b => `- ${b}`).join('\n')}`);
 
 const AUDIENCE_DIRECTIVES: Record<DebateAudience, { readingLevel: string; detailInstruction: string; moderatorBias: string }> = {
   policymakers: {
-    readingLevel: 'Write for a policy reporter or congressional staffer — someone smart and busy who needs to understand and quote you. Lead with your main claim in the first sentence. Use active voice with named actors. One idea per sentence. Prefer concrete examples and specific numbers over abstract categories. Every paragraph should contain at least one sentence a reporter could quote directly without rewriting. Avoid nominalizations (say "regulators decided" not "the regulatory decision"), hedge stacking ("may potentially" → pick one), and sentences that require re-reading. Technical terms are fine when they\'re load-bearing; define them briefly on first use. This applies to the statement field only — structured metadata fields like taxonomy_refs and move_types are not reader-facing.',
+    readingLevel: 'Write for a policy reporter or congressional staffer — someone smart and busy who needs to understand and quote you. Lead with your main claim in the first sentence. Use active voice with named actors. One idea per sentence. Prefer concrete examples and specific numbers over abstract categories. Prefer short, plain words over abstract or polysyllabic equivalents — a simpler word that says the same thing is always better. Every paragraph should contain at least one sentence a reporter could quote directly without rewriting. Avoid nominalizations (say "regulators decided" not "the regulatory decision"), hedge stacking ("may potentially" → pick one), and sentences that require re-reading. Technical terms are fine when they\'re load-bearing; define them briefly on first use. This applies to the statement field only — structured metadata fields like taxonomy_refs and move_types are not reader-facing.',
     detailInstruction: 'Provide a thorough, in-depth response — 3-5 paragraphs. Include a steelman of the strongest opposing position, disclose 1-2 key assumptions your argument depends on, and develop your reasoning with evidence. Frame arguments in terms of implementability, enforcement mechanisms, and political feasibility. Reference existing legislation, executive orders, or regulatory frameworks where relevant. Structure each major argument as: (1) State your conclusion. (2) Name the principle, standard, or evidence that governs the question. (3) Apply that standard to the specific facts of this debate. (4) Close by restating the conclusion in light of the application.',
     moderatorBias: 'Steer toward actionable policy disagreements. Prefer questions about implementation feasibility, enforcement mechanisms, jurisdictional authority, and constituent impact.',
   },
@@ -217,8 +217,26 @@ const AUDIENCE_DIRECTIVES: Record<DebateAudience, { readingLevel: string; detail
   },
 };
 
+// Grade targets: policymakers → FK ~12 (ceiling 13); all others → FK ~10 (ceiling 11). PI decision; stipulated.
+export const AUDIENCE_GRADE_TARGET: Record<DebateAudience, { target: number; ceiling: number }> = {
+  policymakers:          { target: 12, ceiling: 13 },
+  technical_researchers: { target: 10, ceiling: 11 },
+  industry_leaders:      { target: 10, ceiling: 11 },
+  academic_community:    { target: 10, ceiling: 11 },
+  general_public:        { target: 10, ceiling: 11 },
+};
+
+export function gradeTargetPreamble(audience?: DebateAudience): string {
+  const key = audience ?? 'policymakers';
+  if (key === 'policymakers') {
+    return 'READING LEVEL (measurable): target Flesch-Kincaid grade ~12, no higher than 13, a senior congressional staffer reads it once and can quote it. The density comes from SUBSTANCE, not vocabulary: prefer plain words; use a technical term only when it is load-bearing, and define it in the same sentence on first use. One idea per sentence; no sentence over 30 words.\n\n';
+  }
+  return 'READING LEVEL (measurable): target Flesch-Kincaid grade ~10, no higher than 11, an informed general reader follows it without rereading. No jargon without a plain-English equivalent in the same sentence. Prefer short, plain words over abstract/polysyllabic ones. One idea per sentence; no sentence over 30 words.\n\n';
+}
+
 export function getReadingLevel(audience?: DebateAudience): string {
-  return AUDIENCE_DIRECTIVES[audience ?? 'policymakers'].readingLevel;
+  const key = audience ?? 'policymakers';
+  return gradeTargetPreamble(key) + AUDIENCE_DIRECTIVES[key].readingLevel;
 }
 
 export function getDetailInstruction(audience?: DebateAudience): string {
@@ -230,7 +248,7 @@ export function getStyleReinforcement(audience?: DebateAudience): string {
   const key = audience ?? 'policymakers';
   const base = 'STYLE REMINDER (re-read before writing): One idea per sentence. Maximum 30 words per sentence — if you need a comma, consider a period instead. No debate-procedural language ("I concede", "concession logged", "I conditionally agree"). State your position directly.';
   const audienceSpecific: Record<DebateAudience, string> = {
-    policymakers: 'Every sentence must be quotable by a reporter without rewriting. Active voice, named actors, concrete numbers.',
+    policymakers: 'Every sentence must be quotable by a reporter without rewriting. Active voice, named actors, concrete numbers. Short, plain words over polysyllabic ones.',
     technical_researchers: 'Precise vocabulary. Quantify claims. Distinguish empirical from theoretical.',
     industry_leaders: 'Lead with the business conclusion. Translate technical risk to operational risk. No PhD-level jargon.',
     academic_community: 'Name the theoretical tradition. Distinguish descriptive from normative. Hedge once per claim, not twice.',
@@ -275,7 +293,7 @@ function extractStarredNodes(taxonomyContext: string): string[] {
   return results;
 }
 
-export function buildRecapSection(taxonomyContext: string, phase?: DebatePhase, pov?: string, pendingInterventionField?: string): string {
+export function buildRecapSection(taxonomyContext: string, phase: DebatePhase | undefined, pov: string | undefined, soul: PovInfo, pendingInterventionField?: string): string {
   const starred = extractStarredNodes(taxonomyContext);
   if (starred.length === 0 && !phase && !pov) return '';
 
@@ -295,17 +313,14 @@ export function buildRecapSection(taxonomyContext: string, phase?: DebatePhase, 
     lines.push(`Phase priority: ${priorities[phase]}`);
   }
 
-  if (pov) {
-    const info = POVER_INFO[pov as keyof typeof POVER_INFO];
-    if (info?.boundaries?.hardcoded?.length > 0) {
-      lines.push(`Hardcoded boundaries (NEVER concede): ${info.boundaries.hardcoded.join('; ')}`);
-    }
-    if (info?.value_hierarchy?.length > 0) {
-      lines.push(`Value hierarchy: ${info.value_hierarchy.map((v, i) => `(${i + 1}) ${v}`).join(' > ')}`);
-    }
-    if (info?.epistemic_stance?.length > 0) {
-      lines.push(`Epistemic stance: ${info.epistemic_stance[0]}. Falsification: ${info.epistemic_stance[info.epistemic_stance.length - 1].replace(/^Falsification challenge: /, '')}`);
-    }
+  if (soul.boundaries?.hardcoded && soul.boundaries.hardcoded.length > 0) {
+    lines.push(`Hardcoded boundaries (NEVER concede): ${soul.boundaries.hardcoded.join('; ')}`);
+  }
+  if (soul.value_hierarchy && soul.value_hierarchy.length > 0) {
+    lines.push(`Value hierarchy: ${soul.value_hierarchy.map((v, i) => `(${i + 1}) ${v}`).join(' > ')}`);
+  }
+  if (soul.epistemic_stance && soul.epistemic_stance.length > 0) {
+    lines.push(`Epistemic stance: ${soul.epistemic_stance[0]}. Falsification: ${soul.epistemic_stance[soul.epistemic_stance.length - 1].replace(/^Falsification challenge: /, '')}`);
   }
 
   lines.push('Write as a human — no academic transitions, no meta-announcements, no shared jargon.');

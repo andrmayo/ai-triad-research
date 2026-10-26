@@ -1,0 +1,578 @@
+# ─── main-CI Monitor (t/3737) ───
+# What:  When CI on main concludes (+ a cron backstop), asks "is the tip of `main` broken?" by OBSERVING the push-event workflow
+#        runs on main's head SHA (NOT by modelling which required contexts should have posted —
+#        see operations/devops/main-ci-monitor.mjs header for why that model was rejected).
+#          - `CI` (the designated main-health workflow) concluded failure  → FULL alert issue.
+#          - any OTHER push workflow concluded failure                     → LOW-severity notice issue.
+#          - `CI` created but unconcluded past the deadline                → alert (hung run).
+#          - `CI` absent entirely (e.g. a paths-filtered/docs-only push)   → UNKNOWN, no emission.
+#          - `CI` success, nothing failed                                  → green; close open alerts.
+#        Warn-only today: this workflow only opens/updates/closes issues; it gates nothing.
+# Why the cadence + deadline: main-health CI's observed worst-case is ~13m; deadline 30m (×2.3).
+
+name: main-ci-monitor
+
+# Schedule re-registered 2026-10-12 after the AI-Rosetta-Stone org move: crons stopped firing silently (t/4173).
+on:
+  # PRIMARY trigger (t/3931): classify main's head as soon as `CI` on main concludes, so a red surfaces
+  # within minutes. The cron alone was observed firing only every 1.5–7.4h (GitHub schedule throttling).
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  # BACKSTOP: still needed for what workflow_run cannot see — a CI run that never concludes (hung →
+  # the deadline alert) and the liveness heartbeat. Requested every 15 min; real bound is
+  # best-effort, 2-5h (t/4501: the round-minute offset below did NOT fix GitHub's scheduler
+  # congestion for this repo's high-frequency crons — post-fix measured p95 gap ~=4.8h). Do not
+  # assume it fires anywhere close to every 15 min.
+  schedule:
+    - cron: '7,22,37,52 * * * *'  # t/4501: off round-minute marks (did not restore cadence — see above)
+  workflow_dispatch:
+
+# One evaluation at a time: a workflow_run and a cron run landing together would otherwise both see
+# "no open issue" and open duplicates. The running evaluation is never cancelled; GitHub keeps at most
+# one pending run per group (a newer pending one replaces an older), which loses nothing — every run
+# classifies main's CURRENT head, so the newest pending run subsumes the one it replaced.
+concurrency:
+  group: main-ci-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+  actions: read   # main-ci-monitor.mjs lists actions/runs for main's head (t/3906)
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RED_LABEL: main-ci-red
+  NOTICE_LABEL: main-ci-notice
+  INFRA_LABEL: main-ci-infra
+  HEARTBEAT_LABEL: main-ci-monitor-heartbeat
+  SCHEDULE_HEARTBEAT_LABEL: main-ci-monitor-schedule-heartbeat
+
+jobs:
+  monitor:
+    # workflow_run's `branches` filter matches head_branch only, so a fork PR from a branch named `main`
+    # would also fire it. Only a PUSH to main says anything about the tip.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+
+      # ── SELF-HEALTH: detection probe (t/3737#4) ──────────────────────────────────────────────
+      # ⚠️ COUPLING — DO NOT DELETE without reading (TL p/331#1631, Gate Co-Location across decisions).
+      # The classifier's "CI absent → no emission" branch means a healthy week of `main` produces
+      # SILENCE, which by inspection is indistinguishable from a DEAD monitor. This self-health block
+      # (detection probe + liveness/wiring heartbeat below) is the ONLY thing that tells "healthy and
+      # quiet" apart from "broken and quiet." The no-emission branch and this block are LOAD-BEARING
+      # FOR EACH OTHER — the reciprocal pointer lives at case 5 in operations/devops/main-ci-monitor.mjs.
+      # The detection probe re-runs the full verdict unit suite every scheduled run, so a regression
+      # that stops red-detection working FAILS THIS JOB (a loud, attributable signal) rather than
+      # silently degrading the monitor to always-green.
+      - name: Self-health — detection probe (verdict unit suite)
+        run: node --test operations/devops/main-ci-monitor.test.mjs
+
+      # ── Observe what ran on main's head, classify. Writes verdict.json (never inlined — Shell Quoting Rule).
+      - name: Classify main's head
+        id: classify
+        # The classifier shells out to `gh api`, which needs GH_TOKEN in the step env (github-script
+        # steps get a token implicitly; plain `run:` steps do not). Missing since t/3737 -> every run
+        # was CANNOT EVALUATE from 2026-09-29 (GH #2551, t/3906).
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node operations/devops/main-ci-monitor.mjs "${{ github.repository }}" > verdict.json || true
+          echo "----- verdict.json -----"; cat verdict.json
+
+      # ── SELF-HEALTH: liveness + wiring heartbeat ─────────────────────────────────────────────
+      # Liveness: each run stamps `now` into a dedicated heartbeat issue's body and checks the PRIOR
+      # stamp's age. GitHub auto-disables a scheduled workflow after 60 days of repo inactivity; when
+      # that happens the schedule stops firing silently. The first run after any gap surfaces "monitor
+      # was asleep since <ts>" — the gap becomes visible the moment the monitor wakes. Wiring: touching
+      # the issues API here proves the token + issues:write path the alert steps depend on.
+      - name: Self-health — liveness + wiring heartbeat
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9
+        with:
+          script: |
+            const { pathToFileURL } = require('url');
+            const { heartbeatGap, ESCALATED_LABEL } = await import(pathToFileURL(`${process.env.GITHUB_WORKSPACE}/operations/devops/main-ci-monitor.mjs`).href);
+            const label = process.env.HEARTBEAT_LABEL;
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const now = new Date();
+            const list = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo, state: 'open', labels: label, per_page: 1,
+            });
+            const stamp = `main-ci-monitor heartbeat: ${now.toISOString()} (run ${context.runId})`;
+            if (list.data.length === 0) {
+              // lint:alert-label-exempt: t/4414 this IS the heartbeat the r/23 bridge reads
+              // directly (its open body/timestamp, not a label scan) -- it never needs to
+              // escalate itself. A real gap (heartbeatGap below) gets its own separate,
+              // ESCALATED_LABEL-carrying issue.
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title: 'main-ci-monitor — liveness heartbeat (do not close)',
+                body: `${stamp}\n\nThis issue is the monitor's liveness heartbeat; each scheduled run updates it. Leaving it open is intentional — a stale timestamp here means the monitor stopped running.`,
+                labels: [label],
+              });
+              console.log('created heartbeat issue');
+            } else {
+              const issue = list.data[0];
+              const prior = Date.parse((issue.body || '').match(/heartbeat:\s*([0-9T:.\-Z]+)/)?.[1] || '');
+              // t/3912: a gap past the recalibrated threshold is its OWN escalated issue — a comment on this
+              // never-closing heartbeat issue is the quiet-update shape that hid #2551 (30 gap comments).
+              const gap = heartbeatGap({ priorMs: prior, nowMs: now.getTime() });
+              console.log(`heartbeat gap: ${gap.gapMin}m (stale=${gap.stale})`);
+              if (gap.stale) {
+                const msg = `⚠️ Monitor liveness GAP: previous heartbeat was ${new Date(prior).toISOString()}, ${gap.gapMin}m ago. The scheduled run may have been disabled/paused in that window — main was UNMONITORED. Investigate why the schedule stopped.\n\n- **Run:** ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+                const open = await github.rest.issues.listForRepo({ owner, repo, state: 'open', labels: 'main-ci-monitor-stale', per_page: 1 });
+                if (open.data.length > 0) {
+                  await github.rest.issues.createComment({ owner, repo, issue_number: open.data[0].number, body: msg });
+                } else {
+                  const created = await github.rest.issues.create({ owner, repo,
+                    title: `main-ci-monitor: liveness gap of ${gap.gapMin}m`, body: msg,
+                    labels: ['main-ci-monitor-stale', ESCALATED_LABEL, 'bug'] });
+                  try { await github.rest.issues.addAssignees({ owner, repo, issue_number: created.data.number, assignees: [owner] }); }
+                  catch (e) { core.warning(`could not assign ${owner} to #${created.data.number}: ${e.message}`); }
+                }
+              }
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: issue.number, body: `${stamp}\n\nThis issue is the monitor's liveness heartbeat; each scheduled run updates it. Leaving it open is intentional — a stale timestamp here means the monitor stopped running.`,
+              });
+            }
+
+      # ── SELF-HEALTH: schedule-only liveness heartbeat (t/4173) ──────────────────────────────
+      # The heartbeat above is refreshed by EITHER trigger (workflow_run OR schedule), so a stalled
+      # GitHub cron is invisible as long as pushes to main keep landing — exactly what happened after
+      # the org move: GitHub's schedules stalled 5-8h and NOTHING alerted, because workflow_run kept
+      # firing on every push and refreshed the heartbeat as if cron were fine. This second heartbeat
+      # updates ONLY on a `schedule`-triggered run, so it alone goes stale when cron stalls, regardless
+      # of push traffic. Same pure heartbeatGap()/stale threshold as the primary heartbeat above.
+      - name: Self-health — schedule-only liveness heartbeat (t/4173)
+        if: github.event_name == 'schedule'
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9
+        with:
+          script: |
+            const { pathToFileURL } = require('url');
+            const { heartbeatGap, ESCALATED_LABEL } = await import(pathToFileURL(`${process.env.GITHUB_WORKSPACE}/operations/devops/main-ci-monitor.mjs`).href);
+            const label = process.env.SCHEDULE_HEARTBEAT_LABEL;
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const now = new Date();
+            const list = await github.rest.issues.listForRepo({ owner, repo, state: 'open', labels: label, per_page: 1 });
+            const note = 'Updated ONLY by `schedule`-triggered runs (t/4173) — unlike the main heartbeat, push-triggered (workflow_run) runs do NOT refresh this. A stale timestamp here means GitHub\'s cron stopped firing this workflow, even if push traffic kept the other heartbeat looking healthy.';
+            const stamp = `main-ci-monitor SCHEDULE-ONLY heartbeat: ${now.toISOString()} (run ${context.runId})`;
+            if (list.data.length === 0) {
+              // lint:alert-label-exempt: t/4414 this IS the heartbeat the r/23 bridge reads
+              // directly -- see the sibling heartbeat above for the same reasoning.
+              await github.rest.issues.create({
+                owner, repo,
+                title: 'main-ci-monitor — schedule-only liveness heartbeat (do not close)',
+                body: `${stamp}\n\n${note}`,
+                labels: [label],
+              });
+              console.log('created schedule-only heartbeat issue');
+            } else {
+              const issue = list.data[0];
+              const prior = Date.parse((issue.body || '').match(/heartbeat:\s*([0-9T:.\-Z]+)/)?.[1] || '');
+              const gap = heartbeatGap({ priorMs: prior, nowMs: now.getTime() });
+              console.log(`schedule-only heartbeat gap: ${gap.gapMin}m (stale=${gap.stale})`);
+              if (gap.stale) {
+                const msg = `⚠️ GitHub SCHEDULE stall: the previous schedule-triggered run of main-ci-monitor was ${new Date(prior).toISOString()}, ${gap.gapMin}m ago. Push-triggered runs may have masked this on the primary heartbeat (t/4173) — confirm GitHub's cron is actually firing for this repo/workflow.\n\n- **Run:** ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+                const open = await github.rest.issues.listForRepo({ owner, repo, state: 'open', labels: 'main-ci-monitor-schedule-stale', per_page: 1 });
+                if (open.data.length > 0) {
+                  await github.rest.issues.createComment({ owner, repo, issue_number: open.data[0].number, body: msg });
+                } else {
+                  const created = await github.rest.issues.create({ owner, repo,
+                    title: `main-ci-monitor: schedule-cron stall of ${gap.gapMin}m`, body: msg,
+                    labels: ['main-ci-monitor-schedule-stale', ESCALATED_LABEL, 'bug'] });
+                  try { await github.rest.issues.addAssignees({ owner, repo, issue_number: created.data.number, assignees: [owner] }); }
+                  catch (e) { core.warning(`could not assign ${owner} to #${created.data.number}: ${e.message}`); }
+                }
+              }
+              await github.rest.issues.update({ owner, repo, issue_number: issue.number, body: `${stamp}\n\n${note}` });
+            }
+
+      # ── Route the verdict to graded, deduped, auto-closing issues ────────────────────────────
+      - name: Route verdict → alert / notice / infra / recovery
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9
+        with:
+          script: |
+            const fs = require('fs');
+            const { pathToFileURL } = require('url');
+            const { escalationDecision, ESCALATED_LABEL } = await import(pathToFileURL(`${process.env.GITHUB_WORKSPACE}/operations/devops/main-ci-monitor.mjs`).href);
+            let v;
+            try { v = JSON.parse(fs.readFileSync('verdict.json', 'utf8')); }
+            catch { v = { ok: false, error: 'verdict.json missing/empty — the classifier shim did not produce output' }; }
+
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const ts = new Date().toISOString();
+
+            async function openOrUpdate(label, title, body) {
+              const ex = await github.rest.issues.listForRepo({ owner, repo, state: 'open', labels: label, per_page: 1 });
+              if (ex.data.length > 0) {
+                const issue = ex.data[0];
+                // t/3912: decide BEFORE this run's comment. Prior sightings = the opening + each "Still present".
+                const d = escalationDecision({
+                  openedAtMs: Date.parse(issue.created_at), priorOccurrences: 1 + (issue.comments || 0),
+                  labels: (issue.labels || []).map((l) => (typeof l === 'string' ? l : l.name)), nowMs: Date.now(),
+                });
+                await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body: `Still present at ${ts}.\n\n${body}` });
+                console.log(`updated #${issue.number} (${label}); escalation: ${d.escalate} — ${d.reason}`);
+                if (d.escalate) {
+                  // ONE distinguishable event per episode: the label is the latch, the assignment + @mention notify.
+                  await github.rest.issues.addLabels({ owner, repo, issue_number: issue.number, labels: [ESCALATED_LABEL] });
+                  try { await github.rest.issues.addAssignees({ owner, repo, issue_number: issue.number, assignees: [owner] }); }
+                  catch (e) { core.warning(`could not assign ${owner} to #${issue.number}: ${e.message}`); }
+                  await github.rest.issues.createComment({ owner, repo, issue_number: issue.number,
+                    body: `@${owner} 🔺 **ESCALATED** — this alert is ${d.reason}; it has not cleared on its own. Labelled \`${ESCALATED_LABEL}\` (DevOps is pinged via the local escalation bridge). This fires once per episode.` });
+                }
+              } else {
+                // lint:alert-label-exempt: t/4414 this helper's design deliberately defers
+                // ESCALATED_LABEL to the persistence check above (addLabels, once it has
+                // survived past one episode) rather than applying it at creation -- a
+                // first-sighting alert that clears on its own was never meant to page anyone.
+                await github.rest.issues.create({ owner, repo, title, body, labels: [label, 'bug'] });
+                console.log(`opened new (${label})`);
+              }
+            }
+            async function closeIfOpen(label, note) {
+              const ex = await github.rest.issues.listForRepo({ owner, repo, state: 'open', labels: label, per_page: 10 });
+              for (const i of ex.data) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: i.number, body: `${note} at ${ts}.` });
+                await github.rest.issues.update({ owner, repo, issue_number: i.number, state: 'closed' });
+                console.log(`auto-closed #${i.number} (${label})`);
+              }
+            }
+
+            // CANNOT-EVALUATE (infra) — fail LOUD, distinct from a main-red (opposite remedies).
+            if (!v.ok) {
+              await openOrUpdate(process.env.INFRA_LABEL,
+                'main-ci-monitor: CANNOT EVALUATE (infra)',
+                `The monitor could not evaluate main's head — this is an infra problem with the monitor, not (necessarily) a red main.\n\n- **Error:** \`${v.error}\`\n- **Run:** ${runUrl}\n- **Time:** ${ts}`);
+              return;
+            }
+            // t/3912: any successful evaluation ends a CANNOT-EVALUATE episode (not only a green main), so
+            // escalation counts CONSECUTIVE failures and a transient one followed by a clean read never escalates.
+            await closeIfOpen(process.env.INFRA_LABEL, 'Resolved — monitor evaluated main cleanly');
+
+            const vd = v.verdict || {};
+            const head = `- **Head:** \`${v.sha}\` (${v.headAgeMin}m old)\n- **Runs observed:** ${(v.runObserved||[]).join(', ') || '(none)'}\n- **Verdict:** ${vd.reason}\n- **Run:** ${runUrl}`;
+
+            if (vd.severity === 'red') {
+              await openOrUpdate(process.env.RED_LABEL,
+                `main is RED — ${vd.state === 'stuck' ? "CI run stuck" : "CI failed"} on the tip`,
+                `## main-CI FULL alert\n\n${head}\n\nThe designated main-health workflow (\`CI\`) is failing/stuck on the current tip of \`main\`. Triage and fix or revert. Close when \`CI\` is green on a newer head.`);
+              // A full red supersedes a lingering low notice.
+              await closeIfOpen(process.env.NOTICE_LABEL, 'Superseded by a full main-ci-red alert');
+            } else if (vd.severity === 'notice') {
+              await openOrUpdate(process.env.NOTICE_LABEL,
+                'main — a non-CI push workflow is failing (low severity)',
+                `## main-CI low-severity notice\n\n${head}\n\nA push-event workflow OTHER than the main-health \`CI\` concluded failure (or CI is stuck-but-not-failed). Not a confirmed broken build; surfaced so it isn't silently dropped.`);
+            } else {
+              // green / unresolved-within-deadline / unknown → nothing to alert; clear any resolved alerts.
+              if (vd.state === 'green') {
+                await closeIfOpen(process.env.RED_LABEL, 'Resolved — CI green on the tip again');
+                await closeIfOpen(process.env.NOTICE_LABEL, 'Resolved — no failing push workflow on the tip');
+              }
+              console.log(`no alert: ${vd.state} — ${vd.reason}`);
+            }
+
+      # ── PUSH LIVENESS (t/4126) ───────────────────────────────────────────────────────────────
+      # 2026-10-08: four pushes to main produced NO push workflow runs for ~35-40 minutes — the
+      # case-5 "CI absent" branch above is BY DESIGN silent for this (indistinguishable from a
+      # docs-only push at a single head). This walks a window of recent commits instead of just
+      # the head, so an uncovered, non-docs-only commit older than the deadline is caught. Uses
+      # the SAME ESCALATED_LABEL + openOrUpdate/closeIfOpen plumbing as the alerts above, so it
+      # surfaces through the existing r/23 bridge with no new reminder (t/4126 acceptance).
+      # Scheduled/dispatch only, same cadence reasoning as the other secondary checks below.
+      - name: Push liveness — fetch + classify recent main commits (t/4126)
+        if: github.event_name != 'workflow_run'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node operations/devops/push-liveness-check.mjs "${{ github.repository }}" > /tmp/push-liveness-verdict.json || true
+          echo "----- push-liveness-verdict.json -----"; cat /tmp/push-liveness-verdict.json
+
+      - name: Push liveness — route verdict (t/4126)
+        if: github.event_name != 'workflow_run'
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9
+        with:
+          script: |
+            const fs = require('fs');
+            const { pathToFileURL } = require('url');
+            const { ESCALATED_LABEL } = await import(pathToFileURL(`${process.env.GITHUB_WORKSPACE}/operations/devops/main-ci-monitor.mjs`).href);
+            let v;
+            try { v = JSON.parse(fs.readFileSync('/tmp/push-liveness-verdict.json', 'utf8')); }
+            catch { v = { ok: false, error: 'push-liveness-verdict.json missing/empty' }; }
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const LABEL = 'main-push-liveness';
+            const open = await github.rest.issues.listForRepo({ owner, repo, state: 'open', labels: LABEL, per_page: 1 });
+
+            if (!v.ok) {
+              console.log(`push-liveness: CANNOT EVALUATE — ${v.error}`);
+              return; // advisory-only: an eval failure here is not itself alert-worthy.
+            }
+            const { alert = false, violations = [] } = v.verdict || {};
+            console.log(`push-liveness: ${v.commitsChecked} commit(s) checked, ${violations.length} violation(s)`);
+            if (!alert) {
+              if (open.data.length) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: open.data[0].number, body: `Resolved — all recent main commits are covered by a ci.yml run. ${runUrl}` });
+                await github.rest.issues.update({ owner, repo, issue_number: open.data[0].number, state: 'closed' });
+              }
+              return;
+            }
+            // Per-SHA observability (t/4126 ask): distinguish "GitHub never listed the PushEvent"
+            // from "a run should have fired but didn't" (trigger/filter mismatch).
+            const rows = violations.map(x => `- \`${x.sha}\` — ${x.ageMin}m with no ci.yml run; GitHub PushEvent ${x.pushEventListed ? 'WAS listed (trigger/filter mismatch)' : 'was NOT listed (delivery gap)'}`).join('\n');
+            const body = `## main push-liveness alert (t/4126)\n\nOne or more recent commits on \`main\` have no \`ci.yml\` run (direct or via a later covering commit) ${violations[0]?.ageMin ?? '?'}+ minutes after landing:\n\n${rows}\n\n**Remedy:** wait ~15 minutes for GitHub to catch up. If it doesn't, \`workflow_dispatch\` \`ci.yml\` on main's tip — one run covers the whole range.\n\n- **Run:** ${runUrl}`;
+            if (open.data.length) {
+              const issue = open.data[0];
+              await github.rest.issues.update({ owner, repo, issue_number: issue.number, body });
+              await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body: `Still present at ${new Date().toISOString()}.` });
+            } else {
+              const created = await github.rest.issues.create({ owner, repo, title: `main push-liveness: ${violations.length} uncovered commit(s)`, body, labels: [LABEL, ESCALATED_LABEL, 'bug'] });
+              try { await github.rest.issues.addAssignees({ owner, repo, issue_number: created.data.number, assignees: [owner] }); }
+              catch (e) { core.warning(`could not assign ${owner}: ${e.message}`); }
+            }
+
+      # ── FLAKE-HEAL TRIPWIRE (t/4085, advisory) ───────────────────────────────────────────────
+      # t/4080's rerun verdict heals a test when its own file reruns clean in isolation — the
+      # surviving vector (t/4080 GV, #3093) is an ORDER-DEPENDENT failure: state leaked by an
+      # earlier file in the same shard, invisible to a single-run verdict, visible only by
+      # counting repeats across main runs. This step fetches the last M main ci.yml runs' per-
+      # shard self-heal artifacts (uploaded by the isolated recording step added to ci.yml),
+      # counts repeat healers (operations/devops/flake-heal-tripwire.mjs, pure + unit-tested),
+      # and warns via an idempotent `flake-tripwire`-labelled issue. NEVER fails the job —
+      # continue-on-error plus "|| true" on every gh call that can legitimately 404 (a run with
+      # no matching artifact, e.g. nothing healed that run, or the recording step itself failed).
+      # Scheduled/dispatch only, same cadence reasoning as the scheduled-workflow-health step.
+      - name: Flake-heal tripwire — fetch self-heal artifacts (t/4085)
+        if: github.event_name != 'workflow_run'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node operations/devops/collect-flake-heal-runs.mjs "${{ github.repository }}" > /tmp/flake-tripwire-runs.json
+          echo "----- flake-tripwire-runs.json -----"; cat /tmp/flake-tripwire-runs.json
+          node operations/devops/flake-heal-tripwire.mjs < /tmp/flake-tripwire-runs.json > /tmp/flake-tripwire-verdict.json || true
+          echo "----- flake-tripwire-verdict.json -----"; cat /tmp/flake-tripwire-verdict.json
+
+      - name: Flake-heal tripwire — route verdict (t/4085)
+        if: github.event_name != 'workflow_run'
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9
+        with:
+          script: |
+            const fs = require('fs');
+            const { pathToFileURL } = require('url');
+            // t/4414 (e/349#8): this alert had no label the r/23 bridge watches.
+            const { ESCALATED_LABEL } = await import(pathToFileURL(`${process.env.GITHUB_WORKSPACE}/operations/devops/main-ci-monitor.mjs`).href);
+            let v;
+            try { v = JSON.parse(fs.readFileSync('/tmp/flake-tripwire-verdict.json', 'utf8')); }
+            catch { v = { ok: false, error: 'flake-tripwire-verdict.json missing/empty' }; }
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const LABEL = 'flake-tripwire';
+            const open = await github.rest.issues.listForRepo({ owner, repo, state: 'open', labels: LABEL, per_page: 1 });
+
+            if (!v.ok) {
+              console.log(`flake-tripwire: CANNOT EVALUATE — ${v.error}`);
+              return; // advisory-only: an eval failure here is not itself alert-worthy (t/4085 scope).
+            }
+            const { flagged = [], unknownRuns = [], evaluableRuns = 0 } = v.verdict || {};
+            console.log(`flake-tripwire: ${evaluableRuns} evaluable run(s), ${unknownRuns.length} unknown, ${flagged.length} flagged`);
+            if (flagged.length === 0) {
+              if (open.data.length) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: open.data[0].number, body: `Resolved — no repeat healers in the last ${v.runsConsidered} main run(s). ${runUrl}` });
+                await github.rest.issues.update({ owner, repo, issue_number: open.data[0].number, state: 'closed' });
+              }
+              return;
+            }
+            const rows = flagged.map(f => `- \`${f.testId}\` — healed in ${f.count}/${v.runsConsidered} runs: ${f.runIds.join(', ')}`).join('\n');
+            const unk = unknownRuns.length ? `\n\n${unknownRuns.length} run(s) could not be evaluated (missing/unreadable artifacts): ${unknownRuns.join(', ')} — excluded from the counts above, not counted as zero heals.` : '';
+            const body = `## Flake-heal tripwire (t/4085, advisory)\n\nTest(s) self-healed on ${process.env.N_REPEAT_HEALS || '3'}+ of the last ${v.runsConsidered} main \`ci.yml\` runs — likely an order-dependent failure (state leaked by an earlier file in the same shard), not a one-off flake:\n\n${rows}${unk}\n\nThis is advisory only; it does not fail any build. Investigate the owning file for shared/global state. Closes automatically once it drops out of the window.\n\n- **Run:** ${runUrl}`;
+            if (open.data.length) {
+              await github.rest.issues.update({ owner, repo, issue_number: open.data[0].number, body });
+              await github.rest.issues.createComment({ owner, repo, issue_number: open.data[0].number, body: `Still present at ${new Date().toISOString()}.` });
+            } else {
+              await github.rest.issues.create({ owner, repo, title: `Flake-heal tripwire: ${flagged.length} repeat healer(s)`, body, labels: [LABEL, ESCALATED_LABEL] });
+            }
+
+      # ── SCHEDULED-WORKFLOW HEALTH (t/4058) ───────────────────────────────────────────────────
+      # Everything above watches PUSH-event runs on main's head. Scheduled workflows never run on push,
+      # so they were unmonitored: deploy-drift-check crashed 7x, compliance-live failed daily since its
+      # first run, dependabot-weekly every Monday, cluster-conflicts for 6 weeks, all silently (t/4058#1).
+      # This step judges each workflow DECLARED in operations/devops/scheduled-workflows.json from its
+      # recent `schedule` runs (pure verdict: scheduled-workflow-health.mjs, suite in CI) and keeps ONE
+      # issue current, labelled `alert-escalated` so DevOps' hourly r/23 bridge surfaces it. It also
+      # re-derives the set of workflows that declare `schedule:` but are NOT listed, and reports those
+      # as unmonitored (the list-completeness lint also runs in CI; this catches what reached main).
+      # Re-surfacing: when the problem set changes, `owner-acked` is removed so r/23 shows it again.
+      # Scheduled/dispatch runs only (workflow_run fires per CI completion; this needs no such cadence).
+      # continue-on-error: a fault here must never take down the main-health monitoring above it.
+      - name: Scheduled-workflow health → alert-escalated issue (t/4058)
+        if: github.event_name != 'workflow_run'
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9
+        with:
+          script: |
+            const { pathToFileURL } = require('url');
+            const fs = require('fs'), path = require('path');
+            const ws = process.env.GITHUB_WORKSPACE;
+            const { scheduledWorkflowVerdict, problemFingerprint, scheduledWorkflowFiles } =
+              await import(pathToFileURL(`${ws}/operations/devops/scheduled-workflow-health.mjs`).href);
+            const { ESCALATED_LABEL } = await import(pathToFileURL(`${ws}/operations/devops/main-ci-monitor.mjs`).href);
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const LABEL = 'scheduled-workflow-alert', ACK = 'owner-acked';
+            const declared = JSON.parse(fs.readFileSync(`${ws}/operations/devops/scheduled-workflows.json`, 'utf8')).workflows;
+            const wfDir = path.join(ws, '.github', 'workflows');
+            const actual = scheduledWorkflowFiles(fs.readdirSync(wfDir).filter(n => /\.ya?ml$/.test(n))
+              .map(n => ({ name: n, text: fs.readFileSync(path.join(wfDir, n), 'utf8') })));
+            const listed = new Set(declared.map(w => w.file));
+            const unlisted = actual.filter(f => !listed.has(f));
+
+            const nowMs = Date.now();
+            const verdicts = [];
+            for (const w of declared) {
+              let runs = [];
+              try {
+                const r = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: w.file, event: 'schedule', branch: 'main', per_page: 6 });
+                runs = r.data.workflow_runs.map(x => ({ conclusion: x.conclusion, createdAt: x.created_at }));
+                console.log(`  ${w.file}: total=${r.data.total_count} newest=${r.data.workflow_runs.slice(0,2).map(x => `#${x.id}@${x.created_at}/${x.event}/${x.head_branch}`).join(' ')}`);
+              } catch (e) {
+                verdicts.push({ file: w.file, status: 'silent', streak: 0, lastRunAt: null, reason: `could not list runs: ${e.message}` });
+                continue;
+              }
+              let v = scheduledWorkflowVerdict({ file: w.file, runs, maxSilentHours: w.maxSilentHours, nowMs });
+              if (v.status === 'silent') {
+                // A stale API read once reported pr-triage's newest scheduled run as 31 days old while a run
+                // from 1.5h earlier existed (t/4058 live probe). Confirm SILENT with a second read.
+                const r2 = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: w.file, event: 'schedule', branch: 'main', per_page: 6 });
+                v = scheduledWorkflowVerdict({ file: w.file, runs: r2.data.workflow_runs.map(x => ({ conclusion: x.conclusion, createdAt: x.created_at })), maxSilentHours: w.maxSilentHours, nowMs });
+              }
+              verdicts.push(v);
+            }
+            for (const f of unlisted) verdicts.push({ file: f, status: 'unmonitored', reason: 'declares schedule: but is not in scheduled-workflows.json' });
+
+            const problems = verdicts.filter(v => v.status !== 'ok');
+            const fp = problemFingerprint(verdicts);
+            const summary = problems.map(v => `- **\`${v.file}\`** — ${v.status}: ${v.reason}${v.lastRunAt ? ` (last scheduled run ${v.lastRunAt})` : ''}`).join('\n');
+            core.summary.addHeading('Scheduled-workflow health (t/4058)', 3)
+              .addRaw(`Checked ${declared.length} declared workflows; ${problems.length} problem(s).\n\n${summary || 'All healthy.'}\n`).write();
+            console.log(`scheduled-workflow health: ${declared.length} checked, ${problems.length} problem(s); fp=${fp}`);
+
+            const open = await github.rest.issues.listForRepo({ owner, repo, state: 'open', labels: LABEL, per_page: 1 });
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            if (problems.length === 0) {
+              if (open.data.length) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: open.data[0].number, body: `Resolved — all ${declared.length} scheduled workflows healthy. ${runUrl}` });
+                await github.rest.issues.update({ owner, repo, issue_number: open.data[0].number, state: 'closed' });
+              }
+              return;
+            }
+            const body = `<!-- fp:${fp} -->\n@${owner} **Scheduled workflows failing, silent, or unmonitored** (t/4058). main-ci-monitor does not watch these otherwise.\n\n${summary}\n\nFix each, or record why it is accepted. This issue updates in place and closes itself when all are healthy.\n\n- **Run:** ${runUrl}`;
+            if (!open.data.length) {
+              const created = await github.rest.issues.create({ owner, repo, title: `Scheduled workflow health: ${problems.length} problem(s)`, body, labels: [LABEL, ESCALATED_LABEL] });
+              try { await github.rest.issues.addAssignees({ owner, repo, issue_number: created.data.number, assignees: [owner] }); }
+              catch (e) { core.warning(`could not assign ${owner}: ${e.message}`); }
+              return;
+            }
+            const issue = open.data[0];
+            const priorFp = ((issue.body || '').match(/<!-- fp:(.*?) -->/) || [])[1];
+            await github.rest.issues.update({ owner, repo, issue_number: issue.number, title: `Scheduled workflow health: ${problems.length} problem(s)`, body });
+            if (priorFp !== fp) {
+              const before = new Set((priorFp || '').split(',').filter(Boolean));
+              const now = fp.split(',').filter(Boolean);
+              const added = now.filter(x => !before.has(x));
+              const cleared = [...before].filter(x => !now.includes(x));
+              if (added.length) {
+                // NEW problems: re-surface through r/23 (drop owner-acked) AND outside Orca (@mention) —
+                // r/23 is an Orca reminder and stalls with the Orca host (t/4053#5, CL p/210#99).
+                if (issue.labels.some(l => (l.name || l) === ACK)) {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: issue.number, name: ACK }).catch(() => {});
+                }
+                const clr = cleared.length ? `; cleared: \`${cleared.join(', ')}\`` : '';
+                await github.rest.issues.createComment({ owner, repo, issue_number: issue.number,
+                  body: `@${owner} **New scheduled-workflow problem(s):** \`${added.join(', ')}\`${clr}. ${runUrl}` });
+              } else {
+                // Only clearances: record them, but do not un-ack or re-ping — something got better.
+                await github.rest.issues.createComment({ owner, repo, issue_number: issue.number,
+                  body: `Cleared: \`${cleared.join(', ')}\` (no new problems). ${runUrl}` });
+              }
+            }
+
+      # ── ZERO-JOB PUSH-FAILURE: a workflow file GitHub rejected structurally (t/4347) ───────────
+      # PR #3527 (t/4340, TL review): environment-branch-policy-check.yml declared an invalid
+      # permissions: key. GitHub rejected the WHOLE file -- run 39478983829, a push-event run with
+      # ZERO jobs and conclusion: failure, for a workflow with no push: trigger at all (GitHub
+      # evaluates every workflow file's triggers on every push, regardless of what that file
+      # declares). workflow-lint's new Check 4 catches the invalid-key CLASS at PR time now; this
+      # catches the SYMPTOM live, for any workflow already on main and for any other way GitHub
+      # can reject a file (bad YAML, a key workflow-lint doesn't check yet, etc.) -- distinct from
+      # an ordinary job failing inside the workflow, which has jobCount > 0.
+      # Checks EVERY workflow file (not just declared/scheduled ones): the bug this is modeled on
+      # hit a workflow with no schedule: trigger either.
+      - name: Zero-job push-failure → invalid workflow file (t/4347)
+        if: github.event_name != 'workflow_run'
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9
+        with:
+          script: |
+            const { pathToFileURL } = require('url');
+            const fs = require('fs'), path = require('path');
+            const ws = process.env.GITHUB_WORKSPACE;
+            const { invalidWorkflowFileVerdict } = await import(pathToFileURL(`${ws}/operations/devops/scheduled-workflow-health.mjs`).href);
+            const { ESCALATED_LABEL } = await import(pathToFileURL(`${ws}/operations/devops/main-ci-monitor.mjs`).href);
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const LABEL = 'invalid-workflow-file';
+            const wfDir = path.join(ws, '.github', 'workflows');
+            const files = fs.readdirSync(wfDir).filter(n => /\.ya?ml$/.test(n));
+
+            const verdicts = [];
+            for (const file of files) {
+              let runs = [];
+              try {
+                const r = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: file, event: 'push', per_page: 1 });
+                if (r.data.workflow_runs.length) {
+                  const run0 = r.data.workflow_runs[0];
+                  const jobs = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: run0.id, per_page: 1 });
+                  runs = [{ conclusion: run0.conclusion, jobCount: jobs.data.total_count, runId: run0.id }];
+                }
+              } catch (e) {
+                console.log(`  ${file}: could not check (${e.message})`);
+                continue;
+              }
+              const v = invalidWorkflowFileVerdict({ file, runs });
+              if (v.invalid) verdicts.push(v);
+            }
+            console.log(`zero-job push-failure: ${files.length} workflow file(s) checked, ${verdicts.length} invalid`);
+
+            const open = await github.rest.issues.listForRepo({ owner, repo, state: 'open', labels: LABEL, per_page: 1 });
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            if (!verdicts.length) {
+              if (open.data.length) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: open.data[0].number, body: `Resolved — no workflow file currently shows a 0-job push-failure run. ${runUrl}` });
+                await github.rest.issues.update({ owner, repo, issue_number: open.data[0].number, state: 'closed' });
+              }
+              return;
+            }
+            const fp = verdicts.map(v => `${v.file}:${v.runId}`).sort().join(',');
+            const rows = verdicts.map(v => `- **\`${v.file}\`** — run ${v.runId}: ${v.reason}`).join('\n');
+            const body = `<!-- fp:${fp} -->\n@${owner} **${verdicts.length} workflow file(s) GitHub rejected structurally** (t/4347) -- 0 jobs + \`conclusion: failure\` on a push-event run means the YAML itself is invalid (bad key, bad structure), not a job failing inside it. Every trigger the file declares is silently dead until this is fixed.\n\n${rows}\n\nFix the YAML (check \`permissions:\` keys first -- workflow-lint's Check 4 now catches that specific cause at PR time) and push; this closes automatically.\n\n- **Run:** ${runUrl}`;
+            if (!open.data.length) {
+              const created = await github.rest.issues.create({ owner, repo, title: `Invalid workflow file(s): ${verdicts.length}`, body, labels: [LABEL, ESCALATED_LABEL] });
+              try { await github.rest.issues.addAssignees({ owner, repo, issue_number: created.data.number, assignees: [owner] }); }
+              catch (e) { core.warning(`could not assign ${owner}: ${e.message}`); }
+              return;
+            }
+            const issue = open.data[0];
+            const priorFp = ((issue.body || '').match(/<!-- fp:(.*?) -->/) || [])[1];
+            await github.rest.issues.update({ owner, repo, issue_number: issue.number, title: `Invalid workflow file(s): ${verdicts.length}`, body });
+            if (priorFp !== fp) {
+              await github.rest.issues.removeLabel({ owner, repo, issue_number: issue.number, name: 'owner-acked' }).catch(() => {});
+              await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body: `Problem set changed. ${runUrl}` });
+            }

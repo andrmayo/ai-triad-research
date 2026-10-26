@@ -5,7 +5,10 @@
  * Web bridge — implements AppAPI via REST and WebSocket calls to the server.
  * Used when the app runs in a browser served by the container.
  */
-import type { AppAPI, SourceDocumentResolution, DebateDelta, UserPreferences, BriefExportJobView, BriefExportRecord } from './types';
+import type { AppAPI, SourceDocumentResolution, DebateDelta, UserPreferences, BriefExportJobView, BriefExportRecord, StartInquiryRequest, InquiryStatusResponse, InquiryResultSummary, InquiryResult, RefreshModelsResponse } from './types';
+import { pullDataUpdatesRest } from './dataUpdatesPull';
+import { createTaxonomyVersions } from './taxonomyVersions';
+import { exportInquiryToFileWeb } from './inquiryExportWeb';
 import { instrumentBridge } from './instrumentBridge';
 import { makeCancellationError } from './cancellation';
 import { ActionableError } from '@lib/debate/errors';
@@ -18,6 +21,7 @@ import { nextStepsForStatus } from './httpErrorSteps';
 import { computeEmbeddingsChunked } from './embeddingsBatch';
 import { runChatStream, chatStreamBus } from './chatStream';
 import { runOpEdCreate, cancelActiveOpEdRun, opedProgressBus } from './opedStream';
+import { readByokKeys, maskByokKey } from './byokKeys';
 import { onQuotaMilestone } from '../hooks/useQuotaWarning';
 export { getResilienceState, subscribeResilience, resetResilience } from './resilience';
 export type { ResilienceStatus, CircuitState, ThrottleState, EndpointCategory } from './resilience';
@@ -41,6 +45,26 @@ function openAppWindow(hash: string): void {
 function throwHttpError(status: number, err: ActionableError): never {
   (err as ActionableError & { httpStatus: number }).httpStatus = status;
   throw err;
+}
+
+/**
+ * t/4186: a concurrent GitHub write conflict on commit. Discriminated by body `code`
+ * (TL contract, p/772#1), not the bare 409 — other 409s on this path (e.g. save_in_progress)
+ * must keep their existing generic handling. Extracted from `post` to keep its complexity
+ * within the file's complexity budget. Reads a clone so `post` can still read the body.
+ */
+async function throwIfWriteConflict(res: Response, path: string): Promise<void> {
+  if (res.status !== 409 || path !== '/api/sync/commit') return;
+  const data = await res.clone().json().catch(bridgeWarn('Failed to parse 409 response body', {})) as Record<string, unknown>;
+  if (data.code !== 'WRITE_CONFLICT') return;
+  const err = new ActionableError({
+    goal: 'Commit taxonomy changes',
+    problem: 'Someone else changed this file. Reload to see their version.',
+    location: 'web-bridge.post',
+    nextSteps: ['Reload to see the other writer’s change', 'Reapply your edit after reloading'],
+  });
+  (err as ActionableError & { code: string }).code = 'WRITE_CONFLICT';
+  throwHttpError(409, err);
 }
 
 // nextStepsForStatus moved to ./httpErrorSteps (leaf module, unit-tested) — t/2366.
@@ -149,6 +173,7 @@ async function fetchWithSessionRecovery(
   }
   return res;
 }
+const taxonomyVersions /* t/4187: ETag/If-Match version cell, taxonomyVersions.ts; a PUT is never retried */ = createTaxonomyVersions((path, init) => { const m = init.method ?? 'GET', cat = categorizeEndpoint(path, m); return fetchWithSessionRecovery(path, init, { timeoutMs: m === 'GET' ? DEFAULT_READ_TIMEOUT_MS : DEFAULT_MUTATION_TIMEOUT_MS, maxRetries: m === 'GET' ? defaultMaxRetries(cat, 'GET') : 0, critical: true, category: cat }); });
 
 async function isAnonymous(): Promise<boolean> {
   if (_authAnonymous !== null) return _authAnonymous;
@@ -305,6 +330,7 @@ async function post<T = unknown>(path: string, body?: unknown, opts?: FetchOptio
       }));
     }
   }
+  await throwIfWriteConflict(res, path);
   if (!res.ok) {
     const text = await res.text();
     throwHttpError(res.status, new ActionableError({
@@ -534,37 +560,6 @@ async function patchDebateDelta(delta: DebateDelta): Promise<{ newVersion: numbe
 
 export { get as bridgeGet, post as bridgePost, put as bridgePut, del as bridgeDel };
 
-/** Read BYOK keys from sessionStorage, backward-compatible with legacy single-key strings. */
-function readByokKeys(backend: string): string[] {
-  const raw = sessionStorage.getItem(`byok-${backend}`);
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) return parsed.filter((k: unknown) => typeof k === 'string' && k);
-  } catch (err) {
-    getGlobalRecorder()?.record({
-      type: 'system.error',
-      component: 'web-bridge',
-      level: 'warn',
-      message: `BYOK key JSON parse fallback for backend '${backend}'`,
-      error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
-    });
-  }
-  return [raw];
-}
-
-function maskByokKey(key: string): string {
-  const sep = key.indexOf('|');
-  if (sep > 0) {
-    const endpoint = key.slice(0, sep);
-    const k = key.slice(sep + 1);
-    const masked = k.length <= 4 ? k.slice(0, 2) + '***' : k.slice(0, 4) + '...' + k.slice(-4);
-    return `${endpoint} | ${masked}`;
-  }
-  if (key.length <= 4) return key.slice(0, 2) + '***';
-  return key.slice(0, 4) + '...' + key.slice(-4);
-}
-
 function bridgeWarn<T>(message: string, fallback: T) {
   return (err: unknown) => {
     getGlobalRecorder()?.record({
@@ -761,17 +756,24 @@ const rawApi: AppAPI = {
   // User preferences
   getPreferences: () => get<UserPreferences | null>('/api/preferences').catch(() => null),
   setPreferences: (prefs: UserPreferences) => put('/api/preferences', prefs, { idempotent: true }).then(() => {}),
-
   // Taxonomy directories
   getTaxonomyDirs: () => get('/api/taxonomy-dirs'),
   getActiveTaxonomyDir: () => get('/api/taxonomy-dir/active'),
   setTaxonomyDir: (dirName) => put('/api/taxonomy-dir/active', { dirName }).then(() => {}),
-
   // Taxonomy CRUD
-  loadTaxonomyFile: (pov) => get(`/api/taxonomy/${encodeURIComponent(pov)}`),
-  saveTaxonomyFile: (pov, data) => put(`/api/taxonomy/${encodeURIComponent(pov)}`, data).then(() => {}),
+  loadTaxonomyFile: (pov) => taxonomyVersions.load(pov),
+  loadTaxonomyFileForEdit: (pov) => taxonomyVersions.loadForEdit(pov),
+  loadTaxonomyFilesForEdit: (povs) => taxonomyVersions.loadManyForEdit(povs),
+  saveTaxonomyFile: (pov, data) => taxonomyVersions.save(pov, data),
   loadPolicyRegistry: () => get('/api/policy-registry'),
+  // t/4034: recount member_count / source_povs for these ids after a save (lib/policy/registryRecount.ts).
+  recountPolicyMembers: (ids) => post('/api/policy-registry/recount', { ids }),
   loadLineageCategories: () => get('/api/lineage-categories'),
+  // t/3852: durable delete-audit log; WARN+swallow on failure (never block the delete it records).
+  logNodeDeletion: (entry) => post('/api/node-delete-log', entry).then(() => {}).catch((err) =>
+    getGlobalRecorder()?.record({ type: 'system.error', component: 'bridge', level: 'warn',
+      message: 'logNodeDeletion endpoint unavailable (t/3860) or failed', data: { nodeId: entry.nodeId },
+      error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } })),
   loadLineageInfo: () => get<Record<string, unknown>>('/api/lineage-info'),
   loadEdges: () => get('/api/edges?include=rationale'), // t/2949: load the FULL set (rationale) so a whole-file save can't drop it; server strips by default
   getEdgeDetail: (index) => get(`/api/edges/${index}`),
@@ -783,6 +785,7 @@ const rawApi: AppAPI = {
   saveEdges: (data) => put('/api/edges', data).then(() => {}),
   buildNodeSourceIndex: () => get('/api/node-source-index'),
   buildPolicySourceIndex: () => get('/api/policy-source-index'),
+  getNodeSources: (nodeId) => get(`/api/node-source-index/${encodeURIComponent(nodeId)}`),
 
   // Conflict CRUD
   loadConflictFiles: () => get('/api/conflicts'),
@@ -808,29 +811,18 @@ const rawApi: AppAPI = {
   setDataRoot: (newRoot) => post('/api/data/set-root', { newRoot }),
   pickDirectory: () => Promise.resolve({ cancelled: true }),
   checkDataUpdates: () => post('/api/data/check-updates'),
-  pullDataUpdates: async () => {
-    // This endpoint streams heartbeats + progress lines to prevent proxy timeouts.
-    // The final non-empty line is the JSON result.
-    const res = await fetch('/api/data/pull', { method: 'POST' });
-    const text = await res.text();
-    const lines = text.split('\n').filter(l => l.trim() && !l.startsWith('progress:'));
-    if (lines.length === 0) {
-      throw new ActionableError({
-        goal: 'Pull data updates',
-        problem: 'Server returned no result',
-        location: 'web-bridge.pullDataUpdates',
-        nextSteps: ['Check the server logs', 'Try again'],
-      });
-    }
-    return JSON.parse(lines[lines.length - 1]);
-  },
+  pullDataUpdates: () => pullDataUpdatesRest(), // extracted (ADR-007) — see dataUpdatesPull.ts
 
   getChangedFiles: () => post<{ path: string; status: string }[]>('/api/data/changed-files').catch(bridgeWarn('getChangedFiles failed', [])),
+  // t/4052: read everywhere; review is desktop-only (hosted answers 405), so the web queue disables it.
+  loadPovTagProposals: () => get('/api/pov-tag-proposals'),
+  reviewPovTagProposal: (nodeId, decision, expectedStatus) => post('/api/pov-tag-proposals/review', { nodeId, decision, expectedStatus }),
   getFileDiff: (filePath) => post<string>('/api/data/file-diff', { filePath }).catch(bridgeWarn('getFileDiff failed', '')),
 
   // AI models & keys
   loadAIModels: () => get('/api/models'),
-  refreshAIModels: () => post('/api/models/refresh'),
+  // t/4031: opts travel as the POST body; a plain refresh still sends none. Not retried (a mutation).
+  refreshAIModels: (opts) => post<RefreshModelsResponse>('/api/models/refresh', opts),
   validateApiKey: (key, backend) => post('/api/keys/validate', { key, backend }),
   verifyStoredKeys: (backend) => post('/api/keys/verify-stored', { backend }),
   setApiKey: async (key, backend) => {
@@ -1016,6 +1008,14 @@ const rawApi: AppAPI = {
   deleteDebateSession: (id) => del(`/api/debates/${encodeURIComponent(id)}`).then(() => {}),
   loadDebateComments: (id) => get(`/api/debates/${encodeURIComponent(id)}/comments`),
   saveDebateComments: (id, data) => put(`/api/debates/${encodeURIComponent(id)}/comments`, data).then(() => {}),
+
+  // Inquiry (t/3582) — client of routes/inquiry.ts (t/3581); idempotency key rides a header, never the body.
+  startInquiry: (request: StartInquiryRequest, idempotencyKey?: string) => post<{ jobId: string }>('/api/inquiry', request, undefined, idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined),
+  getInquiry: (jobId: string) => get<InquiryStatusResponse>(`/api/inquiry/${encodeURIComponent(jobId)}`),
+  listInquiries: () => get<InquiryResultSummary[]>('/api/inquiry'),
+  exportInquiryToFile: (result: InquiryResult, title: string, format: 'json' | 'markdown' | 'pdf') => exportInquiryToFileWeb(result, title, format),
+  shareInquiry: (jobId) => post<{ shareId: string; url: string }>(`/api/inquiry/${encodeURIComponent(jobId)}/share`, {}),
+  unshareInquiry: (jobId) => del<{ ok: boolean }>(`/api/inquiry/${encodeURIComponent(jobId)}/share`),
 
   // Brief Export (t/2805, T7) — client of the T6 REST API (server: routes/briefExports.ts).
   createBriefExport: (debateId, body) => post<{ jobId: string }>(`/api/debates/${encodeURIComponent(debateId)}/exports`, body),

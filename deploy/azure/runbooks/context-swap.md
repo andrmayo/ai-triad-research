@@ -1,10 +1,15 @@
 # Runbook: Required-Context Swap Protocol
 
-**Owner:** DevOps. **Last updated:** 2026-08-04
+**Owner:** DevOps. **Last updated:** 2026-09-30
 
 Changing which status contexts are required on `main` silently strands every open PR that predates the swap: the new check never reports on those PRs, so armed auto-merge cannot fire. This runbook makes the swap and the re-trigger a single atomic operation.
 
 See also: `docs/orca-github-workflow.md` §5 (costs) and §6 item 4.
+
+> **Before you touch branch protection:** if a PR is `BLOCKED` but its required checks all read
+> **green**, this runbook is probably the WRONG tool — that's usually a duplicate in-flight CI
+> suite, not a context problem. See [merge-state-troubleshooting.md](merge-state-troubleshooting.md)
+> first (t/3605 was mis-diagnosed as a context outage and cost a HIGH ticket).
 
 ---
 
@@ -18,19 +23,29 @@ Any change to `required_status_checks.contexts` on the `main` branch — adding 
 
 ### Step 1 — Make the protection change
 
+> **⚠️ Use the `required_status_checks` SUB-RESOURCE, never a full `PUT /protection`.**
+> A full `PUT` to `.../branches/main/protection` replaces the **entire** protection object — every
+> field you omit or misstate is silently reset. That is how you regress `enforce_admins` to `false`
+> (it is `true` today — t/3736) or drop a required context such as `joint-gv-guard`. The
+> `PATCH .../required_status_checks` sub-resource below touches **only** `strict` + `contexts` and
+> leaves `enforce_admins`, reviews, and restrictions untouched. (t/3780)
+
+**First, read the CURRENT contexts** — the swap is relative to live state, not to this doc (which drifts):
+
 ```bash
-# Example: update required contexts via GitHub API
-gh api repos/jpsnover/ai-triad-research/branches/main/protection \
-  --method PUT \
+gh api repos/AI-Rosetta-Stone/ai-triad-research/branches/main/protection/required_status_checks --jq '.contexts'
+```
+
+**Then PATCH the full desired set.** The `contexts` array is **replace-semantics** within this
+sub-resource, so list every context you want to keep, plus/minus your change:
+
+```bash
+# Example: ADD "<new-context>" to the set you just read. Edit the list to match the CURRENT contexts.
+gh api -X PATCH repos/AI-Rosetta-Stone/ai-triad-research/branches/main/protection/required_status_checks \
   --input - <<'EOF'
 {
-  "required_status_checks": {
-    "strict": false,
-    "contexts": ["ci-gate", "CodeQL"]
-  },
-  "enforce_admins": false,
-  "required_pull_request_reviews": null,
-  "restrictions": null
+  "strict": false,
+  "contexts": ["ci-gate", "CodeQL", "joint-gv-guard", "<new-context>"]
 }
 EOF
 ```
@@ -38,8 +53,7 @@ EOF
 Verify the change took effect:
 
 ```bash
-gh api repos/jpsnover/ai-triad-research/branches/main/protection/required_status_checks \
-  --jq '.contexts'
+gh api repos/AI-Rosetta-Stone/ai-triad-research/branches/main/protection/required_status_checks --jq '.contexts'
 ```
 
 ### Step 2 — Re-trigger every open PR (mandatory)
@@ -68,7 +82,7 @@ Optional parameters:
 
 | Parameter | Default | Purpose |
 |-----------|---------|---------|
-| `-Repo` | `jpsnover/ai-triad-research` | Target repo |
+| `-Repo` | `AI-Rosetta-Stone/ai-triad-research` | Target repo |
 | `-RequiredContexts` | fetched from live protection | Override which contexts to verify |
 | `-TimeoutMinutes` | `8` | Extend for slow CI |
 | `-WhatIf` | off | Dry-run |

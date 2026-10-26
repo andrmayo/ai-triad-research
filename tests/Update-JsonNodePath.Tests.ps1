@@ -132,3 +132,273 @@ Describe 'Update-JsonNodePath — nested surgical replacement (t/2921)' -Tag 'su
         }
     }
 }
+
+Describe 'Update-JsonNodePath -Upsert — insert + container-create (t/3438)' -Tag 'summary' {
+
+    It 'inserts a missing scalar leaf into an EXISTING container; siblings preserved' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:Fixture } {
+            param($Raw)
+            # acc-001.graph_attributes exists (assumes/policy_actions/type) but has no debate_grounding.
+            $out = Update-JsonNodePath -RawText $Raw -NodeId 'acc-001' -Path @('graph_attributes','debate_grounding') -Value 'We hold X.' -Upsert
+            $ga = (@($out | ConvertFrom-Json).nodes | Where-Object { $_.id -eq 'acc-001' })[0].graph_attributes
+            $ga.debate_grounding | Should -Be 'We hold X.'
+            $ga.type             | Should -Be 'belief'      # sibling preserved
+            @($ga.assumes).Count | Should -Be 2             # sibling array preserved
+        }
+    }
+
+    It 'creates the graph_attributes container + leaf when the container is absent; node siblings preserved' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:Fixture } {
+            param($Raw)
+            # acc-003 has NO graph_attributes.
+            $out = Update-JsonNodePath -RawText $Raw -NodeId 'acc-003' -Path @('graph_attributes','debate_grounding') -Value 'We commit to Y.' -Upsert
+            $n = (@($out | ConvertFrom-Json).nodes | Where-Object { $_.id -eq 'acc-003' })[0]
+            $n.graph_attributes.debate_grounding | Should -Be 'We commit to Y.'
+            $n.interpretations.skeptic.summary   | Should -Be 'sumS'   # node sibling preserved
+        }
+    }
+
+    It 'FAILS CLOSED (path-not-found) when the leaf is absent and -Upsert is NOT passed' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:Fixture } {
+            param($Raw)
+            { Update-JsonNodePath -RawText $Raw -NodeId 'acc-001' -Path @('graph_attributes','debate_grounding') -Value 'x' } | Should -Throw
+        }
+    }
+
+    It 'FAILS CLOSED under -Upsert when a remaining segment is an array index (object-container create only)' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:Fixture } {
+            param($Raw)
+            { Update-JsonNodePath -RawText $Raw -NodeId 'acc-003' -Path @('graph_attributes', 0) -Value 'x' -Upsert } | Should -Throw
+        }
+    }
+
+    It 'replace-mode is byte-identical with -Upsert passed (upsert never alters the found-key path)' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:Fixture } {
+            param($Raw)
+            # Seed a debate_grounding, then replace it both with and without -Upsert → identical output.
+            $seeded = Update-JsonNodePath -RawText $Raw -NodeId 'acc-001' -Path @('graph_attributes','debate_grounding') -Value 'first' -Upsert
+            $replPlain  = Update-JsonNodePath -RawText $seeded -NodeId 'acc-001' -Path @('graph_attributes','debate_grounding') -Value 'second'
+            $replUpsert = Update-JsonNodePath -RawText $seeded -NodeId 'acc-001' -Path @('graph_attributes','debate_grounding') -Value 'second' -Upsert
+            $replUpsert | Should -Be $replPlain     # -Upsert is inert when the key already exists
+        }
+    }
+}
+
+Describe 'Update-JsonNodePath -Remove — key deletion (t/3460)' -Tag 'summary' {
+
+    # ── Removes EXACTLY the target key (positive) ───────────────────────────────────────────────────
+    It 'removes a CONTAINER-valued member (graph_attributes.assumes = array); siblings preserved' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:Fixture } {
+            param($Raw)
+            $out = Update-JsonNodePath -RawText $Raw -NodeId 'acc-001' -Path @('graph_attributes','assumes') -Remove
+            $ga = (@($out | ConvertFrom-Json).nodes | Where-Object { $_.id -eq 'acc-001' })[0].graph_attributes
+            $ga.PSObject.Properties['assumes']            | Should -BeNullOrEmpty    # gone
+            $ga.type                                       | Should -Be 'belief'      # sibling scalar preserved
+            @($ga.policy_actions).Count                    | Should -Be 2             # sibling array preserved
+            $ga.disagreement_type                          | Should -Be 'empirical'
+        }
+    }
+
+    It 'removes a MIDDLE scalar member (graph_attributes.type); substring-collider disagreement_type untouched' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:Fixture } {
+            param($Raw)
+            $out = Update-JsonNodePath -RawText $Raw -NodeId 'acc-001' -Path @('graph_attributes','type') -Remove
+            $ga = (@($out | ConvertFrom-Json).nodes | Where-Object { $_.id -eq 'acc-001' })[0].graph_attributes
+            $ga.PSObject.Properties['type'] | Should -BeNullOrEmpty
+            $ga.disagreement_type           | Should -Be 'empirical'   # collider survives
+            @($ga.assumes).Count            | Should -Be 2
+        }
+    }
+
+    It 'removes the LAST member (graph_attributes.disagreement_type); preceding sibling preserved' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:Fixture } {
+            param($Raw)
+            $out = Update-JsonNodePath -RawText $Raw -NodeId 'acc-001' -Path @('graph_attributes','disagreement_type') -Remove
+            $ga = (@($out | ConvertFrom-Json).nodes | Where-Object { $_.id -eq 'acc-001' })[0].graph_attributes
+            $ga.PSObject.Properties['disagreement_type'] | Should -BeNullOrEmpty
+            $ga.type                                      | Should -Be 'belief'
+        }
+    }
+
+    It 'removes the ONLY member → container collapses to a valid empty object {} (t/3460#2 Q2)' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:Fixture } {
+            param($Raw)
+            # acc-003.interpretations = { "skeptic": {...} } — single member.
+            $out = Update-JsonNodePath -RawText $Raw -NodeId 'acc-003' -Path @('interpretations','skeptic') -Remove
+            $n = (@($out | ConvertFrom-Json).nodes | Where-Object { $_.id -eq 'acc-003' })[0]
+            $n.PSObject.Properties['interpretations']            | Should -Not -BeNullOrEmpty  # container stays
+            @($n.interpretations.PSObject.Properties).Count      | Should -Be 0                # …now empty {}
+        }
+    }
+
+    It 'anti-sweep: a -Remove leaves foreign WIP on another node byte-identical (only the edited line changes)' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:Fixture } {
+            param($Raw)
+            $out = Update-JsonNodePath -RawText $Raw -NodeId 'acc-001' -Path @('graph_attributes','type') -Remove
+            $out | Should -BeLike '*"resolved_node_id": "sit-477"*'
+            $out | Should -BeLike '*"ratio": 3.0*'                  # NOT churned to 3
+            $origLines = @($Raw -split "`n"); $newLines = @($out -split "`n")
+            $newLines.Count | Should -Be $origLines.Count
+            $diff = for ($i = 0; $i -lt $origLines.Count; $i++) { if ($origLines[$i] -ne $newLines[$i]) { $i } }
+            @($diff).Count | Should -Be 1                            # only the acc-001 line changed
+        }
+    }
+
+    # ── Refuses fail-closed (negative); primitive throws → no output propagates ─────────────────────
+    It 'REFUSES an absent key (path-not-found) — throws, nothing removed' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:Fixture } {
+            param($Raw)
+            { Update-JsonNodePath -RawText $Raw -NodeId 'acc-001' -Path @('graph_attributes','nonexistent') -Remove } | Should -Throw
+        }
+    }
+
+    It 'REFUSES an array-index final segment (element removal reflows indices → would orphan)' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:Fixture } {
+            param($Raw)
+            { Update-JsonNodePath -RawText $Raw -NodeId 'acc-001' -Path @('graph_attributes','assumes',0) -Remove } | Should -Throw
+        }
+    }
+
+    It 'REFUSES a missing intermediate segment (no structure creation under -Remove)' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:Fixture } {
+            param($Raw)
+            { Update-JsonNodePath -RawText $Raw -NodeId 'acc-001' -Path @('nonexistent','x') -Remove } | Should -Throw
+        }
+    }
+
+    It 'no orphan blank line when removing a non-last member in multi-line JSON (trailing-comma branch)' {
+        # Regression test for the blank-line bug (t/3433). The single-line fixture cannot catch it;
+        # this fixture uses realistic multi-line indentation. Removing synthetic_phrases (non-last)
+        # must not leave behind a whitespace-only line from the absorbed preceding newline+indent.
+        InModuleScope AITriad {
+            $ml = @'
+{
+  "nodes": [
+    {
+      "id": "ml-001",
+      "graph_attributes": {
+        "attribution_text": "Some text.",
+        "synthetic_phrases": ["foo", "bar"],
+        "aphorism": "test aphorism"
+      }
+    }
+  ]
+}
+'@ -replace "`r`n", "`n"
+            $out = Update-JsonNodePath -RawText $ml -NodeId 'ml-001' -Path @('graph_attributes','synthetic_phrases') -Remove
+            $ga  = (@($out | ConvertFrom-Json).nodes | Where-Object { $_.id -eq 'ml-001' })[0].graph_attributes
+            $ga.PSObject.Properties['synthetic_phrases'] | Should -BeNullOrEmpty
+            $ga.aphorism           | Should -Be 'test aphorism'
+            $ga.attribution_text   | Should -Be 'Some text.'
+            $out | Should -Not -Match '(?m)^\s+$'   # no whitespace-only lines
+        }
+    }
+
+    It 'REFUSES -Remove + -Upsert together (mutually exclusive)' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:Fixture } {
+            param($Raw)
+            { Update-JsonNodePath -RawText $Raw -NodeId 'acc-001' -Path @('graph_attributes','type') -Remove -Upsert } | Should -Throw
+        }
+    }
+
+    It 'REFUSES -Remove carrying a Value (ambiguous intent)' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:Fixture } {
+            param($Raw)
+            { Update-JsonNodePath -RawText $Raw -NodeId 'acc-001' -Path @('graph_attributes','type') -Value 'x' -Remove } | Should -Throw
+        }
+    }
+
+    # ── Fault-injection: the re-parse-verify NET (not an upstream input refusal) catches a bad splice ──
+    It 'FAULT-INJECTION: a doctored (wrong) member span is caught by re-parse-verify — throws, no corrupt output' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:Fixture } {
+            param($Raw)
+            # Force the member locator to report a WRONG span so the splice deletes the wrong bytes. This
+            # bypasses every input guard (the key IS present) — only the re-parse-verify net can catch it.
+            # It must throw, never return a corrupted string.
+            Mock Find-JsonMemberSpan { @{ KeyStart = 5; ValueEnd = 60 } }
+            { Update-JsonNodePath -RawText $Raw -NodeId 'acc-001' -Path @('graph_attributes','type') -Remove } | Should -Throw
+            Should -Invoke Find-JsonMemberSpan -Times 1 -Exactly   # the fault path was actually exercised
+        }
+    }
+}
+
+Describe 'Update-JsonNodePath -ArrayValue (t/3969)' -Tag 'summary' {
+
+    BeforeAll {
+        $script:ArrayFixture = @'
+{
+  "nodes": [
+    { "id": "skp-001", "label": "has tags", "pov_tags": ["old-tag"] },
+    { "id": "skp-002", "label": "no tags yet" },
+    { "id": "skp-003", "graph_attributes": { "foo": "bar" } }
+  ]
+}
+'@ -replace "`r`n", "`n"
+
+        # Raw-JSON (not reparsed) check that $NodeId's $Field is an array with exactly the given elements,
+        # per the PovTags.RoundTrip.Tests.ps1 discipline (#2839) — reparsing would hide an unroll.
+        function Test-FieldWrittenAsArray([string]$Raw, [string]$NodeId, [string]$Field, [string[]]$Expected) {
+            $doc = $Raw | ConvertFrom-Json -AsHashtable
+            $node = $doc.nodes | Where-Object { $_.id -eq $NodeId } | Select-Object -First 1
+            $actual = $node[$Field]
+            if ($actual -isnot [System.Collections.IList]) { return $false }
+            if (@($actual).Count -ne $Expected.Count) { return $false }
+            for ($i = 0; $i -lt $Expected.Count; $i++) { if ($actual[$i] -ne $Expected[$i]) { return $false } }
+            return $true
+        }
+    }
+
+    It 'replaces an existing array with a ONE-element array (the unroll-prone case — REGRESSION GUARD: fails if the encode line reverts to piping $Value into ConvertTo-Json, confirmed by temporarily reverting the source line)' {
+        $out = InModuleScope AITriad -Parameters @{ Raw = $script:ArrayFixture } {
+            param($Raw)
+            Update-JsonNodePath -RawText $Raw -NodeId 'skp-001' -Path @('pov_tags') -Value @('critical') -ArrayValue
+        }
+        Test-FieldWrittenAsArray $out 'skp-001' 'pov_tags' @('critical') | Should -BeTrue
+    }
+
+    It 'replaces an existing array with a ZERO-element array' {
+        $out = InModuleScope AITriad -Parameters @{ Raw = $script:ArrayFixture } {
+            param($Raw)
+            Update-JsonNodePath -RawText $Raw -NodeId 'skp-001' -Path @('pov_tags') -Value @() -ArrayValue
+        }
+        Test-FieldWrittenAsArray $out 'skp-001' 'pov_tags' @() | Should -BeTrue
+    }
+
+    It 'replaces an existing array with a TWO-element array' {
+        $out = InModuleScope AITriad -Parameters @{ Raw = $script:ArrayFixture } {
+            param($Raw)
+            Update-JsonNodePath -RawText $Raw -NodeId 'skp-001' -Path @('pov_tags') -Value @('a', 'b') -ArrayValue
+        }
+        Test-FieldWrittenAsArray $out 'skp-001' 'pov_tags' @('a', 'b') | Should -BeTrue
+    }
+
+    It '-Upsert -ArrayValue creates a ONE-element array leaf that did not exist before' {
+        $out = InModuleScope AITriad -Parameters @{ Raw = $script:ArrayFixture } {
+            param($Raw)
+            Update-JsonNodePath -RawText $Raw -NodeId 'skp-002' -Path @('pov_tags') -Value @('critical') -Upsert -ArrayValue
+        }
+        Test-FieldWrittenAsArray $out 'skp-002' 'pov_tags' @('critical') | Should -BeTrue
+    }
+
+    It 'REJECTS an array Value with no -ArrayValue switch (fail-closed default)' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:ArrayFixture } {
+            param($Raw)
+            { Update-JsonNodePath -RawText $Raw -NodeId 'skp-001' -Path @('pov_tags') -Value @('x') } | Should -Throw
+        }
+    }
+
+    It 'REJECTS a nested (non-flat) array under -ArrayValue' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:ArrayFixture } {
+            param($Raw)
+            $nested = @(@('x', 'y'), 'z')
+            { Update-JsonNodePath -RawText $Raw -NodeId 'skp-001' -Path @('pov_tags') -Value $nested -ArrayValue } | Should -Throw
+        }
+    }
+
+    It 'REJECTS an object-shaped target even with -ArrayValue (t/2921 Q2 still holds for objects)' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:ArrayFixture } {
+            param($Raw)
+            { Update-JsonNodePath -RawText $Raw -NodeId 'skp-003' -Path @('graph_attributes') -Value @('x') -ArrayValue } | Should -Throw
+        }
+    }
+}

@@ -12,6 +12,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { IncomingMessage, ServerResponse } from 'http';
 
 const getCommunityOpEd = vi.fn();
+const mintAndProjectCommunityOpEd = vi.fn(); // t/3484: the single mint+project path the route now delegates to
 const isAdmin = vi.fn(() => false);
 const mintCommunityOpedShare = vi.fn(async () => 'share-xyz');
 const revokeCommunityOpedShare = vi.fn();
@@ -20,8 +21,9 @@ const writePublicCommunityOpEd = vi.fn(async () => {});
 const deletePublicCommunityOpEd = vi.fn(async () => {});
 const checkRate = vi.fn(() => ({ allowed: true, retryAfterMs: 0 }));
 const getStorageUserId = vi.fn(() => 'user-1');
+const logServerWarn = vi.fn(); // t/3334: capture the mint-refusal WARN→Log_s
 
-vi.mock('../community/community.js', () => ({ getCommunityOpEd: (...a: unknown[]) => getCommunityOpEd(...a), isAdmin: (...a: unknown[]) => isAdmin(...a) }));
+vi.mock('../community/community.js', () => ({ getCommunityOpEd: (...a: unknown[]) => getCommunityOpEd(...a), mintAndProjectCommunityOpEd: (...a: unknown[]) => mintAndProjectCommunityOpEd(...a), isAdmin: (...a: unknown[]) => isAdmin(...a) }));
 vi.mock('../community/communityOpedShares.js', () => ({
   mintCommunityOpedShare: (...a: unknown[]) => mintCommunityOpedShare(...a),
   revokeCommunityOpedShare: (...a: unknown[]) => revokeCommunityOpedShare(...a),
@@ -36,9 +38,11 @@ vi.mock('../security/userContext.js', () => ({ getStorageUserId: () => getStorag
 vi.mock('../security/rateLimitResponse.js', () => ({ rateLimitResponseBody: () => ({ error: 'rate_limited', retryAfter: 1 }) }));
 vi.mock('../../../../lib/flight-recorder/index.js', () => ({ getGlobalRecorder: () => ({ record: vi.fn() }) }));
 vi.mock('../logger.js', () => ({
-  log: { api: { info: vi.fn(), warn: vi.fn(), error: vi.fn() }, server: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } },
+  log: { api: { info: vi.fn(), warn: vi.fn(), error: vi.fn() }, server: { info: vi.fn(), warn: (...a: unknown[]) => logServerWarn(...a), error: vi.fn(), debug: vi.fn() } },
   getRequestId: () => 'test-req', getRequestContext: () => undefined,
 }));
+// t/3334: deterministic backend name for the mint-refusal WARN's discriminating data.
+vi.mock('../storage/fileIO.js', () => ({ getUserContentBackend: () => ({ constructor: { name: 'FilesystemBackend' } }) }));
 
 import { registerCommunityRoutes } from '../routes/community.js';
 import type { ServerCtx } from '../routes/context.js';
@@ -67,7 +71,10 @@ describe('POST/DELETE /api/community/opeds/:id/share (t/3315)', () => {
     vi.clearAllMocks();
     isAdmin.mockReturnValue(false);
     checkRate.mockReturnValue({ allowed: true, retryAfterMs: 0 });
-    mintCommunityOpedShare.mockResolvedValue('share-xyz');
+    // t/3484: the route now delegates mint+project to mintAndProjectCommunityOpEd (single path); it
+    // pre-reads getCommunityOpEd ONLY to source submittedBy. Defaults: found item + minted outcome.
+    getCommunityOpEd.mockResolvedValue({ found: true, item: GOOD_ITEM });
+    mintAndProjectCommunityOpEd.mockResolvedValue({ outcome: 'minted', shareId: 'share-xyz' });
     getStorageUserId.mockReturnValue('user-1');
     const { router, handlers } = makeRouter();
     registerCommunityRoutes(router as never, { getGithubBackend: () => null } as unknown as ServerCtx);
@@ -75,33 +82,65 @@ describe('POST/DELETE /api/community/opeds/:id/share (t/3315)', () => {
     del = handlers['DELETE /api/community/opeds/:id/share'];
   });
 
-  it('mints: returns {shareId,url}, writes the public projection, response carries NO item/identity data', async () => {
-    getCommunityOpEd.mockResolvedValue(GOOD_ITEM);
+  it('mints: delegates to mintAndProjectCommunityOpEd with the item submitter, returns {shareId,url}, no identity leak', async () => {
+    getCommunityOpEd.mockResolvedValue({ found: true, item: GOOD_ITEM }); // submittedBy source
+    mintAndProjectCommunityOpEd.mockResolvedValue({ outcome: 'minted', shareId: 'share-xyz' });
     const res = fakeRes();
     await post(req('/api/community/opeds/oped-1/share'), res, {});
     expect(res._status).toBe(200);
     expect(res._body).toEqual({ shareId: 'share-xyz', url: '/share/oped/share-xyz' });
-    expect(mintCommunityOpedShare).toHaveBeenCalledWith('oped-1', 'author-9'); // submitter tracked server-side
-    expect(writePublicCommunityOpEd).toHaveBeenCalledWith(GOOD_ITEM, 'share-xyz');
-    // no identity/metadata leaked in the response
-    expect(JSON.stringify(res._body)).not.toContain('author-9');
+    // t/3484: single mint+project path (t/3483#2 no-dual-mint); submitter sourced from community_metadata.
+    expect(mintAndProjectCommunityOpEd).toHaveBeenCalledWith('oped-1', 'author-9');
+    expect(JSON.stringify(res._body)).not.toContain('author-9'); // no identity leaked
+    expect(logServerWarn).not.toHaveBeenCalled();
   });
 
-  it('404 when the community item does not exist', async () => {
-    getCommunityOpEd.mockResolvedValue(null);
+  it('already-shared → 200 with the stable shareId (idempotent)', async () => {
+    mintAndProjectCommunityOpEd.mockResolvedValue({ outcome: 'already-shared', shareId: 'share-xyz' });
+    const res = fakeRes();
+    await post(req('/api/community/opeds/oped-1/share'), res, {});
+    expect(res._status).toBe(200);
+    expect(res._body).toEqual({ shareId: 'share-xyz', url: '/share/oped/share-xyz' });
+    expect(logServerWarn).not.toHaveBeenCalled();
+  });
+
+  it('404 when the item is ABSENT (wrong/missing id) — routine, NO operator WARN (t/3430)', async () => {
+    getCommunityOpEd.mockResolvedValue({ found: false, reason: 'absent' });
+    mintAndProjectCommunityOpEd.mockResolvedValue({ outcome: 'skipped', reason: 'absent' });
     const res = fakeRes();
     await post(req('/api/community/opeds/missing/share'), res, {});
     expect(res._status).toBe(404);
-    expect(mintCommunityOpedShare).not.toHaveBeenCalled();
+    // t/3430: 'absent' is ordinary not-found — must NOT emit the operator corruption WARN.
+    expect(logServerWarn).not.toHaveBeenCalled();
   });
 
-  it('422 (assert-presence) when the item is empty/malformed — never mints a shareId for it', async () => {
-    getCommunityOpEd.mockResolvedValue({ topic: '', opeds: [] });
+  it('404 + operator WARN when the item is SILENT-EMPTY (reason=empty = possible corruption) (t/3430)', async () => {
+    getCommunityOpEd.mockResolvedValue({ found: false, reason: 'empty' });
+    mintAndProjectCommunityOpEd.mockResolvedValue({ outcome: 'skipped', reason: 'empty' });
     const res = fakeRes();
-    await post(req('/api/community/opeds/empty/share'), res, {});
+    await post(req('/api/community/opeds/silent-empty/share'), res, {});
+    expect(res._status).toBe(404);
+    // t/3430: 'empty' = ADR-001 silent-empty guard = possible GitHub-API silent-empty / corruption →
+    // WARN→Log_s, DISCRIMINATED from ordinary 'absent'. Mapping preserved through the helper's reason.
+    expect(logServerWarn).toHaveBeenCalledTimes(1);
+    expect(logServerWarn).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'silent-empty', backend: 'FilesystemBackend', path: 'mint', reason: 'empty' }),
+      expect.stringContaining('SILENT-EMPTY'),
+    );
+  });
+
+  it('422 when the item is malformed (missing topic) — WARNs, never registers a shareId (t/3334)', async () => {
+    getCommunityOpEd.mockResolvedValue({ found: true, item: { topic: '', opeds: [{ pov: 'accelerationist', body: 'x' }] } });
+    mintAndProjectCommunityOpEd.mockResolvedValue({ outcome: 'skipped', reason: 'malformed' });
+    const res = fakeRes();
+    await post(req('/api/community/opeds/malformed/share'), res, {});
     expect(res._status).toBe(422);
-    expect(mintCommunityOpedShare).not.toHaveBeenCalled();
-    expect(writePublicCommunityOpEd).not.toHaveBeenCalled();
+    // t/3334: malformed found item = unambiguous corruption → WARN→Log_s with id + backend.
+    expect(logServerWarn).toHaveBeenCalledTimes(1);
+    expect(logServerWarn).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'malformed', backend: 'FilesystemBackend', reason: 'malformed' }),
+      expect.stringContaining('malformed'),
+    );
   });
 
   it('429 when rate-limited (mint = any authed user, RATE-LIMITED)', async () => {

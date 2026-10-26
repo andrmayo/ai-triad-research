@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 // Licensed under the MIT License. See LICENSE file in the project root.
 
-import type { StageDiagnostics, BriefWorkProduct, PlanWorkProduct, DraftWorkProduct, CiteWorkProduct, TurnPipelineResult, PromptComponentChars, DraftQualityGateResult } from '../types.js';
+import type { StageDiagnostics, BriefWorkProduct, PlanWorkProduct, DraftWorkProduct, CiteWorkProduct, TurnPipelineResult, PromptComponentChars, DraftQualityGateResult, EditingMeta } from '../types.js';
 import { ActionableError } from '../errors.js';
 import { getGlobalRecorder } from '../../flight-recorder/index.js';
 import { validateDraftStage, validateCiteStage, validatePlanStage, isFillerRelevance, parseDraftQualityResult, resolveMoveName } from '../turnValidator.js';
@@ -10,7 +10,7 @@ import type { MoveAnnotation } from '../helpers.js';
 import { briefStagePrompt, briefStagePromptV2, planStagePrompt, draftStagePrompt, citeStagePrompt, citeRetryPrompt, draftQualityCheckPrompt, assumptionsExtractionPrompt, classifyOffScopeDrift, offScopeRepairHint } from '../prompts.js';
 import { flattenEnvelope } from '../cacheTypes.js';
 import { briefStageEnvelope, planStageEnvelope, draftStageEnvelope, citeStageEnvelope } from '../envelopes.js';
-import { resolveBackend } from '../../ai-client/registry.js';
+import { inferBackend } from '../../ai-client/registry.js';
 import { buildCitationBank, buildScopedCitationBank, formatCitationBank, scrubCitations, validateCitationsAgainstBank, extractCitationMatches } from '../citationResolution.js';
 import type { CitationBankEntry, CitationResolutionDiagnostics } from '../citationResolution.js';
 import type { DocMetaMap } from '../evidenceFromSummaries.js';
@@ -23,6 +23,7 @@ import { buildRepairBlock, trySpecificityMicroFix, tryInterventionMicroFix, tryD
 import { extractDraftMeta } from './assemble.js';
 import { DEFAULT_STAGE_TEMPERATURES } from './types.js';
 import type { TurnPipelineInput, StageGenerateFn, StageProgressFn, EnvelopeGenerateFn } from './types.js';
+import { runReadabilityEditPass } from './readabilityEditPass.js';
 
 export async function runTurnPipeline(
   input: TurnPipelineInput,
@@ -49,6 +50,10 @@ export async function runTurnPipeline(
   const isOuterRetry = (input.repairHints?.length ?? 0) > 0;
   const MAX_STAGE_RETRIES = isOuterRetry ? 0 : 3;
   let degradedTurn = false;
+  let step = 0;
+  const totalStages =
+    6  // always: brief, plan, evidence, draft, postDraft, cite
+    + ((!isOuterRetry && !input.skipPreCheck && input.preCheckModel) ? 1 : 0); // draft_quality
 
   // Per-component char counts for prompt growth forensics (t/221)
   const hintsChars =
@@ -77,7 +82,7 @@ export async function runTurnPipeline(
     console.log(`[pipeline] Brief stage FROZEN — reusing prior output`);
   } else {
     for (let briefAttempt = 0; briefAttempt <= MAX_STAGE_RETRIES; briefAttempt++) {
-      onProgress?.('brief', `${input.label} is briefing${briefAttempt > 0 ? ` (retry ${briefAttempt})` : ''}...`);
+      onProgress?.('brief', `${input.label} is briefing${briefAttempt > 0 ? ` (retry ${briefAttempt})` : ''}...`, briefAttempt === 0 ? { step: ++step, total: totalStages } : undefined);
       getGlobalRecorder()?.record({
         type: 'turn.stage', component: 'turn-pipeline', level: 'info',
         speaker: input.label, debate_id: (input as any).debate_id, turn_id: (input as any).turn_id,
@@ -200,7 +205,7 @@ export async function runTurnPipeline(
   } else {
     let planRepairHints: string[] = [];
     for (let planAttempt = 0; planAttempt <= MAX_STAGE_RETRIES; planAttempt++) {
-      onProgress?.('plan', `${input.label} is planning${planAttempt > 0 ? ` (retry ${planAttempt})` : ''}...`);
+      onProgress?.('plan', `${input.label} is planning${planAttempt > 0 ? ` (retry ${planAttempt})` : ''}...`, planAttempt === 0 ? { step: ++step, total: totalStages } : undefined);
       getGlobalRecorder()?.record({
         type: 'turn.stage', component: 'turn-pipeline', level: 'info',
         speaker: input.label,
@@ -333,6 +338,7 @@ export async function runTurnPipeline(
 
   let topicAlignmentResult: { topic_aligned: boolean; repaired: boolean; draft_attempt: number } | undefined;
   let qualityGateResult: { pre_repair: DraftQualityGateResult; post_repair?: DraftQualityGateResult; repair_outcome?: 'fixed' | 'partial' | 'unchanged' } | undefined;
+  let editingMeta: TurnPipelineResult['editing_meta'];
 
   if (input.frozenDraft) {
     draft = input.frozenDraft;
@@ -343,6 +349,7 @@ export async function runTurnPipeline(
 
   // ── Stage 2.5: EVIDENCE (deterministic — no LLM call) ──
   // Retrieve source document evidence for the plan's target nodes.
+  onProgress?.('evidence', `${input.label} retrieving evidence...`, { step: ++step, total: totalStages });
   // Produces a compact evidence brief injected into the DRAFT prompt.
   if (input.frozenEvidenceBlock != null) {
     evidenceBlock = input.frozenEvidenceBlock;
@@ -419,7 +426,8 @@ export async function runTurnPipeline(
   // Path B (gemini/claude tool-calling) requires multi-turn provider support — future enhancement.
   let citationBank: CitationBankEntry[] = [];
   let citationBankBlock = '';
-  const citationBackend = resolveBackend(input.model);
+  // A diagnostic label only (the path used is fixed below), so an unknown id must not throw (t/4101).
+  const citationBackend = inferBackend(input.model);
   const citationPathIntended = (citationBackend === 'gemini' || citationBackend === 'claude') ? 'B' : 'A';
   const citationPathUsed: 'tool-calling' | 'bank-scrub' = 'bank-scrub'; // Path B requires multi-turn provider support (future)
   let citationBankBuildTime = 0;
@@ -475,7 +483,7 @@ export async function runTurnPipeline(
 
   const MAX_DRAFT_RETRIES = isOuterRetry ? 1 : 2; // outer retry gets 1 inner retry; normal gets up to 2
   for (let draftAttempt = 0; draftAttempt <= MAX_DRAFT_RETRIES; draftAttempt++) {
-    onProgress?.('draft', `${input.label} is drafting${draftAttempt > 0 ? ` (retry ${draftAttempt})` : ''}...`);
+    onProgress?.('draft', `${input.label} is drafting${draftAttempt > 0 ? ` (retry ${draftAttempt})` : ''}...`, draftAttempt === 0 ? { step: ++step, total: totalStages } : undefined);
     getGlobalRecorder()?.record({
       type: 'turn.stage', component: 'turn-pipeline', level: 'info',
       speaker: input.label,
@@ -626,6 +634,27 @@ export async function runTurnPipeline(
       console.log(`[pipeline] Draft field-level merge: froze ${ALL_DRAFT_FIELDS.filter(f => !targetedFields.has(f)).join(', ')}, regenerated ${[...targetedFields].join(', ')}`);
     }
 
+    // Emit draft-field coverage event (t/3769) — _covered:true makes absence distinguishable from present-but-zero.
+    if (draft) {
+      getGlobalRecorder()?.record({
+        type: 'debate.stage_draft_fields',
+        component: 'turn-pipeline',
+        level: 'info',
+        speaker: input.label,
+        phase: input.phase,
+        data: {
+          stage: 'draft',
+          claim_sketches: draft.claim_sketches?.length ?? 0,
+          prior_steelmans: draft.prior_steelmans?.length ?? 0,
+          turn_symbols: draft.turn_symbols?.length ?? 0,
+          statement_chars: draft.statement?.length ?? 0,
+          position_update: !!draft.position_update,
+          commitment: !!draft.commitment,
+          _covered: true,
+        },
+      });
+    }
+
     // Backfill empty claim_sketches targets from prior draft — LLMs drop AN-ID
     // targets when regenerating claims because they focus on text, not ID mappings.
     if (draft?.claim_sketches && priorDraft?.claim_sketches) {
@@ -659,6 +688,7 @@ export async function runTurnPipeline(
         pendingIntervention: stageInput.pendingIntervention as import('../types.js').ModeratorIntervention | undefined,
         suppressedHints: input.suppressedHints,
         speaker: input.pov as import('../types.js').SpeakerId,
+        soul: stageInput.soul!,
       });
       // Record validation result on the stage diagnostic
       const lastDiag = stageDiags[stageDiags.length - 1];
@@ -679,6 +709,7 @@ export async function runTurnPipeline(
         : draftVal.errorHints.length > 0;
       if (draftShouldRetry && draftAttempt < maxDraftRetries) {
         // ── Micro-fix passes: try targeted fixes before full retry ──
+        onProgress?.('micro-fix', `${input.label} refining...`, { step, total: totalStages });
         const specFix = await trySpecificityMicroFix(
           draft, draftVal.repairHints ?? [], stageDiags, input, generate,
           evidenceBlock, citationBankBlock,
@@ -740,6 +771,15 @@ export async function runTurnPipeline(
     draftRepairHints = [];
     break;
   }
+
+  // ── Post-draft readability edit pass ──
+  onProgress?.('postDraft', `${input.label} post-processing draft...`, { step: ++step, total: totalStages });
+  if (draft?.statement) {
+    const editResult = await runReadabilityEditPass(draft.statement, input.audience, generate, input.model, `${input.label}`);
+    (draft as Record<string, unknown>).statement = editResult.statement;
+    editingMeta = editResult.editing_meta;
+  }
+
   // ── Post-Draft assumptions extraction (lightweight LLM call) ──
   // Deferred from Draft to reduce cognitive load during generation (t/298).
   // Opening turns already produce key_assumptions — only extract for non-opening turns.
@@ -945,7 +985,8 @@ export async function runTurnPipeline(
       if (evidenceWpToUpdate) {
         evidenceWpToUpdate.ungrounded_claims = ungroundedClaims;
       }
-      console.log(`[pipeline] Ungrounded claims: ${ungroundedClaims.length} factual assertions not traceable to source corpus`);
+      const claimSnippets = ungroundedClaims.map(c => c.claim.slice(0, 120)).join('; ');
+      console.log(`[pipeline] Ungrounded claims: ${ungroundedClaims.length} factual assertions not traceable to source corpus — ${claimSnippets}`);
     }
   }
 
@@ -1051,7 +1092,7 @@ export async function runTurnPipeline(
     input.preCheckModel &&
     draft?.statement
   ) {
-    onProgress?.('draft_quality', `${input.label} is quality-checking draft...`);
+    onProgress?.('draft_quality', `${input.label} is quality-checking draft...`, { step: ++step, total: totalStages });
     const preCheckPromptText = draftQualityCheckPrompt(
       draft.statement,
       input.lastOpponentStatement,
@@ -1274,9 +1315,10 @@ export async function runTurnPipeline(
     /taxonomy_refs.*(?:filler|too-short|relevance)|No new taxonomy_refs|Unknown taxonomy node|Unknown policy_refs|grounding_confidence/i.test(h)
   ) ?? [];
   let citeParsed: ReturnType<typeof parseStageResponse<CiteWorkProduct>>;
+  let citeStep = 0; // captured on first attempt; filler-retry re-emits the same step (TL t/3845#1)
 
   for (let citeAttempt = 0; citeAttempt <= MAX_STAGE_RETRIES; citeAttempt++) {
-    onProgress?.('cite', `${input.label} is citing${citeAttempt > 0 ? ` (retry ${citeAttempt})` : ''}...`);
+    onProgress?.('cite', `${input.label} is citing${citeAttempt > 0 ? ` (retry ${citeAttempt})` : ''}...`, citeAttempt === 0 ? { step: (citeStep = ++step), total: totalStages } : { step: citeStep, total: totalStages });
     getGlobalRecorder()?.record({
       type: 'turn.stage', component: 'turn-pipeline', level: 'info',
       speaker: input.label,
@@ -1356,7 +1398,7 @@ export async function runTurnPipeline(
   );
   if (weakRefs.length > 0) {
     console.log(`[pipeline] ${weakRefs.length} weak taxonomy_refs detected, running cite retry for: ${weakRefs.map(r => r.node_id).join(', ')}`);
-    onProgress?.('cite', `${input.label} is strengthening refs...`);
+    onProgress?.('cite', `${input.label} is strengthening refs...`, { step: citeStep, total: totalStages });
     const retryPrompt = citeRetryPrompt(
       weakRefs.map(r => ({ node_id: r.node_id, relevance: r.relevance ?? '' })),
       draftJson,
@@ -1415,6 +1457,7 @@ export async function runTurnPipeline(
     ignoredEvidenceDocIds: ignoredEvidenceDocIds.length > 0 ? ignoredEvidenceDocIds : undefined,
     stage_diagnostics: stageDiags,
     total_time_ms: Date.now() - pipelineStart,
+    editing_meta: editingMeta,
     topicAlignmentResult,
     qualityGateResult,
     degraded_turn: degradedTurn || undefined,

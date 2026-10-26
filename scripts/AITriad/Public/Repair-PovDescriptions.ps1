@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
+# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 # Licensed under the MIT License. See LICENSE file in the project root.
 
 function Repair-PovDescriptions {
@@ -50,7 +50,7 @@ function Repair-PovDescriptions {
 
         [ValidateScript({ Test-AIModelId $_ })]
         [ArgumentCompleter({ param($cmd, $param, $word) $script:ValidModelIds | Where-Object { $_ -like "$word*" } })]
-        [string]$Model = 'gemini-3.5-flash-lite',
+        [string]$Model = (Get-AITierModel -Tier basic),
 
         [string]$ApiKey
     )
@@ -61,13 +61,10 @@ function Repair-PovDescriptions {
     $TaxDir = Get-TaxonomyDir
 
     # Resolve API key for AI fixes
-    $ResolvedKey = $null
+    # Backend from ai-models.json, never guessed; only the user's -ApiKey is forwarded (t/4087).
+    $HasAIKey = $false
     if (-not $WhatIfPreference) {
-        if ($Model -match '^gemini') { $Backend = 'gemini' }
-        elseif ($Model -match '^claude') { $Backend = 'claude' }
-        elseif ($Model -match '^openai') { $Backend = 'openai' }
-        else { $Backend = 'gemini' }
-        $ResolvedKey = Resolve-AIApiKey -ExplicitKey $ApiKey -Backend $Backend
+        $HasAIKey = (Get-AIModelKeyStatus -Model $Model -ApiKey $ApiKey).HasKey
     }
 
     $PovFiles = @('accelerationist', 'safetyist', 'skeptic')
@@ -87,7 +84,7 @@ function Repair-PovDescriptions {
         $FilePath = Join-Path $TaxDir "$PovName.json"
         if (-not (Test-Path $FilePath)) { continue }
 
-        $Data = Get-Content $FilePath -Raw | ConvertFrom-Json
+        $Data = Read-PovTaxonomyFile -Path $FilePath   # shape-preserving read for the canonical write (t/4356)
         $Modified = $false
 
         Write-Host "`n=== $PovName ===" -ForegroundColor Cyan
@@ -95,6 +92,7 @@ function Repair-PovDescriptions {
         foreach ($Node in $Data.nodes) {
             $Desc = $Node.description
             if (-not $Desc) { continue }
+            if (Test-TaxonomyNodeSuperseded $Node) { continue }   # no AI rewrite of a retired node; $Data keeps it (t/4356)
             # Skip parent nodes
             if ($Node.PSObject.Properties['children'] -and $Node.children -and @($Node.children).Count -gt 0) { continue }
             # Category filter
@@ -153,7 +151,7 @@ function Repair-PovDescriptions {
             # ── Show before ───────────────────────────────────────────────
             $BeforeTail = if ($Desc.Length -gt 60) { "...$($Desc.Substring($Desc.Length - 60))" } else { $Desc }
 
-            if ($NeedsAI -and -not $WhatIfPreference -and $ResolvedKey) {
+            if ($NeedsAI -and -not $WhatIfPreference -and $HasAIKey) {
                 # AI-assisted repair
                 $Prompt = @"
 You are repairing a taxonomy node description. Do NOT rewrite — only fix the specific issues listed.
@@ -182,7 +180,7 @@ Rules:
 "@
 
                 try {
-                    $Result = Invoke-AIApi -Prompt $Prompt -Model $Model -ApiKey $ResolvedKey `
+                    $Result = Invoke-AIApi -Prompt $Prompt -Model $Model -ApiKey $ApiKey `
                         -Temperature 0.2 -MaxTokens 1024 -TimeoutSec 30
                     if ($Result -and $Result.Text) {
                         $NewDesc = $Result.Text.Trim() -replace '^\s*```\s*', '' -replace '\s*```\s*$', ''
@@ -225,8 +223,7 @@ Rules:
 
         # Write back if modified
         if ($Modified -and -not $WhatIfPreference) {
-            Assert-DataWriteAllowed -Path $FilePath  # t/2902
-            $Data | ConvertTo-Json -Depth 20 | Set-Content -Path $FilePath -Encoding UTF8
+            Write-PovTaxonomyFile -Path $FilePath -Data $Data   # canonical TS format (t/4356)
             Write-Host "  Saved $FilePath" -ForegroundColor Green
         }
     }

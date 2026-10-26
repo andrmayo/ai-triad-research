@@ -11,8 +11,17 @@
 #   quality-gates (t/1292; .ts/.tsx LOC moved to ESLint max-lines per ADR-007, t/1692)
 #   doc-accuracy  doc-link steps (t/2093; repo at zero dead links after t/2092)
 #   license-notices staleness (t/2920; ≥1 green warn cycle + platform-determinism fixed)
+#   test-electron  Required scripts present + TypeScript check (renderer) (t/3897; 8-day warn
+#                  cycle 2026-10-04 to 2026-10-12, zero failure annotations; --if-present also
+#                  dropped from Lint/Test in the same PR, plus the new matrix-membership job)
 # FLIP-PENDING (remove continue-on-error to enforce):
 #   doc-accuracy  doc-claims + REPO_MAP steps (t/1324)
+#   schema-drift  warn-only until Phase-2 blocking flip (t/3447, t/3469)
+#   complexity-budget  PS complexity ratchet (scripts/ t/3829, operations/ t/3849),
+#                      warn-first per scan scope until ≥1 green cycle each (flip gated on SO + TL-GV)
+#   agents-md-budget   instruction-file size ratchet (t/4323), covers only the 2 AGENTS.md files
+#                      the main repo tracks (root + operations/devops/azure/); warn-first until
+#                      ≥1 green cycle (flip is a separate T2 step per t/4323)
 # NEVER-FLIP (annotation-only by design — continue-on-error stays permanently):
 #   debate-eval        — nondeterministic AI scores, signal not gate (t/1329)
 #   commit-hygiene     — visibility not friction, never fails CI (t/1319)
@@ -22,7 +31,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `epic/**` (t/3642): an epic integration branch must run CI on each merge so
+    # the INTEGRATED state of several roles' children is tested — a PR-only fix
+    # would let integration breakage accumulate silently (t/3618 exposed this:
+    # 4 individually-green children, zero runs against the epic head).
+    branches: [main, 'epic/**']
     # Skip the post-merge re-run for docs-only pushes. All code PRs already
     # ran CI before merging (branch protection). A push where every changed
     # file matches this list cannot affect any compiled artifact, so re-running
@@ -35,7 +48,32 @@ on:
       - 'docs/**'
       - 'deploy/azure/runbooks/**'
   pull_request:
-    branches: [main]
+    # `epic/**` (t/3642): a child PR opened directly against an epic base branch
+    # must be tested BEFORE it merges into the epic. `branches: [main]` alone
+    # matched nothing for such PRs → GitHub fired zero CI runs (t/3618).
+    branches: [main, 'epic/**']
+    # Label/auto-merge event types (labeled/unlabeled/auto_merge_enabled) were
+    # dropped here (t/3607 PR B): the joint-gv auto-merge guard now lives in its
+    # own lightweight required workflow (.github/workflows/joint-gv-guard.yml)
+    # subscribed to those events. Keeping them on ci.yml re-ran the full matrix on
+    # every label/auto-merge toggle, re-opening a transient BLOCKED window on an
+    # already-green PR (t/3605/t/3607). Code CI only needs code-change events.
+    # lint:gated-events: opened,synchronize,reopened,edited
+    # ^ machine-readable declaration (t/3646): every event that can change what ci-gate
+    #   aggregates. workflow-lint asserts pull_request.types ⊇ this set for the required context.
+    # 'edited' added (workflow-lint R3-floor, t/3646): also fires on a PR body/title edit — e.g.
+    # declaring `Tier: T2` after opening, which t/4103's tier-check needs re-evaluated. ci-gate's
+    # own job just re-aggregates its `needs:` jobs' pass/fail for the SAME commit SHA on an
+    # edited-only event (no code changes), so this is a harmless re-aggregation, not a re-run of
+    # the full test matrix.
+    types: [opened, synchronize, reopened, edited]
+  # Nightly FULL-suite backstop (cost fix). Pushes to main/epic/** are now path-filtered
+  # by `changes` exactly like PRs, so an unfiltered run no longer happens on every merge
+  # (~35 merges/day x ~36 jobs was the bulk of Actions minutes). This scheduled run keeps
+  # the "unconditional run on main" safety net that catches a too-narrow filter (the t/3443
+  # shape), at most one day late instead of on every merge. workflow_dispatch also runs all.
+  schedule:
+    - cron: '23 7 * * *'
   workflow_dispatch:
 
 permissions:
@@ -45,6 +83,35 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  # ── record-base-ref (t/3687): retarget stale-green guard sink ──────────────
+  # Records the base ref NAME this workflow ran against as a commit STATUS, so the
+  # pre-self-merge merge-guard can detect a base RETARGET after CI (base-ref-name
+  # identity — timestamps and merge-SHA both failed; see merge-guard-predicate.mjs).
+  # DIAGNOSTIC ONLY — this status must NEVER be added to required contexts (TL p/331):
+  # that would turn a diagnostic into a merge blocker nobody designed. Scoped token
+  # (statuses:write only, not a broadening of the heavy jobs). Posts to the PR HEAD sha,
+  # NOT github.sha — on pull_request github.sha is the merge commit, which GitHub rebuilds
+  # when main advances (the merge-SHA trap, t/3687), orphaning the status for exactly the
+  # long-lived PRs the guard protects. Gated to pull_request (on push, github.base_ref is empty).
+  record-base-ref:
+    name: Record base ref (t/3687)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Post base-ref-record commit status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          gh api --method POST "repos/${REPO}/statuses/${HEAD_SHA}" \
+            -f state=success \
+            -f context="base-ref-record/ci.yml" \
+            -f description="${BASE_REF}"
+
   # ── changes: paths-filter that gates which code jobs run per PR ────────────
   # LOAD-BEARING for branch protection (t/1962). `ci-gate` (below) treats a
   # SKIPPED gated job as satisfied — which is only sound *because this filter is
@@ -55,10 +122,15 @@ jobs:
   # caught. Any edit to these filters must preserve: every code path maps to the
   # job(s) that test it, and every filter includes '.github/workflows/ci.yml' so
   # ci.yml edits run the full suite.
+  # Runs on pull_request AND push (cost fix): on push to main/epic/** the filter diffs the
+  # pushed commit(s) against the previous tip (github.event.before), so a merge only re-runs
+  # the job families its files touch. schedule/workflow_dispatch skip this job and every
+  # gated job runs unconditionally (the full-suite backstop).
   changes:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       pull-requests: read
     outputs:
       powershell: ${{ steps.filter.outputs.powershell }}
@@ -72,7 +144,15 @@ jobs:
       lockfile-sync: ${{ steps.filter.outputs.lockfile-sync }}
       bicep-env: ${{ steps.filter.outputs.bicep-env }}
       bicep-resources: ${{ steps.filter.outputs.bicep-resources }}
+      schema-drift: ${{ steps.filter.outputs.schema-drift }}
+      verify-config: ${{ steps.filter.outputs.verify-config }}
+      citation-link-ci: ${{ steps.filter.outputs.citation-link-ci }}
     steps:
+      # push events: paths-filter diffs with local git, so it needs a checkout (PR events use the API).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+        if: github.event_name == 'push'
+        with:
+          fetch-depth: 0
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         id: filter
         with:
@@ -89,11 +169,16 @@ jobs:
               - 'scripts/**'
               - 'tests/**'
               - 'operations/devops/**'
+              # .githooks/** — the hooks are tested by tests/WorkflowMode.Hooks.Tests.ps1 and the
+              # pre-commit hint parity step; a hook-only change previously ran neither.
+              - '.githooks/**'
               - 'lib/**'
               - 'ai-models.json'
               - 'deploy/azure/main.bicep'
               - 'taxonomy-editor/src/server/briefExportJobs.ts'
-              - '.github/workflows/ci.yml'
+              # .github/workflows/** (t/4058) — the scheduled-workflow list lint reads every workflow
+              # file; a PR that only ADDS a scheduled workflow must still run it (skip-reads-as-pass).
+              - '.github/workflows/**'
             electron:
               - 'taxonomy-editor/**'
               - 'poviewer/**'
@@ -103,11 +188,31 @@ jobs:
               - 'ai-models.json'
               - '.github/workflows/ci.yml'
               - 'scripts/AITriad/Prompts/**'  # promptCatalog.lint validates this dir; must re-run when prompts change here (t/2915)
+              # tests/fixtures/** (t/4367) — lib/sourceIndex/sourceIdentityFixture.test.ts (run by
+              # test-electron's vitest) reads tests/fixtures/source-identity-cases.json, a shared
+              # input also read by the PS Pester suite. #3546 changed only this fixture + PS/docs
+              # files, matched NO electron path, test-electron SKIPPED, and main's CI reported
+              # success while 8 TS tests were failing. Every path a test-electron test READS must
+              # be in this list (the t/3189/t/4058 rule, same soundness class).
+              - 'tests/fixtures/**'
+              # root pnpm-lock.yaml — the license-notices staleness gate (t/2918) lives INSIDE
+              # this job and reads the @img/sharp-* set directly from the ROOT lockfile
+              # (generate-notices.cjs:224 → path.resolve('..','pnpm-lock.yaml')). A root-lock-only
+              # dep bump (e.g. sharp 0.35.3→0.35.4, #2145) shifts the notices content but matched
+              # NO electron path → test-electron skipped on the PR → the REQUIRED license gate
+              # false-greened (ci-gate treats a skipped gated job as satisfied; t/2094/t/2025
+              # soundness rule) → reds post-merge on main's unconditional run. Include the root
+              # lockfile so the gate fires pre-merge on any dep bump that can shift notices (t/3443).
+              - 'pnpm-lock.yaml'
             debate:
               - 'lib/debate/**'
               - 'evals/**'
               - 'ai-usages.json'
               - 'ai-models.json'
+              # behaviourRevision.test.ts monitors this cross-package file (t/4166).
+              # Without this entry a Rosetta Stone edit skips test-debate, the staleness
+              # test never fires, and a stale generated constant lands on main undetected.
+              - 'taxonomy-editor/src/renderer/hooks/useDebateStore/shared/modelConfig.ts'
               - '.github/workflows/ci.yml'
             schema:
               - 'taxonomy/schemas/**'
@@ -116,15 +221,26 @@ jobs:
               - '.github/workflows/ci.yml'
             lib:
               - 'lib/**'
+              - 'pnpm-lock.yaml'        # ESLint version bump skips lib-lint otherwise (t/3443 shape)
               - '.github/workflows/ci.yml'
+              # tests/fixtures/** (t/4367) — same shared-input gap as 'electron' above:
+              # lib/sourceIndex/sourceIdentityFixture.test.ts reads this fixture too.
+              - 'tests/fixtures/**'
             # 'embeddings' gates embedding-onnx-equivalence (t/3198): the real-ONNX bit-exact
             # worker↔in-thread check. Narrower than 'lib' — only the embeddings subtree (worker,
             # in-thread module, harness) or a ci.yml edit can change the equivalence outcome, so
-            # a broad lib change need not pay the build:server + model-download cost. Advisory job
-            # (not in ci-gate needs), so a too-narrow filter cannot false-green a required context.
+            # a broad lib change need not pay the build:server + model-download cost. PROMOTED to
+            # REQUIRED (in ci-gate needs, t/3240) — so a too-narrow filter would let an ORT-kernel
+            # change land on main UNOBSERVED; the onnxruntime-node manifest+lockfile are included below.
             embeddings:
               - 'lib/embeddings/**'
               - '.github/workflows/ci.yml'
+              # SO cond 2 (t/3240#7): an onnxruntime-node version bump changes the ONNX kernels and
+              # could break bit-exact equivalence, so an ORT-pin PR must bear the gate. A lockfile path
+              # fires the job on EVERY dep bump (not just ORT) — ACCEPTED BY DESIGN per TL (~51s,
+              # skip = OK, also catches transitive ORT bumps); do NOT narrow it.
+              - 'taxonomy-editor/package.json'
+              - 'taxonomy-editor/pnpm-lock.yaml'
             python:
               - 'scripts/**'
               - '.github/ci/**'
@@ -135,6 +251,14 @@ jobs:
               # merged its disjoint-scope contract untested). test-python now runs the
               # reconciler --selftest for these paths (see that job).
               - 'research/comp-linguist/scripts/**'
+              # research/comp-linguist/tools/** — formalizer / golden scorer / Option C parity
+              # tests (t/3940). Previously matched no filter, so they never ran in CI.
+              - 'research/comp-linguist/tools/**'
+              # lib/debate/soul-docs/** — the ONLY input of tools/test_render_soul_md.py (its
+              # _SOUL_DIR). Without it a soul-JSON-only PR skipped test-python, ci-gate counted the
+              # skip as a pass, and #2938 left main's .soul.md views stale unobserved (t/4029, the
+              # t/3189 shape). Rule: every path a test-python test READS must be in this list.
+              - 'lib/debate/soul-docs/**'
               - '.github/workflows/ci.yml'
             # 'container' gates test-container (t/2094). SOUNDNESS: ci-gate treats
             # a SKIPPED gated job as satisfied, so this list must cover EVERYTHING
@@ -198,13 +322,92 @@ jobs:
               - 'deploy/azure/main.bicep'
               - 'operations/devops/Test-BicepAcaResourcePairs.ps1'
               - '.github/workflows/ci.yml'
+            # 'schema-drift' gates the warn-only drift gate (t/3469, t/3447 Phase-1).
+            # Triggers on schema-of-record changes, Zod validator changes, or the runner
+            # script. Skip = OK (warn-only; not in ci-gate). NEVER-FILTER on data-repo
+            # changes — that's a separate repo and can't be path-filtered here.
+            schema-drift:
+              - 'lib/schema/**'
+              - 'lib/debate/schemas.ts'
+              - 'operations/devops/run-schema-drift.ts'
+              - '.github/workflows/ci.yml'
+            # 'verify-config' gates the verify-config job (t/4150, t/4109 root #14). CI never ran
+            # `npm run verify:config` before this (TL grep of ci.yml, origin/main, 10-12). Route
+            # enumeration from reading scripts/Verify-Config.ps1 in full (t/4150#3): every file
+            # whose change can flip the script's $Results (FAIL-capable), plus the WARN-only
+            # lanes' own source files (can never flip the exit code, but are still genuine config
+            # changes worth the warn cycle's visibility).
+            verify-config:
+              - 'ai-models.json'
+              - 'outlets.json'
+              - 'scripts/Verify-Config.ps1'
+              - 'operations/devops/DataRepoHooksVerdict.ps1'
+              - 'tests/Test-AIModelsConfig.Tests.ps1'
+              - 'tests/ModelLiteralLint.Tests.ps1'
+              - 'tests/OutletsKeySetGate.Tests.ps1'
+              - 'tests/OutletKeySetVerdict.Tests.ps1'
+              - 'tests/AIBackendProfiles.Completeness.Tests.ps1'
+              - 'taxonomy-editor/src/server/__tests__/keysValidation.test.ts'
+              - 'taxonomy-editor/src/main/__tests__/modelConfigCache.test.ts'
+              - 'lib/debate/__tests__/configInvariant.test.ts'
+              - 'lib/electron-shared/modelDiscovery.test.ts'
+              - 'taxonomy-editor/src/renderer/hooks/useTaxonomyStore/slices/__tests__/registryCompleteness.test.ts'
+              - 'lib/ai-config/modelLiteralLint.test.ts'
+              - 'lib/ai-config/modelLiteralLint.conformance.test.ts'
+              - 'lib/oped/__tests__/outletsKeySetGate.test.ts'
+              # WARN-only lanes (never flip $Results, included for warn-cycle visibility):
+              - 'lib/ai-client/cache-pricing-cli.ts'
+              - 'lib/ai-client/registry.ts'
+              - 'scripts/CalibrationEpochCheck.ps1'
+              - 'research/comp-linguist/docs/metric-provenance-register.md'
+              - '.github/workflows/ci.yml'
+            # 'citation-link-ci' gates citation-link-ci-fixture (t/4443, t/4147 SO C5a). The data
+            # repo's citation-link-integrity.yml checks out this repo's code at `main` with no
+            # `ref:`, so a change to these files changes a BLOCKING data gate's verdict without
+            # that gate ever running on the code PR. Path-filtered to exactly the cmdlet + its
+            # Private helpers (not the broad 'powershell' group) per the ticket's own ask.
+            citation-link-ci:
+              - 'scripts/AITriad/Public/Test-CitationLinkIntegrity.ps1'
+              - 'scripts/AITriad/Public/Build-NodeSourceIndex.ps1'
+              - 'scripts/AITriad/Private/Get-SummariesInputHash.ps1'
+              - 'scripts/AITriad/Private/Compare-NodeSourceIndexKeySet.ps1'
+              - 'scripts/AITriad/Private/Get-NodeSourceIndexLink.ps1'
+              - 'tests/fixtures/citation-link-integrity/**'
+              - 'operations/devops/Test-CitationLinkIntegrityFixtureCI.ps1'
+              - '.github/workflows/ci.yml'
 
   test-powershell:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.powershell == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.powershell == 'true')
+    # Outer hang-bound for the whole job (replaces GitHub's 360-min default — a hung suite
+    # otherwise burns 6h of CI). Set 5 min above the step-level Pester timeout below so the STEP
+    # timeout fires first on the common case (the Pester run), yielding the clear "has timed out"
+    # message + the explicit TIMED-OUT annotation, instead of the job-cancel's ambiguous
+    # "operation was canceled" (t/3646 flip diagnosis burned ~20 min on exactly that). This job
+    # bound only catches a hang in a NON-Pester step. Does NOT address transient runner-preemption
+    # cancels on main (t/3663 area); the durable fix is trimming/parallelizing the suite (t/3665,
+    # PowerShell scope) off its ~14-min edge.
+    timeout-minutes: 30
     runs-on: ubuntu-latest
+    # t/3668: shard the Pester suite across parallel matrix jobs, KEEPING -Force per-file isolation
+    # (each shard runs a DISJOINT slice — no import-once, no state bleed; t/3665 close-out chose
+    # shard-with-Force over the 84-var reset re-architecture). ci-gate aggregates the shards via
+    # needs.test-powershell.result (all must pass); test-powershell is NOT itself a required
+    # context (only ci-gate is), so this is a ci.yml-only change — no branch-protection edit.
+    # t/4095: 2 -> 6 shards, modulo slicing -> duration-balanced LPT bin-pack (ShardBalancer.ps1),
+    # to bring the critical path (slowest shard) under 8 min -- 2 EQUAL-COUNT shards still let an
+    # imbalanced split of SLOW vs fast files set the ceiling regardless of shard count. 4 shards
+    # balanced the measured Pester-only time perfectly (187s/shard) but observed 7-8m20s wall
+    # clock per shard on real CI; 5 shards (125s/shard measured) still swung 6m30s-8m25s across
+    # 3 runs on the same head -- fixed per-job overhead dominates and CI runner variance alone
+    # spans close to a minute, so shrinking the variable part further buys margin against that
+    # variance rather than hitting a precise number.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
 
@@ -212,7 +415,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
         continue-on-error: true
         with:
-          repository: jpsnover/ai-triad-data
+          repository: AI-Rosetta-Stone/ai-triad-data
           path: ai-triad-data
           fetch-depth: 1
 
@@ -222,7 +425,7 @@ jobs:
 
       # Node + tsx required by parity tests (-Tag parity) in t/2609.
       # tsx must be available so the no-silent-skip guard fires on absence.
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413  # v6.1.0
         with:
           version: '11.20.0'
 
@@ -250,20 +453,274 @@ jobs:
         run: Install-Module Pester -Force -Scope CurrentUser
 
       - name: Run Pester tests with coverage
+        id: pester
+        # Step-level bound on the one long step (green ~10-14 min → 25 = ~2x headroom). A STEP
+        # timeout fails only this step (later steps still run), so the "Explain a test-powershell
+        # timeout" step below can turn the kill into an explicit annotation. GitHub's own message
+        # here is "has timed out after 25 minutes" — already unambiguous vs a test failure (t/3665).
+        timeout-minutes: 25
         shell: pwsh
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARD_TOTAL: '6'
+          # t/4454 Phase 1 (TL condition 4, t/4454#3): when set, every real-data-root write hit
+          # during the test run appends one line here. PowerShell's side (#3770) owns the writer;
+          # this step only consumes the log afterward (see "Report DATA-ROOT-TEST-WRITE hits" below).
+          AITRIAD_DATA_ROOT_TEST_WRITE_LOG: ${{ runner.temp }}/data-root-test-write-${{ matrix.shard }}.log
         run: |
           . ./operations/devops/Get-PesterExcludePaths.ps1  # single source of truth (t/3010)
+          . ./operations/devops/FlakeVerdict.ps1            # t/3546 verdict message (content regression-guarded by tests/FlakeVerdict.Tests.ps1)
+          . ./operations/devops/ShardBalancer.ps1           # t/4095: duration-balanced LPT bin-pack, replaces the t/3668 modulo slice
           $config = New-PesterConfiguration
-          $config.Run.Path = './tests/'
+          # t/4095: duration-balanced assignment, not round-robin-by-index (t/3668's `file-index %
+          # shardTotal` ignored duration entirely, so the slowest shard set the critical path
+          # regardless of shard count). Every shard job computes the FULL assignment (not just its
+          # own slice) and validates union-equals-all BEFORE selecting its slice -- a slicing bug
+          # is then caught by whichever shard would otherwise silently run a wrong/incomplete set,
+          # not discovered later from a missing test nobody ran.
+          $shard = [int]$env:SHARD; $shardTotal = [int]$env:SHARD_TOTAL
+          $allTests = @(Get-ChildItem ./tests -Recurse -Filter *.Tests.ps1 | Sort-Object FullName)
+          $repoRoot = (Get-Location).Path
+          $allPaths = @($allTests | ForEach-Object { $_.FullName.Substring($repoRoot.Length + 1) -replace '\\', '/' })
+          $durationsRaw = Get-Content -Raw -LiteralPath './operations/devops/test-powershell-shard-durations.json' | ConvertFrom-Json
+          $durations = @{}
+          foreach ($prop in $durationsRaw.PSObject.Properties) { $durations[$prop.Name] = [double]$prop.Value }
+          $assignment = Get-ShardAssignment -Files $allPaths -Durations $durations -ShardTotal $shardTotal
+          $coverage = Test-ShardAssignmentCoverage -Files $allPaths -Shards $assignment.Shards
+          if (-not $coverage.IsValid) {
+            Write-Host "::error::shard assignment coverage check FAILED -- Missing=$($coverage.Missing.Count) Duplicated=$($coverage.Duplicated.Count) Extra=$($coverage.Extra.Count). Missing: $($coverage.Missing -join '; '). Duplicated: $($coverage.Duplicated -join '; '). Extra: $($coverage.Extra -join '; ')"
+            exit 1
+          }
+          $myRelPaths = @($assignment.Shards[$shard - 1])
+          $pathToFull = @{}
+          foreach ($t in $allTests) { $pathToFull[$t.FullName.Substring($repoRoot.Length + 1) -replace '\\', '/'] = $t.FullName }
+          $mine = @($myRelPaths | ForEach-Object { $pathToFull[$_] })
+          Write-Host "::notice::test-powershell shard $shard/$shardTotal — running $($mine.Count) of $($allTests.Count) test files (duration-balanced, t/4095)"
+          if ($mine.Count -eq 0) { Write-Host "::error::shard $shard matched 0 test files (slicing bug) — failing safe."; exit 1 }
+          $config.Run.Path = $mine
           # Live-data SituationBDI compliance decoupled to compliance-live.yml
           # (t/2331, t/2324#1): data-corpus state must not block code PRs.
           $config.Run.ExcludePath = Get-PesterExcludePaths
           $config.Output.Verbosity = 'Detailed'
-          $config.Run.Exit = $true
+          # t/3530: we OWN the red/green decision (Run.Exit=$false + PassThru) so we can rerun a
+          # lone flaky test once and surface the failing test name after the coverage dump. The
+          # manual verdict below is >= as strict as Run.Exit was: it gates on Pester's overall
+          # $r.Result (failed tests AND container/discovery errors), NOT on FailedCount — a
+          # syntax-error-only file yields FailedCount=0 but Result=Failed (verified, Pester 6.1.0).
+          $config.Run.Exit = $false
+          $config.Run.PassThru = $true
           $config.CodeCoverage.Enabled = $true
           $config.CodeCoverage.Path = @('./scripts/AITriad/Public/*.ps1')
+          # REPORTING-ONLY — NOT an enforced floor. Verified (t/3530): Pester's Run.Exit never
+          # failed the build on sub-target coverage, and this step deliberately does not either.
+          # It only prints "Covered X% / 5%" for visibility. Making coverage a real gate would be
+          # a gate promotion (own SO + warn phase), not a quiet addition here.
           $config.CodeCoverage.CoveragePercentTarget = 5
-          Invoke-Pester -Configuration $config
+
+          $r = Invoke-Pester -Configuration $config
+
+          # t/3665 timeout observability: the suite finished executing (pass OR fail). Its ABSENCE
+          # in the annotate step below => the step was killed mid-run by timeout-minutes, i.e. a
+          # TIMEOUT, not a test failure. Written after run 1 returns; a rare rerun-phase timeout is
+          # still caught by GitHub's native "has timed out" step message.
+          New-Item -ItemType File -Force -Path "$env:RUNNER_TEMP/pester-suite-ran.marker" | Out-Null
+
+          # ── t/3530 manual verdict: reruns a lone flake, fails safe on everything else ──
+          if ($null -eq $r) {
+            Write-Host "::error::test-powershell: Pester returned no result object — failing safe."
+            exit 1
+          }
+          if ($r.Result -eq 'Passed') { exit 0 }
+          # Container/discovery error (syntax error, throwing BeforeAll): FailedContainersCount>0,
+          # often with FailedCount=0. Nothing to rerun — fail immediately (R1/R3).
+          if ($r.FailedContainersCount -gt 0) {
+            $r.Containers | Where-Object { $_.Result -eq 'Failed' } | ForEach-Object {
+              Write-Host "::error::test-powershell container/discovery error: $($_.Item.Name)"
+            }
+            Write-Host "::error::test-powershell: $($r.FailedContainersCount) container/discovery error(s) — fix required (not a flaky test)."
+            exit 1
+          }
+          # Not passed, but no failed tests and no failed containers -> unknown non-pass. Fail safe.
+          if ($r.FailedCount -le 0) {
+            Write-Host "::error::test-powershell: run did not pass (Result=$($r.Result)) with no failed tests or containers — failing safe."
+            exit 1
+          }
+          # Pure test failure(s) — eligible for ONE flake rerun of only those tests (R3), no coverage.
+          $failedTests = @($r.Tests | Where-Object { $_.Result -eq 'Failed' })
+          $failedNames = @($failedTests | ForEach-Object { $_.ExpandedPath })
+          # t/4080: rerun the failing test FILES, not a Filter.FullName name filter. A name filter cannot
+          # match data-driven `It '... <Name>' -ForEach` tests (it matched NOTHING -> every test NotRun ->
+          # the old Result/TotalCount check read that as healed and laundered real failures to green:
+          # main 696ea125, run 37668037103, 12 hidden failures). Rerunning whole files costs a little more,
+          # only on the (rare) failure path; the verdict below then checks each failed test BY NAME.
+          $failedFiles = @($failedTests | ForEach-Object { $_.ScriptBlock.File } | Where-Object { $_ } | Sort-Object -Unique)
+          Write-Host "::warning::test-powershell: $($failedNames.Count) test(s) failed on run 1 — rerunning their $($failedFiles.Count) file(s) once to distinguish flake from real failure."
+          if ($failedFiles.Count -eq 0) { Write-Host "::error::test-powershell: could not resolve the failing tests' files — failing safe (t/4080)."; exit 1 }
+          $rc = New-PesterConfiguration
+          $rc.Run.Path = $failedFiles
+          $rc.Run.Exit = $false
+          $rc.Run.PassThru = $true
+          $rc.Output.Verbosity = 'Detailed'
+          # t/3546: best-effort delay before the in-job rerun. Lets TRANSIENT-releasing contention
+          # clear — a subprocess mid-teardown still releasing its port, a temp-file / advisory-lock
+          # race. Honest limit: it does NOT clear a fixed-port TIME_WAIT (~60s on Linux) or a live
+          # parallel-shard hold of the same port; those need the ephemeral -Port 0 source fix
+          # (t/3547, PowerShell). Cheap — only paid on the (rare) failure path.
+          Start-Sleep -Seconds 5
+          $r2 = Invoke-Pester -Configuration $rc
+          # t/4080 (replaces R4): healed ONLY if every run-1 failed test RE-RAN and PASSED, matched by name.
+          # NotRun / Skipped / absent all count as NOT healed — the old Result/TotalCount check counted
+          # NotRun tests toward "covered" and read zero-failures-because-nothing-ran as Passed.
+          # Identity = File + ExpandedPath, aggregated (SO e/279#6): ExpandedPath alone omits the file, so
+          # co-named tests in two files (or two -ForEach rows) would collide and a Passed copy could erase a Failed one.
+          $asId = { param($t) [pscustomobject]@{ File = [string]$t.ScriptBlock.File; ExpandedPath = [string]$t.ExpandedPath; Result = [string]$t.Result } }
+          $verdict = Get-FlakeRerunVerdict -FailedTests @($failedTests | ForEach-Object { & $asId $_ }) -RerunTests @(if ($null -ne $r2) { $r2.Tests | ForEach-Object { & $asId $_ } })
+          if ($verdict.Healed) {
+            Write-Host "::warning::test-powershell: all $($failedNames.Count) failing test(s) RE-RAN and PASSED — treated as flake (self-healed): $($failedNames -join '; ')"
+            # t/4085: hand the healed identities to the isolated recording step below via a
+            # plain file -- Get-FlakeRerunVerdict's Healed branch is all-or-nothing (it only
+            # reaches here when EVERY run-1 failed test healed), so $failedTests IS the full
+            # healed set; no partial-heal reconstruction needed.
+            # MUST-fix (Lead review, t/4085 PR #3134): this write sits INSIDE the verdict step,
+            # which runs under pwsh's default $ErrorActionPreference='Stop' -- an unhandled
+            # ConvertTo-Json/Out-File failure here would throw and turn a HEALED, green shard
+            # red. The recording step is supposed to be the only thing that can fail on this
+            # path; this try/catch keeps that true by construction, not by hoping the write
+            # never fails. The verdict's own exit code is unconditional either way.
+            try {
+              $failedTests | ForEach-Object { [pscustomobject]@{ File = $_.ScriptBlock.File; ExpandedPath = $_.ExpandedPath } } |
+                ConvertTo-Json -AsArray | Out-File -FilePath "$env:RUNNER_TEMP/flake-heals-input.json" -Encoding utf8
+            } catch {
+              Write-Host "::warning::test-powershell: t/4085 hand-off write failed ($($_.Exception.Message)) -- the self-heal record for this shard will be lost, but the verdict (healed) is unaffected."
+            }
+            exit 0
+          }
+          # Real failure (or NotRerun) path -- nothing healed this shard; record an empty list
+          # so the isolated step below always runs against a well-formed file (never "missing").
+          # Same MUST-fix as above: a write failure here must not turn an otherwise-correct
+          # "real failure" verdict into something else, nor abort before the exit 1 below.
+          try {
+            @() | ConvertTo-Json -AsArray | Out-File -FilePath "$env:RUNNER_TEMP/flake-heals-input.json" -Encoding utf8
+          } catch {
+            Write-Host "::warning::test-powershell: t/4085 hand-off write failed ($($_.Exception.Message)) -- the self-heal record for this shard will be lost, but the verdict (not healed) is unaffected."
+          }
+          if (@($verdict.NotRerun).Count -gt 0) {
+            Write-Host "::error::test-powershell: $(@($verdict.NotRerun).Count) failed test(s) did NOT re-run (not found in the rerun of their own files) — NOT treated as flake (fail safe): $($verdict.NotRerun -join '; ')"
+          }
+          # Real failure (still red, or rerun didn't cover all). t/3546: the verdict claims only
+          # what an IN-JOB rerun can prove. An immediate same-job rerun cannot clear resource
+          # contention held by the first attempt (fixed-port TIME_WAIT, parallel-shard bind, lock,
+          # temp file), so a contention flake fails both attempts identically — the old
+          # "FAILED (both runs)" wording read as definitive and a good PR was held on it. The
+          # message (Format-FlakeVerdictMessage, in FlakeVerdict.ps1) names the classes it can't
+          # clear + each test's duration + a fresh-run-verify direction; its content is
+          # regression-guarded by tests/FlakeVerdict.Tests.ps1 (A/B/D can't catch a stripped
+          # caveat). Selection is unchanged from t/3530; only the wording + durations are new.
+          $stillFailedTests = if ($null -ne $r2) {
+            @($r2.Tests | Where-Object { $_.Result -eq 'Failed' } | ForEach-Object { @{ Name = $_.ExpandedPath; DurationMs = $_.Duration.TotalMilliseconds } })
+          } else {
+            @($r.Tests | Where-Object { $_.Result -eq 'Failed' } | ForEach-Object { @{ Name = $_.ExpandedPath; DurationMs = $_.Duration.TotalMilliseconds } })
+          }
+          Format-FlakeVerdictMessage -FailedTest $stillFailedTests | ForEach-Object { Write-Host $_ }
+          exit 1
+
+      - name: Report DATA-ROOT-TEST-WRITE hits (t/4454 Phase 1, TL condition 4)
+        # Isolated sink, same #2070 pattern as the self-heal step below: if: always() runs whether
+        # the Pester step passed, healed, or failed; warn-only, never fails the job (Phase 1 is
+        # detection -- CI's data root is the ephemeral clone, so a hit here is exactly the offender
+        # list Phase 2 (Block) needs before it can promote to a real gate). PowerShell's side
+        # (#3770) owns the writer; one line per hit: "DATA-ROOT-TEST-WRITE target=<path>
+        # caller=<test>:<line> via <writer>".
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        env:
+          SHARD: ${{ matrix.shard }}
+          LOG_PATH: ${{ runner.temp }}/data-root-test-write-${{ matrix.shard }}.log
+        run: |
+          if (Test-Path -LiteralPath $env:LOG_PATH) {
+            $lines = @(Get-Content -LiteralPath $env:LOG_PATH | Where-Object { $_ -match '\S' } | Sort-Object -Unique)
+            if ($lines.Count -gt 0) {
+              "### DATA-ROOT-TEST-WRITE (shard $($env:SHARD)): $($lines.Count) hit(s)" >> $env:GITHUB_STEP_SUMMARY
+              $lines | ForEach-Object {
+                "- ``$_``" >> $env:GITHUB_STEP_SUMMARY
+                Write-Host "::warning::$_"
+              }
+            } else {
+              "### DATA-ROOT-TEST-WRITE (shard $($env:SHARD)): 0 hits" >> $env:GITHUB_STEP_SUMMARY
+            }
+          } else {
+            "### DATA-ROOT-TEST-WRITE (shard $($env:SHARD)): 0 hits" >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Record test-powershell self-heals (t/4085, isolated sink)
+        # #2070 sink pattern: this step is ISOLATED from the Pester step's verdict by construction.
+        # if: always() runs it whether the Pester step passed, healed-and-exited-0, or failed;
+        # continue-on-error: true means a bug in the builder, the write, or the upload here can
+        # NEVER retroactively change that step's already-decided outcome. The non-negotiable
+        # (t/4085#1 AC1) is one-directional: this step reads what the Pester step decided, never
+        # the other way around.
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          . ./operations/devops/FlakeVerdict.ps1
+          $inputPath = "$env:RUNNER_TEMP/flake-heals-input.json"
+          # Absent file = a path that never reached the verdict's healed/still-failing branches
+          # (a clean pass, a container/discovery error, a null-result fail-safe) -- all of those
+          # have zero heals to record, same as an explicit empty array. Never an error.
+          $healedRaw = if (Test-Path $inputPath) { @(Get-Content -Raw -LiteralPath $inputPath | ConvertFrom-Json) } else { @() }
+          $healedTest = @($healedRaw | ForEach-Object { [pscustomobject]@{ File = [string]$_.File; ExpandedPath = [string]$_.ExpandedPath } })
+          $records = New-FlakeHealRecord -HealedTest $healedTest -RunId "$env:GITHUB_RUN_ID" -HeadSha "$env:GITHUB_SHA" -Branch "$env:GITHUB_REF_NAME" -Shard "$env:SHARD"
+          $outDir = "$env:RUNNER_TEMP/flake-heals"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          $outFile = "$outDir/flake-heals-shard-$env:SHARD.jsonl"
+          if (@($records).Count -eq 0) {
+            New-Item -ItemType File -Force -Path $outFile | Out-Null
+          } else {
+            $records | ForEach-Object { $_ | ConvertTo-Json -Compress } | Out-File -FilePath $outFile -Encoding utf8
+          }
+          # NOTE: "$env:SHARD:" (variable immediately followed by a colon) silently interpolates
+          # empty in a double-quoted string -- PowerShell reads "SHARD:" as part of the drive/scope
+          # name. ${env:SHARD} with braces is the safe form (confirmed empty on real CI before this fix).
+          Write-Host "::notice::test-powershell shard ${env:SHARD}: recorded $(@($records).Count) self-heal(s) (t/4085)"
+
+      - name: Upload test-powershell self-heal records (t/4085)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: flake-heals-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/flake-heals/flake-heals-shard-${{ matrix.shard }}.jsonl
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Explain a test-powershell mid-run kill
+        # t/3665 observability (prevention-per-incident, observability half): a mid-run kill reds
+        # main with NO assertion to point at — the silent class. Diagnosing the t/3646 flip burned
+        # ~20 min on a buried "operation was canceled". Both kill paths land here with the suite
+        # UNFINISHED (completion marker absent); they want DIFFERENT remedies, so branch on outcome:
+        #   failure   => step-level timeout-minutes killed it        => TIMED OUT  (trim the suite)
+        #   cancelled => runner preemption / external / concurrency  => CANCELLED  (just rerun)
+        # A real test failure writes the marker first, so this step stays silent then and the
+        # Pester step's own ::error:: verdict speaks. This step is diagnostic only — it never fails
+        # the job (the Pester step already drove red). Caveat: a kill that takes the RUNNER itself
+        # away leaves no runner to execute this step; it covers signalled cancels + step timeouts.
+        if: ${{ always() && steps.pester.outcome != 'success' }}
+        shell: pwsh
+        env:
+          PESTER_OUTCOME: ${{ steps.pester.outcome }}
+        run: |
+          # Marker present => the suite ran to completion (pass or fail); nothing to explain here.
+          if (Test-Path "$env:RUNNER_TEMP/pester-suite-ran.marker") { exit 0 }
+          switch ($env:PESTER_OUTCOME) {
+            'failure'   { Write-Host "::error::test-powershell: TIMED OUT after 25 minutes — not a test failure. The Pester suite was killed by timeout-minutes before finishing; durable fix is trimming/parallelizing the suite (t/3665, PowerShell scope)." }
+            'cancelled' { Write-Host "::error::test-powershell: CANCELLED mid-run (runner preemption or external cancel) — not a test failure. Rerun the job; if it recurs it is infra, not the suite (t/3665 lowers exposure by shortening the run)." }
+            default     { Write-Host "::error::test-powershell: ended abnormally (outcome=$($env:PESTER_OUTCOME)) with the suite unfinished — not a test failure. Rerun; investigate if it recurs." }
+          }
+          exit 0
 
       - name: In-memory job store scale guard (real files)
         # Runs the gate against the ACTUAL main.bicep + briefExportJobs.ts — distinct
@@ -284,7 +741,7 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.electron == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.electron == 'true')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -297,7 +754,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
         continue-on-error: true
         with:
-          repository: jpsnover/ai-triad-data
+          repository: AI-Rosetta-Stone/ai-triad-data
           path: ai-triad-data
           fetch-depth: 1
 
@@ -305,7 +762,7 @@ jobs:
         run: ln -s "$GITHUB_WORKSPACE/ai-triad-data" ../ai-triad-data
         continue-on-error: true
 
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413  # v6.1.0
         with:
           version: '11.20.0'
 
@@ -334,13 +791,88 @@ jobs:
       # repo-wide — a gate-integrity false-green. Test must never be masked by
       # the security gate; the two are now independent jobs.
 
-      - name: Lint
+      - name: Required scripts present (t/3897, FLIPPED — blocking)
+        # `--if-present` on Lint/Test below used to read a MISSING script as a green job:
+        # workflow-app had neither until t/3847/t/3894, so every PR touching it passed checks
+        # that never ran. This step names that gap per app and now BLOCKS (8-day warn cycle,
+        # 2026-10-04 to 2026-10-12, zero failure annotations -- t/3897#5). `--if-present` is
+        # dropped from Lint/Test below in the SAME PR, and the matrix-membership job below
+        # closes "a new app not in the matrix gets no check" (t/3897#1/#2).
         working-directory: ${{ matrix.app }}
-        run: pnpm run --if-present lint
+        run: |
+          node -e '
+            const s = (require("./package.json").scripts) || {};
+            const missing = ["test", "lint"].filter(k => !(typeof s[k] === "string" && s[k].trim()));
+            if (missing.length) {
+              console.log(`::error::${process.env.APP}: package.json has no ${missing.join(" / ")} script -- the matching CI step is SKIPPED by --if-present and reads green (t/3897)`);
+              process.exit(1);
+            }
+            console.log(`${process.env.APP}: test + lint scripts present`);
+          '
+        env:
+          APP: ${{ matrix.app }}
+
+      # t/3981: dependency-boundary rules (.dependency-cruiser.cjs) previously ran only in local
+      # `verify` and release-validation, so a PR could merge a boundary violation. BLOCKING from day
+      # one (SO e/251#2, TL e/251#3): deterministic, 0 offenders at landing. Runs the t/3975 wrapper
+      # (exit 1 = error violation, named; exit 2 = could not cruise), never raw depcruise, whose exit
+      # code wraps at 256. Cruises taxonomy-editor/src AND ../lib, so a lib/**-only PR is covered:
+      # the `electron` changes filter includes lib/**. taxonomy-editor leg only; the sibling apps have
+      # no boundary config. Runs BEFORE Lint so a lint failure cannot skip it. Do NOT add continue-on-error: exit 2 must fail the job.
+      - name: Dependency boundaries (depcruise, t/3981)
+        if: matrix.app == 'taxonomy-editor'
+        working-directory: taxonomy-editor
+        run: npm run depcruise
+
+      - name: Lint
+        id: lint
+        working-directory: ${{ matrix.app }}
+        # t/3897, FLIPPED: `--if-present` read a missing script as a green step. The "Required
+        # scripts present" step above already blocks on a missing lint/test script, so this no
+        # longer needs the escape hatch -- dropping it means a real lint failure here is a real
+        # failure, not silently absent.
+        run: pnpm run lint
+
+      # Refactor tickets (advisory): on a lint failure, re-run ESLint as JSON and hand it to
+      # the complexity-tickets job, which files/updates a complexity:refactor issue per
+      # over-budget file. Runs only when Lint already failed; never changes this job's result.
+      # This job runs PR code, so it gets no issues:write; the write lives in complexity-tickets.
+      - name: Capture complexity-budget violations (refactor tickets)
+        if: failure() && steps.lint.outcome == 'failure'
+        continue-on-error: true
+        working-directory: ${{ matrix.app }}
+        env:
+          APP: ${{ matrix.app }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/complexity-reports"
+          # Same target as every matrix app's `lint` script (`eslint src/`), called directly
+          # so the formatter flags reach ESLint without relying on pnpm argument forwarding.
+          pnpm exec eslint src/ --format json --output-file "$RUNNER_TEMP/complexity-reports/eslint-$APP.json" || true
+
+      - name: Upload complexity-budget violations
+        if: failure() && steps.lint.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: complexity-violations-${{ matrix.app }}
+          path: ${{ runner.temp }}/complexity-reports/
+          if-no-files-found: ignore
+          retention-days: 3
+
 
       - name: TypeScript check (main)
         working-directory: ${{ matrix.app }}
         run: pnpm exec tsc --noEmit -p tsconfig.main.json
+
+      - name: TypeScript check (renderer, t/3897, FLIPPED — blocking)
+        # The step above checks the MAIN process only (tsconfig.main.json); renderers of the
+        # sibling apps were type-checked by nothing (workflow-app's renderer was TS5101-red
+        # unnoticed, fixed in afa114ca before this flip). taxonomy-editor is excluded: its
+        # renderer is covered by the `renderer-tsc` job (check-renderer-tsc.sh). 8-day warn
+        # cycle, 2026-10-04 to 2026-10-12, zero failure annotations (t/3897#5) -- now blocking.
+        if: matrix.app != 'taxonomy-editor'
+        working-directory: ${{ matrix.app }}
+        run: pnpm exec tsc --noEmit -p tsconfig.json
 
       - name: Test
         # Skip for taxonomy-editor: its "Test with coverage" step below already
@@ -348,14 +880,61 @@ jobs:
         # plain run was pure duplication (~3.5 min wasted per CI run, t/1988).
         # Mutually exclusive with that step: taxonomy-editor → coverage-only;
         # the other apps → plain run only (they have no coverage step).
+        # t/3897, FLIPPED: `--if-present` dropped, same reasoning as Lint above.
         if: matrix.app != 'taxonomy-editor'
         working-directory: ${{ matrix.app }}
-        run: pnpm run --if-present test
+        run: pnpm run test
 
       - name: Test with coverage
         if: matrix.app == 'taxonomy-editor'
         working-directory: ${{ matrix.app }}
-        run: pnpm exec vitest run --coverage
+        # Tee'd to a log for the DATA-ROOT-TEST-WRITE summary step below (t/4454 Phase 1 parity
+        # with test-powershell) -- PIPESTATUS[0] preserves vitest's own exit code through the
+        # pipe (bash's $? after a pipeline is the LAST command's, i.e. tee's, which always
+        # succeeds; without this, a real vitest failure would silently pass the step).
+        run: |
+          set -o pipefail
+          pnpm exec vitest run --coverage 2>&1 | tee "$RUNNER_TEMP/vitest-taxonomy-editor.log"
+
+      - name: Report DATA-ROOT-TEST-WRITE hits (t/4454 Phase 1 vitest parity, TL ruling p/331#2356)
+        # Isolated sink, same #2070 pattern as test-powershell's equivalent step -- warn-only,
+        # never fails the job. dataRootGuard.ts (lib/test-support) only instruments
+        # taxonomy-editor's vite config (via #3769's src/renderer/test-setup.ts, resolved through
+        # vite.config.ts's `root: 'src/renderer'`), so this only runs for that matrix leg.
+        #
+        # Three-state read (TL ruling p/331#2364, after p/331#2360's false-clean finding --
+        # "0 hits" alone can't distinguish "checked, found nothing" from "never checked"):
+        #   - no DATA-ROOT-GUARD-INSTALLED marker in the log -> "guard not installed" (t/4464's
+        #     own runtime signal, not a static grep of config/setup files -- robust to whichever
+        #     setup file or vitest project structure actually wires it in).
+        #   - marker present, no DATA-ROOT-TEST-WRITE hits -> "0 hits" (a real clean result).
+        #   - hits -> list them, same as before.
+        # Both tokens are console.warn'd to the same stream (stderr), so both are in the one
+        # tee'd log. One line per hit: "DATA-ROOT-TEST-WRITE op=<op> target=<target>
+        # protectedRoot=<root>"; the marker: "DATA-ROOT-GUARD-INSTALLED mode=<mode> roots=[...]".
+        if: always() && matrix.app == 'taxonomy-editor'
+        continue-on-error: true
+        shell: bash
+        run: |
+          LOG="$RUNNER_TEMP/vitest-taxonomy-editor.log"
+          if [ -f "$LOG" ]; then
+            mapfile -t HITS < <(grep -o 'DATA-ROOT-TEST-WRITE.*' "$LOG" | sort -u)
+            GUARD_INSTALLED=$(grep -q 'DATA-ROOT-GUARD-INSTALLED' "$LOG" && echo true || echo false)
+          else
+            HITS=()
+            GUARD_INSTALLED=false
+          fi
+          if [ "${#HITS[@]}" -gt 0 ]; then
+            echo "### DATA-ROOT-TEST-WRITE (vitest, taxonomy-editor): ${#HITS[@]} hit(s)" >> "$GITHUB_STEP_SUMMARY"
+            for line in "${HITS[@]}"; do
+              echo "- \`$line\`" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::$line"
+            done
+          elif [ "$GUARD_INSTALLED" = true ]; then
+            echo "### DATA-ROOT-TEST-WRITE (vitest, taxonomy-editor): 0 hits" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### DATA-ROOT-TEST-WRITE (vitest, taxonomy-editor): guard not installed -- 0 hits is NOT a clean result" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Build
         if: matrix.app == 'taxonomy-editor'
@@ -415,7 +994,7 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.electron == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.electron == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
@@ -424,7 +1003,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
         continue-on-error: true
         with:
-          repository: jpsnover/ai-triad-data
+          repository: AI-Rosetta-Stone/ai-triad-data
           path: ai-triad-data
           fetch-depth: 1
 
@@ -432,7 +1011,7 @@ jobs:
         run: ln -s "$GITHUB_WORKSPACE/ai-triad-data" ../ai-triad-data
         continue-on-error: true
 
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413  # v6.1.0
         with:
           version: '11.20.0'
 
@@ -479,6 +1058,28 @@ jobs:
         working-directory: taxonomy-editor
         run: pnpm run smoke:styled
 
+  # ── test-electron-matrix-membership: close the "new app, no check" vector (t/3897, TL #2) ──
+  # The test-electron `matrix.app` list above is hand-maintained. An app added to the repo but
+  # never added to that list gets NEITHER the "Required scripts present" check NOR the renderer
+  # tsc check -- silently uncovered, with nothing in CI to notice. Asserts the matrix list is
+  # EXACTLY the set of top-level directories whose package.json has a `build` script -- the
+  # same authoritative enumeration t/3847 used. Always runs (not path-filtered): it's a cheap,
+  # deterministic comparison with no per-app build/install cost.
+  #
+  # SO conditions C1/C2 (t/3897, p/682#17): C1 also asserts every matrix app has an entry in
+  # the `changes` job's electron: path filter -- a third hand-maintained list; missing from it
+  # means a PR touching only that app never triggers test-electron at all, and ci-gate "passes"
+  # a job that never ran. C2 scopes the app: [...] regex to the test-electron job's own text
+  # block (it previously matched the FIRST app: [...] anywhere in the file). Logic extracted to
+  # a standalone script (.github/scripts/test-electron-matrix-membership.mjs) rather than an
+  # inline node -e, now that it parses two separate blocks of ci.yml.
+  test-electron-matrix-membership:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      - name: Assert test-electron matrix matches package.json build apps and the electron filter (t/3897)
+        run: node .github/scripts/test-electron-matrix-membership.mjs
+
   # ── renderer-tsc: renderer type-check gate (t/2252) ──
   # CI ran `tsc --noEmit -p tsconfig.main.json` for main-process code but NEVER
   # ran renderer tsc — a renderer import error / unresolved module passes all CI
@@ -494,12 +1095,12 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.electron == 'true' || needs.changes.outputs.lib == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.electron == 'true' || needs.changes.outputs.lib == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
 
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413  # v6.1.0
         with:
           version: '11.20.0'
 
@@ -525,6 +1126,74 @@ jobs:
       - name: Renderer type-check
         run: bash taxonomy-editor/scripts/check-renderer-tsc.sh
 
+  # ── verify-config: npm run verify:config never ran in CI before this (t/4150, t/4109 root #14) ──
+  # Route enumeration from reading scripts/Verify-Config.ps1 in full (t/4150#3): the `verify-config`
+  # paths filter above covers every FAIL-capable file plus the WARN-only lanes' own sources.
+  # WARN-first per t/4109: continue-on-error: true, and this does NOT join ci-gate's needs yet —
+  # joining is the later T2 blocking-promotion step. Judge the warn phase by annotations/step
+  # outcome, never by the checkmark (continue-on-error always reports success regardless), same
+  # discipline as t/3897's renderer-tsc/missing-scripts measurement.
+  verify-config:
+    needs: [changes]
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.verify-config == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+
+      # Verify-Config.ps1's Pester gates import the module, which loads the taxonomy. Without the
+      # data repo, the import warns "no valid JSON files loaded" into ModelLiteralLint's emitter
+      # stdout and 3 of its tests fail on a polluted JSON array (t/4150#4). Same checkout as the
+      # test-powershell shards.
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+        continue-on-error: true
+        with:
+          repository: jpsnover/ai-triad-data
+          path: ai-triad-data
+          fetch-depth: 1
+
+      - name: Symlink data repo to expected location
+        run: ln -s "$GITHUB_WORKSPACE/ai-triad-data" ../ai-triad-data
+        continue-on-error: true
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413  # v6.1.0
+        with:
+          version: '11.20.0'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v6
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: 'pnpm-lock.yaml'
+
+      - name: Install Node dependencies (vitest delegation half) (retry on transient nuget/network failures — t/2975)
+        run: |
+          for i in 1 2 3; do
+            pnpm install --frozen-lockfile --filter taxonomy-editor && break
+            if [ "$i" -lt 3 ]; then
+              echo "pnpm install attempt $i failed; retry in $((i * 15))s"
+              sleep $((i * 15))
+            else
+              echo "::error::pnpm install failed after $i attempts"
+              exit 1
+            fi
+          done
+
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -Force -Scope CurrentUser
+
+      # WARN-FIRST (t/4150): continue-on-error sits on the STEP, as on every other warn gate in
+      # this file. A red run shows as a failure-level annotation and step outcome=failure while
+      # the job stays green. Judge the warn phase by annotations and outcome, never by the
+      # checkmark (TL t/3897#2). Promotion to blocking (dropping this, joining ci-gate) is T2.
+      - name: Run verify:config
+        shell: pwsh
+        continue-on-error: true
+        run: ./scripts/Verify-Config.ps1
+
   # ── contrast-check: static token-contrast ratchet gate (t/2264) ──
   # Catches text reversed out over a tokenized fill that is light in some themes —
   # the defect class vitest/jsdom is structurally blind to (applies no stylesheet).
@@ -538,7 +1207,7 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.electron == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.electron == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -570,11 +1239,14 @@ jobs:
           gh label create "$LABEL" --color "B60205" --description "CI: contrast-check alert on main" 2>/dev/null || true
 
           EXISTING=$(gh issue list --state open --label "$LABEL" --json number --jq '.[0].number // empty')
+          # t/4414 lint finding (e/349#6 class): this alert had no label the r/23 bridge
+          # watches, so a persisting contrast regression could sit open and unseen.
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --body-file "$BODY_FILE"
+            gh issue edit "$EXISTING" --remove-label "owner-acked" --add-label "alert-escalated" 2>/dev/null || true
             echo "::error::contrast-check RED on main — appended to issue #${EXISTING}"
           else
-            ISSUE_URL=$(gh issue create --title "$TITLE" --label "$LABEL" --body-file "$BODY_FILE")
+            ISSUE_URL=$(gh issue create --title "$TITLE" --label "$LABEL" --label "alert-escalated" --body-file "$BODY_FILE")
             echo "::error::contrast-check RED on main — alert issue created: ${ISSUE_URL}"
           fi
           rm -f "$BODY_FILE"
@@ -607,7 +1279,7 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.electron == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.electron == 'true')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -624,7 +1296,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
 
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413  # v6.1.0
         with:
           version: '11.20.0'
 
@@ -680,12 +1352,12 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.lib == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.lib == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
 
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413  # v6.1.0
         with:
           version: '11.20.0'
 
@@ -701,6 +1373,10 @@ jobs:
       - name: Lint (errors gate; warnings advisory — see header)
         working-directory: lib
         run: pnpm run lint
+
+      - name: Complexity-budget drift check — built-in vs mirror, every src file (t/3821)
+        working-directory: lib
+        run: node eslint-rules/generate-complexity-baseline.mjs --root ../taxonomy-editor/src --drift-check
 
       - name: TypeScript check — lib/debate (t/2217)
         working-directory: lib
@@ -718,7 +1394,7 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.lib == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.lib == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -774,7 +1450,7 @@ jobs:
       - name: Check doc links (main-repo presence)
         run: bash .github/scripts/check-doc-links.sh
 
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413  # v6.1.0
         with:
           version: '11.20.0'
 
@@ -810,7 +1486,7 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.debate == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.debate == 'true')
     runs-on: ubuntu-latest
     env:
       GEMINI_API_KEY: ${{ secrets.FREE_TIER_GEMINI_KEY }}
@@ -818,7 +1494,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
         continue-on-error: true
 
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413  # v6.1.0
         continue-on-error: true
         with:
           version: '11.20.0'
@@ -853,7 +1529,7 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.schema == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.schema == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
@@ -863,7 +1539,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
         continue-on-error: true
         with:
-          repository: jpsnover/ai-triad-data
+          repository: AI-Rosetta-Stone/ai-triad-data
           path: ai-triad-data
           fetch-depth: 1
 
@@ -871,7 +1547,7 @@ jobs:
         run: ln -s "$GITHUB_WORKSPACE/ai-triad-data" ../ai-triad-data
         continue-on-error: true
 
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413  # v6.1.0
         continue-on-error: true
         with:
           version: '11.20.0'
@@ -889,6 +1565,63 @@ jobs:
       - name: Validate schemas
         continue-on-error: true
         run: node scripts/validate-schemas.mjs
+
+  # ── schema-drift: warn-only schema-of-record drift gate (t/3469, t/3447 Phase-1) ──
+  # Diffs lib/schema/taxonomy-schema.json against live consumer surfaces (Zod validators,
+  # corpus). Zero-noise preconditions cleared: t/3448–3451 (data defects), t/3467
+  # (comparator type_mismatch false positives). Warn-only: continue-on-error stays until
+  # Phase-2 blocking flip (separate PR, TL Gate-Verification required, t/3447).
+  # NOT in ci-gate — a warn-phase gate must never block the required context.
+  # Runner: operations/devops/run-schema-drift.ts (DevOps CI wiring, calls Shared Lib comparator).
+  schema-drift:
+    needs: [changes]
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.schema-drift == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+        continue-on-error: true
+        with:
+          repository: AI-Rosetta-Stone/ai-triad-data
+          path: ai-triad-data
+          fetch-depth: 1
+
+      - name: Symlink data repo to expected location
+        run: ln -s "$GITHUB_WORKSPACE/ai-triad-data" ../ai-triad-data
+        continue-on-error: true
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413  # v6.1.0
+        with:
+          version: '11.20.0'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v6
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: 'pnpm-lock.yaml'
+
+      - name: Install dependencies (retry on transient nuget/network failures — t/2975)
+        run: |
+          for i in 1 2 3; do
+            pnpm install --frozen-lockfile --ignore-scripts && break
+            if [ "$i" -lt 3 ]; then
+              echo "pnpm install attempt $i failed; retry in $((i * 15))s"
+              sleep $((i * 15))
+            else
+              echo "::error::pnpm install failed after $i attempts"
+              exit 1
+            fi
+          done
+
+      - name: Schema drift check — warn-only (t/3469)
+        continue-on-error: true
+        env:
+          AI_TRIAD_DATA_ROOT: ${{ github.workspace }}/ai-triad-data
+        run: pnpm exec tsx operations/devops/run-schema-drift.ts
 
   # ── test-container: build+readiness-smoke, PARALLELIZED off the test jobs (t/2073) ──
   # WAS `needs: [test-powershell, test-electron]` with a `!contains(failure)`
@@ -916,7 +1649,7 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.container == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.container == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
@@ -961,14 +1694,14 @@ jobs:
           done
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
         with:
           driver-opts: image=moby/buildkit:buildx-stable-1
 
       - name: Extract base image tag from Dockerfile
         id: base_tag
         run: |
-          TAG=$(grep -oP 'FROM ghcr\.io/jpsnover/ai-triad-base:\K\S+' taxonomy-editor/Dockerfile | head -1)
+          TAG=$(grep -oP 'FROM ghcr\.io/ai-rosetta-stone/ai-triad-base:\K\S+' taxonomy-editor/Dockerfile | head -1)
           echo "tag=${TAG%% *}" >> $GITHUB_OUTPUT
           echo "Base image tag: $TAG"
 
@@ -976,18 +1709,18 @@ jobs:
         env:
           BASE_TAG: ${{ steps.base_tag.outputs.tag }}
         run: |
-          if docker pull "ghcr.io/jpsnover/ai-triad-base:$BASE_TAG" 2>/dev/null; then
+          if docker pull "ghcr.io/ai-rosetta-stone/ai-triad-base:$BASE_TAG" 2>/dev/null; then
             echo "Pulled base image from GHCR"
           else
             echo "Base image not in GHCR — building locally"
             docker buildx build --load \
               -f deploy/azure/Dockerfile.base \
               --build-arg PRELOAD_MODEL=false \
-              -t "ghcr.io/jpsnover/ai-triad-base:$BASE_TAG" .
+              -t "ghcr.io/ai-rosetta-stone/ai-triad-base:$BASE_TAG" .
           fi
 
       - name: Build app container image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7
         with:
           context: .
           file: taxonomy-editor/Dockerfile
@@ -1041,7 +1774,7 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.python == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.python == 'true')
     runs-on: ubuntu-latest
     env:
       PYTHONUTF8: '1'
@@ -1074,6 +1807,19 @@ jobs:
           HF_HUB_OFFLINE: '1'
           TRANSFORMERS_OFFLINE: '1'
         run: python -m pytest test_*.py -v
+      # CL tools tests (t/3940). Stdlib + pytest only; the module loads entities.json lazily
+      # (#2827) so these run WITHOUT the data repo. Same no-silent-skip floor as above:
+      # 17 collected today, floor 15 — a collection error or a module-level skip fails loud.
+      - name: CL tools tests (t/3940)
+        working-directory: research/comp-linguist/tools
+        run: |
+          COUNT=$(python -m pytest test_*.py --collect-only -q 2>&1 | grep -E "^[0-9]+ test" | awk '{print $1}')
+          echo "Collected ${COUNT:-0} tests"
+          if [ "${COUNT:-0}" -lt 15 ]; then
+            echo "::error::pytest collected fewer than 15 CL tools tests — possible silent-skip or collection error (t/3940)"
+            exit 1
+          fi
+          python -m pytest test_*.py -v
       # G7 grounding reconciler selftest (t/3189). reconcile_grounding.py ships a
       # CLI selftest (--selftest: consistency / disjoint-scope / idempotence /
       # change-detection / removal-purge — the G7 contract) that exits non-zero on
@@ -1100,7 +1846,7 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.python == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.python == 'true')
     runs-on: ubuntu-latest
     # PYTHONUTF8=1: PEP 540 UTF-8 Mode — forces UTF-8 for stdio AND open() on win32.
     # Recurring 7× on the win32 fleet for non-ASCII (em-dashes, arrows, etc.) — t/2046.
@@ -1139,7 +1885,7 @@ jobs:
       - name: Checkout data repo (composition-drift gate, t/2430)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
         with:
-          repository: jpsnover/ai-triad-data
+          repository: AI-Rosetta-Stone/ai-triad-data
           path: ai-triad-data
           token: ${{ secrets.DATA_REPO_TOKEN || secrets.GITHUB_TOKEN }}
       - name: Composition-drift gate — selftest + blocking (t/2430)
@@ -1163,7 +1909,7 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.lockfile-sync == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.lockfile-sync == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
@@ -1187,7 +1933,7 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' ||
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' ||
        needs.changes.outputs.container == 'true' ||
        needs.changes.outputs.lib == 'true')
     runs-on: ubuntu-latest
@@ -1212,12 +1958,12 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.container == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.container == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
 
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413  # v6.1.0
         with:
           version: '11.20.0'
 
@@ -1296,12 +2042,12 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.embeddings == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.embeddings == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
 
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413  # v6.1.0
         with:
           version: '11.20.0'
 
@@ -1375,6 +2121,116 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - name: Lint workflow YAML files
         run: python3 .github/ci/workflow-lint.py
+      - name: Fault tests for test-electron-matrix-membership.mjs (t/4236)
+        run: node --test .github/scripts/test-electron-matrix-membership.test.mjs
+
+  # ── ci-filter-coverage: each paths-filtered job's test read-set covered by its own filter
+  # (t/4140, third occurrence of the class: t/2025, t/3189, t/4029). NO path filter of its own —
+  # a self-check about filters must never itself be skippable (same reasoning as workflow-lint
+  # above). Warn-only (continue-on-error): promotion to blocking is T2.
+  ci-filter-coverage:
+    needs: [changes]
+    if: always() && !cancelled() && needs.changes.result != 'failure' && needs.changes.result != 'cancelled'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - name: Check paths-filter coverage of declared test read-sets
+        run: |
+          node --test .github/scripts/check-filter-coverage.test.mjs
+          node .github/scripts/check-filter-coverage.mjs
+
+  # ── pov-tag-orphan-check: differential POV-tag orphan scan (t/3987, SO e/253#2/#4) ──
+  # A POV-tag registry change must show what it orphans before it merges. Runs the taxonomy
+  # ../ai-triad-data checkout through lib/schema/pov-tags-cli.ts --scan-data, differentially
+  # against the PR's base (or push's parent) registry: only orphans THIS change INTRODUCES are
+  # actionable; pre-existing orphans and structural problems are visibility-only (one bad data
+  # commit must not turn every unrelated code PR red). Always runs, no path filter — it's a
+  # cheap static scan, and a path-filtered job reports skipped, which ci-gate treats as passing
+  # (the t/3981 lesson this ticket exists to avoid repeating).
+  # WARN-FIRST (t/3987): never fails the job yet. Flip to blocking is a separate ticket needing
+  # a mandatory SO, and must land before the first registry rename/removal (adding tags can't
+  # orphan anything).
+  pov-tag-orphan-check:
+    needs: [changes]
+    if: always() && !cancelled() && needs.changes.result != 'failure' && needs.changes.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        continue-on-error: true
+        with:
+          repository: AI-Rosetta-Stone/ai-triad-data
+          path: ai-triad-data
+          fetch-depth: 1
+
+      - name: Symlink data repo to expected location
+        run: ln -s "$GITHUB_WORKSPACE/ai-triad-data" ../ai-triad-data
+        continue-on-error: true
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413  # v6.1.0
+        with:
+          version: '11.20.0'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v6
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: 'pnpm-lock.yaml'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Fetch base POV-tag registry
+        # PR: the base ref's registry. Push: the parent commit's. If the base file doesn't exist
+        # at that ref (e.g. the registry was just added), warn and skip the scan as non-differential
+        # -- never fail on this; MSYS_NO_PATHCONV=1 per the Shell Quoting Rule (git show on Windows runners).
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_REF="origin/${{ github.base_ref }}"
+          else
+            BASE_REF="HEAD^"
+          fi
+          if MSYS_NO_PATHCONV=1 git show "$BASE_REF:lib/debate/soul-docs/pov-tags.json" > base-pov-tags.json 2>/tmp/base-registry-err.txt; then
+            echo "have_base=true" >> "$GITHUB_ENV"
+          else
+            echo "::warning::pov-tag-orphan-check: no base registry at $BASE_REF ($(cat /tmp/base-registry-err.txt)) — running non-differential"
+            echo "have_base=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run the orphan scan
+        id: scan
+        # EXPLICIT exit-code capture (Lead spec #4): bash steps run under `set -e` by default, so
+        # a bare non-zero exit would abort the script before $? is ever read -- the `&&`/`||`
+        # compound keeps the script's own exit status 0 regardless, letting us read the REAL
+        # exit code from either branch. Not a pipe (which would mask it a different way).
+        run: |
+          if [ "$have_base" = "true" ]; then
+            npx tsx lib/schema/pov-tags-cli.ts --scan-data ../ai-triad-data/taxonomy/Origin --base-registry base-pov-tags.json > scan-output.txt && EXIT_CODE=0 || EXIT_CODE=$?
+          else
+            npx tsx lib/schema/pov-tags-cli.ts --scan-data ../ai-triad-data/taxonomy/Origin > scan-output.txt && EXIT_CODE=0 || EXIT_CODE=$?
+          fi
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+      - name: Report outcome (warn-first — never fails the job)
+        run: |
+          EXIT_CODE="${{ steps.scan.outputs.exit_code }}"
+          cat scan-output.txt || true
+          VERDICT_LINE=$(tail -n 1 scan-output.txt 2>/dev/null || echo '{}')
+          if [ "$EXIT_CODE" = "0" ]; then
+            echo "::warning::pov-tag-orphan-check: clean. $VERDICT_LINE"
+            echo "pov-tag-orphan-check: clean (exit 0). $VERDICT_LINE" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$EXIT_CODE" = "1" ]; then
+            echo "::warning::pov-tag-orphan-check: introduced orphans (warn-first, not yet blocking). $VERDICT_LINE"
+            echo "pov-tag-orphan-check: INTRODUCED ORPHANS (exit 1, warn-first). $VERDICT_LINE" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::pov-tag-orphan-check: COULD NOT VERIFY (exit $EXIT_CODE) — never treat this as a pass. $VERDICT_LINE"
+            echo "pov-tag-orphan-check: COULD NOT VERIFY (exit $EXIT_CODE). $VERDICT_LINE" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   # ── bicep-env-drift: Bicep baseEnv ↔ ExpectedEnvVars sync gate (t/2631) ──
   # Parses literal-string entries from the baseEnv block in deploy/azure/main.bicep
@@ -1394,7 +2250,7 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.bicep-env == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.bicep-env == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
@@ -1413,7 +2269,7 @@ jobs:
     needs: [changes]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.bicep-resources == 'true')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.bicep-resources == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
@@ -1422,7 +2278,258 @@ jobs:
         shell: pwsh
         run: ./operations/devops/Test-BicepAcaResourcePairs.ps1
 
-  # ── ci-gate: the SINGLE required status context (t/1962) ──────────────────
+  # ── citation-link-ci-fixture: leg-c both-arms proof against a committed fixture ──
+  # (t/4443, t/4147 SO C5a). The data repo's citation-link-integrity.yml checks out this
+  # repo's code at `main` with no `ref:`, so a code change to Test-CitationLinkIntegrity
+  # (or its Build-NodeSourceIndex/hash/helper dependencies) changes a BLOCKING data gate's
+  # verdict without that gate ever running on the code PR itself. This job runs leg (c)
+  # against tests/fixtures/citation-link-integrity/ and asserts both arms itself (fresh
+  # passes, stale fails) — a regression in either direction turns this job red.
+  # Non-required (T1); skip = OK through ci-gate.
+  citation-link-ci-fixture:
+    needs: [changes]
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.citation-link-ci == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+
+      - name: Citation-link-integrity leg (c), both arms, against the committed fixture (t/4443)
+        shell: pwsh
+        run: ./operations/devops/Test-CitationLinkIntegrityFixtureCI.ps1
+
+  agents-md-budget:
+    needs: [changes]
+    if: always() && !cancelled()
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+
+      # No setup-node: ubuntu-latest ships a current Node already (SO review recommendation,
+      # e/337#2 — not a condition, dropped to match sibling warn-first jobs' convention).
+
+      - name: agents-md-budget checker test suite (BLOCKING — t/4323 SO condition C1, e/337#2)
+        # Unlike the budget CHECK itself (warn-only business output, below), the TESTS PROVING the
+        # checker works must actually gate CI — a `.test.mjs` wired into no workflow is
+        # authoring-time evidence only, never re-checked on the next edit (t/3871 lesson). No
+        # `continue-on-error` here: a broken/shrunk suite fails this job and ci-gate.
+        run: bash scripts/run-agents-md-budget-tests.sh
+
+      - name: Instruction-file size ratchet (WARN-FIRST — t/4323)
+        # WARN-FIRST, same Gate Promotion discipline as complexity-budget (t/3829):
+        # this job IS in ci-gate's needs, but `continue-on-error: true` makes a budget
+        # violation a VISIBLE red STEP inside a GREEN job → ci-gate stays green →
+        # non-blocking. Promotion to blocking is a separate, deliberate T2 step (NOT
+        # this PR), per t/4323's own tier note.
+        # Unconditional (not path-filtered on `changes`): the check is two file reads,
+        # negligible cost, and a budget-file edit without a matching AGENTS.md edit
+        # should still be exercised.
+        # Scope: docs/agent-instruction-budgets.json lists only the two AGENTS.md files
+        # the main repo actually tracks (root + operations/devops/azure/) — every other
+        # AGENTS.md is Orca-overlay-tracked and invisible to this checkout; that gap is
+        # NOT covered here (see t/4323 route table).
+        id: agents-md-budget
+        continue-on-error: true
+        run: node scripts/check-agents-md-budget.mjs
+
+  complexity-budget:
+    needs: [changes]
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.powershell == 'true')
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+
+      - name: Test PowerShell complexity budget (WARN-FIRST — t/3829)
+        # WARN-FIRST per the ticket's Gate Promotion rule. This job IS in ci-gate's
+        # needs, but `continue-on-error: true` makes a budget violation a VISIBLE red
+        # STEP inside a GREEN job → ci-gate stays green → non-blocking. Accrue ≥1 green
+        # cycle on real scripts/ PRs, then FLIP TO BLOCKING by removing the one
+        # `continue-on-error: true` line below — the job then fails on violation and
+        # ci-gate blocks, with NO ci-gate-needs edit and NO branch-protection change
+        # (ci-gate is the sole required context). The flip is a separate deliberate
+        # step (mandatory Second Opinion + TL Gate-Verification), NOT this PR.
+        # Scope: baseline scripts/complexity-baseline.json; __meta__.scan="scripts"
+        # covers scripts/** (operations/** complexity is the second step below, t/3849).
+        # Invocation + exit-code contract (0 clean / 1 on violation via New-ActionableError)
+        # owned by PowerShell (p/169#144-146).
+        id: ps-budget-scripts
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Import-Module ./scripts/AITriad/AITriad.psd1 -Force
+          Test-ComplexityBudget -FailOnViolation
+
+      - name: Test operations/ complexity budget (WARN-FIRST — t/3849)
+        # t/3849: extends the t/3829 ratchet to operations/** (28 .ps1/.psm1, incl.
+        # merge-gating scripts). Second step in the SAME job rather than a sibling job
+        # or a new `changes` filter output — the existing `powershell` filter already
+        # includes 'operations/devops/**' (ci.yml:140), which is every file in this
+        # scan's scope today, so this step's trigger condition is identical to the
+        # scripts/ step above with no new filter plumbing to keep in sync.
+        # WARN-FIRST, same Gate Promotion discipline as the scripts/ step: accrue >=1
+        # green cycle on a real operations/-touching PR, then flip to blocking by
+        # removing this step's `continue-on-error: true` — separate deliberate step
+        # (mandatory Second Opinion + TL Gate-Verification), NOT this PR. Oracle: same
+        # single Measure-CodeComplexity implementation as the scripts/ step above (no
+        # second counter to parity-check against -- the Class-8 risk t/3829#9 flagged
+        # as "inherited by this ticket" doesn't reappear, because there is still only
+        # one counter regardless of scan root).
+        # Baseline: operations/complexity-baseline.json; __meta__.scan="operations".
+        id: ps-budget-operations
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Import-Module ./scripts/AITriad/AITriad.psd1 -Force
+          Test-ComplexityBudget -Path ./operations -FailOnViolation
+
+      # Refactor tickets (advisory): when either budget step above flagged a file, re-run
+      # both scans without -FailOnViolation and hand the violations to complexity-tickets
+      # (same artifact contract as test-electron's ESLint capture).
+      - name: Capture PowerShell budget violations (refactor tickets)
+        if: steps.ps-budget-scripts.outcome == 'failure' || steps.ps-budget-operations.outcome == 'failure'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Import-Module ./scripts/AITriad/AITriad.psd1 -Force
+          $out = Join-Path $env:RUNNER_TEMP 'complexity-reports'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $scans = @(
+            @{ root = 'scripts';    result = Test-ComplexityBudget }
+            @{ root = 'operations'; result = Test-ComplexityBudget -Path ./operations }
+          )
+          foreach ($s in $scans) {
+            [pscustomobject]@{ root = $s.root; violations = @($s.result.Violations) } |
+              ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $out "ps-$($s.root).json") -Encoding utf8
+          }
+
+      - name: Upload PowerShell budget violations
+        if: steps.ps-budget-scripts.outcome == 'failure' || steps.ps-budget-operations.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: complexity-violations-powershell
+          path: ${{ runner.temp }}/complexity-reports/
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v6
+        with:
+          node-version: '22'
+
+      - name: Merge-guard predicate tests (WARN-FIRST — t/3871)
+        # t/3871: operations/devops/merge-guard-predicate.test.mjs ran in NO workflow, so its tests
+        # were authoring-time evidence only and the NEXT change to the predicate was never re-checked
+        # — the tested-code/running-code drift behind the t/3695 bug class. Hosted in THIS job
+        # because its `powershell` filter already covers operations/devops/** (the predicate and
+        # its suite), so no new job, filter output, or required context. Built-ins only — no install.
+        # The step runs operations/devops/run-merge-guard-tests.sh, the SAME script proven locally on
+        # all arms (green / narrowed-predicate red / empty suite / missing suite / below floor). It
+        # fails on an empty or shrunk suite via a test-count FLOOR (`node --test` reports an empty
+        # file as `# tests 1`, so a `> 0` check would pass it).
+        # WARN-FIRST, same Gate Promotion discipline as the complexity steps above: flip by removing
+        # this step's `continue-on-error: true` after >=1 green cycle — separate step, SO + TL-GV.
+        # SURVIVING VECTOR (t/3871, TL p/331#1801), stated here so a green isn't over-read: CI proves
+        # the predicate on main, but the LIVE pre-self-merge-verify rule executes whatever predicate
+        # is ON DISK in the shared checkout — a stale shared tree runs stale gate code, and an
+        # uncommitted edit there changes fleet-wide gate behaviour without passing this step.
+        continue-on-error: true
+        shell: bash
+        run: bash operations/devops/run-merge-guard-tests.sh
+
+      - name: Pre-commit hint ↔ worktree path guard parity (WARN-FIRST — TL p/331#1877)
+        # The worktree-add command .githooks/pre-commit tells a refused agent to run must PASS the
+        # worktree-path-guard; it said `../wt-<ticket>`, which the guard blocks. Reads the real hook
+        # and runs the real guard predicate. The suite has a floor (>=2 suggestions) and a red-arm
+        # case, so it can't pass vacuously. `.githooks/**` is in this job's `powershell` filter.
+        # WARN-FIRST: flip by removing continue-on-error after >=1 green cycle (SO + TL GV).
+        continue-on-error: true
+        run: node --test operations/devops/precommit-hint-guard-parity.test.mjs
+
+      - name: Scheduled-workflow health verdict + list lint (WARN-FIRST — t/4058)
+        # Pure verdict for main-ci-monitor's scheduled-workflow check, plus the LINT that every workflow
+        # with `schedule:` is in operations/devops/scheduled-workflows.json (an unlisted one would be
+        # silently unmonitored — the class behind 4 workflows failing unnoticed for up to 6 weeks).
+        # The suite carries a population floor (>=15 scheduled workflows) so a broken detector cannot
+        # pass it vacuously. WARN-FIRST: flip by removing continue-on-error (SO + TL GV).
+        continue-on-error: true
+        run: node --test operations/devops/scheduled-workflow-health.test.mjs
+
+      - name: Flake-heal tripwire unit suites (WARN-FIRST — t/4085)
+        # Same t/3871 lesson as the merge-guard-predicate step above, applied proactively: a .test.mjs
+        # authored but never wired into a workflow is tested-code/running-code drift waiting to happen
+        # (evidence only at authoring time, never re-checked on the next edit). Covers BOTH the pure
+        # tripwire counter (countRepeatHealers — flagged/not-flagged boundaries, CANNOT-EVALUATE arms)
+        # and the artifact-classification predicate added for the t/4085 PR review (classifyRunArtifacts
+        # — partial-upload-is-unknown, malformed-line-is-unknown). WARN-FIRST: flip by removing
+        # continue-on-error after >=1 green cycle (SO + TL GV), same discipline as its neighbors.
+        continue-on-error: true
+        run: |
+          node --test operations/devops/flake-heal-tripwire.test.mjs
+          node --test operations/devops/collect-flake-heal-runs.test.mjs
+
+      - name: Stuck-PR classifier unit suite (WARN-FIRST — t/4115)
+        # Same t/3871 wiring discipline: pr-triage.yml's own "Self-health — classifier unit
+        # suite" step (inside the stuck-pr-alert job) already re-runs this every scheduled
+        # triage, but that only proves the WORKFLOW'S invocation stays wired -- this step
+        # additionally covers it on every PR, so a regression is caught before merge, not
+        # just at the next 2h cron. WARN-FIRST: flip by removing continue-on-error after
+        # >=1 green cycle (SO + TL GV), same discipline as its neighbors.
+        continue-on-error: true
+        run: node --test operations/devops/stuck-pr-classifier.test.mjs
+
+  # ── complexity-tickets: refactor issues for over-budget files (advisory) ─────
+  # Collects the complexity-violations-* artifacts that test-electron (ESLint
+  # local/complexity-budget) and complexity-budget (PS Test-ComplexityBudget) upload
+  # when they flag a file, and opens one complexity:refactor issue per file, or
+  # comments on the open one. No artifacts → nothing to do. The weekly side (offender
+  # report + closing issues for files that dropped out of every baseline) is
+  # .github/workflows/complexity-report.yml; both share .github/scripts/complexity-tickets.mjs.
+  # Holds the run's only issues:write, kept out of the jobs that execute PR code.
+  # NOT in ci-gate's needs and continue-on-error on every step: ticket filing must
+  # never block or red a merge. Same-repo PRs and pushes only (fork / Dependabot
+  # tokens are read-only, so the writes would fail anyway).
+  complexity-tickets:
+    needs: [test-electron, complexity-budget]
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+
+      - name: Download complexity-budget violations
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
+        with:
+          pattern: complexity-violations-*
+          path: complexity-reports
+          merge-multiple: true
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v6
+        with:
+          node-version: '22'
+
+      - name: File or update refactor issues
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: node .github/scripts/complexity-tickets.mjs file-violations --dir complexity-reports
+
+  # ── ci-gate: the SINGLE required status context (t/1962)──────────────────
   # Replaces the 6 individual code-check contexts in branch protection. Those get
   # SKIPPED by path-filtering on non-electron PRs (docs-only, PS-only); a skipped
   # required context never reports `success`, so `strict` protection blocked those
@@ -1457,16 +2564,180 @@ jobs:
   # path-filtered to scripts/** changes, skip = OK.
   # bicep-aca-resources (t/3212) is gated here: ACA cpu:memory allowed-pair
   # validation in main.bicep; path-filtered to bicep-resources changes, skip = OK.
+  # complexity-budget (t/3829, extended to operations/** by t/3849) is in needs but
+  # WARN-FIRST: continue-on-error on EACH step makes a budget violation a red step in
+  # a GREEN job, so ci-gate stays green (non-blocking) until each step's deliberate
+  # flip (remove its continue-on-error → SO + TL-GV, independently per scan scope).
+  # Path-filtered to the powershell filter (scripts/** and operations/devops/**),
+  # skip = OK.
+  # (joint-gv-automerge-guard removed t/3607 PR B — the joint-gv auto-merge block
+  # now lives in .github/workflows/joint-gv-guard.yml as its own required status
+  # context, not gated through ci-gate.)
+  # embedding-onnx-equivalence (t/3198/t/3240) is gated here: real-ONNX bit-exact
+  # worker↔in-thread equivalence; path-filtered to embeddings changes + the ORT
+  # manifest/lockfile, skip = OK. Promoted advisory→required per TL GV t/3240#5 +
+  # Second Opinion e/143#2.
   ci-gate:
     name: ci-gate
-    needs: [changes, test-powershell, test-electron, test-container, python-embed-smoke, test-python, dependency-coverage, lockfile-overrides-check, lib-lint, renderer-tsc, contrast-check, test-server-prod-config, workflow-lint, bicep-env-drift, schema-version-bump, render-smoke, bicep-aca-resources]
+    needs: [changes, test-powershell, test-electron, test-electron-matrix-membership, test-container, python-embed-smoke, test-python, dependency-coverage, lockfile-overrides-check, lib-lint, renderer-tsc, contrast-check, test-server-prod-config, workflow-lint, bicep-env-drift, schema-version-bump, render-smoke, bicep-aca-resources, embedding-onnx-equivalence, complexity-budget, agents-md-budget]
     if: always()
+    # lint:skipped-tolerated: yes — path-filtered gated jobs gate on needs.changes.outputs.* and
+    #   skip by design on PRs that don't touch their subsystem; a skipped need is expected, not a
+    #   failure, so the Block step below asserts on failure/cancelled only (R5, t/3646/e/209).
+    # lint:tolerated-skip: workflow-lint t/3685 — workflow-lint gates on needs.changes.result (NOT
+    #   outputs.*): it lints the whole workflow SSOT, so it runs on every PR where `changes` succeeds
+    #   and is never path-filtered. Its only skip is when `changes` is failure/cancelled — and
+    #   `changes` is itself in this needs list, so the Block step catches that as a red `changes`.
+    #   The skip therefore cannot produce a false-green; audited-tolerant, not gated on outputs.*.
+    # lint:tolerated-skip: agents-md-budget t/4323 — no paths filter by design (the check is two
+    #   cheap file reads, not scoped to a subsystem). `if: always() && !cancelled()` runs the job
+    #   even when an upstream need (e.g. `changes`) fails, so its only skip is a user-cancelled
+    #   run — not the silent-partial-coverage species this rule guards against.
+    permissions:
+      contents: read
+      pull-requests: write  # t/4368: posts a PR comment only when a shared-input gap is found
     runs-on: ubuntu-latest
     steps:
       - name: Report gated job results
         run: echo "gated results -> ${{ join(needs.*.result, ' ') }}"
+
+      - name: Skipped-job visibility summary (t/4368 deliverable 3)
+        # Always runs, every event -- a false-green skip must be visible in the PR UI, not
+        # implicit (t/4367). Separate from "Report gated job results" above (plain log line,
+        # kept for continuity): this writes a human-scannable table to the job summary, with
+        # every `skipped` result visually flagged.
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          node -e '
+            const needs = JSON.parse(process.env.NEEDS_JSON);
+            const lines = ["### Gated job results", "", "| Job | Result |", "|---|---|"];
+            for (const [name, info] of Object.entries(needs)) {
+              const flag = info.result === "skipped" ? " ⚠️ SKIPPED" : "";
+              lines.push(`| \`${name}\` | ${info.result}${flag} |`);
+            }
+            require("fs").appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
+          '
+
       - name: Block on any failed/cancelled gated job
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         run: |
           echo "::error::ci-gate: a gated job did not pass (see results above)"
           exit 1
+
+      - name: CI shared-input coverage check (t/4368 deliverable 2)
+        # PR-only: on a push event (post-merge main run) there is no PR to comment on, and the
+        # merge gate already ran this check pre-merge. Advisory only -- never fails the job.
+        # always() (live-fire catch, t/4368): the preceding Block step deliberately exits 1 when
+        # a gated job fails -- WITHOUT always(), that failure silently skips every step after it,
+        # including this one, so a coverage gap goes unreported on exactly the PRs most likely to
+        # have one. This step must run independent of Block's own outcome.
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+        with:
+          fetch-depth: 0
+
+      - name: Evaluate shared-input coverage
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9
+        env:
+          FILTER_OUTPUTS: ${{ toJSON(needs.changes.outputs) }}
+        with:
+          script: |
+            const { pathToFileURL } = require('url');
+            const { execSync } = require('child_process');
+            const fs = require('fs');
+            const os = require('os');
+            const path = require('path');
+
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const prNumber = context.payload.pull_request.number;
+            const MARKER = '<!-- ci-shared-input-coverage:verdict -->';
+
+            async function postComment(body, { createIfAbsent } = { createIfAbsent: true }) {
+              const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: prNumber, per_page: 100 });
+              const existing = comments.find((c) => c.body?.includes(MARKER));
+              if (existing) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body: `${MARKER}\n${body}` });
+              } else if (createIfAbsent) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: `${MARKER}\n${body}` });
+              }
+            }
+
+            function showFromBase(sha, repoPath) {
+              try {
+                return execSync(`git show ${sha}:${repoPath}`, { cwd: process.env.GITHUB_WORKSPACE, encoding: 'utf8', maxBuffer: 1024 * 1024 * 16 });
+              } catch {
+                return null;
+              }
+            }
+
+            try {
+              await run();
+            } catch (err) {
+              // A crash must never silently read as clean -- post it, but never fail this
+              // advisory job (t/4103's lesson, applied here too).
+              core.warning(`ci-shared-input-coverage CRASHED: ${err && err.stack ? err.stack : String(err)}`);
+              await postComment(`**ci-shared-input-coverage: CANNOT EVALUATE** — ${String(err && err.message ? err.message : err)}`);
+            }
+
+            // Wrapped in a named function (not bare top-level code) so `return` is syntactically
+            // valid under `node --check` too -- same shape as tier-check/t1-approval-guard's own
+            // scripts in this repo.
+            async function run() {
+              // Loaded from the BASE branch's live tip, never the PR's own head (same
+              // anti-self-narrowing posture as tier-check/cl-path-check, e/291 C1): a PR must
+              // not be able to narrow the registry to exempt its own under-filtered path.
+              execSync(`git fetch origin ${JSON.stringify(context.payload.pull_request.base.ref)}`, { cwd: process.env.GITHUB_WORKSPACE, encoding: 'utf8' });
+              const baseTipSha = execSync('git rev-parse FETCH_HEAD', { cwd: process.env.GITHUB_WORKSPACE, encoding: 'utf8' }).trim();
+
+              // Bootstrap (same posture as tier-check/cl-path-check): the registry/predicate not
+              // existing YET on base's tip is expected -- this is the PR that first adds them --
+              // and must read as a neutral skip, never as "CANNOT EVALUATE". postSkippedVerdict
+              // OVERWRITES any prior comment (not just core.info + return) -- a PR can go through
+              // more than one run as its base tip changes, and a stale "CANNOT EVALUATE" from an
+              // earlier run must not linger once a later run determines it's actually a clean skip.
+              async function postSkippedVerdict(reason) {
+                core.info(`ci-shared-input-coverage: skipped (bootstrap) -- ${reason}`);
+                await postComment(`_ci-shared-input-coverage: skipped (bootstrap) -- ${reason}_`);
+              }
+
+              const registryText = showFromBase(baseTipSha, 'operations/devops/ci-shared-inputs.json');
+              if (registryText === null) {
+                await postSkippedVerdict("registry not yet on the base branch's tip. Once this PR merges, later PRs are checked against it.");
+                return;
+              }
+              const predicateText = showFromBase(baseTipSha, 'operations/devops/ci-shared-input-coverage-predicate.mjs');
+              const matcherText = showFromBase(baseTipSha, 'operations/devops/cl-path-check-predicate.mjs');
+              if (predicateText === null || matcherText === null) {
+                await postSkippedVerdict('predicate or matcher module not yet on the base tip (registry present, code missing).');
+                return;
+              }
+
+              const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ci-shared-input-coverage-'));
+              fs.writeFileSync(path.join(tmpDir, 'cl-path-check-predicate.mjs'), matcherText);
+              const predicatePath = path.join(tmpDir, 'ci-shared-input-coverage-predicate.mjs');
+              fs.writeFileSync(predicatePath, predicateText);
+              const { evaluateCoverage, formatCoverageComment } = await import(pathToFileURL(predicatePath).href);
+
+              const registry = JSON.parse(registryText);
+              const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: prNumber, per_page: 100 });
+              const changedPaths = files.map((f) => f.filename);
+              const filterOutputs = JSON.parse(process.env.FILTER_OUTPUTS);
+
+              const { underCovered } = evaluateCoverage(registry, changedPaths, filterOutputs);
+              core.info(`ci-shared-input-coverage: ${underCovered.length} under-covered entr${underCovered.length === 1 ? 'y' : 'ies'}`);
+
+              const commentBody = formatCoverageComment(underCovered);
+              if (commentBody) {
+                await postComment(commentBody);
+                return;
+              }
+              // Live-fire caught this (t/4368): a clean result never called postComment at all,
+              // so a prior run's gap-found comment (e.g. after the path's filter got fixed by a
+              // later push) stayed stale forever. createIfAbsent:false still clears it via the
+              // existing-comment update branch, but never spams a "clean" comment onto a PR that
+              // was never flagged in the first place -- same createIfAbsent precedent as
+              // tier-check.yml's own clean path.
+              await postComment('_ci-shared-input-coverage: clean — no advisory findings._', { createIfAbsent: false });
+            } // end run()

@@ -26,6 +26,7 @@ import { updateConvergenceTracker } from '../../../utils/convergenceScoring';
 import { computeQbafStrengths } from '@lib/debate/qbaf';
 import type { QbafNode, QbafEdge } from '@lib/debate/qbaf';
 import { factCheckToBaseStrength } from '@lib/debate/argumentNetwork';
+import { normalizeSteelmanTarget, steelmanVerdict } from '@lib/debate/steelman';
 import { validateFactCheckResult } from '@lib/debate/factCheckValidator';
 import { needsGc, pruneArgumentNetwork, GC_TRIGGER, GC_TARGET } from '@lib/debate/networkGc';
 import { computeConvergenceSignals } from '@lib/debate/convergenceSignals';
@@ -291,7 +292,7 @@ export function detectZeroClaims(
 // ── extractClaimsAndUpdateAN sub-steps (t/1848 batch 3) ──────────────
 // Behavior-preserving decomposition of the AN extraction hot-path. Bodies
 // moved verbatim (line-slice transform); only signatures/calls hand-authored.
-type _ProcessedClaims = ReturnType<typeof processExtractedClaims>;
+type _ProcessedClaims = Awaited<ReturnType<typeof processExtractedClaims>>;
 type NewAnNode = _ProcessedClaims['newNodes'][number];
 type NewAnEdge = _ProcessedClaims['newEdges'][number];
 type PriorClaimList = Parameters<typeof extractClaimsPrompt>[2];
@@ -401,7 +402,7 @@ async function runLookaheadGate(speaker: SpeakerId, an: { nodes: ArgumentNetwork
             }
 
             const taxEdgesRetry = useTaxonomyStore.getState().edgesFile?.edges;
-            const regenClaims = processExtractedClaims(
+            const regenClaims = await processExtractedClaims(
               {
                 claims: regenParsed.claims,
                 statement: regenResult.statement,
@@ -745,23 +746,29 @@ async function runPostExtractionAnalytics(get: () => any, set: (partial: any) =>
 }
 
 async function runSteelmanValidation(newNodes: NewAnNode[], get: () => any, set: (partial: any) => void, speaker: SpeakerId, debate: DebateSession): Promise<void> {
-    // Steelman validation (non-blocking)
+    // Steelman validation (non-blocking). t/3514: the target is normalized first — label values
+    // ("Safetyist") used to miss the id-keyed commitments lookup and skip every steelman silently.
+    // Every steelman now gets a persisted verdict (faithful / diverges / unchecked + reason).
     const steelmanNodes = newNodes.filter(n => n.steelman_of);
     if (steelmanNodes.length > 0) {
       try {
         for (const sNode of steelmanNodes) {
-          const targetPover = sNode.steelman_of!;
-          const targetCommits = (get().activeDebate?.commitments?.[targetPover] as CommitmentStore | undefined);
-          if (!targetCommits || targetCommits.asserted.length === 0) continue;
+          const targetPover = normalizeSteelmanTarget(sNode.steelman_of, speaker).target;
+          const asserted = targetPover
+            ? ((get().activeDebate?.commitments?.[targetPover] as CommitmentStore | undefined)?.asserted ?? []).slice(-10)
+            : [];
+          if (!targetPover || asserted.length === 0) {
+            sNode.steelman_check = { verdict: 'unchecked', reason: targetPover ? 'Target has no recorded assertions yet' : `"${sNode.steelman_of}" is not a steelman target` };
+            continue;
+          }
 
-          const pairs = targetCommits.asserted.slice(-10).map(assertion => ({
-            text_a: sNode.text,
-            text_b: assertion,
-          }));
+          const pairs = asserted.map(assertion => ({ text_a: sNode.text, text_b: assertion }));
           const nliResult = await api.nliClassify(pairs);
-          const maxEntailment = Math.max(...nliResult.results.map(r => r.nli_entailment ?? 0));
+          sNode.steelman_check = steelmanVerdict(asserted, nliResult.results.map(r => r.nli_entailment));
+          const maxEntailment = sNode.steelman_check.max_entailment ?? 0;
+          const targetCommits = { asserted };
 
-          if (maxEntailment < 0.6) {
+          if (sNode.steelman_check.verdict === 'diverges') {
             const targetLabel = POVER_INFO[targetPover as Exclude<SpeakerId, 'user'>]?.label ?? targetPover;
             const speakerLbl = POVER_INFO[speaker as Exclude<SpeakerId, 'user'>]?.label ?? speaker;
             const topAssertions = targetCommits.asserted.slice(-3).map(a => `"${a}"`).join('; ');
@@ -791,8 +798,12 @@ async function runSteelmanValidation(newNodes: NewAnNode[], get: () => any, set:
           error: { name: (nliErr as Error).name ?? 'Error', message: String(nliErr), stack: (nliErr as Error).stack },
         });
         console.warn('[Steelman] NLI validation failed (non-blocking):', nliErr);
+        for (const sNode of steelmanNodes) {
+          sNode.steelman_check ??= { verdict: 'unchecked', reason: 'NLI check failed this turn' };
+        }
         pushWarning(get, set, 'Steelman validation skipped this turn');
       }
+      phaseGuardedSet(get, set, {}); // re-render: verdicts were written onto committed nodes
     }
 }
 
@@ -1150,7 +1161,7 @@ export async function extractClaimsAndUpdateAN(
     const speakerCommits: CommitmentStore = commitments[speaker] || { asserted: [], conceded: [], challenged: [] };
 
     const taxEdges = useTaxonomyStore.getState().edgesFile?.edges;
-    const claimsResult = processExtractedClaims(
+    const claimsResult = await processExtractedClaims(
       {
         claims: parsed.claims,
         statement,
@@ -1244,7 +1255,17 @@ export async function extractClaimsAndUpdateAN(
     checkAnInvariants(`post-save(extract,${entryId.slice(-6)})`, get, expectedMinAnCount);
 
     console.log(`[AN] Extracted ${newNodes.length} claims, ${newEdges.length} edges from ${speakerLabel}'s turn`);
-    getGlobalRecorder()?.record({ type: 'an.commit', component: 'argument-network-extraction', level: 'info', debate_id: debate.id, turn_id: entryId, speaker, message: `Committed ${newNodes.length} nodes, ${newEdges.length} edges`, data: { new_nodes: newNodes.length, new_edges: newEdges.length, node_ids: commitResult.assignedNodeIds, an_nodes_after: commitResult.idBase + newNodes.length, rejected: diagRejected.length, rejection_reasons: claimsResult.rejectionReasons } });
+    getGlobalRecorder()?.record({ type: 'an.commit', component: 'argument-network-extraction', level: 'info', debate_id: debate.id, turn_id: entryId, speaker, message: `Committed ${newNodes.length} nodes, ${newEdges.length} edges`, data: {
+      new_nodes: newNodes.length, new_edges: newEdges.length, node_ids: commitResult.assignedNodeIds, an_nodes_after: commitResult.idBase + newNodes.length, rejected: diagRejected.length, rejection_reasons: claimsResult.rejectionReasons,
+      // t/3763: per-node summary so a dump answers "what did node AN-30 claim, and who was
+      // it steelmanning?" in one event read instead of cross-referencing the turn embedding
+      // event for the source text. assignedNodeIds is index-parallel to newNodes (both are
+      // the batch committed by this turn, in extraction order).
+      nodes: newNodes.map((n, i) => ({
+        id: commitResult.assignedNodeIds[i], claim_preview: n.text.slice(0, 80), steelman_of: n.steelman_of ?? null,
+        pov: n.steelman_of ?? speaker, // FR records effective pov (steelmanned camp), not speaker pov
+      })),
+    } });
     trace(TraceEventName.AN_EXTRACT_COMPLETE, {
       debate_id: debate.id,
       turn_id: entryId,

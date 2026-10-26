@@ -3,8 +3,10 @@
 
 import { useState, useEffect, useRef, useMemo, useCallback, type ReactNode } from 'react';
 import { getGlobalRecorder } from '@lib/flight-recorder/index';
-import type { SituationNode } from '../../types/taxonomy';
+import type { PovNode, SituationNode } from '../../types/taxonomy';
 import { useTaxonomyStore } from '../../hooks/useTaxonomyStore';
+import { allNodesById, isSupersededNode } from '../../hooks/useTaxonomyStore/superseded';
+import { SupersededBanner } from '../taxonomy/SupersededBanner';
 import { useDebateStore } from '../../hooks/useDebateStore';
 import { useKeyboardNav } from '../../hooks/useKeyboardNav';
 import { useResizablePanel, useResizableRightPanel } from '../../hooks/useResizablePanel';
@@ -26,6 +28,7 @@ import { PROMPT_CATALOG } from '../../data/promptCatalog';
 import { api } from '@bridge';
 import { sortSituationNodes, type SitSortMode } from './situationSort';
 import { SituationListItem } from './SituationListItem';
+import { subscribeToSituationDebateStart } from './waitForSituationDebateStart';
 import './SituationsTab.css';
 
 // --- Presentational sub-components (props in → JSX out, NO hooks) ---------
@@ -209,6 +212,10 @@ interface SituationsNormalDetailProps {
   selectedNodeId: string | null;
   setSelectedNodeId: (id: string | null) => void;
   selectedNode: SituationNode | null;
+  /** t/4363 (t/4355 child): selectedNodeId resolved to a held-aside POV node rather than a
+   *  situations node. Shown read-only with the "Superseded by" banner, never through
+   *  SituationDetail (its `interpretations` field is required and POV nodes don't have one). */
+  supersededPovNode: PovNode | null;
   handlePin: () => void;
   handleRelated: () => void;
   handleDebate: () => void;
@@ -219,7 +226,7 @@ interface SituationsNormalDetailProps {
 // Pane 2, final branch: the normal detail panel (+ pinned stack).
 function SituationsNormalDetail({
   detailCollapsed, setDetailCollapsed, isPhone, selectedNodeId, setSelectedNodeId,
-  selectedNode, handlePin, handleRelated, handleDebate, pinnedStack, hasToolbarPane,
+  selectedNode, supersededPovNode, handlePin, handleRelated, handleDebate, pinnedStack, hasToolbarPane,
 }: SituationsNormalDetailProps) {
   return (
     <>
@@ -242,6 +249,14 @@ function SituationsNormalDetail({
           )}
           {selectedNode ? (
             <SituationDetail node={selectedNode} onPin={handlePin} onRelated={handleRelated} onDebate={handleDebate} />
+          ) : supersededPovNode ? (
+            <>
+              <SupersededBanner node={supersededPovNode} />
+              <div className="detail-panel-superseded-readonly">
+                <h3>{supersededPovNode.label}</h3>
+                <p>{supersededPovNode.description}</p>
+              </div>
+            </>
           ) : (
             <div className="detail-panel-empty">Select a situation node to edit</div>
           )}
@@ -320,14 +335,33 @@ function SituationsDetailPane({
   );
 }
 
+/**
+ * t/4363 (t/4355 child): `selectedNodeId` is normally a situations-node id, resolved above via
+ * `situations.nodes.find`. `allNodesById` only indexes POV nodes (acc/saf/skp) — the situations/cc
+ * file is a separate slice, never held aside — so this fallback only fires if `selectedNodeId` ever
+ * resolves to a POV id while this tab is mounted, and only surfaces it when that node is superseded
+ * (a live POV node isn't this tab's business to show). Exported for direct unit testing. TL p/696#8:
+ * reads the caller's already-subscribed store state, so the component stays reactive.
+ */
+export function resolveSupersededFallback(
+  selectedSituationNode: SituationNode | null,
+  selectedNodeId: string | null,
+  taxonomyState: Parameters<typeof allNodesById>[0],
+): PovNode | null {
+  if (selectedSituationNode || !selectedNodeId) return null;
+  const node = allNodesById(taxonomyState).get(selectedNodeId);
+  return node && isSupersededNode(node) ? node : null;
+}
+
 export function SituationsTab() {
+  const taxonomyState = useTaxonomyStore();
   const {
     situations, selectedNodeId, setSelectedNodeId, createSituationNode,
     pinnedStack, pinAtDepth,
     attributeFilter, attributeInfo,
     relatedNodeId, showRelatedEdges, selectedEdge,
     toolbarPanel, setActiveTab,
-  } = useTaxonomyStore();
+  } = taxonomyState;
   const [listCollapsed, setListCollapsed] = useState(false);
   const [detailCollapsed, setDetailCollapsed] = useState(false);
   const [sitSortMode, setSitSortMode] = useState<SitSortMode>('label');
@@ -371,6 +405,7 @@ export function SituationsTab() {
   const [selectedFallacyKey, setSelectedFallacyKey] = useState<string | null>(null);
   const [selectedPromptEntry, setSelectedPromptEntry] = useState<PromptCatalogEntry | null>(PROMPT_CATALOG[0]);
   const [promptInspectorActive, setPromptInspectorActive] = useState(false);
+  const [debateLaunching, setDebateLaunching] = useState(false);
   const { width, onMouseDown } = useResizablePanel();
   const breakpoint = useBreakpoint();
   const isPhone = breakpoint === 'phone' || breakpoint === 'phone-lg';
@@ -500,6 +535,7 @@ export function SituationsTab() {
   }, []);
 
   const selectedNode = situations?.nodes.find(n => n.id === selectedNodeId) || null;
+  const supersededPovNode = resolveSupersededFallback(selectedNode, selectedNodeId, taxonomyState);
 
   // Hooks must precede the `if (!situations)` early return (rules-of-hooks, t/2299).
   // selectedNode was already `... || null`, so hoisting it does not change its type.
@@ -520,15 +556,33 @@ export function SituationsTab() {
   }, [setActiveTab, setSelectedNodeId]);
 
   const createSituationDebate = useDebateStore(s => s.createSituationDebate);
-  const handleDebate = useCallback(async () => {
-    if (!selectedNode) return;
-    try {
-      await createSituationDebate(selectedNode.id);
+  const handleDebate = useCallback(() => {
+    if (!selectedNode || debateLaunching) return;
+    setDebateLaunching(true);
+    const nodeId = selectedNode.id;
+
+    // Mirrors SituationDebatePanel.handleLaunch's fix (t/3752): open the popout
+    // (t/3749 — setActiveTab alone lands on the summary card, not the live debate)
+    // as soon as the record exists, instead of blocking on createSituationDebate's
+    // full watch-only opening round (enterClarificationOrBegin, t/3629 — don't touch).
+    const unsubscribe = subscribeToSituationDebateStart(nodeId, (id) => {
+      unsubscribe();
+      void api.openDebateWindow(id).catch((openErr: Error) => {
+        getGlobalRecorder()?.record({ type: 'system.error', component: 'situations-tab', level: 'warn', debate_id: id, message: 'Failed to open debate popout window after situation debate launch', error: { name: openErr.name ?? 'Error', message: String(openErr), stack: openErr.stack } });
+      });
       setActiveTab('debate');
-    } catch (err) {
-      getGlobalRecorder()?.record({ type: 'system.error', component: 'situations-tab', level: 'error', message: 'Failed to create situation debate', error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } });
-    }
-  }, [selectedNode, createSituationDebate, setActiveTab]);
+      setDebateLaunching(false);
+    });
+
+    createSituationDebate(nodeId)
+      .catch((err) => {
+        getGlobalRecorder()?.record({ type: 'system.error', component: 'situations-tab', level: 'error', message: 'Failed to create situation debate', error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } });
+        setDebateLaunching(false);
+      })
+      .finally(() => {
+        unsubscribe();
+      });
+  }, [selectedNode, debateLaunching, createSituationDebate, setActiveTab]);
 
   if (!situations) {
     return <div className="detail-panel-empty">No situations data loaded</div>;
@@ -690,6 +744,7 @@ export function SituationsTab() {
             selectedNodeId={selectedNodeId}
             setSelectedNodeId={setSelectedNodeId}
             selectedNode={selectedNode}
+            supersededPovNode={supersededPovNode}
             handlePin={handlePin}
             handleRelated={handleRelated}
             handleDebate={handleDebate}

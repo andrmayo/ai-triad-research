@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
+# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 # Licensed under the MIT License. See LICENSE file in the project root.
 
 function Invoke-GraphQuery {
@@ -23,7 +23,7 @@ function Invoke-GraphQuery {
     .PARAMETER Model
         AI model to use. Defaults to 'gemini-3.5-flash-lite'.
     .PARAMETER ApiKey
-        AI API key. If omitted, resolved via backend-specific env var or AI_API_KEY.
+        AI API key. If omitted, resolved via the backend-specific env var (AI_API_KEY is a fallback for gemini models only).
     .PARAMETER Temperature
         Sampling temperature (0.0-1.0). Default: 0.3.
     .PARAMETER Raw
@@ -65,7 +65,7 @@ function Invoke-GraphQuery {
 
         [ValidateScript({ Test-AIModelId $_ })]
         [ArgumentCompleter({ param($cmd, $param, $word) $script:ValidModelIds | Where-Object { $_ -like "$word*" } })]
-        [string]$Model = 'gemini-3.5-flash-lite',
+        [string]$Model = (Get-AITierModel -Tier basic),
 
         [string]$ApiKey = '',
 
@@ -83,14 +83,10 @@ function Invoke-GraphQuery {
     # ── Step 1: Validate environment ──
     Write-Step 'Validating environment'
 
-    if     ($Model -match '^gemini') { $Backend = 'gemini' }
-    elseif ($Model -match '^claude') { $Backend = 'claude' }
-    elseif ($Model -match '^groq')   { $Backend = 'groq'   }
-        elseif ($Model -match '^openai') { $Backend = 'openai' }
-    else                             { $Backend = 'gemini'  }
-    $ResolvedKey = Resolve-AIApiKey -ExplicitKey $ApiKey -Backend $Backend
-    if ([string]::IsNullOrWhiteSpace($ResolvedKey)) {
-        Write-Fail 'No API key found. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or AI_API_KEY.'
+    # Backend from ai-models.json, never guessed; only the user's -ApiKey is forwarded (t/4087).
+    $KeyStatus = Get-AIModelKeyStatus -Model $Model -ApiKey $ApiKey
+    if (-not $KeyStatus.HasKey) {
+        Write-Fail "No API key found for the $($KeyStatus.Backend) backend. Set $($KeyStatus.EnvHint), or pass -ApiKey."
         throw 'No API key configured'
     }
 
@@ -108,6 +104,7 @@ function Invoke-GraphQuery {
         if (-not (Test-Path $FilePath)) { continue }
 
         $FileData = Get-Content -Raw -Path $FilePath | ConvertFrom-Json
+        Set-TaxonomyDocumentSelectable -Document $FileData -Name $PovKey   # the graph the model sees (t/4356)
         foreach ($Node in $FileData.nodes) {
             $NodeEntry = [ordered]@{
                 id          = $Node.id
@@ -141,6 +138,12 @@ function Invoke-GraphQuery {
         } else {
             $GraphEdges = @($EdgesData.edges | Where-Object { $_.status -eq $StatusFilter })
         }
+    }
+
+    # An edge with a superseded endpoint is history, not graph (t/4356).
+    $Superseded = Get-SupersededNodeIdSet
+    if ($Superseded.Count -gt 0) {
+        $GraphEdges = @($GraphEdges | Where-Object { -not $Superseded.Contains([string]$_.source) -and -not $Superseded.Contains([string]$_.target) })
     }
 
     Write-OK "Loaded $($GraphEdges.Count) edges (filter: $StatusFilter)"
@@ -269,7 +272,7 @@ $SchemaPrompt
         $Result = Invoke-AIApi `
             -Prompt $FullPrompt `
             -Model $Model `
-            -ApiKey $ResolvedKey `
+            -ApiKey $ApiKey `
             -Temperature $Temperature `
             -MaxTokens 8192 `
             -ResponseSchema $GraphQuerySchema
@@ -290,9 +293,17 @@ $SchemaPrompt
         try {
             $Response = $Repaired | ConvertFrom-Json
         } catch {
-            Write-Fail 'Could not parse response'
-            Write-Host $ResponseText -ForegroundColor DarkGray
-            return
+            # t/3857: this used to Write-Fail + bare `return` -- never rethrow, so a response the
+            # AI returned that couldn't be parsed even after repair was indistinguishable from a
+            # successful query. No internal caller relies on this today, but a silent $null on
+            # failure is a trap for the next one.
+            throw (New-ActionableError -AsErrorRecord `
+                    -Goal 'Answer the graph query' `
+                    -Problem "The AI response could not be parsed as JSON, even after repair: $($_.Exception.Message)" `
+                    -Location 'Invoke-GraphQuery' `
+                    -NextSteps @(
+                        'Re-run the query -- this is usually a transient malformed-response issue.',
+                        "Raw response: $ResponseText"))
         }
     }
 

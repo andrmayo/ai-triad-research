@@ -57,6 +57,14 @@ function New-OpEd {
         Target publication category. Sets the default word-count band and
         audience/tone guidance from real editorial specifications. Overridden by
         an explicit -WordCount.
+
+        The valid set and every outlet's data are read from lib/oped/outlets.json
+        (the single source of truth shared with the TS renderer, t/3819) on EVERY
+        call — not cached for the session, confirmed empirically (t/3863). Editing
+        the file takes effect on your very next call with no module reload needed.
+        A missing or malformed outlets.json is refused LOUDLY at parameter binding
+        (before this cmdlet's body ever runs) naming the file and the parse/schema
+        failure, rather than silently falling back to a stale or empty set.
     .PARAMETER WordCount
         Explicit target length (300-2000 words). Overrides the -Outlet default.
     .PARAMETER NewsHook
@@ -90,6 +98,13 @@ function New-OpEd {
     .PARAMETER MaxSituations
         Maximum situation-library stress cases to retrieve and inject (0-15,
         default 3). 0 disables situation grounding.
+    .PARAMETER PovTag
+        NOT IMPLEMENTED. Tagged op-eds are generated through the app/server path
+        only (SO e/254#6 cond 2a) — passing this throws an ActionableError rather
+        than silently ignoring the tag or diverging from the TS implementation's
+        included/excludedUntagged counts.
+    .PARAMETER TagMode
+        NOT IMPLEMENTED. See -PovTag.
     .OUTPUTS
         [PSCustomObject] with Headline, Subtitle, Body, WordCount, Pov,
         Outlet, Model, Backend, Grounding, StanceRelationship, SourceFormat,
@@ -144,9 +159,13 @@ function New-OpEd {
         [ValidateSet('accelerationist', 'safetyist', 'skeptic', 'acc', 'saf', 'skp')]
         [string]$Pov,
 
-        [ValidateSet('WashingtonPost', 'NYTimes', 'WallStreetJournal', 'USAToday',
-            'ForeignAffairs', 'Politico', 'Regional', 'Generic')]
-        [string]$Outlet = 'Generic',
+        # t/3863: dynamic set read from lib/oped/outlets.json (t/3861 SSOT) via
+        # OutletsSsotValuesGenerator, not a hardcoded literal list. Fails CLOSED —
+        # a missing/malformed SSOT throws at parameter binding (see
+        # Get-OpEdOutletsData for why). The default reads $script:RepoRoot's
+        # defaultOutlet on every call (no caching, t/3863#1), so it is live too.
+        [ValidateSet([OutletsSsotValuesGenerator])]
+        [string]$Outlet = (Get-OpEdOutletsData).defaultOutlet,
 
         [ValidateRange(300, 2000)]
         [int]$WordCount,
@@ -171,11 +190,32 @@ function New-OpEd {
         [int]$MaxGroundingNodes = 12,
 
         [ValidateRange(0, 15)]
-        [int]$MaxSituations = 3
+        [int]$MaxSituations = 3,
+
+        # t/3997 (SO e/254#6 cond 2a): accepted ONLY so a caller gets this cmdlet's own
+        # ActionableError instead of PowerShell's generic "parameter not found" — never read
+        # beyond the refusal check below. PowerShell does not implement tag selection; if it
+        # did, the included/excludedUntagged counts would come from two implementations and
+        # lose the comparability they exist for (the e/241 hand-mirroring pattern).
+        [string]$PovTag,
+
+        [ValidateSet('scope', 'prioritize')]
+        [string]$TagMode
     )
 
     Set-StrictMode -Version Latest
 
+    # t/3997: refuse tag selection immediately, before any other work (soul load, outlet
+    # resolution, source fetch) — tagged op-eds are TS-only (app/server path).
+    if ($PSBoundParameters.ContainsKey('PovTag') -or $PSBoundParameters.ContainsKey('TagMode')) {
+        throw (New-ActionableError -PassThru `
+            -Goal 'Generate a tag-scoped op-ed' `
+            -Problem "Tagged op-eds are generated through the app/server path only. PowerShell doesn't implement tag selection, so its counts can't diverge (SO e/254#6 condition 2)." `
+            -Location 'New-OpEd' `
+            -NextSteps 'Use the app or server op-ed generator.')
+    }
+
+    # The steps live in Private/NewOpEdSteps.ps1 (t/3910).
     # Shared prompt artifacts live in lib/oped/prompts/ (canonical TS-core location, t/2609).
     $OPedPromptsDir = [System.IO.Path]::GetFullPath((Join-Path $script:ModuleRoot '..\..\lib\oped\prompts'))
 
@@ -187,256 +227,24 @@ function New-OpEd {
     }
     $PovKey = $PovMap[$Pov.ToLowerInvariant()]
 
-    # ── Load the Soul document (lives in the code repo, not the data repo) ───
-    # $script:ModuleRoot is scripts/AITriad; soul docs live at
-    # <repo-root>/lib/debate/soul-docs/<pov>.soul.json.
-    $RepoRoot = Split-Path -Parent (Split-Path -Parent $script:ModuleRoot)
-    $SoulPath = Join-Path $RepoRoot (Join-Path 'lib/debate/soul-docs' "$PovKey.soul.json")
-    if (-not (Test-Path $SoulPath)) {
-        throw (New-ActionableError -PassThru `
-            -Goal 'Generate an op-ed in a POV voice' `
-            -Problem "Soul document not found for POV '$PovKey': $SoulPath" `
-            -Location 'New-OpEd' `
-            -NextSteps @(
-                "Confirm lib/debate/soul-docs/$PovKey.soul.json exists in the repo",
-                'Run from a full checkout; Soul documents ship with the code repo, not the data repo'
-            ))
-    }
-    try {
-        $Soul = Get-Content -Path $SoulPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    } catch {
-        throw (New-ActionableError -PassThru `
-            -Goal 'Generate an op-ed in a POV voice' `
-            -Problem "Soul document at $SoulPath is not valid JSON: $($_.Exception.Message)" `
-            -Location 'New-OpEd' `
-            -NextSteps 'Validate the Soul document JSON and retry.')
-    }
+    $Soul       = Read-OpEdSoul -PovKey $PovKey
+    $VoiceBlock = Get-OpEdVoiceBlock -Soul $Soul
+    $OutletInfo = Resolve-OpEdOutlet -Outlet $Outlet -WordCount $WordCount -HasWordCount:($PSBoundParameters.ContainsKey('WordCount'))
 
-    # ── Build the voice block from the Soul document ─────────────────────────
-    $v = $Soul.voice
-    $VoiceLines = [System.Collections.Generic.List[string]]::new()
-    $VoiceLines.Add("PERSONALITY: $($Soul.personality)")
-    $VoiceLines.Add("DISPOSITION: $($v.disposition)")
-    $VoiceLines.Add("RHETORICAL STYLE: $($v.style)")
-    $VoiceLines.Add("REASONING MODE: $($v.reasoning)")
-    $VoiceLines.Add("PREFERRED EVIDENCE: $($v.evidence)")
-    $VoiceLines.Add("SIGNATURE MOVE: $($v.signature)")
-    $VoiceLines.Add('')
-    $VoiceLines.Add([string]$v.prose_style)
-    $VoiceLines.Add('')
-    $VoiceLines.Add([string]$v.voice_hygiene)
-    $VoiceLines.Add('')
-    $VoiceLines.Add('VALUE HIERARCHY (in priority order):')
-    $rank = 1
-    foreach ($val in @($Soul.value_hierarchy)) { $VoiceLines.Add("  $rank. $val"); $rank++ }
-    $VoiceLines.Add('')
-    $VoiceLines.Add('EPISTEMIC STANCE:')
-    foreach ($e in @($Soul.epistemic_stance)) { $VoiceLines.Add("  - $e") }
-    $VoiceLines.Add('')
-    $VoiceLines.Add('ANTI-PATTERNS (never do these):')
-    foreach ($a in @($Soul.anti_patterns)) { $VoiceLines.Add("  - $a") }
-    $VoiceBlock = $VoiceLines -join "`n"
+    # ── Source material, then grounding in the camp's registered taxonomy ────
+    $Prep          = Resolve-OpEdSourcePrep -ParameterSetName $PSCmdlet.ParameterSetName -SourcePrep $SourcePrep -Url $Url
+    $SourceContext = Get-OpEdSourceContext -Prep $Prep -Topic $Topic -TopicBound:($PSBoundParameters.ContainsKey('Topic'))
+    $Topic         = $SourceContext.Topic
+    $GroundingInfo = Get-OpEdGrounding -PovKey $PovKey -Topic $Topic -NewsHook $NewsHook -Thesis $Thesis `
+        -SourceMaterial $SourceContext.SourceMaterial -ParameterSetName $PSCmdlet.ParameterSetName `
+        -MaxGroundingNodes $MaxGroundingNodes -MaxSituations $MaxSituations -VoiceOnly:$VoiceOnly
+    $Grounding     = $GroundingInfo.Grounding
+    $SBrief        = Get-OpEdSourceBrief -Prep $Prep -Model $Model -PromptsDir $OPedPromptsDir
 
-    # ── Resolve the target word count from the outlet band (unless explicit) ─
-    $OutletBands = @{
-        WashingtonPost    = @{ Words = 800;  Guidance = 'The Washington Post: max 800 words, strong news hook, hyperlink-able sources, zero jargon; national public audience.' }
-        NYTimes           = @{ Words = 800;  Guidance = 'The New York Times Guest Essay: ~800 words, sharp thesis, general national readership.' }
-        WallStreetJournal = @{ Words = 900;  Guidance = 'The Wall Street Journal: 600-1200 words, rapid thesis, business/policy relevance, market and regulatory framing, zero jargon; executives, investors, policymakers.' }
-        USAToday          = @{ Words = 650;  Guidance = 'USA Today: 550-750 words, embed verifiable source references, plain and direct; broad national audience.' }
-        ForeignAffairs    = @{ Words = 1200; Guidance = 'Foreign Affairs / policy platform: 800-1500 words, deeper structural analysis permitted; subject specialists, Hill staff, agency officials.' }
-        Politico          = @{ Words = 1000; Guidance = 'Politico: ~1000 words, policy-mechanics focus, timely; Hill and agency audience.' }
-        Regional          = @{ Words = 650;  Guidance = 'Regional / local daily: 500-800 words, direct regional relevance, local anecdotes, state-level calls to action; municipal voters and state legislators.' }
-        Generic           = @{ Words = 800;  Guidance = 'General-interest opinion desk: ~800 words, strong news hook, plain language, broad public audience.' }
-    }
-    $Band = $OutletBands[$Outlet]
-    $TargetWords = if ($PSBoundParameters.ContainsKey('WordCount')) { $WordCount } else { $Band.Words }
-
-    # ── Resolve source material via Get-OpEdSource ───────────────────────────
-    # -Url builds a SourcePrep internally (single-voice path); -SourcePrep
-    # accepts one from the ElectronMain orchestrator (3-POV path). Both then
-    # follow the identical draft path — one implementation, two entry points.
-    $Prep = $null
-    if ($PSCmdlet.ParameterSetName -eq 'FromPrep') {
-        $Prep = $SourcePrep
-    } elseif ($PSCmdlet.ParameterSetName -eq 'FromUrl') {
-        Write-Verbose "Fetching + converting source material from $Url"
-        # Get-OpEdSource is convert-only (t/3307); the CLI's best-effort fetch lives in the localized
-        # Private helper Get-OpEdSourceFromUrl (WAF-limited interim, migrates to the shared Node
-        # fetch-CLI under t/3312 — one entry point for the migration + any WAF-fetch prevention guard).
-        $Prep = Get-OpEdSourceFromUrl -Url $Url -Verbose:($VerbosePreference -ne 'SilentlyContinue')
-    }
-
-    $SourceMaterial = '(no external source supplied — argue from the topic and general knowledge)'
-    if ($null -ne $Prep) {
-        $SourceMaterial = [string]$Prep.SourceMarkdown
-        if (-not $PSBoundParameters.ContainsKey('Topic') -or [string]::IsNullOrWhiteSpace($Topic)) {
-            $Topic = "Write an op-ed responding to the source material below (from $($Prep.SourceUrl)). Choose the sharpest angle consistent with your camp's convictions."
-        }
-    }
-
-    # ── Ground the essay in the camp's registered taxonomy ───────────────────
-    # Retrieve the POV's most topic-relevant BDI nodes (its actual beliefs /
-    # desires / intentions) and situation-library stress cases via the same
-    # embedding relevance the debate engine uses, and inject them as the
-    # substance the essay must argue from. This is what makes the op-ed reflect
-    # THIS project's taxonomy rather than the model's generic priors. Grounded by
-    # default; -VoiceOnly (or zeroed counts) skips it. Retrieval failure (data
-    # repo / embeddings.json / Python unavailable) degrades to voice-only with a
-    # warning rather than failing the whole generation.
-    $Grounding = [System.Collections.Generic.List[PSObject]]::new()
-    $GroundingNodesText = '(none — argue from your camp voice and general knowledge)'
-    $SituationsText     = '(none supplied)'
-    if (-not $VoiceOnly -and ($MaxGroundingNodes -gt 0 -or $MaxSituations -gt 0)) {
-        # Query = the topic signal, plus the hook/thesis and a slice of any source.
-        $QueryParts = @($Topic, $NewsHook, $Thesis) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-        if ($PSCmdlet.ParameterSetName -eq 'FromUrl' -and $SourceMaterial.Length -gt 0) {
-            $QueryParts += $SourceMaterial.Substring(0, [Math]::Min(1500, $SourceMaterial.Length))
-        }
-        $RetrievalQuery = $QueryParts -join '. '
-
-        try {
-            $WantSituations = $MaxSituations -gt 0
-            $PovArg = if ($WantSituations) { @($PovKey, 'situations') } else { @($PovKey) }
-            $Relevant = Get-RelevantTaxonomyNodes -Query $RetrievalQuery -POV $PovArg `
-                -IncludeSituations:$WantSituations -MaxTotal 50 -MinPerCategory 2
-
-            $BdiNodes = @($Relevant | Where-Object { $_.POV -eq $PovKey } |
-                Sort-Object Score -Descending | Select-Object -First $MaxGroundingNodes)
-            $SitNodes = @($Relevant | Where-Object { $_.POV -eq 'situations' } |
-                Sort-Object Score -Descending | Select-Object -First $MaxSituations)
-
-            if (@($BdiNodes).Count -gt 0) {
-                $sb = [System.Text.StringBuilder]::new()
-                foreach ($n in $BdiNodes) {
-                    $desc = [string]$n.Description
-                    if ($desc.Length -gt 240) { $desc = $desc.Substring(0, 240) + '…' }
-                    # Prefix the node id so the model can reference it back in grounding_usage.
-                    [void]$sb.AppendLine("- [$($n.Id)] [$($n.Category)] $($n.Label): $desc")
-                    $Grounding.Add([PSCustomObject]@{
-                        Id = $n.Id; Type = 'bdi'; POV = $n.POV; Category = $n.Category
-                        Label = $n.Label; RelevanceScore = $n.Score; Reflection = ''
-                    })
-                }
-                $GroundingNodesText = $sb.ToString().TrimEnd()
-            }
-
-            if (@($SitNodes).Count -gt 0) {
-                $sb2 = [System.Text.StringBuilder]::new()
-                foreach ($s in $SitNodes) {
-                    $desc = [string]$s.Description
-                    if ($desc.Length -gt 300) { $desc = $desc.Substring(0, 300) + '…' }
-                    [void]$sb2.AppendLine("- [$($s.Id)] $($s.Label): $desc")
-                    $Grounding.Add([PSCustomObject]@{
-                        Id = $s.Id; Type = 'situation'; POV = $s.POV; Category = 'Situation'
-                        Label = $s.Label; RelevanceScore = $s.Score; Reflection = ''
-                    })
-                }
-                $SituationsText = $sb2.ToString().TrimEnd()
-            }
-
-            Write-Verbose "Grounding: $(@($BdiNodes).Count) BDI nodes + $(@($SitNodes).Count) situations retrieved"
-        } catch {
-            Write-Warning "Taxonomy grounding unavailable — writing voice-only. ($($_.Exception.Message))"
-        }
-    }
-
-    # ── Source comprehension pass (best-effort) ───────────────────────────────
-    # Populates SOURCE_* prompt placeholders from the CL-owned op-ed-source-brief
-    # prompt. If the orchestrator pre-populated SourceBrief on the prep object,
-    # use it directly (saves a second AI call). If the prompt file is not yet
-    # deployed (CL lands it separately), silently degrades — SOURCE_* will be
-    # empty strings, which the prompt treats as "(not supplied)".
-    $SBrief = $null
-    if ($null -ne $Prep -and -not [string]::IsNullOrWhiteSpace($Prep.SourceMarkdown)) {
-        if ($Prep.PSObject.Properties.Name -contains 'SourceBrief' -and $null -ne $Prep.SourceBrief) {
-            $SBrief = $Prep.SourceBrief
-        } else {
-            try {
-                $BriefSchema = @{
-                    type       = 'object'
-                    properties = @{
-                        author                  = @{ type = 'string' }
-                        actor_type              = @{ type = 'string' }
-                        thesis                  = @{ type = 'string' }
-                        stance                  = @{ type = 'string' }
-                        primary_recommendations = @{ type = 'array'; items = @{ type = 'string' } }
-                        key_claims              = @{ type = 'array'; items = @{ type = 'string' } }
-                        readable                = @{ type = 'string' }
-                    }
-                    required   = @('thesis', 'readable')
-                }
-                $BriefPrompt = Get-Prompt -Name 'op-ed-source-brief' -PromptsDir $OPedPromptsDir -Replacements @{
-                    SOURCE_MATERIAL = [string]$Prep.SourceMarkdown
-                }
-                $BriefResult = Invoke-AIApi -Prompt $BriefPrompt -Model $Model -Temperature 0.2 `
-                    -MaxTokens 4000 -JsonMode -ResponseSchema $BriefSchema
-                if ($null -ne $BriefResult -and -not [string]::IsNullOrWhiteSpace($BriefResult.Text)) {
-                    $SBrief = $BriefResult.Text | ConvertFrom-Json
-                    $Prep.SourceBrief = $SBrief
-                }
-            } catch {
-                Write-Warning "Source comprehension pass skipped — SOURCE_* placeholders will be empty. ($($_.Exception.Message))"
-            }
-        }
-    }
-
-    # ── Assemble prompt-fill values for the optional fields ──────────────────
-    $NewsHookText = if ([string]::IsNullOrWhiteSpace($NewsHook)) {
-        '(none supplied — invent a plausible current news hook and make clear in the lede what timely event it assumes, so the author can verify it against real events before submitting)'
-    } else { $NewsHook }
-
-    $ThesisText = if ([string]::IsNullOrWhiteSpace($Thesis)) {
-        '(none supplied — derive a clear, arguable thesis that follows from your camp value hierarchy)'
-    } else { $Thesis }
-
-    $AuthorBioText = if ([string]::IsNullOrWhiteSpace($AuthorBio)) {
-        '(none supplied — write a generic authority line the author can replace, e.g. "[Author], [affiliation]")'
-    } else { $AuthorBio }
-
-    # ── Load prompt templates ────────────────────────────────────────────────
-    $SystemPrompt = Get-Prompt -Name 'op-ed-generation-system' -PromptsDir $OPedPromptsDir -Replacements @{
-        POV_LABEL       = $Soul.label
-        VOICE_BLOCK     = $VoiceBlock
-        WORD_COUNT      = "$TargetWords"
-        OUTLET_GUIDANCE = $Band.Guidance
-    }
-    $UserPrompt = Get-Prompt -Name 'op-ed-generation-user' -PromptsDir $OPedPromptsDir -Replacements @{
-        TOPIC               = $Topic
-        WORD_COUNT          = "$TargetWords"
-        OUTLET_GUIDANCE     = $Band.Guidance
-        NEWS_HOOK           = $NewsHookText
-        THESIS              = $ThesisText
-        AUTHOR_BIO          = $AuthorBioText
-        SOURCE_MATERIAL     = $SourceMaterial
-        GROUNDING_NODES     = $GroundingNodesText
-        SITUATIONS          = $SituationsText
-        SOURCE_AUTHOR       = if ($null -ne $SBrief -and $SBrief.PSObject.Properties.Name -contains 'author') { [string]$SBrief.author } else { '' }
-        SOURCE_ACTOR_TYPE   = if ($null -ne $SBrief -and $SBrief.PSObject.Properties.Name -contains 'actor_type') { [string]$SBrief.actor_type } else { '' }
-        SOURCE_THESIS       = if ($null -ne $SBrief -and $SBrief.PSObject.Properties.Name -contains 'thesis') { [string]$SBrief.thesis } else { '' }
-        SOURCE_STANCE       = if ($null -ne $SBrief -and $SBrief.PSObject.Properties.Name -contains 'stance') { [string]$SBrief.stance } else { '' }
-        SOURCE_RECOMMENDATIONS = if ($null -ne $SBrief -and $SBrief.PSObject.Properties.Name -contains 'primary_recommendations') {
-            (@($SBrief.primary_recommendations) -join '; ')
-        } else { '' }
-        # Mirror promptLoader.ts SOURCE_KEY_CLAIMS: numbered list "  {i+1}. {claim}"
-        # joined by LF, falling back to "(none extracted)" when empty (t/2721 parity).
-        SOURCE_KEY_CLAIMS   = if ($null -ne $SBrief -and $SBrief.PSObject.Properties.Name -contains 'key_claims' -and $null -ne $SBrief.key_claims -and @($SBrief.key_claims).Count -gt 0) {
-            $Claims = @($SBrief.key_claims)
-            (0..($Claims.Count - 1) | ForEach-Object { "  $($_ + 1). $($Claims[$_])" }) -join "`n"
-        } else { '(none extracted)' }
-    }
-
-    # ── Response schema — structured output for clean field extraction ───────
-    $Schema = @{
-        type       = 'object'
-        properties = @{
-            headline      = @{ type = 'string' }
-            subtitle      = @{ type = 'string' }
-            body_markdown = @{ type = 'string' }
-            word_count    = @{ type = 'integer' }
-            stance        = @{ type = 'string'; description = 'How the camp engages the source: agree/extend/rebut (or empty if no source)' }
-        }
-        required   = @('headline', 'body_markdown', 'word_count')
-    }
+    # ── Draft ─────────────────────────────────────────────────────────────────
+    $Prompts = Get-OpEdPromptPair -Soul $Soul -VoiceBlock $VoiceBlock -OutletInfo $OutletInfo -Topic $Topic `
+        -NewsHook $NewsHook -Thesis $Thesis -AuthorBio $AuthorBio -SourceMaterial $SourceContext.SourceMaterial `
+        -Grounding $GroundingInfo -SBrief $SBrief -PromptsDir $OPedPromptsDir
 
     # Budget output tokens generously. The default model is a "thinking" model
     # (gemini-3.x pro/flash) whose reasoning tokens are billed against the same
@@ -444,153 +252,48 @@ function New-OpEd {
     # the JSON mid-string (parse then falls back to raw text). Allow ~3 tokens
     # per target word for prose plus a large fixed reserve for reasoning, the
     # optional pitch, and JSON overhead.
+    $TargetWords = $OutletInfo.TargetWords
     $MaxTokens = [int]([math]::Ceiling($TargetWords * 3)) + 5000
 
     Write-Verbose "Generating op-ed: pov='$PovKey' outlet='$Outlet' words=$TargetWords model='$Model' temp=$Temperature"
 
-    $Result = Invoke-AIApi `
-        -Prompt $UserPrompt `
-        -SystemInstruction $SystemPrompt `
-        -Model $Model `
-        -Temperature $Temperature `
-        -MaxTokens $MaxTokens `
-        -JsonMode `
-        -ResponseSchema $Schema
+    $Result = Invoke-OpEdDraft -UserPrompt $Prompts.User -SystemPrompt $Prompts.System -Model $Model `
+        -Temperature $Temperature -MaxTokens $MaxTokens
+    $Draft  = ConvertFrom-OpEdDraftResponse -Text $Result.Text
 
-    if ($null -eq $Result -or [string]::IsNullOrWhiteSpace($Result.Text)) {
-        throw (New-ActionableError -PassThru `
-            -Goal 'Generate an op-ed in a POV voice' `
-            -Problem 'The AI backend returned no text.' `
-            -Location 'New-OpEd' `
-            -NextSteps @(
-                'Confirm an API key is registered for the selected model backend',
-                'Retry, or try a different -Model'
-            ))
-    }
+    # ── Readability edit pass, word count, reflection ────────────────────────
+    $Limits    = Get-OpEdReadabilityLimit -OutletInfo $OutletInfo
+    $Edit      = Invoke-OpEdReadabilityEdit -Body $Draft.Body -Limits $Limits -Model $Model -MaxTokens $MaxTokens -PromptsDir $OPedPromptsDir
+    $FinalBody = $Edit.FinalBody
+    $ActualWords = Measure-OpEdWordCount -Text $FinalBody
+    Add-OpEdGroundingReflection -Grounding $Grounding -FinalBody $FinalBody -SBrief $SBrief -Model $Model -PromptsDir $OPedPromptsDir
 
-    # ── Parse the structured response, degrading gracefully to raw text ──────
-    $Headline           = ''
-    $Subtitle           = ''
-    $Body               = ''
-    $StanceRelationship = ''
-    $ReportedWords      = 0
-    try {
-        $Parsed = $Result.Text | ConvertFrom-Json
-        $Headline = [string]$Parsed.headline
-        if ($Parsed.PSObject.Properties.Name -contains 'subtitle')    { $Subtitle = [string]$Parsed.subtitle }
-        $Body = [string]$Parsed.body_markdown
-        if ($Parsed.PSObject.Properties.Name -contains 'word_count')  { $ReportedWords = [int]$Parsed.word_count }
-        if ($Parsed.PSObject.Properties.Name -contains 'stance')      { $StanceRelationship = [string]$Parsed.stance }
-    } catch {
-        Write-Warning "Response was not valid JSON; returning raw text as the body. ($($_.Exception.Message))"
-        $Body = [string]$Result.Text
-    }
-
-    # Prefer an actual count over the model's self-report.
-    $ActualWords = if ([string]::IsNullOrWhiteSpace($Body)) { 0 } else {
-        @($Body -split '\s+' | Where-Object { $_ -ne '' }).Count
-    }
-
-    # ── Reflection pass: map each grounding element to how/where it's reflected ──
-    # A separate lightweight call that reads the FINISHED essay. Deliberately NOT
-    # folded into the main call: asking for the essay AND per-element usage in one
-    # JSON response makes the metadata contend with the body for the output token
-    # budget and truncates the essay (observed). Judging against the real text
-    # also yields truthful placements rather than mid-write predictions.
-    # Best-effort — any failure leaves Reflection as '(not reported)'.
-    if (@($Grounding).Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($Body)) {
-        foreach ($g in $Grounding) { $g.Reflection = '(not reported)' }
-        try {
-            $glb = [System.Text.StringBuilder]::new()
-            foreach ($g in $Grounding) {
-                [void]$glb.AppendLine("- [$($g.Id)] ($($g.Type)/$($g.Category)) $($g.Label)")
-            }
-            $ReflPrompt = Get-Prompt -Name 'op-ed-grounding-reflection' -PromptsDir $OPedPromptsDir -Replacements @{
-                OPED_BODY      = $Body
-                GROUNDING_LIST = $glb.ToString().TrimEnd()
-                # Mirror generate.ts:291-293 reflection pass: numbered key_claims list,
-                # "(none)" fallback when absent. Without this the shared prompt's
-                # {{SOURCE_CLAIMS}} slot (t/2890) rendered literally on the PS path (t/2911).
-                SOURCE_CLAIMS  = if ($null -ne $SBrief -and $SBrief.PSObject.Properties.Name -contains 'key_claims' -and $null -ne $SBrief.key_claims -and @($SBrief.key_claims).Count -gt 0) {
-                    $ReflClaims = @($SBrief.key_claims)
-                    (0..($ReflClaims.Count - 1) | ForEach-Object { "  $($_ + 1). $($ReflClaims[$_])" }) -join "`n"
-                } else { '(none)' }
-            }
-            $ReflSchema = @{
-                type       = 'object'
-                properties = @{
-                    grounding_usage = @{
-                        type  = 'array'
-                        items = @{
-                            type       = 'object'
-                            properties = @{ id = @{ type = 'string' }; reflection = @{ type = 'string' } }
-                            required   = @('id', 'reflection')
-                        }
-                    }
-                }
-                required   = @('grounding_usage')
-            }
-            $ReflMax = [Math]::Max(4000, (@($Grounding).Count * 150) + 3000)
-            $ReflResult = Invoke-AIApi -Prompt $ReflPrompt -Model $Model -Temperature 0.2 `
-                -MaxTokens $ReflMax -JsonMode -ResponseSchema $ReflSchema
-            if ($ReflResult -and -not [string]::IsNullOrWhiteSpace($ReflResult.Text)) {
-                $ReflParsed = $ReflResult.Text | ConvertFrom-Json
-                if ($ReflParsed.PSObject.Properties.Name -contains 'grounding_usage') {
-                    $UsageMap = @{}
-                    foreach ($u in @($ReflParsed.grounding_usage)) {
-                        if ($null -ne $u -and $u.PSObject.Properties.Name -contains 'id') {
-                            $UsageMap[[string]$u.id] = [string]$u.reflection
-                        }
-                    }
-                    foreach ($g in $Grounding) {
-                        if ($UsageMap.ContainsKey($g.Id)) { $g.Reflection = $UsageMap[$g.Id] }
-                    }
-                }
-            }
-        } catch {
-            Write-Warning "Grounding-reflection pass failed; Grounding.Reflection left as '(not reported)'. ($($_.Exception.Message))"
-        }
-    }
-
+    $PrepField = Get-OpEdPrepField -Prep $Prep
     $Output = [PSCustomObject]@{
-        Headline             = $Headline
-        Subtitle             = $Subtitle
-        Body                 = $Body
+        Headline             = $Draft.Headline
+        Subtitle             = $Draft.Subtitle
+        Body                 = $FinalBody
         WordCount            = $ActualWords
         Pov                  = $PovKey
         Outlet               = $Outlet
         Model                = $Model
         Backend              = $Result.Backend
         Grounding            = $Grounding.ToArray()
-        StanceRelationship   = $StanceRelationship
-        SourceFormat         = if ($null -ne $Prep) { $Prep.SourceFormat } else { $null }
-        SourceExtractionTool = if ($null -ne $Prep) { $Prep.SourceExtractionTool } else { $null }
-        ReadableWords        = if ($null -ne $Prep) { $Prep.ReadableWords } else { $null }
-        ReadableRatio        = if ($null -ne $Prep) { $Prep.ReadableRatio } else { $null }
+        StanceRelationship   = $Draft.StanceRelationship
+        SourceFormat         = $PrepField.SourceFormat
+        SourceExtractionTool = $PrepField.SourceExtractionTool
+        ReadableWords        = $PrepField.ReadableWords
+        ReadableRatio        = $PrepField.ReadableRatio
         SourceUnderstanding  = $SBrief
+        EditingMeta          = $Edit.EditingMeta
     }
 
     # ── Optionally write a Markdown file ─────────────────────────────────────
+    # The file carries the same body the cmdlet returns: after the edit pass and the para-split (t/4069).
     if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
-        $md = [System.Text.StringBuilder]::new()
-        if ($Headline) { [void]$md.AppendLine("# $Headline"); [void]$md.AppendLine() }
-        if ($Subtitle) { [void]$md.AppendLine("*$Subtitle*"); [void]$md.AppendLine() }
-        [void]$md.AppendLine($Body)
-        if (@($Grounding).Count -gt 0) {
-            [void]$md.AppendLine()
-            [void]$md.AppendLine('---')
-            [void]$md.AppendLine()
-            [void]$md.AppendLine('## Taxonomy grounding (relevance + how it is reflected)')
-            [void]$md.AppendLine()
-            [void]$md.AppendLine('| Element | Type | Category | Relevance | Reflected in the op-ed |')
-            [void]$md.AppendLine('|---|---|---|---|---|')
-            foreach ($g in $Grounding) {
-                $refl = ([string]$g.Reflection) -replace '\|', '\|'
-                [void]$md.AppendLine("| $($g.Id) — $($g.Label) | $($g.Type) | $($g.Category) | $([Math]::Round([double]$g.RelevanceScore, 4)) | $refl |")
-            }
-        }
+        $Markdown = Format-OpEdMarkdown -Headline $Draft.Headline -Subtitle $Draft.Subtitle -Body $FinalBody -Grounding $Grounding
         $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-        [System.IO.File]::WriteAllText($OutputPath, $md.ToString(), $Utf8NoBom)
+        [System.IO.File]::WriteAllText($OutputPath, $Markdown, $Utf8NoBom)
         Write-Verbose "Wrote op-ed to $OutputPath"
     }
 

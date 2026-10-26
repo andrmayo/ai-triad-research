@@ -43,9 +43,9 @@ jobs:
       - name: Checkout data repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
         with:
-          repository: jpsnover/ai-triad-data
+          repository: AI-Rosetta-Stone/ai-triad-data
           path: ai-triad-data
-          token: ${{ secrets.DATA_REPO_TOKEN || secrets.GITHUB_TOKEN }}  # Scope: contents:write on jpsnover/ai-triad-data (checkout + git push)
+          token: ${{ secrets.DATA_REPO_TOKEN || secrets.GITHUB_TOKEN }}  # Scope: contents:write on AI-Rosetta-Stone/ai-triad-data (checkout + git push)
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v6
@@ -61,6 +61,15 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v6
         with:
           node-version: '22'
+
+      - name: Check for GEMINI_API_KEY (visibility only -- t/4059)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "::warning::GEMINI_API_KEY intentionally unset — conflict clusters use generic \"Cluster N\" labels by PI decision (t/4059#1). Do not add a key without revisiting that decision."
+            echo "**GEMINI_API_KEY not set:** conflict clusters are labelled generically (\"Cluster N\") -- intentional, by PI decision (t/4059#1), not a misconfiguration." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Compute conflict clusters
         env:

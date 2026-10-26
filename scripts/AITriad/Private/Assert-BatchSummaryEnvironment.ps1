@@ -1,0 +1,41 @@
+# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
+# Licensed under the MIT License. See LICENSE file in the project root.
+
+function Assert-BatchSummaryEnvironment {
+    <#
+    .SYNOPSIS
+        Invoke-BatchSummary STEP 0 (t/3910): require an API key (unless -DryRun) and
+        the input paths, and create the output directories.
+    .PARAMETER RequiredPath
+        Paths that must exist (sources dir, taxonomy dir, version file).
+    .PARAMETER EnsureDirectory
+        Output directories to create when absent (summaries, conflicts). Honors the
+        caller's -WhatIf through the inherited $WhatIfPreference.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Backend,
+        [AllowEmptyString()][string]$ApiKey,
+        [switch]$DryRun,
+        [string[]]$RequiredPath = @(),
+        [string[]]$EnsureDirectory = @()
+    )
+
+    if (-not $DryRun -and [string]::IsNullOrWhiteSpace($ApiKey)) {
+        # Names only the backend's own variable: AI_API_KEY is the gemini-only fallback (t/4102).
+        $EnvHint = if ($script:AIBackendKeyEnvHint.ContainsKey($Backend)) { $script:AIBackendKeyEnvHint[$Backend] } else { 'AI_API_KEY' }
+        Write-Fail "No API key found. Set $EnvHint."
+        throw "No API key found for $Backend backend."
+    }
+
+    foreach ($req in $RequiredPath) {
+        if (-not (Test-Path $req)) {
+            Write-Fail "Required path not found: $req"
+            throw "Required path not found: $req"
+        }
+    }
+
+    foreach ($dir in $EnsureDirectory) {
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    }
+}

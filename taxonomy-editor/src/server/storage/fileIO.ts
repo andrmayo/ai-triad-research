@@ -20,12 +20,17 @@ import type { StorageBackend } from './storageBackend.js';
 import { log } from '../logger.js';
 import { FilesystemBackend } from './filesystemBackend.js';
 import { getGlobalRecorder, redactRecord } from '../../../../lib/flight-recorder/index.js';
-import { parseNpy, extractNodeVectors } from '../../../../lib/npy.js';
+import { parseNpy, extractNodeVectorsAsync, type ExtractStats } from '../../../../lib/npy.js';
 import type { OrganizationEdge } from '../../../../lib/organizations/types.js';
 import type { Entity } from '../../../../lib/entities/types.js';
 import type { EntityMentionsFile, ContainerMentions } from '../../../../lib/entities/mentionTypes.js';
 import { serializeEdgesJson } from '../../../../lib/edges/serializeEdges.js';
 import { ABSENT_BASELINE, type EdgesData } from '../../../../lib/edges/mergeEdgesPreservingRationale.js';
+import { getCurrentUserId } from '../security/userContext.js';
+import { scheduleOverlayCommit } from './overlayCommitScheduler.js';
+import type { NodeSourceIndex } from '../../../../lib/sourceIndex/types.js';
+import { buildNodeSourceIndex } from './nodeSourceIndex.js';
+import { repairSnapshotMojibake } from '../../../../lib/sanitize/repairSnapshotMojibake.js';
 
 // ── Extracted sub-modules (ADR-007, t/1688) — cohesion splits behind a stable
 // barrel: importers keep importing these symbols from './fileIO.js'. Each module
@@ -34,6 +39,9 @@ import { ABSENT_BASELINE, type EdgesData } from '../../../../lib/edges/mergeEdge
 export * from './debateStore.js';
 export * from './calibrationStore.js';
 export * from './urlFetch.js';
+export * from './overlayCommitScheduler.js';
+export * from './conflictsFileIO.js';
+export * from './nodeSourceIndex.js';
 export type { OpEdSetSummary } from '../../../../lib/oped/types.js';
 export { listOpedSets, loadOpedSet, saveOpedSetInProgress, loadOpedSetInProgress, finalizeOpedSet, deleteOpedSet, getOpedSetsQuotaStatus } from './opedStore.js';
 export { upsertOpedRun, countRunningOpedRuns, getOpedRun } from './opedRunStore.js';
@@ -212,7 +220,7 @@ export function getDataRootPath(): string {
 
 // ── Taxonomy CRUD ──
 
-async function resolveTaxonomyFilePath(pov: string): Promise<string> {
+export async function resolveTaxonomyFilePath(pov: string): Promise<string> {
   assertSafePov(pov);
   const taxDir = getTaxonomyDir();
   if (pov === 'situations') {
@@ -236,6 +244,32 @@ export async function readTaxonomyFile(pov: string, opts?: { ref?: string }): Pr
   });
   // Strip UTF-8 BOM if present — PowerShell's Set-Content writes BOM by default
   return JSON.parse(raw.replace(/^\uFEFF/, ''));
+}
+
+/** t/4187: `backend.readFileWithVersion` is optional (test-double backends
+ *  needn't stub it); every production backend implements it. Falls back to a
+ *  plain `readFile` + empty version \u2014 a real, never-stale "no precondition
+ *  support" marker \u2014 for any backend that doesn't. Exported (t/4217) for harvestStore.ts's RMW writers. */
+export async function readFileWithVersionOrFallback(
+  filePath: string, opts?: { ref?: string },
+): Promise<{ content: string; version: string } | null> {
+  if (backend.readFileWithVersion) return backend.readFileWithVersion(filePath, opts);
+  const content = await backend.readFile(filePath, opts);
+  return content === null ? null : { content, version: '' };
+}
+
+/** t/4241: version available before JSON.parse, so a content-hash-keyed cache can skip parsing on a hit (t/4241#4). */
+export async function readTaxonomyFileRawWithVersion(pov: string, opts?: { ref?: string }): Promise<{ content: string; version: string }> {
+  const filePath = await resolveTaxonomyFilePath(pov);
+  const result = await readFileWithVersionOrFallback(filePath, opts);
+  if (result === null) throw new ActionableError({ goal: 'Read taxonomy file', problem: `Taxonomy file not found: ${filePath}`, location: 'server/fileIO.ts -> readTaxonomyFileRawWithVersion', nextSteps: ['Verify the POV file exists in the active taxonomy directory'] });
+  return { content: result.content.replace(/^\uFEFF/, ''), version: result.version };
+}
+
+/** t/4187: like readTaxonomyFile, but also returns the version for the save route's write precondition (ETag). */
+export async function readTaxonomyFileWithVersion(pov: string, opts?: { ref?: string }): Promise<{ data: unknown; version: string }> {
+  const raw = await readTaxonomyFileRawWithVersion(pov, opts);
+  return { data: JSON.parse(raw.content), version: raw.version };
 }
 
 const SYNTHETIC_POV_KEYS = new Set(['acc', 'saf', 'skp']);
@@ -324,29 +358,50 @@ export async function loadSyntheticEmbeddings(): Promise<Record<string, { pov: s
     const npyPath = path.join(synDir, `embeddings_${pov}.npy`);
     const idxPath = path.join(synDir, `index_${pov}.json`);
 
+    // t/4286#20: per-stage timing for each POV file, so the cold-load canary can name the stage behind the
+    // ~700 ms event-loop block. Synchronous stages (parse_npy, index_parse) block for their whole duration;
+    // extract yields, so its block is extract_max_slice_ms, not extract_ms.
+    const t0 = performance.now();
     const [npyBuf, idxRaw] = await Promise.all([
       backend.readBinaryFile(npyPath),
       backend.readFile(idxPath, { ref: 'main' }),
     ]);
     if (!npyBuf || !idxRaw) continue;
-
+    const t1 = performance.now();
     const parsed = parseNpy(npyBuf);
+    const t2 = performance.now();
     const index = JSON.parse(idxRaw.replace(/^﻿/, '')) as Record<string, { start: number; count: number }>;
-    Object.assign(result, extractNodeVectors(parsed, index, pov));
+    const t3 = performance.now();
+    // t/4286: extractNodeVectorsAsync yields internally (by node count and by floats copied), but that alone
+    // doesn't help this loop's own back-to-back calls — the explicit yield below ensures the event loop gets a
+    // turn between each synthetic POV file too, not just within one (ServerAPI/Shared Lib).
+    const stats: ExtractStats = { slices: 0, maxSliceMs: 0, floats: 0 };
+    Object.assign(result, await extractNodeVectorsAsync(parsed, index, pov, undefined, stats));
+    const t4 = performance.now();
+    log.server.info({
+      component: 'storage', op: 'loadSyntheticEmbeddings', pov, npy_bytes: npyBuf.length, nodes: Object.keys(index).length,
+      read_ms: Math.round(t1 - t0), parse_npy_ms: Math.round(t2 - t1), index_parse_ms: Math.round(t3 - t2),
+      extract_ms: Math.round(t4 - t3), extract_max_slice_ms: Math.round(stats.maxSliceMs), extract_slices: stats.slices,
+    }, 'synthetic embeddings: per-file load timing (t/4286)');
+    await new Promise<void>((r) => setImmediate(r));
     found = true;
   }
 
   return found ? result : null;
 }
 
-export async function writeTaxonomyFile(pov: string, data: unknown): Promise<void> {
+export async function writeTaxonomyFile(pov: string, data: unknown, opts?: { baseSha?: string }): Promise<{ version: string }> {
   const filePath = await resolveTaxonomyFilePath(pov);
-  await backend.writeFile(filePath, JSON.stringify(data, null, 2));
+  // t/4353 (Shared Lib, p/692#13): the canonical POV-file format is
+  // JSON.stringify(o, null, 2) + "\n" — the desktop writer's format, and
+  // what every file on disk ends in today. Omitting the trailing newline
+  // here would fork the format on the first hosted save.
+  return backend.writeFile(filePath, JSON.stringify(data, null, 2) + '\n', opts);
 }
 
 // ── Conflict CRUD ──
 
-function getConflictsDir(): string {
+export function getConflictsDir(): string {
   const config = loadDataConfig();
   return resolveDataPath(config.conflicts_dir);
 }
@@ -362,129 +417,49 @@ export async function readAggregatedCruxes(): Promise<unknown | null> {
 // writeEdgesFile). Callers ensureSessionBranch() first, so this lands on the
 // caller's session branch. Regeneration safety (Export-AggregatedCruxes) is
 // handled by Merge-CruxExternalEvidence.ps1 (t/1540), not here.
-export async function writeAggregatedCruxes(data: unknown): Promise<void> {
+export async function writeAggregatedCruxes(data: unknown, opts?: { baseSha?: string }): Promise<{ version: string }> {
   const filePath = path.join(getTaxonomyDir(), 'aggregated-cruxes.json');
-  await backend.writeFile(filePath, JSON.stringify(data, null, 2));
+  const result = await backend.writeFile(filePath, JSON.stringify(data, null, 2), opts);
+  scheduleOverlayCommit(getCurrentUserId()); // t/4258/t/4277 C3: no following commit otherwise
+  return result;
 }
 
+/** t/4190: like readAggregatedCruxes, also returns the version (ETag). */
+export async function readAggregatedCruxesWithVersion(): Promise<{ data: unknown; version: string } | null> {
+  try {
+    const result = await readFileWithVersionOrFallback(path.join(getTaxonomyDir(), 'aggregated-cruxes.json'));
+    if (result === null) return null;
+    return { data: JSON.parse(result.content), version: result.version };
+  } catch (err: unknown) { getGlobalRecorder()?.record({ type: 'system.error', component: 'file-io', level: 'warn', message: 'readAggregatedCruxesWithVersion: read/parse failed, returning null', data: { error: String(err) } }); return null; }
+}
+
+// t/4391: _conflict-clusters.json is pipeline-generated (an AI clustering pass
+// over conflicting node pairs) — a user never writes it directly, so it's
+// pinned to main like organizations.json/organization_edges.json above,
+// not read via the caller's session branch.
 export async function readConflictClusters(): Promise<unknown | null> {
   const filePath = path.join(getConflictsDir(), '_conflict-clusters.json');
-  const raw = await backend.readFile(filePath);
+  const raw = await backend.readFile(filePath, { ref: 'main' });
   if (raw === null) return null;
   try { return JSON.parse(raw); } catch { /* telemetry — silent by design */ return null; }
 }
 
-// Conflicts are stored in a single wrapper file (t/689 / t/693) instead of
-// ~1,244 individual {claimId}.json files (which cost 62 batched API reads to
-// list). The 5-minute response cache lives in server.ts and is invalidated by
-// the route handlers on create/write/delete — unchanged by this layer.
-const CONFLICTS_FILE = 'conflicts.json';
-const CONFLICTS_SCHEMA_VERSION = '2.0';
-
-interface ConflictsWrapper {
-  _schema_version: string;
-  last_modified: string;
-  conflict_count: number;
-  conflicts: Record<string, unknown>[];
-}
-
-function conflictsFilePath(): string {
-  return path.join(getConflictsDir(), CONFLICTS_FILE);
-}
-
-function claimIdOf(entry: unknown): string | undefined {
-  return (entry as { claim_id?: string })?.claim_id;
-}
-
-/** Read the conflicts wrapper, tolerating a missing or malformed file (→ empty). */
-async function readConflictsWrapper(): Promise<ConflictsWrapper> {
-  const empty: ConflictsWrapper = {
-    _schema_version: CONFLICTS_SCHEMA_VERSION,
-    last_modified: new Date().toISOString(),
-    conflict_count: 0,
-    conflicts: [],
-  };
-  const raw = await backend.readFile(conflictsFilePath());
-  if (raw === null) return empty;
+/** t/4190: like readConflictClusters, also returns the version (ETag). */
+export async function readConflictClustersWithVersion(): Promise<{ data: unknown; version: string } | null> {
   try {
-    const parsed = JSON.parse(raw) as Partial<ConflictsWrapper>;
-    const conflicts = Array.isArray(parsed.conflicts) ? parsed.conflicts as Record<string, unknown>[] : [];
-    return {
-      _schema_version: parsed._schema_version ?? CONFLICTS_SCHEMA_VERSION,
-      last_modified: parsed.last_modified ?? empty.last_modified,
-      conflict_count: conflicts.length,
-      conflicts,
-    };
-  } catch {
-    /* telemetry — silent by design; treat an unreadable conflicts file as empty */
-    return empty;
-  }
-}
-
-/** Persist the conflicts array, refreshing conflict_count + last_modified. */
-async function writeConflictsWrapper(conflicts: Record<string, unknown>[]): Promise<void> {
-  const wrapper: ConflictsWrapper = {
-    _schema_version: CONFLICTS_SCHEMA_VERSION,
-    last_modified: new Date().toISOString(),
-    conflict_count: conflicts.length,
-    conflicts,
-  };
-  await backend.writeFile(conflictsFilePath(), JSON.stringify(wrapper, null, 2));
-}
-
-export async function readAllConflictFiles(): Promise<unknown[]> {
-  return (await readConflictsWrapper()).conflicts;
-}
-
-export async function writeConflictFile(claimId: string, data: unknown): Promise<void> {
-  assertSafeId(claimId, 'claimId');
-  const wrapper = await readConflictsWrapper();
-  const idx = wrapper.conflicts.findIndex(c => claimIdOf(c) === claimId);
-  if (idx === -1) throw new ActionableError({
-    goal: 'Update conflict definition',
-    problem: `Conflict not found: ${claimId}`,
-    location: 'server/fileIO.ts → writeConflictFile',
-    nextSteps: [
-      `Verify that a conflict with claim_id "${claimId}" exists in ${CONFLICTS_FILE}`,
-      'Use createConflictFile() to create a new conflict instead of writeConflictFile()',
-      'Call readAllConflictFiles() to list available conflicts',
-    ],
-  });
-  wrapper.conflicts[idx] = data as Record<string, unknown>;
-  await writeConflictsWrapper(wrapper.conflicts);
-}
-
-export async function createConflictFile(claimId: string, data: unknown): Promise<void> {
-  assertSafeId(claimId, 'claimId');
-  const wrapper = await readConflictsWrapper();
-  if (wrapper.conflicts.some(c => claimIdOf(c) === claimId)) throw new ActionableError({
-    goal: 'Create conflict definition',
-    problem: `Conflict already exists: ${claimId}`,
-    location: 'server/fileIO.ts → createConflictFile',
-    nextSteps: [
-      `Use writeConflictFile() to update the existing conflict "${claimId}"`,
-      'Delete the existing conflict first if you intend to replace it',
-    ],
-  });
-  wrapper.conflicts.push(data as Record<string, unknown>);
-  await writeConflictsWrapper(wrapper.conflicts);
-}
-
-export async function deleteConflictFile(claimId: string): Promise<void> {
-  assertSafeId(claimId, 'claimId');
-  const wrapper = await readConflictsWrapper();
-  const filtered = wrapper.conflicts.filter(c => claimIdOf(c) !== claimId);
-  // No-op if the claim wasn't present (mirrors the prior delete-missing behavior).
-  if (filtered.length !== wrapper.conflicts.length) {
-    await writeConflictsWrapper(filtered);
-  }
+    const result = await readFileWithVersionOrFallback(path.join(getConflictsDir(), '_conflict-clusters.json'), { ref: 'main' });
+    if (result === null) return null;
+    return { data: JSON.parse(result.content), version: result.version };
+  } catch (err: unknown) { getGlobalRecorder()?.record({ type: 'system.error', component: 'file-io', level: 'warn', message: 'readConflictClustersWithVersion: read/parse failed, returning null', data: { error: String(err) } }); return null; }
 }
 
 // ── Lineage categories ──
 
+// t/4391: lineage_categories.json is pipeline-generated (AI-computed lineage
+// taxonomy), never user-written — pinned to main, not the session branch.
 export async function readLineageCategories(): Promise<unknown | null> {
   const filePath = path.join(getTaxonomyDir(), 'lineage_categories.json');
-  const raw = await backend.readFile(filePath);
+  const raw = await backend.readFile(filePath, { ref: 'main' });
   if (raw === null) return null;
   try { return JSON.parse(raw); } catch { /* telemetry — silent by design */ return null; }
 }
@@ -496,6 +471,12 @@ let lineageInfoCache: Record<string, unknown> | null = null;
 export async function readLineageEnrichments(): Promise<Record<string, unknown>> {
   if (lineageInfoCache) return lineageInfoCache;
   const filePath = path.join(getDataRoot(), 'calibration', 'core', 'lineage-enrichments.json');
+  // t/4391: NOT pinned to main, despite looking pipeline-generated —
+  // calibrationStore.ts's promoteLineageEnrichments() writes this exact file
+  // through the backend with no ref (lands on the caller's session branch,
+  // same as every other unpinned write), so pinning the read here would
+  // break read-after-write for whoever just promoted an entry (TL p/538#161:
+  // "pin only where no path writes that file through the session backend").
   const raw = await backend.readFile(filePath, { optional: true });
   if (raw === null) return {};
   try {
@@ -562,6 +543,12 @@ export async function readOrganizationEdges(): Promise<OrganizationEdge[] | null
   }
 }
 
+// t/4391: NOT pinned to main, despite sitting next to organizations.json/
+// organization_edges.json above (which correctly do pin it) — routes/
+// policyRegistry.ts's POST /api/policy-registry/recount writes
+// policy_actions.json back through the backend with no ref (lands on the
+// caller's session branch), so pinning this read would break read-after-
+// write for the next recount's baseSha (TL p/538#161).
 export async function readPolicyRegistry(): Promise<unknown | null> {
   try {
     const taxDir = getTaxonomyDir();
@@ -711,6 +698,23 @@ export async function readEdgesFile(): Promise<unknown | null> {
   }
 }
 
+/** t/4189: like readEdgesFile, but also returns the version for the save
+ *  route to hand back to the client as its write precondition (ETag). */
+export async function readEdgesFileWithVersion(): Promise<{ data: unknown; version: string } | null> {
+  try {
+    const result = await readFileWithVersionOrFallback(getEdgesPath());
+    if (result === null) return null;
+    return { data: JSON.parse(result.content), version: result.version };
+  } catch (err: unknown) {
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'file-io', level: 'warn',
+      message: 'readEdgesFileWithVersion: read/parse failed, returning null',
+      data: { error: String(err) },
+    });
+    return null;
+  }
+}
+
 /**
  * Read the on-disk edges.json as a WRITE baseline for the rationale re-merge (t/2957),
  * strictly discriminating genuine absence from a read/parse failure — unlike `readEdgesFile`
@@ -732,34 +736,50 @@ export async function readEdgesForSaveBaseline(): Promise<EdgesData | typeof ABS
   return JSON.parse(raw) as EdgesData;
 }
 
-export async function writeEdgesFile(data: unknown): Promise<void> {
-  await backend.writeFile(getEdgesPath(), serializeEdgesJson(data));
+export async function writeEdgesFile(data: unknown, opts?: { baseSha?: string }): Promise<{ version: string }> {
+  return backend.writeFile(getEdgesPath(), serializeEdgesJson(data), opts);
 }
 
-export async function updateEdgeStatus(edges: unknown, index: number, status: string): Promise<unknown> {
+/** t/4189: `updateEdgeStatus`/`bulkUpdateEdges`/`swapEdgeDirection` mutate an
+ *  already-loaded edges object and save it — unlike `writeTaxonomyFile`'s
+ *  plain `(data, opts) => {version}` shape, callers need the mutated object
+ *  back too (it becomes the route's in-memory cache). When the index/indices
+ *  don't match anything, no write happens — the version is the client's own
+ *  `baseSha` echoed back (nothing moved), not a fresh one. */
+export async function updateEdgeStatus(
+  edges: unknown, index: number, status: string, opts?: { baseSha?: string },
+): Promise<{ data: unknown; version: string }> {
   const arr = edges as { edges: Record<string, unknown>[] };
   if (arr.edges && arr.edges[index]) {
     arr.edges[index].status = status;
     if (status === 'approved') {
       delete arr.edges[index].direction_flag;
     }
-    await writeEdgesFile(arr);
+    const result = await writeEdgesFile(arr, opts);
+    scheduleOverlayCommit(getCurrentUserId()); // t/4258/t/4277 C3: unlike PUT /api/edges, no following commit
+    return { data: arr, version: result.version };
   }
-  return arr;
+  return { data: arr, version: opts?.baseSha ?? '' };
 }
 
-export async function bulkUpdateEdges(edges: unknown, indices: number[], status: string): Promise<unknown> {
+export async function bulkUpdateEdges(
+  edges: unknown, indices: number[], status: string, opts?: { baseSha?: string },
+): Promise<{ data: unknown; version: string }> {
   const arr = edges as { edges: Record<string, unknown>[] };
   if (arr.edges) {
     for (const i of indices) {
       if (arr.edges[i]) arr.edges[i].status = status;
     }
-    await writeEdgesFile(arr);
+    const result = await writeEdgesFile(arr, opts);
+    scheduleOverlayCommit(getCurrentUserId()); // t/4258/t/4277 C3
+    return { data: arr, version: result.version };
   }
-  return arr;
+  return { data: arr, version: opts?.baseSha ?? '' };
 }
 
-export async function swapEdgeDirection(edges: unknown, index: number): Promise<unknown> {
+export async function swapEdgeDirection(
+  edges: unknown, index: number, opts?: { baseSha?: string },
+): Promise<{ data: unknown; version: string }> {
   const arr = edges as { edges: Record<string, unknown>[] };
   if (arr.edges && arr.edges[index]) {
     const edge = arr.edges[index];
@@ -767,109 +787,11 @@ export async function swapEdgeDirection(edges: unknown, index: number): Promise<
     edge.source = edge.target;
     edge.target = tmp;
     delete edge.direction_flag;
-    await writeEdgesFile(arr);
+    const result = await writeEdgesFile(arr, opts);
+    scheduleOverlayCommit(getCurrentUserId()); // t/4258/t/4277 C3
+    return { data: arr, version: result.version };
   }
-  return arr;
-}
-
-// ── Node/Policy source index ──
-
-interface SourceReference {
-  docId: string;
-  title: string;
-  pov: string;
-  stance: string;
-  point: string;
-  verbatim: string;
-  excerptContext: string;
-  url: string | null;
-  sourceType: string;
-  datePublished: string;
-}
-
-type NodeSourceIndex = Record<string, SourceReference[]>;
-
-type NodeSourceMeta = { title: string; url: string | null; sourceType: string; datePublished: string };
-
-async function loadNodeMetaCache(sourcesDir: string | null): Promise<Record<string, NodeSourceMeta>> {
-  const metaCache: Record<string, NodeSourceMeta> = {};
-  const sourceEntries = sourcesDir ? await backend.listDirectory(sourcesDir) : [];
-  await Promise.all(sourceEntries.map(async (name) => {
-    const metaPath = path.join(sourcesDir!, name, 'metadata.json');
-    try {
-      const metaRaw = await backend.readFile(metaPath);
-      if (metaRaw !== null) {
-        const meta = JSON.parse(metaRaw);
-        metaCache[name] = {
-          title: meta.title || name,
-          url: meta.url || null,
-          sourceType: meta.source_type || 'unknown',
-          datePublished: meta.date_published || meta.source_time || '',
-        };
-      }
-    } catch { /* telemetry — silent by design;  skip */ }
-  }));
-  return metaCache;
-}
-
-async function indexSummaryFile(
-  summariesDir: string, file: string, metaCache: Record<string, NodeSourceMeta>, index: NodeSourceIndex,
-): Promise<void> {
-  const docId = file.replace(/\.json$/, '');
-  let summary: {
-    pov_summaries?: Record<string, {
-      key_points?: Array<{
-        taxonomy_node_id?: string | null;
-        point?: string; stance?: string; verbatim?: string; excerpt_context?: string;
-      }>;
-    }>;
-  };
-  try {
-    const raw = await backend.readFile(path.join(summariesDir, file));
-    if (raw === null) return;
-    summary = JSON.parse(raw);
-  } catch { /* telemetry — silent by design */ return; }
-  const meta = metaCache[docId] ?? { title: docId, url: null, sourceType: 'unknown', datePublished: '' };
-  for (const [pov, povData] of Object.entries(summary.pov_summaries || {})) {
-    for (const kp of povData.key_points || []) {
-      const nodeId = kp.taxonomy_node_id;
-      if (!nodeId) continue;
-      if (!index[nodeId]) index[nodeId] = [];
-      index[nodeId].push({
-        docId, title: meta.title, pov,
-        stance: kp.stance || 'neutral',
-        point: kp.point || '',
-        verbatim: kp.verbatim || '',
-        excerptContext: kp.excerpt_context || '',
-        url: meta.url, sourceType: meta.sourceType, datePublished: meta.datePublished,
-      });
-    }
-  }
-}
-
-async function indexSummaryFiles(
-  summaryFiles: string[], summariesDir: string, metaCache: Record<string, NodeSourceMeta>, index: NodeSourceIndex,
-): Promise<void> {
-  await Promise.all(
-    summaryFiles.filter(f => f.endsWith('.json')).map(file => indexSummaryFile(summariesDir, file, metaCache, index))
-  );
-}
-
-/**
- * Scan all summary JSON files and build a reverse index:
- * nodeId → list of source references that mapped to it.
- */
-export async function buildNodeSourceIndex(): Promise<NodeSourceIndex> {
-  const summariesDir = resolveDataPath(loadDataConfig().summaries_dir);
-  const sourcesDir = getSourcesDir();
-  const index: NodeSourceIndex = {};
-
-  const summaryFiles = await backend.listDirectory(summariesDir);
-  if (summaryFiles.length === 0) return index;
-
-  const metaCache = await loadNodeMetaCache(sourcesDir);
-  await indexSummaryFiles(summaryFiles, summariesDir, metaCache, index);
-  return index;
+  return { data: arr, version: opts?.baseSha ?? '' };
 }
 
 interface PolicySourceReference {
@@ -904,13 +826,15 @@ async function buildNodeToPoliciesMap(): Promise<Map<string, string[]>> {
   return nodeToPolicies;
 }
 
+// t/4391: source metadata.json (ingestion output) is pipeline-generated, not
+// user-written — pinned to main like nodeSourceIndex.ts's own copy of this read.
 async function loadPolicyMetaCache(sourcesDir: string | null): Promise<Record<string, { dateIngested: string; sourceTime: string }>> {
   const metaCache: Record<string, { dateIngested: string; sourceTime: string }> = {};
-  const sourceEntries = sourcesDir ? await backend.listDirectory(sourcesDir) : [];
+  const sourceEntries = sourcesDir ? await backend.listDirectory(sourcesDir, { ref: 'main' }) : [];
   for (const name of sourceEntries) {
     const metaPath = path.join(sourcesDir!, name, 'metadata.json');
     try {
-      const metaRaw = await backend.readFile(metaPath);
+      const metaRaw = await backend.readFile(metaPath, { ref: 'main' });
       if (metaRaw !== null) {
         const meta = JSON.parse(metaRaw);
         metaCache[name] = {
@@ -989,9 +913,18 @@ export async function listProposals(): Promise<unknown[]> {
   }
 }
 
-export async function saveProposal(filename: string, data: unknown): Promise<void> {
+export async function saveProposal(filename: string, data: unknown, opts?: { baseSha?: string }): Promise<{ version: string }> {
   assertSafeFilename(filename, 'proposal filename');
-  await backend.writeFile(path.join(getDataRoot(), filename), JSON.stringify(data, null, 2));
+  return backend.writeFile(path.join(getDataRoot(), filename), JSON.stringify(data, null, 2), opts);
+}
+
+/** t/4192: a single proposal's content plus its version, for the save route
+ *  to hand back to the client as its write precondition (ETag). */
+export async function readProposalWithVersion(filename: string): Promise<{ data: unknown; version: string } | null> {
+  assertSafeFilename(filename, 'proposal filename');
+  const result = await readFileWithVersionOrFallback(path.join(getDataRoot(), filename));
+  if (result === null) return null;
+  return { data: JSON.parse(result.content), version: result.version };
 }
 
 // ── Admin feedback & error reports (t/837) ──
@@ -1115,95 +1048,8 @@ export async function listFlightRecorderDumpIds(): Promise<Array<{ kind: 'client
   return results;
 }
 
-// ── Harvest operations ──
-
-export async function harvestCreateConflict(conflict: Record<string, unknown>): Promise<boolean> {
-  const id = conflict.claim_id as string || conflict.id as string;
-  if (!id) return false;
-  assertSafeId(id, 'conflict id');
-  await backend.writeFile(
-    path.join(getConflictsDir(), `${id}.json`),
-    JSON.stringify(conflict, null, 2),
-  );
-  return true;
-}
-
-export async function harvestAddDebateRef(nodeId: string, debateId: string): Promise<boolean> {
-  // Find which POV file contains this node and update it
-  for (const pov of [...POV_KEYS, 'situations']) {
-    try {
-      const filePath = await resolveTaxonomyFilePath(pov);
-      const raw = await backend.readFile(filePath);
-      if (raw === null) continue;
-      const data = JSON.parse(raw);
-      const nodes = data.nodes || data;
-      const node = Array.isArray(nodes) ? nodes.find((n: Record<string, unknown>) => n.id === nodeId) : null;
-      if (node) {
-        if (!node.debate_refs) node.debate_refs = [];
-        if (!node.debate_refs.includes(debateId)) {
-          node.debate_refs.push(debateId);
-          await backend.writeFile(filePath, JSON.stringify(data, null, 2));
-        }
-        return true;
-      }
-    } catch { /* telemetry — silent by design;  try next */ }
-  }
-  return false;
-}
-
-export async function harvestUpdateSteelman(nodeId: string, attackerPov: string, newText: string): Promise<boolean> {
-  for (const pov of [...POV_KEYS, 'situations']) {
-    try {
-      const filePath = await resolveTaxonomyFilePath(pov);
-      const raw = await backend.readFile(filePath);
-      if (raw === null) continue;
-      const data = JSON.parse(raw);
-      const nodes = data.nodes || data;
-      const node = Array.isArray(nodes) ? nodes.find((n: Record<string, unknown>) => n.id === nodeId) : null;
-      if (node) {
-        if (typeof node.steelman_vulnerability === 'string') {
-          node.steelman_vulnerability = { [attackerPov]: newText };
-        } else if (typeof node.steelman_vulnerability === 'object' && node.steelman_vulnerability !== null) {
-          node.steelman_vulnerability[attackerPov] = newText;
-        } else {
-          node.steelman_vulnerability = { [attackerPov]: newText };
-        }
-        await backend.writeFile(filePath, JSON.stringify(data, null, 2));
-        return true;
-      }
-    } catch { /* telemetry — silent by design;  try next */ }
-  }
-  return false;
-}
-
-export async function harvestAddVerdict(conflictId: string, verdict: Record<string, unknown>): Promise<boolean> {
-  assertSafeId(conflictId, 'conflict id'); // L4 (t/720): block path traversal before path construction
-  const filePath = path.join(getConflictsDir(), `${conflictId}.json`);
-  const raw = await backend.readFile(filePath);
-  if (raw === null) return false;
-  const data = JSON.parse(raw);
-  data.verdict = verdict;
-  await backend.writeFile(filePath, JSON.stringify(data, null, 2));
-  return true;
-}
-
-export async function harvestQueueConcept(concept: Record<string, unknown>): Promise<boolean> {
-  const dir = resolveDataPath('harvests');
-  await backend.writeFile(
-    path.join(dir, `concept-${Date.now()}.json`),
-    JSON.stringify(concept, null, 2),
-  );
-  return true;
-}
-
-export async function harvestSaveManifest(manifest: Record<string, unknown>): Promise<boolean> {
-  const dir = resolveDataPath('harvests');
-  await backend.writeFile(
-    path.join(dir, `manifest-${Date.now()}.json`),
-    JSON.stringify(manifest, null, 2),
-  );
-  return true;
-}
+// ── Harvest operations (extracted to harvestStore.ts, ADR-007, max-lines) ──
+export { harvestCreateConflict, harvestAddDebateRef, harvestUpdateSteelman, harvestAddVerdict, harvestQueueConcept, harvestSaveManifest } from './harvestStore.js';
 
 // ── Summaries & Sources ──
 
@@ -1242,14 +1088,15 @@ export async function discoverSources(): Promise<DiscoveredSource[]> {
   if (!sourcesDir) return []; // sources unavailable (web mode or repo not cloned)
   const summariesDir = getSummariesDir();
 
-  const sourceEntries = await backend.listDirectory(sourcesDir);
+  // t/4391: source metadata/summaries are pipeline-generated, not user-written.
+  const sourceEntries = await backend.listDirectory(sourcesDir, { ref: 'main' });
   if (sourceEntries.length === 0) return [];
 
   const sources: DiscoveredSource[] = [];
   for (const name of sourceEntries) {
     const metaPath = path.join(sourcesDir, name, 'metadata.json');
     try {
-      const metaRaw = await backend.readFile(metaPath);
+      const metaRaw = await backend.readFile(metaPath, { ref: 'main' });
       if (metaRaw === null) continue; // not a source directory (no metadata)
       const meta = JSON.parse(metaRaw);
       const summaryPath = path.join(summariesDir, `${name}.json`);
@@ -1260,7 +1107,12 @@ export async function discoverSources(): Promise<DiscoveredSource[]> {
         sourceType: meta.source_type || 'unknown',
         datePublished: meta.date_published || meta.source_time || '',
         dateIngested: meta.date_ingested || '',
-        hasSummary: await backend.fileExists(summaryPath),
+        // t/4428: pinned to main — same pipeline-generated-data rule as the
+        // sourceEntries/metaPath reads above and loadSummary() below; this
+        // also keeps the check off the session-branch Contents-API path for
+        // every source in this loop (the hot-path concern from t/4428#2
+        // condition 2) rather than needing a per-request memo.
+        hasSummary: await backend.fileExists(summaryPath, { ref: 'main' }),
         tags: meta.pov_tags || [],
         authors: meta.authors || [],
       });
@@ -1269,19 +1121,37 @@ export async function discoverSources(): Promise<DiscoveredSource[]> {
   return sources.sort((a, b) => (a.title ?? '').localeCompare(b.title ?? ''));
 }
 
+// t/4391: AI-written summaries are pipeline-generated, not user-written.
 export async function loadSummary(docId: string): Promise<unknown | null> {
   assertSafeId(docId, 'document id');
   const filePath = path.join(getSummariesDir(), `${docId}.json`);
-  const raw = await backend.readFile(filePath);
+  const raw = await backend.readFile(filePath, { ref: 'main' });
   if (raw === null) return null;
   try { return JSON.parse(raw); } catch { /* telemetry — silent by design */ return null; }
 }
 
+/** t/4394/t/4411: read-side repair of console-code-page mojibake in a PDF-derived
+ *  snapshot, for a path that feeds a model or display — never a hashing path
+ *  (`nodeSourceIndex.ts`'s `computeSnapshotHash` must keep reading the raw bytes,
+ *  since `content_sha256` is computed over the snapshot exactly as written). The
+ *  file itself is never rewritten; this is a pure read-time transform, same as
+ *  PS's `Read-SnapshotForModel`. WARNs once per call when a repair actually
+ *  applied, so the gate's reach is visible without being noisy on clean docs. */
+function repairSnapshotForModel(text: string, sourceId: string): string {
+  const { text: repaired, variant } = repairSnapshotMojibake(text);
+  if (variant !== 'none') {
+    log.server.warn({ sourceId, variant }, 'Snapshot mojibake repaired on read (t/4394)');
+  }
+  return repaired;
+}
+
+// t/4391: an ingested source snapshot is pipeline-generated, not user-written.
 export async function loadSnapshot(sourceId: string): Promise<string | null> {
   assertSafeId(sourceId, 'source id');
   const sourcesDir = getSourcesDir();
   if (!sourcesDir) return null; // sources unavailable
-  return backend.readFile(path.join(sourcesDir, sourceId, 'snapshot.md'));
+  const raw = await backend.readFile(path.join(sourcesDir, sourceId, 'snapshot.md'), { ref: 'main' });
+  return raw === null ? null : repairSnapshotForModel(raw, sourceId);
 }
 
 // ── Source document resolution ──
@@ -1297,12 +1167,13 @@ export interface SourceDocumentResolution {
   path?: string;
 }
 
-/** Find the raw PDF inside a source's `raw/` directory. Returns absolute path or null. */
+/** Find the raw PDF inside a source's `raw/` directory. Returns absolute path or null.
+ *  t/4391: an ingested source's raw file is pipeline-generated, not user-written. */
 async function findRawPdfPath(docId: string): Promise<string | null> {
   const sourcesDir = getSourcesDir();
   if (!sourcesDir) return null;
   const rawDir = path.join(sourcesDir, docId, 'raw');
-  const entries = await backend.listDirectory(rawDir);
+  const entries = await backend.listDirectory(rawDir, { ref: 'main' });
   const pdf = entries.find(e => e.toLowerCase().endsWith('.pdf'));
   return pdf ? path.join(rawDir, pdf) : null;
 }
@@ -1327,7 +1198,8 @@ export async function resolveSourceDocument(docId: string): Promise<SourceDocume
   // Read metadata best-effort to learn the original document type.
   let sourceType = '';
   try {
-    const metaRaw = await backend.readFile(path.join(docDir, 'metadata.json'));
+    // t/4391: ingested source metadata/snapshot are pipeline-generated.
+    const metaRaw = await backend.readFile(path.join(docDir, 'metadata.json'), { ref: 'main' });
     if (metaRaw) sourceType = String(JSON.parse(metaRaw).source_type ?? '').toLowerCase();
   } catch (err) {
     // Malformed/missing metadata — fall back to content detection below.
@@ -1341,13 +1213,13 @@ export async function resolveSourceDocument(docId: string): Promise<SourceDocume
   }
 
   const pdfPath = await findRawPdfPath(docId);
-  const snapshot = await backend.readFile(path.join(docDir, 'snapshot.md'));
+  const snapshot = await backend.readFile(path.join(docDir, 'snapshot.md'), { ref: 'main' });
   const fileUrl = `/api/source-documents/${encodeURIComponent(docId)}/file`;
 
   // Prefer markdown snapshot — renders inline with claim highlighting and
   // auto-scroll to the fact location. PDFs don't render in Electron's iframe.
   if (snapshot !== null) {
-    return { available: true, type: 'markdown', content: snapshot };
+    return { available: true, type: 'markdown', content: repairSnapshotForModel(snapshot, docId) };
   }
   if (pdfPath) {
     return { available: true, type: 'pdf', path: fileUrl };
@@ -1364,7 +1236,7 @@ export async function readSourceDocumentPdf(docId: string): Promise<Buffer | nul
 }
 
 // ── Data-root validation (t/3296) — extracted to dataRootValidator.ts ──
-export { validateDataRoot } from './dataRootValidator.js';
+export { validateDataRoot, validateCacheDirDisjoint } from './dataRootValidator.js';
 
 // ── Dictionary ──
 

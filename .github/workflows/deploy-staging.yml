@@ -20,15 +20,19 @@ permissions:
   contents: read
   packages: read
   id-token: write  # For Azure OIDC login
+  actions: read    # t/4194 SO C1: `gh run list` in the cross-workflow wait-gate step
 
 concurrency:
   group: deploy-staging
-  cancel-in-progress: true
+  # SO C1c (p/682#20): with per-workflow groups, a pending-run replacement only ever drops an
+  # OLDER run of THIS SAME workflow, which is what we want — so cancel-in-progress:false is safe
+  # and avoids cancelling a live traffic shift mid-flight.
+  cancel-in-progress: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/taxonomy-editor
+  IMAGE_NAME: ai-rosetta-stone/taxonomy-editor
   RESOURCE_GROUP: ai-triad
   CONTAINER_APP_NAME: taxonomy-editor-staging
 
@@ -37,24 +41,128 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event.workflow_run.conclusion == 'success'
     environment: staging
+    timeout-minutes: 30  # SO C2 (t/4194, p/682#16): same rationale as deploy-azure.yml's job —
+                         # staging's own runtime is normally shorter, so a tighter cap.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
 
-      - name: Resolve image tag from triggering workflow
-        id: resolve_tag
+      - name: Warn if IDENTITY_MAP is incomplete (t/4326; staging warns, prod fails)
+        # Staging keeps whatever IDENTITY_MAP the last prod Bicep apply wrote (Sync-StagingEnv
+        # skips param references); this only makes an empty/incomplete repo variable visible.
+        shell: pwsh
+        env:
+          IDENTITY_MAP_VALUE: ${{ vars.IDENTITY_MAP }}
+        run: ./operations/devops/azure/Assert-IdentityMapConfigured.ps1 -Value $env:IDENTITY_MAP_VALUE -Mode Warn
+
+      - name: Wait for a concurrent prod deploy to finish (t/4194 SO C1)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          # Extract the version from the triggering workflow's ref (e.g., refs/tags/v0.8.0)
-          REF="${{ github.event.workflow_run.head_branch }}"
-          TAG="${REF#v}"
-          if [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-            echo "tag=$TAG" >> $GITHUB_OUTPUT
-          else
-            echo "tag=latest" >> $GITHUB_OUTPUT
-          fi
-          echo "Deploying tag: $(grep tag= $GITHUB_OUTPUT | cut -d= -f2)"
+          # t/4194 SO C1 (p/682#16, p/682#20): deploy-azure.yml's Bicep apply reconciles BOTH the
+          # prod and staging Container Apps in one shot (t/2049/t/2047 landmine) — including
+          # re-pinning staging's traffic from a value captured BEFORE that apply. If this workflow
+          # mutates the staging app (new revision, traffic promote) while deploy-azure.yml is
+          # mid-apply, its stale pre-apply capture can stomp this run's promotion, or vice versa. A
+          # single shared GH concurrency group was tried first and rejected: it holds only ONE
+          # pending run, so a third trigger silently REPLACES (drops) the queued one instead of
+          # serializing.
+          #
+          # SO C1a: a naive symmetric gate (both workflows wait for "any in-progress other-workflow
+          # run") deadlocks into the exact failure it's meant to prevent — a run sitting in ITS OWN
+          # wait step is itself in_progress, so two near-simultaneous dispatches see each other,
+          # both wait out the full budget, and both proceed together. Fixed by ORDER, not
+          # symmetry: wait only for an other-workflow run STARTED BEFORE this run. Exactly one of
+          # any two near-simultaneous runs then waits.
+          #
+          # SO C1e: `createdAt`/`created_at` is NOT re-set on a re-run — a `gh run rerun` of an old
+          # prod run would keep its original (old) timestamp and so never be seen as "earlier" than
+          # a genuinely later-dispatched staging run, defeating the order check on exactly the
+          # recovery path this gate is counted on for. Use `startedAt` (gh run list) /
+          # `run_started_at` (API) — both ARE re-set on a re-run — instead.
+          #
+          # SO C1b: budgets are tied to the OTHER job's own timeout-minutes, with asymmetric
+          # failure modes. Staging waits up to PROD's job timeout (45m = deploy-azure.yml's
+          # `deploy` job `timeout-minutes: 45`) and then FAILS CLOSED: staging isn't urgent, and a
+          # long prod apply is exactly when a stale-capture stomp is most likely, so staging backs
+          # off entirely rather than racing ahead — the next Container Image build or a re-run
+          # picks staging up. (Prod's own gate, in deploy-azure.yml, waits up to staging's 30m
+          # timeout and fails OPEN — see that file for the asymmetric rationale.)
+          #
+          # SO C1d: a failed/empty `gh run list` is NOT the same as "zero other runs" — treat it as
+          # BUSY (keep polling) rather than proceeding, so a persistently unreachable API fails
+          # closed at the budget (per C1b), never on the first blip.
+          #
+          # RESIDUAL VECTOR (named, not closed; SO-accepted at p/682#20): this is TOCTOU, not a
+          # lock — a deploy-azure.yml run that starts in the instant after this poll's last check
+          # is not caught. Only an actual mutex (e.g. a blob lease, t/4179) closes that.
+          $MaxWaitSeconds = 2700  # SO C1b: matches deploy-azure.yml `deploy` job's timeout-minutes: 45
+          $PollIntervalSeconds = 20
+          $Elapsed = 0
+          $OwnStartedAt = gh api "repos/$env:GH_REPO/actions/runs/$env:GITHUB_RUN_ID" --jq '.run_started_at'
+          if (-not $OwnStartedAt) {
+            Write-Host "::error::t/4194 guard: could not resolve this run's own run_started_at via the API — failing closed (SO C1b: staging is not urgent)."
+            exit 1
+          }
+          while ($true) {
+            $Raw = gh run list --repo $env:GH_REPO --workflow deploy-azure.yml --status in_progress --json databaseId,startedAt 2>$null
+            $ApiOk = -not ($null -eq $Raw -or $Raw -eq '')
+            if ($ApiOk) {
+              $Others = @($Raw | ConvertFrom-Json)
+              $Earlier = @($Others | Where-Object { [datetimeoffset]$_.startedAt -lt [datetimeoffset]$OwnStartedAt })
+            } else {
+              # SO C1d: unknown, NOT zero — fall through to the elapsed/poll logic below as "busy".
+              $Earlier = $null
+            }
+            if ($ApiOk -and $Earlier.Count -eq 0) {
+              Write-Host "No EARLIER in-progress deploy-azure.yml run — proceeding."
+              break
+            }
+            if ($Elapsed -ge $MaxWaitSeconds) {
+              if ($ApiOk) {
+                Write-Host "::error::t/4194 guard: an earlier deploy-azure.yml run is still in progress after ${MaxWaitSeconds}s — failing CLOSED (SO C1b: staging is not urgent; the next Container Image build or a re-run will pick this up)."
+              } else {
+                Write-Host "::error::t/4194 guard: 'gh run list' for deploy-azure.yml kept failing for ${MaxWaitSeconds}s — failing CLOSED (SO C1b/C1d: cannot prove it's safe, so don't proceed)."
+              }
+              exit 1
+            }
+            if ($ApiOk) {
+              Write-Host "$($Earlier.Count) earlier deploy-azure.yml run(s) still in progress — waiting ${PollIntervalSeconds}s (elapsed ${Elapsed}s/${MaxWaitSeconds}s)..."
+            } else {
+              Write-Host "::warning::t/4194 guard: 'gh run list' for deploy-azure.yml returned nothing this poll (API error or rate limit) — treating as busy, not clear (SO C1d); retrying in ${PollIntervalSeconds}s..."
+            }
+            Start-Sleep -Seconds $PollIntervalSeconds
+            $Elapsed += $PollIntervalSeconds
+          }
+
+      # t/4129: the BUILT commit comes from the Container Image run's NAME, not workflow_run.head_sha.
+      # On a workflow_dispatch with an explicit `sha` (the only real build path), head_sha is the
+      # DISPATCH ref tip (main at dispatch time) while the build checks out, bakes and tags inputs.sha.
+      # Using head_sha looked up a tag that was never pushed (built eeb267d0, looked up d42561bc).
+      # Fail-closed: no `(sha-<hex>)` marker in the run name aborts the deploy; never fall back to head_sha.
+      - name: Determine the built commit from the Container Image run name (t/4129)
+        id: built
+        shell: pwsh
+        env:
+          RUN_NAME: ${{ github.event.workflow_run.display_title }}
+        run: |
+          & ./operations/devops/Get-BuiltShaFromRunName.ps1 -RunName $env:RUN_NAME -GitHubOutput
+
+      - name: Resolve image digest from the built commit (t/3679 — never :latest)
+        id: resolve_digest
+        shell: pwsh
+        env:
+          BUILT_SHA: ${{ steps.built.outputs.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # t/3679: resolve the BUILT commit's PERMANENT sha-<commit> tag -> the immutable @sha256 digest
+          # (the TESTED artifact), NEVER :latest. Fail-closed on empty/not-found/ambiguous
+          # (Resolve-ImageDigest.ps1). $BUILT_SHA is read from env, not interpolated inline.
+          & ./operations/devops/Resolve-ImageDigest.ps1 -Sha $env:BUILT_SHA -GitHubOutput
 
       - name: Log in to Azure
-        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c  # v3
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906  # v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -88,17 +196,94 @@ jobs:
       - name: Deploy new revision to staging (0% traffic)
         id: new_revision
         shell: pwsh
+        env:
+          HEAD_SHA: ${{ steps.built.outputs.sha }}  # t/4129: the BUILT commit, not workflow_run.head_sha
+          IMAGE_REF: ${{ steps.resolve_digest.outputs.image_ref }}
+          RESOLVED_DIGEST: ${{ steps.resolve_digest.outputs.digest }}
         run: |
           Import-Module ./scripts/AITriad/AITriad.psm1 -Force
-          $ShortSha = '${{ github.event.workflow_run.head_sha }}'.Substring(0, 7)
+          # t/3679: deploy the DIGEST-PINNED ref (…@sha256:<digest>), not a tag — a recycle re-pulls identical
+          # bytes. DEPLOY_SHA + suffix encode the built commit ($HEAD_SHA, which IS the deployed commit here).
+          # IMAGE_DIGEST + IMAGE_DEPLOYED_AT stamped for the detect half; IMAGE_DEPLOYED_AT is DEPLOY-time
+          # (not container start) so a recycle without a deploy shows the same timestamp (condition 6).
+          $ShortSha = $env:HEAD_SHA.Substring(0, [Math]::Min(7, $env:HEAD_SHA.Length))
+          # t/4376: the suffix is deterministic and ACA revision names are immutable, so a re-run of a run
+          # that already created staging-<sha7> was rejected ("revision with suffix … already exists") and
+          # left the app provisioningState=Failed. Reuse an existing same-image revision instead.
+          . ./operations/devops/azure/Get-StagingRevisionVerdict.ps1
+          $RevName = "${{ env.CONTAINER_APP_NAME }}--staging-$ShortSha"
+          $Existing = az containerapp revision show `
+            --name '${{ env.CONTAINER_APP_NAME }}' -g '${{ env.RESOURCE_GROUP }}' --revision $RevName `
+            --query '{image:properties.template.containers[0].image, active:properties.active}' -o json 2>$null
+          # Not found exits non-zero -> create. Reset so the miss can't leak as this step's exit code (t/4252).
+          $Existing = if ($LASTEXITCODE -eq 0 -and $Existing) { $Existing | ConvertFrom-Json } else { $null }
+          $global:LASTEXITCODE = 0
+          $Verdict = Get-StagingRevisionVerdict -ExistingImage $Existing.image -ExpectedImageRef $env:IMAGE_REF
+          Write-Host "t/4376 revision verdict for '$RevName': $($Verdict.Action) ($($Verdict.Reason))"
+          if ($Verdict.Action -eq 'refuse') {
+            throw (New-ActionableError -AsErrorRecord `
+              -Goal "Deploy staging revision '$RevName'" `
+              -Problem "It already exists with image '$($Existing.image)', not the intended '$($env:IMAGE_REF)'" `
+              -Location 'deploy-staging.yml: Deploy new revision to staging (t/4376)' `
+              -NextSteps @("Inspect it: az containerapp revision show -n ${{ env.CONTAINER_APP_NAME }} -g ${{ env.RESOURCE_GROUP }} --revision $RevName",
+                           'The suffix encodes the built commit, so a mismatch means the sha-<commit> tag moved; investigate before redeploying'))
+          }
+          if ($Verdict.Action -eq 'reuse') {
+            if ($Existing.active -ne $true) {
+              Write-Host "::warning::t/4376: re-run — reactivating existing revision '$RevName' instead of re-creating it."
+              az containerapp revision activate `
+                --name '${{ env.CONTAINER_APP_NAME }}' -g '${{ env.RESOURCE_GROUP }}' --revision $RevName -o none
+              if ($LASTEXITCODE -ne 0) {
+                throw (New-ActionableError -AsErrorRecord `
+                  -Goal "Reactivate existing staging revision '$RevName' for a re-run" `
+                  -Problem "az containerapp revision activate exited $LASTEXITCODE" `
+                  -Location 'deploy-staging.yml: Deploy new revision to staging (t/4376)' `
+                  -NextSteps @('Check az output above and the app state: az containerapp show -n ${{ env.CONTAINER_APP_NAME }} -g ${{ env.RESOURCE_GROUP }} --query properties.provisioningState',
+                               'Or push a new commit, so a fresh staging-<sha7> revision is created'))
+              }
+            } else {
+              Write-Host "::warning::t/4376: re-run — reusing existing active revision '$RevName' instead of re-creating it."
+            }
+            Write-Host "New revision: $RevName (reused)"
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "revision=$RevName"
+            exit 0
+          }
+          $DeployedAt = [DateTimeOffset]::UtcNow.ToString('o')
           $Result = New-ContainerAppRevision `
-            -ImageRef '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.resolve_tag.outputs.tag }}' `
+            -ImageRef $env:IMAGE_REF `
             -RevisionSuffix "staging-$ShortSha" `
-            -EnvVars @{ DEPLOY_SHA = '${{ github.event.workflow_run.head_sha }}'; DEPLOY_TAG = '${{ steps.resolve_tag.outputs.tag }}' } `
+            -EnvVars @{
+              DEPLOY_SHA        = $env:HEAD_SHA
+              DEPLOY_TAG        = "sha-$($env:HEAD_SHA)"
+              IMAGE_DIGEST      = $env:RESOLVED_DIGEST
+              IMAGE_DEPLOYED_AT = $DeployedAt
+            } `
             -AppName '${{ env.CONTAINER_APP_NAME }}' `
             -ResourceGroup '${{ env.RESOURCE_GROUP }}'
           Write-Host "New revision: $($Result.RevisionName)"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "revision=$($Result.RevisionName)"
+
+      - name: Assert staging revision is digest-pinned to the intended image (t/3679 condition 3)
+        shell: pwsh
+        env:
+          EXPECTED_REF: ${{ steps.resolve_digest.outputs.image_ref }}
+        run: |
+          # Mirror of the prod assertion (deploy-azure.yml): value-equality of the resolved image ref,
+          # NOT @sha256-shape. Fail-closed before the traffic promote below.
+          $Rev = '${{ steps.new_revision.outputs.revision }}'
+          $Info = az containerapp revision show `
+            --name '${{ env.CONTAINER_APP_NAME }}' -g '${{ env.RESOURCE_GROUP }}' --revision $Rev `
+            --query '{prov:properties.provisioningState, image:properties.template.containers[0].image}' -o json | ConvertFrom-Json
+          Write-Host "New staging revision $Rev — provisioningState=$($Info.prov) image=$($Info.image)"
+          if ($Info.prov -eq 'Failed') {
+            Write-Host "::error::t/3679: staging revision provisioningState is 'Failed' — NOT promoting (fail-closed)."
+            exit 1
+          }
+          if ($Info.image -ne $env:EXPECTED_REF) {
+            Write-Host "::error::t/3679: staging revision image '$($Info.image)' != intended '$($env:EXPECTED_REF)' — digest-pin MISMATCH, NOT promoting (fail-closed)."
+            exit 1
+          }
+          Write-Host "t/3679 assert OK: staging revision digest-pinned to '$($env:EXPECTED_REF)' (value-equal)."
 
       - name: Smoke test new revision (pre-traffic gate)
         id: smoke
@@ -127,20 +312,90 @@ jobs:
           Write-Host "Smoke testing revision at: $BaseUrl"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "base_url=$BaseUrl"
 
-          # Health gate: wait for server up + data loaded before running the full smoke.
-          # 18 attempts x 10s = 3 min cold-start budget.
-          $Health = Test-TaxEditorHealth -BaseUrl $BaseUrl -MaxAttempts 18 -RetryIntervalSec 10
-          if (-not $Health.Healthy) {
-            Write-Host "::error::Health check failed on new staging revision — NOT promoting traffic"
-            $Health.Checks | Format-Table -AutoSize
-            exit 1
+          # Health gate: wait for server up + data loaded before running the full smoke. Same loop as prod
+          # (Wait-RevisionActivation, t/4158 SO C3): it fails fast with the cause named on a revision that can't
+          # start, and names the last GitHub refusal on timeout. 3-minute cold-start budget, as before.
+          . ./operations/devops/Get-RevisionActivationVerdict.ps1
+          $Rev = '${{ steps.new_revision.outputs.revision }}'
+          $App = '${{ env.CONTAINER_APP_NAME }}'
+          $Rg  = '${{ env.RESOURCE_GROUP }}'
+          $Gate = Wait-RevisionActivation -TimeoutSeconds 180 -IntervalSeconds 10 `
+            -GetState   { az containerapp revision show -n $App -g $Rg --revision $Rev --query '{r:properties.runningState,h:properties.healthState}' -o json 2>$null | ConvertFrom-Json } `
+            -GetLogTail { (az containerapp logs show -n $App -g $Rg --revision $Rev --tail 60 --format text 2>$null) -join "`n" } `
+            -Probe      { Test-TaxEditorHealth -BaseUrl $BaseUrl -TimeoutSec 15 -MaxAttempts 1 }
+          if ($Gate.Verdict -ne 'healthy') {
+            if ($Gate.Verdict -eq 'failed') {
+              Write-Host "::error::Staging revision $Rev cannot start ($($Gate.Cause)): $($Gate.Message) — NOT promoting traffic"
+            } else {
+              Write-Host "::error::Health check timed out on new staging revision — NOT promoting traffic"
+            }
+            if ($Gate.LastRefusal) { Write-Host "::error::Last GitHub refusal seen in the revision log: $($Gate.LastRefusal)" }
+            if ($Gate.Result) { $Gate.Result.Checks | Format-Table -AutoSize }
+            # t/4249: explicit from the verdict, not an ambient $LASTEXITCODE — belt-and-suspenders,
+            # Wait-RevisionActivation itself already resets $LASTEXITCODE=0 before returning.
+            exit (Get-HealthCheckExitCode $Gate.Verdict)
           }
           Write-Host "Health gate passed"
+          # t/4249: reset explicitly here too — the smoke test below runs more native calls, and a
+          # reader should never have to trace whether $LASTEXITCODE is clean at this point.
+          $global:LASTEXITCODE = 0
+
+          # t/4513 (TL condition 3, route enumeration): staging inherits AI_TRIAD_DATA_ROOT=/mnt/shared
+          # from baseEnv (main.bicep) -- the same azureFile SMB mount exposed to the t/4504 mount-attach
+          # race on prod. Same probe, same route set, same bound as prod's "Mount readiness probe" step
+          # (deploy-azure.yml). Staging's gates are failure()-driven rather than output-driven, so this
+          # fails the step directly rather than setting a `ready` output.
+          . ./operations/devops/Get-MountReadinessVerdict.ps1
+
+          # SO C1 (t/4513, e/364#2): fail closed when no revision-specific FQDN was resolved above.
+          # $BaseUrl then IS the app url (the OLD, still-serving revision) -- the warning a few lines
+          # up already names this, but the mount probe must not silently proceed against it: that
+          # would probe the sibling revision's already-warm mount and pass on attempt 1, vacuously,
+          # the exact t/4504 shape (looks healthy, isn't this revision).
+          if ([string]::IsNullOrWhiteSpace($RevFqdn)) {
+            Write-Host "::error::Mount readiness probe: no revision-specific FQDN was resolved for this revision -- `$BaseUrl` is the app url (the OLD serving revision), which this probe refuses to test. Treating as not-ready (fail-closed, SO C1, t/4513)."
+            exit 1
+          }
+
+          $MountProbeStart = Get-Date
+          $Routes = @(
+            @{ Path = '/api/entities';                  Field = '';      Label = 'entities' }
+            @{ Path = '/api/organizations';             Field = '';      Label = 'organizations' }
+            @{ Path = '/api/taxonomy/accelerationist';  Field = 'nodes'; Label = 'taxonomy nodes' }
+          )
+          $MountProbe = {
+            try {
+              $DataSession = New-AnonymousWebSession -BaseUrl $BaseUrl -TimeoutSec 15
+              foreach ($R in $Routes) {
+                $Params = @{ BaseUrl = $BaseUrl; Path = $R.Path; Method = 'GET'; TimeoutSec = 15; ExpectJson = $true }
+                if ($DataSession) { $Params.Session = $DataSession }
+                $Check  = Invoke-RemoteCheck @Params
+                $Assert = Test-DataPresenceAssertion -Body $Check.Body -ContentType $Check.ContentType `
+                  -CountField $R.Field -Label $R.Label
+                if (-not $Assert.Pass) {
+                  Write-Host "mount-readiness probe: $($R.Label) not ready — $($Assert.Reason)"
+                  return $false
+                }
+              }
+              return $true
+            } catch {
+              Write-Host "mount-readiness probe error (treated as not-ready): $($_.Exception.Message)"
+              return $false
+            }
+          }
+          $MountVerdict = Wait-MountReady -Probe $MountProbe -MaxAttempts 13 -IntervalSeconds 10
+          $MountElapsedSec = [math]::Round(((Get-Date) - $MountProbeStart).TotalSeconds, 1)
+          if ($MountVerdict.Verdict -ne 'ready') {
+            Write-Host "::error::Mount readiness probe failed after $($MountVerdict.Attempts) attempt(s) (~${MountElapsedSec}s) — NOT promoting staging traffic. See t/4504/t/4513."
+            exit 1
+          }
+          Write-Host "Mount readiness probe passed after $($MountVerdict.Attempts) attempt(s), ~${MountElapsedSec}s"
+          $global:LASTEXITCODE = 0
 
           # Full smoke: all 6 endpoint categories (mandatory pre-traffic gate, t/2376).
           Write-Host "=== Full smoke test against 0%-traffic revision: $BaseUrl ==="
           $SmokeResult = Invoke-TaxEditorSmokeTest -BaseUrl $BaseUrl -Detailed `
-            -DeployedSha '${{ github.event.workflow_run.head_sha }}' `
+            -DeployedSha '${{ steps.built.outputs.sha }}' `
             -AssertDataPresence
           if (-not $SmokeResult.OverallPass) {
             Write-Host "::error::Smoke test failed on new staging revision — NOT promoting traffic"
@@ -156,8 +411,38 @@ jobs:
           Write-Host "Smoke test passed — all categories healthy ($($SmokeResult.EndpointsPassed)/$($SmokeResult.EndpointsTotal) endpoints)"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "passed=true"
 
-      - name: Promote traffic to new revision
+      - name: Warm-gate (/readyz) — staging parity port (t/3309)
+        id: warm_gate
         if: steps.smoke.outputs.passed == 'true'
+        shell: pwsh
+        run: |
+          # t/3309 parity port of the PROD warm-gate (deploy-azure.yml). SAME output-driven mechanism:
+          # Invoke-ReadyzWarmGateCheck polls GET /readyz until {status:ready,nodeCount>0} → warm=true,
+          # else 503 / timeout / any non-warm → warm=false (fail-closed); ALWAYS exits 0 (the gate is
+          # output-driven, not exit-code-driven). Only NEW behavior is what /readyz reports (ServerAPI's
+          # t/3309 data-root readiness); the warm-gate mechanism is unchanged. Brings staging to prod
+          # parity on the traffic-shift gate AND lets t/3309 Arm B (misprovisioned data-root → /readyz
+          # 503) run end-to-end on staging without touching prod.
+          # TimeoutSec 300 = prod parity (deploy-azure.yml). (Restored after the t/3309 both-arms GV;
+          # the Arm-B fire-arm used a temporary 480 window — t/3309.)
+          $BaseUrl = "${{ steps.smoke.outputs.base_url }}"
+          & ./operations/devops/Invoke-ReadyzWarmGateCheck.ps1 -BaseUrl $BaseUrl -TimeoutSec 300 -PollIntervalSec 10
+
+      - name: Fail + roll back if not warm (t/3309)
+        # Staging's rollback is failure()-gated (vs prod's warm-output-gated), so translate the
+        # warm-gate's fail-closed warm=false into a step FAILURE → the existing failure() rollback
+        # (below) restores the prior revision + the run goes RED. This IS the Arm-B outcome
+        # (misprovisioned → /readyz 503 → warm=false → fail + rollback + RED). Mechanism identical to
+        # prod; only the plumbing into staging's failure()-rollback differs. On warm=true this step is
+        # skipped (success() && warm!='true' is false) and the deploy proceeds to promote.
+        if: steps.smoke.outputs.passed == 'true' && steps.warm_gate.outputs.warm != 'true'
+        shell: pwsh
+        run: |
+          Write-Host "::error::/readyz warm-gate reported warm=false (data-root not ready or timeout) — NOT promoting; rolling back to the prior revision. (t/3309)"
+          exit 1
+
+      - name: Promote traffic to new revision
+        if: steps.smoke.outputs.passed == 'true' && steps.warm_gate.outputs.warm == 'true'
         shell: pwsh
         run: |
           Import-Module ./scripts/AITriad/AITriad.psm1 -Force
@@ -170,23 +455,65 @@ jobs:
             -RetryIntervalSec 10
           Write-Host "Staging traffic promoted to ${{ steps.new_revision.outputs.revision }}"
 
-      - name: Deactivate stale revisions (keep serving + prior rollback) (t/2660)
+      - name: Deactivate stale revisions (keep serving + prior rollback) (t/2660, t/4242)
         if: steps.smoke.outputs.passed == 'true'
         continue-on-error: true  # cosmetic GC — must not red a successful deploy
         shell: pwsh
         run: |
           # 30s drain window: prior revision may still be draining long-lived connections
           Start-Sleep -Seconds 30
+          . ./operations/devops/Get-RevisionDeactivationVerdict.ps1
           $serving = '${{ steps.new_revision.outputs.revision }}'
           $prior   = '${{ steps.current_revision.outputs.revision }}'
-          $stale = az containerapp revision list `
+          # t/4242 + SO review (p/682#33): a revision's own `trafficWeight` is a value Azure
+          # DERIVES from the app's ingress traffic config — if the read-after-write lag is in that
+          # derivation, re-reading the same derived field alone can still be stale. Every candidate
+          # that survives the cheap name-based exclusion below gets a FRESH re-check against BOTH
+          # independently-sourced inputs — `revision show`'s own trafficWeight AND a fresh read of
+          # `properties.configuration.ingress.traffic` (the routing source) — immediately before
+          # the actual deactivate call, never an earlier list read.
+          $candidates = az containerapp revision list `
             --name '${{ env.CONTAINER_APP_NAME }}' -g '${{ env.RESOURCE_GROUP }}' `
-            --query '[?properties.trafficWeight==`0` && properties.active==`true`].name' `
-            -o json | ConvertFrom-Json | Where-Object { $_ -ne $prior }
-          foreach ($rev in $stale) {
+            -o json | ConvertFrom-Json
+          foreach ($c in $candidates) {
+            if ($c.name -eq $serving -or @($prior) -contains $c.name) {
+              Write-Host "Skipping $($c.name): name-excluded (serving or protected rollback target), no Azure call needed"
+              continue
+            }
+            # Fresh re-check immediately before the destructive call, on BOTH independent sources —
+            # the earlier list read above is never trusted for the actual decision.
+            $fresh = az containerapp revision show `
+              --name '${{ env.CONTAINER_APP_NAME }}' -g '${{ env.RESOURCE_GROUP }}' --revision $c.name `
+              -o json | ConvertFrom-Json
+            $app = az containerapp show --name '${{ env.CONTAINER_APP_NAME }}' -g '${{ env.RESOURCE_GROUP }}' -o json `
+              | ConvertFrom-Json
+            $trafficEntries = $null
+            $latestRevisionName = $null
+            if ($app.PSObject.Properties['properties']) {
+              if ($app.properties.PSObject.Properties['configuration'] -and
+                  $app.properties.configuration.PSObject.Properties['ingress'] -and
+                  $app.properties.configuration.ingress.PSObject.Properties['traffic']) {
+                $trafficEntries = @($app.properties.configuration.ingress.traffic)
+              }
+              if ($app.properties.PSObject.Properties['latestRevisionName']) {
+                $latestRevisionName = $app.properties.latestRevisionName
+              }
+            }
+            $ingress = Get-IngressTrafficWeightForRevision -RevisionName $c.name `
+              -TrafficEntries $trafficEntries -LatestRevisionName $latestRevisionName
+            $freshWeight = if ($fresh.properties.PSObject.Properties['trafficWeight']) { $fresh.properties.trafficWeight } else { $null }
+            $freshActive = if ($fresh.properties.PSObject.Properties['active']) { [bool]$fresh.properties.active } else { $false }
+            $freshVerdict = Get-RevisionDeactivationVerdict -RevisionName $c.name `
+              -TrafficWeight $freshWeight -Active $freshActive `
+              -IngressWeight $ingress.IngressWeight -IsLatestRevisionWithTraffic $ingress.IsLatestRevisionWithTraffic `
+              -ServingRevisionName $serving -ProtectedNames @($prior)
+            if ($freshVerdict.Action -ne 'deactivate') {
+              Write-Host "Skipping $($c.name) on fresh re-check: $($freshVerdict.Reason)"
+              continue
+            }
             az containerapp revision deactivate `
-              --name '${{ env.CONTAINER_APP_NAME }}' -g '${{ env.RESOURCE_GROUP }}' --revision $rev
-            Write-Host "Deactivated: $rev"
+              --name '${{ env.CONTAINER_APP_NAME }}' -g '${{ env.RESOURCE_GROUP }}' --revision $c.name
+            Write-Host "Deactivated: $($c.name)"
           }
           Write-Host "Active: $serving (serving)$(if ($prior) { ', ' + $prior + ' (rollback)' })"
 
@@ -220,9 +547,43 @@ jobs:
           }
           Write-Host "Staging serving revision '${{ steps.new_revision.outputs.revision }}' baseEnv verified OK"
 
+      - name: Post-deploy verification — serving revision active + /health 200 (t/4242 AC2)
+        if: steps.smoke.outputs.passed == 'true'
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          # t/4301 (Azure, p/241#94): Import-Module does not persist between workflow steps —
+          # missing here, every staging deploy since 10-17 failed this step with
+          # "Test-TaxEditorHealth is not recognized" and rolled back, even when the deploy and
+          # /health were actually fine.
+          Import-Module ./scripts/AITriad/AITriad.psm1 -Force
+          $Rev = '${{ steps.new_revision.outputs.revision }}'
+          $Info = az containerapp revision show `
+            --name '${{ env.CONTAINER_APP_NAME }}' -g '${{ env.RESOURCE_GROUP }}' --revision $Rev `
+            --query '{active:properties.active,weight:properties.trafficWeight}' -o json | ConvertFrom-Json
+          if (-not [bool]$Info.active) {
+            Write-Error "t/4242 AC2: serving revision '$Rev' is NOT active after deploy — the exact t/4242 incident shape (a revision holding traffic but deactivated). Failing the run."
+            exit 1
+          }
+          # SO C4: 100 assumes no canary split (two revisions both > 0% at once) — true today. If
+          # canary deploys are introduced, this check needs to change to "the expected split".
+          if ([int]$Info.weight -ne 100) {
+            Write-Error "t/4242 AC2: serving revision '$Rev' traffic weight is $($Info.weight), not 100 — traffic did not land where expected. Failing the run."
+            exit 1
+          }
+          $Fqdn = az containerapp show --name '${{ env.CONTAINER_APP_NAME }}' -g '${{ env.RESOURCE_GROUP }}' `
+            --query 'properties.configuration.ingress.fqdn' -o tsv
+          $Health = Test-TaxEditorHealth -BaseUrl "https://$Fqdn" -TimeoutSec 15 -MaxAttempts 3 -RetryIntervalSec 10
+          if (-not $Health.Healthy) {
+            Write-Error "t/4242 AC2: /health on the app URL (https://$Fqdn) did not return a healthy 200 after deploy. Failing the run. Detail: $($Health | ConvertTo-Json -Depth 3 -Compress)"
+            exit 1
+          }
+          Write-Host "t/4242 AC2 verified: '$Rev' active at weight 100, /health 200 on https://$Fqdn"
+
       - name: Re-authenticate before rollback
         if: always() && failure() && steps.current_revision.outputs.revision != ''
-        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c  # v3
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906  # v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -233,14 +594,35 @@ jobs:
         shell: pwsh
         run: |
           Import-Module ./scripts/AITriad/AITriad.psm1 -Force
-          Write-Host "::warning::Smoke failed — restoring prior revision: ${{ steps.current_revision.outputs.revision }}"
-          Set-ContainerAppTraffic `
-            -RevisionName '${{ steps.current_revision.outputs.revision }}' `
-            -AppName '${{ env.CONTAINER_APP_NAME }}' `
-            -ResourceGroup '${{ env.RESOURCE_GROUP }}' `
-            -MaxAttempts 3 `
-            -RetryIntervalSec 10
-          if ('${{ steps.new_revision.outputs.revision }}') {
+          $Prior = '${{ steps.current_revision.outputs.revision }}'
+          $NewRev = '${{ steps.new_revision.outputs.revision }}'
+          Write-Host "::warning::Smoke failed — restoring prior revision: $Prior"
+          # t/4376: skip the traffic write when the prior revision already holds 100% (traffic never moved).
+          # A traffic set re-submits the app's stored template, so after a REJECTED update it fails the same
+          # way every attempt; reading first makes the common case a no-op instead of 3 opaque failures.
+          $PriorWeight = az containerapp ingress traffic show `
+            --name '${{ env.CONTAINER_APP_NAME }}' -g '${{ env.RESOURCE_GROUP }}' `
+            --query "[?revisionName=='$Prior'].weight | [0]" -o tsv 2>$null
+          if ($LASTEXITCODE -eq 0 -and "$PriorWeight" -eq '100') {
+            Write-Host "Prior revision '$Prior' already at 100% — traffic never moved; no traffic write needed."
+          } else {
+            Set-ContainerAppTraffic `
+              -RevisionName $Prior `
+              -AppName '${{ env.CONTAINER_APP_NAME }}' `
+              -ResourceGroup '${{ env.RESOURCE_GROUP }}' `
+              -MaxAttempts 3 `
+              -RetryIntervalSec 10
+          }
+          $global:LASTEXITCODE = 0
+          $ProvState = az containerapp show --name '${{ env.CONTAINER_APP_NAME }}' -g '${{ env.RESOURCE_GROUP }}' `
+            --query 'properties.provisioningState' -o tsv 2>$null
+          if ($ProvState -eq 'Failed') {
+            Write-Host "::warning::t/4376: staging app provisioningState is 'Failed' (a rejected template is now its desired state). Serving is unaffected, but a bare 'az containerapp update' would replay that template — let the next deploy-staging run rewrite it."
+          }
+          $global:LASTEXITCODE = 0
+          # t/4376: a re-run of the LATEST run reuses the serving revision, so NewRev can equal Prior —
+          # never deactivate the revision we just restored traffic to.
+          if ($NewRev -and $NewRev -ne $Prior) {
             Disable-ContainerAppRevision `
               -RevisionName '${{ steps.new_revision.outputs.revision }}' `
               -AppName '${{ env.CONTAINER_APP_NAME }}' `

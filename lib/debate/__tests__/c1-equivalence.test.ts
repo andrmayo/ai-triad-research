@@ -68,6 +68,7 @@ function createDeterministicAdapter(): ExtendedAIAdapter {
       callIndex++;
       return resp;
     },
+    registry: { backends: [], models: [] },
   };
 }
 
@@ -92,6 +93,9 @@ function createMinimalTaxonomy(): LoadedTaxonomy {
     edges: null,
     embeddings: {},
     policyRegistry: [],
+    allNodesById: new Map(),
+    resolveNode: (_id: string) => undefined,
+    allEdges: null,
   };
 }
 

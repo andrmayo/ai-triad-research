@@ -8,9 +8,12 @@ import { nodePovFromId } from '@lib/debate/nodeIdUtils';
 import ErrorBoundary from '../../../lib/electron-shared/components/ErrorBoundary';
 import { useTaxonomyStore, initAIModels } from './hooks/useTaxonomyStore';
 import { initDebateSessions } from './hooks/useDebateStore';
+import { useAppRoute } from './routing/useAppRoute';
 import { Toolbar } from './components/shared/Toolbar';
 import { TabBar } from './components/shared/TabBar';
 import { SaveBar } from './components/sync/SaveBar';
+import { SaveConflictBanner } from './components/sync/SaveConflictBanner';
+import { PolicyRecountNotice } from './components/PolicyRecountNotice';
 import { PovTab } from './components/taxonomy/PovTab';
 import { FirstRunDialog } from './components/settings/FirstRunDialog';
 import { WhatsNewToast } from './components/settings/WhatsNewToast';
@@ -34,6 +37,9 @@ import { AnonymousBanner } from './components/community/AnonymousBanner';
 import { ResilienceBanner } from './components/shared/ResilienceBanner';
 import { QuotaBanner } from './components/shared/QuotaBanner';
 import { EmbeddingsStaleBanner } from './components/shared/EmbeddingsStaleBanner';
+import { OrphanedTagsBanner } from './components/shared/OrphanedTagsBanner';
+import { RetiredModelBanner } from './components/shared/RetiredModelBanner';
+import { FreeTierDisclosure } from './components/shared/FreeTierDisclosure';
 import { pullDataTracked } from './utils/syncApi';
 import { useFeatureFlagStore, useFlag } from './hooks/useFeatureFlags';
 import { useTheoryLinkHotkey } from './hooks/useTheoryLinkHotkey';
@@ -52,6 +58,7 @@ const SummariesTab = recordingLazy(() => import('./components/analysis/Summaries
 const CruxesTab = recordingLazy(() => import('./components/debate/CruxesTab').then(m => ({ default: m.CruxesTab })));
 const ValidationTab = recordingLazy(() => import('./components/taxonomy/ValidationTab').then(m => ({ default: m.ValidationTab })));
 const OrganizationsTab = recordingLazy(() => import('./components/organizations/OrganizationsTab').then(m => ({ default: m.OrganizationsTab })));
+const InquiryTab = recordingLazy(() => import('./components/inquiry/InquiryTab').then(m => ({ default: m.InquiryTab })));
 
 // Lazy-loaded window/panel components — separate Electron windows or hash routes
 const DiagnosticsWindow = recordingLazy(() => import('./components/debate-diagnostics').then(m => ({ default: m.DiagnosticsWindow })));
@@ -224,7 +231,7 @@ export function App() {
   if (!bridgeReady) return null;
 
   // If this window was opened as a diagnostics popout, render only that
-  if (hash === '#diagnostics-window') {
+  if (hash.startsWith('#diagnostics-window')) {
     return <ErrorBoundary buildInfo={BUILD_FINGERPRINT}><Suspense fallback={null}><DiagnosticsWindow /></Suspense></ErrorBoundary>;
   }
   if (hash === '#pov-progression-window') {
@@ -286,6 +293,7 @@ function AppRouter() {
 /** Main taxonomy editor application */
 function MainApp() {
   const { activeTab, loading, backgroundLoading, loadingProgress, loadAll, colorScheme, paneSpacing, zoomLevel, zoomIn, zoomOut, zoomReset, toolbarPanel } = useTaxonomyStore();
+  useAppRoute(); // t/3486: restore a deep-linked in-app view (e.g. /opeds/:setId) at boot + popstate.
   const summariesFlag = useFlag('env-electron-summaries');
   // OR both build flags — mirrors the navConfig Op-Eds gate (anyFlag: electron||web). Gates
   // BOTH the tab render below and must stay in sync with the nav gate, else the button shows
@@ -610,7 +618,7 @@ function MainApp() {
   // column (t/2857) so the left nav rail spans full window height, matching Debate/Chat/Op-Eds.
   // showPovHeader mirrors the original TabBar visibility condition exactly. Layout-only.
   const showPovHeader = toolbarPanel === null &&
-    !['situations', 'conflicts', 'cruxes', 'debate', 'chat', 'opeds', 'summaries', 'validation', 'organizations'].includes(activeTab);
+    !['situations', 'conflicts', 'cruxes', 'debate', 'chat', 'opeds', 'summaries', 'validation', 'organizations', 'inquiry'].includes(activeTab);
   const tabContent = (
     <>
       {activeTab === 'accelerationist' && <PovTab pov="accelerationist" />}
@@ -626,6 +634,7 @@ function MainApp() {
         {activeTab === 'summaries' && summariesFlag && <SummariesTab />}
         {activeTab === 'validation' && <ValidationTab />}
         {activeTab === 'organizations' && <OrganizationsTab />}
+        {activeTab === 'inquiry' && <InquiryTab />}
       </Suspense>
     </>
   );
@@ -646,6 +655,9 @@ function MainApp() {
       <ResilienceBanner />
       <QuotaBanner />
       <EmbeddingsStaleBanner />
+      <OrphanedTagsBanner />
+      <RetiredModelBanner />
+      <FreeTierDisclosure />
       {/* Data update banner */}
       {dataUpdate && (
         <div
@@ -755,6 +767,8 @@ function MainApp() {
         <GlobalDetailPaneHost />
       </div>
       <SaveBar />
+      <SaveConflictBanner />
+      <PolicyRecountNotice />
       <BottomNav onOpenMore={() => setHamburgerOpen(true)} />
       {isMobile && <HamburgerMenu isOpen={hamburgerOpen} onClose={() => setHamburgerOpen(false)} />}
       {UpdatePrompt && !loading && <Suspense fallback={null}><UpdatePrompt /></Suspense>}

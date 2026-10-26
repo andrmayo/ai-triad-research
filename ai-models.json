@@ -1,4 +1,5 @@
 {
+  "_minTimeoutMs_provenance": "t/3555: `minTimeoutMs: 0` on the fast-class reachable models (gemini/azure/openai flash/lite/mini, claude-haiku-4-5, groq llama/oss, deepseek-flash) is a 0-BY-DEFAULT CLASS judgment (120s base timeout deemed sufficient by model class) — NOT a per-model measured latency. Two reachable models were individually reviewed to a real 300000 floor instead of 0: openai-gpt-5.5 (flagship base; its pro sibling is floored) and ollama-gemma4-e4b-it-q4-k-m (local inference, hardware-dependent cold-start). Per-model p99-latency validation of the zeros is tracked in t/3662. Do not read a 0 here as a measured value. zai-glm-5-3 / zai-glm-5-3-flash are 0 by MEASUREMENT, not class: every Z.AI call sends reasoning_effort low (lib/ai-client/providers/zai.ts), and a 46KB debate-brief prompt on glm-5.3 measured 21s at low effort vs 205s at provider-default effort (2026-10-02). Raise the floor again if that effort setting is ever removed. claude-haiku-5-5 (t/4086) is floored at 300000, NOT the fast-class 0 that claude-haiku-4-5 uses: it is a 5.x model with adaptive thinking + effort whose reasoning can exceed the 120s base, so it is floored like the other 5.x Claude models (sonnet-5-5, opus-5), not treated as fast-class. Per-model p99-latency validation (t/3662) would refine this.",
   "backends": [
     {
       "id": "gemini",
@@ -45,6 +46,7 @@
   "models": [
     {
       "id": "azure-gpt-4o",
+      "minTimeoutMs": 0,
       "apiModelId": "gpt-4o",
       "label": "Azure GPT-4o",
       "backend": "azure",
@@ -55,6 +57,7 @@
     },
     {
       "id": "azure-gpt-4o-mini",
+      "minTimeoutMs": 0,
       "apiModelId": "gpt-4o-mini",
       "label": "Azure GPT-4o Mini",
       "backend": "azure",
@@ -65,6 +68,7 @@
     },
     {
       "id": "azure-gpt-4.1",
+      "minTimeoutMs": 0,
       "apiModelId": "gpt-4.1",
       "label": "Azure GPT-4.1",
       "backend": "azure",
@@ -75,6 +79,7 @@
     },
     {
       "id": "azure-gpt-4.1-mini",
+      "minTimeoutMs": 0,
       "apiModelId": "gpt-4.1-mini",
       "label": "Azure GPT-4.1 Mini",
       "backend": "azure",
@@ -84,14 +89,33 @@
       }
     },
     {
-      "id": "zai-glm-5-2",
+      "id": "zai-glm-5-3",
       "apiModelId": "glm-5.3",
       "label": "GLM 5.3",
       "backend": "zai",
+      "minTimeoutMs": 0,
       "picker": {
         "label": "GLM 5.3",
         "order": 10
       }
+    },
+    {
+      "id": "zai-glm-5-3-flash",
+      "apiModelId": "glm-5.3-flash",
+      "label": "GLM 5.3 Flash",
+      "backend": "zai",
+      "minTimeoutMs": 0,
+      "picker": {
+        "label": "GLM 5.3 Flash",
+        "order": 20
+      }
+    },
+    {
+      "id": "zai-glm-5-2",
+      "apiModelId": "glm-5.2",
+      "label": "GLM 5.2",
+      "backend": "zai",
+      "minTimeoutMs": 400000
     },
     {
       "id": "moonshot-kimi-k3",
@@ -99,6 +123,7 @@
       "label": "Kimi K3",
       "backend": "moonshot",
       "fixedTemperature": 1,
+      "minTimeoutMs": 400000,
       "picker": {
         "label": "Kimi K3",
         "order": 10
@@ -109,9 +134,21 @@
       "apiModelId": "grok-4.6",
       "label": "Grok 4.6",
       "backend": "xai",
+      "minTimeoutMs": 400000,
       "picker": {
         "label": "Grok 4.6",
         "order": 10
+      }
+    },
+    {
+      "id": "xai-grok-4-7",
+      "apiModelId": "grok-4.7",
+      "label": "Grok 4.7",
+      "backend": "xai",
+      "minTimeoutMs": 400000,
+      "picker": {
+        "label": "Grok 4.7",
+        "order": 5
       }
     },
     {
@@ -125,6 +162,7 @@
       "apiModelId": "gemini-3.1-pro-preview",
       "label": "Gemini 3.1 Pro Preview",
       "backend": "gemini",
+      "minTimeoutMs": 300000,
       "picker": {
         "label": "3.1 Pro Preview (best quality)",
         "order": 20
@@ -132,16 +170,18 @@
     },
     {
       "id": "gemini-3.5-flash-lite",
+      "minTimeoutMs": 0,
       "apiModelId": "gemini-3.5-flash-lite",
       "label": "Gemini 3.5 Flash Lite",
       "backend": "gemini",
       "picker": {
-        "label": "3.1 Flash Lite Preview (default)",
+        "label": "3.5 Flash Lite (default)",
         "order": 10
       }
     },
     {
       "id": "gemini-3.8-flash",
+      "minTimeoutMs": 0,
       "apiModelId": "gemini-3.8-flash",
       "label": "Gemini 3.8 Flash",
       "backend": "gemini",
@@ -152,6 +192,7 @@
     },
     {
       "id": "gemini-3.6-flash",
+      "minTimeoutMs": 0,
       "apiModelId": "gemini-3.6-flash",
       "label": "Gemini 3.6 Flash",
       "backend": "gemini",
@@ -162,6 +203,7 @@
     },
     {
       "id": "gemini-3.5-flash",
+      "minTimeoutMs": 0,
       "apiModelId": "gemini-3.5-flash",
       "label": "Gemini 3.5 Flash",
       "backend": "gemini",
@@ -172,6 +214,7 @@
     },
     {
       "id": "gemini-3.1-flash-lite",
+      "minTimeoutMs": 0,
       "apiModelId": "gemini-3.1-flash-lite",
       "label": "Gemini 3.1 Flash Lite",
       "backend": "gemini",
@@ -185,63 +228,101 @@
       "apiModelId": "gemini-2.5-pro",
       "label": "Gemini 2.5 Pro",
       "backend": "gemini",
+      "minTimeoutMs": 300000,
       "picker": {
         "label": "2.5 Pro",
         "order": 90
-      }
+      },
+      "thinks_by_default": true
     },
     {
       "id": "gemini-2.5-flash",
+      "minTimeoutMs": 0,
       "apiModelId": "gemini-2.5-flash",
       "label": "Gemini 2.5 Flash",
       "backend": "gemini",
       "picker": {
         "label": "2.5 Flash",
         "order": 70
-      }
+      },
+      "thinks_by_default": true
     },
     {
       "id": "gemini-2.5-flash-lite",
+      "minTimeoutMs": 0,
       "apiModelId": "gemini-2.5-flash-lite",
       "label": "Gemini 2.5 Flash-Lite",
       "backend": "gemini",
       "picker": {
         "label": "2.5 Flash Lite (fastest)",
         "order": 80
-      }
+      },
+      "thinks_by_default": true
     },
     {
       "id": "claude-opus-5",
       "apiModelId": "claude-opus-5",
       "label": "Claude Opus 5",
-      "backend": "claude"
+      "backend": "claude",
+      "minTimeoutMs": 300000,
+      "thinks_by_default": true,
+      "picker": {
+        "label": "Opus 5 (flagship)",
+        "order": 5
+      }
     },
     {
       "id": "claude-sonnet-5",
       "apiModelId": "claude-sonnet-5",
       "label": "Claude Sonnet 5",
-      "backend": "claude"
+      "backend": "claude",
+      "minTimeoutMs": 300000,
+      "thinks_by_default": true,
+      "picker": {
+        "label": "Sonnet 5",
+        "order": 7
+      }
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "apiModelId": "claude-sonnet-5-5",
+      "label": "Claude Sonnet 5.5",
+      "backend": "claude",
+      "minTimeoutMs": 300000,
+      "thinks_by_default": true,
+      "picker": {
+        "label": "Sonnet 5.5",
+        "order": 8
+      }
     },
     {
       "id": "claude-fable-5",
       "apiModelId": "claude-fable-5",
       "label": "Claude Fable 5",
-      "backend": "claude"
+      "backend": "claude",
+      "minTimeoutMs": 300000,
+      "thinks_by_default": true,
+      "picker": {
+        "label": "Fable 5",
+        "order": 9
+      }
     },
     {
       "id": "claude-opus-4-8",
       "apiModelId": "claude-opus-4-8",
       "label": "Claude Opus 4.8",
-      "backend": "claude"
+      "backend": "claude",
+      "minTimeoutMs": 300000
     },
     {
       "id": "claude-opus-4-7",
       "apiModelId": "claude-opus-4-7",
       "label": "Claude Opus 4.7",
       "backend": "claude",
+      "minTimeoutMs": 300000,
       "picker": {
-        "label": "Opus 4.7 (flagship)",
-        "order": 10
+        "label": "Opus 4.7",
+        "order": 11
       }
     },
     {
@@ -249,6 +330,7 @@
       "apiModelId": "claude-sonnet-4-6",
       "label": "Claude Sonnet 4.6",
       "backend": "claude",
+      "minTimeoutMs": 300000,
       "picker": {
         "label": "Sonnet 4.6",
         "order": 20
@@ -268,12 +350,25 @@
     },
     {
       "id": "claude-haiku-4-5",
+      "minTimeoutMs": 0,
       "apiModelId": "claude-haiku-4-5-20251001",
       "label": "Claude Haiku 4.5",
       "backend": "claude",
       "picker": {
         "label": "Haiku 4.5 (fastest)",
         "order": 30
+      }
+    },
+    {
+      "id": "claude-haiku-5-5",
+      "minTimeoutMs": 300000,
+      "thinks_by_default": true,
+      "apiModelId": "claude-haiku-5-5",
+      "label": "Claude Haiku 5.5",
+      "backend": "claude",
+      "picker": {
+        "label": "Haiku 5.5",
+        "order": 29
       }
     },
     {
@@ -296,18 +391,14 @@
     },
     {
       "id": "groq-openai-gpt-oss-20b",
+      "minTimeoutMs": 0,
       "apiModelId": "openai/gpt-oss-20b",
       "label": "Openai/Gpt Oss 20b",
       "backend": "groq"
     },
     {
-      "id": "groq-groq-compound-mini",
-      "apiModelId": "groq/compound-mini",
-      "label": "Groq/Compound Mini",
-      "backend": "groq"
-    },
-    {
       "id": "groq-openai-gpt-oss-120b",
+      "minTimeoutMs": 0,
       "apiModelId": "openai/gpt-oss-120b",
       "label": "Openai/Gpt Oss 120b",
       "backend": "groq",
@@ -323,32 +414,10 @@
       "backend": "groq"
     },
     {
-      "id": "groq-groq-compound",
-      "apiModelId": "groq/compound",
-      "label": "Groq/Compound",
-      "backend": "groq"
-    },
-    {
-      "id": "groq-llama-3.1-8b-instant",
-      "apiModelId": "llama-3.1-8b-instant",
-      "label": "Llama 3.1 8b Instant",
-      "backend": "groq"
-    },
-    {
       "id": "groq-canopylabs-orpheus-arabic-saudi",
       "apiModelId": "canopylabs/orpheus-arabic-saudi",
       "label": "Canopylabs/Orpheus Arabic Saudi",
       "backend": "groq"
-    },
-    {
-      "id": "groq-llama-3.3-70b-versatile",
-      "apiModelId": "llama-3.3-70b-versatile",
-      "label": "Llama 3.3 70b Versatile",
-      "backend": "groq",
-      "picker": {
-        "label": "Llama 3.3 70B",
-        "order": 10
-      }
     },
     {
       "id": "openai-gpt-4-0613",
@@ -444,25 +513,29 @@
       "id": "openai-o1-2024-12-17",
       "apiModelId": "o1-2024-12-17",
       "label": "O1 2024 12 17",
-      "backend": "openai"
+      "backend": "openai",
+      "thinks_by_default": true
     },
     {
       "id": "openai-o1",
       "apiModelId": "o1",
       "label": "O1",
-      "backend": "openai"
+      "backend": "openai",
+      "thinks_by_default": true
     },
     {
       "id": "openai-o3-mini",
       "apiModelId": "o3-mini",
       "label": "O3 Mini",
-      "backend": "openai"
+      "backend": "openai",
+      "thinks_by_default": true
     },
     {
       "id": "openai-o3-mini-2025-01-31",
       "apiModelId": "o3-mini-2025-01-31",
       "label": "O3 Mini 2025 01 31",
-      "backend": "openai"
+      "backend": "openai",
+      "thinks_by_default": true
     },
     {
       "id": "openai-gpt-4o-2024-11-20",
@@ -486,13 +559,15 @@
       "id": "openai-o1-pro-2025-03-19",
       "apiModelId": "o1-pro-2025-03-19",
       "label": "O1 Pro 2025 03 19",
-      "backend": "openai"
+      "backend": "openai",
+      "thinks_by_default": true
     },
     {
       "id": "openai-o1-pro",
       "apiModelId": "o1-pro",
       "label": "O1 Pro",
-      "backend": "openai"
+      "backend": "openai",
+      "thinks_by_default": true
     },
     {
       "id": "openai-gpt-4o-mini-tts",
@@ -504,25 +579,29 @@
       "id": "openai-o3-2025-04-16",
       "apiModelId": "o3-2025-04-16",
       "label": "O3 2025 04 16",
-      "backend": "openai"
+      "backend": "openai",
+      "thinks_by_default": true
     },
     {
       "id": "openai-o4-mini-2025-04-16",
       "apiModelId": "o4-mini-2025-04-16",
       "label": "O4 Mini 2025 04 16",
-      "backend": "openai"
+      "backend": "openai",
+      "thinks_by_default": true
     },
     {
       "id": "openai-o3",
       "apiModelId": "o3",
       "label": "O3",
-      "backend": "openai"
+      "backend": "openai",
+      "thinks_by_default": true
     },
     {
       "id": "openai-o4-mini",
       "apiModelId": "o4-mini",
       "label": "O4 Mini",
-      "backend": "openai"
+      "backend": "openai",
+      "thinks_by_default": true
     },
     {
       "id": "openai-gpt-4.1-2025-04-14",
@@ -532,6 +611,7 @@
     },
     {
       "id": "openai-gpt-4.1",
+      "minTimeoutMs": 0,
       "apiModelId": "gpt-4.1",
       "label": "Gpt 4.1",
       "backend": "openai"
@@ -544,6 +624,7 @@
     },
     {
       "id": "openai-gpt-4.1-mini",
+      "minTimeoutMs": 0,
       "apiModelId": "gpt-4.1-mini",
       "label": "Gpt 4.1 Mini",
       "backend": "openai"
@@ -820,6 +901,7 @@
     },
     {
       "id": "openai-gpt-5.5",
+      "minTimeoutMs": 300000,
       "apiModelId": "gpt-5.5",
       "label": "Gpt 5.5",
       "backend": "openai",
@@ -839,6 +921,7 @@
       "apiModelId": "gpt-5.5-pro",
       "label": "Gpt 5.5 Pro",
       "backend": "openai",
+      "minTimeoutMs": 300000,
       "picker": {
         "label": "GPT-5.5 Pro",
         "order": 20
@@ -869,24 +952,65 @@
       "backend": "openai"
     },
     {
-      "id": "deepseek-deepseek-v4-flash",
-      "apiModelId": "deepseek-v4-flash",
-      "label": "Deepseek V4 Flash",
-      "backend": "deepseek"
-    },
-    {
       "id": "deepseek-deepseek-v4-pro",
       "apiModelId": "deepseek-v4-pro",
       "label": "Deepseek V4 Pro",
-      "backend": "deepseek"
+      "backend": "deepseek",
+      "minTimeoutMs": 300000,
+      "picker": {
+        "label": "V4 Pro (reasoning)",
+        "order": 20
+      }
     },
     {
       "id": "ollama-gemma4-e4b-it-q4-k-m",
+      "minTimeoutMs": 300000,
       "apiModelId": "gemma4:e4b-it-q4_K_M",
       "label": "gemma4:e4b-it-q4_K_M (8.0B) Q4_K_M",
       "backend": "ollama",
       "picker": {
         "label": "Gemma 4 E4B (default)",
+        "order": 10
+      }
+    },
+    {
+      "id": "claude-opus-5-5",
+      "apiModelId": "claude-opus-5-5",
+      "label": "Claude Opus 5.5",
+      "backend": "claude",
+      "minTimeoutMs": 300000,
+      "thinks_by_default": true,
+      "picker": {
+        "label": "Opus 5.5",
+        "order": 6
+      }
+    },
+    {
+      "id": "claude-fable-5-1",
+      "apiModelId": "claude-fable-5-1",
+      "label": "Claude Fable 5.1",
+      "backend": "claude",
+      "minTimeoutMs": 300000,
+      "thinks_by_default": true,
+      "picker": {
+        "label": "Fable 5.1 (most capable, $$$)",
+        "order": 10
+      }
+    },
+    {
+      "id": "groq-qwen-qwen3.8-27b",
+      "apiModelId": "qwen/qwen3.8-27b",
+      "label": "Qwen/Qwen3.8 27b",
+      "backend": "groq"
+    },
+    {
+      "id": "deepseek-deepseek-flash",
+      "minTimeoutMs": 0,
+      "apiModelId": "deepseek-flash",
+      "label": "Deepseek Flash",
+      "backend": "deepseek",
+      "picker": {
+        "label": "Flash (default)",
         "order": 10
       }
     }
@@ -895,12 +1019,12 @@
     "gemini": "gemini-3.1-pro-preview",
     "claude": "claude-sonnet-4-6",
     "groq": "groq-openai-gpt-oss-120b",
-    "deepseek": "deepseek-deepseek-v4-flash",
+    "deepseek": "deepseek-deepseek-flash",
     "azure": "azure-gpt-4o",
     "ollama": "ollama-gemma4-e4b-it-q4-k-m",
-    "zai": "zai-glm-5-2",
+    "zai": "zai-glm-5-3",
     "moonshot": "moonshot-kimi-k3",
-    "xai": "xai-grok-4-6"
+    "xai": "xai-grok-4-7"
   },
   "fallbackChains": {
     "gemini-3.1-pro-preview": [
@@ -913,6 +1037,13 @@
     "claude-sonnet-5": [
       "claude-haiku-4-5"
     ],
+    "claude-sonnet-5-5": [
+      "claude-haiku-4-5"
+    ],
+    "claude-opus-5-5": [
+      "claude-sonnet-4-6",
+      "gemini-3.1-pro-preview"
+    ],
     "claude-opus-4-8": [
       "claude-sonnet-4-6",
       "gemini-3.1-pro-preview"
@@ -922,42 +1053,52 @@
     ],
     "claude-haiku-4-5": [
       "gemini-3.5-flash-lite",
-      "groq-llama-3.1-8b-instant"
+      "groq-openai-gpt-oss-20b"
     ],
-    "groq-llama-3.3-70b-versatile": [
-      "groq-llama-3.1-8b-instant"
+    "claude-haiku-5-5": [
+      "gemini-3.5-flash-lite",
+      "groq-openai-gpt-oss-20b"
     ],
     "groq-openai-gpt-oss-120b": [
-      "groq-llama-3.3-70b-versatile"
+      "groq-openai-gpt-oss-20b"
     ],
     "openai-gpt-5.5": [
-      "groq-llama-3.3-70b-versatile"
+      "groq-openai-gpt-oss-120b"
     ],
     "azure-gpt-4o": [
       "azure-gpt-4o-mini"
     ],
     "azure-gpt-4o-mini": [
       "gemini-3.5-flash-lite",
-      "groq-llama-3.1-8b-instant"
+      "groq-openai-gpt-oss-20b"
     ],
     "azure-gpt-4.1": [
       "azure-gpt-4.1-mini"
     ],
     "azure-gpt-4.1-mini": [
       "gemini-3.5-flash-lite",
-      "groq-llama-3.1-8b-instant"
+      "groq-openai-gpt-oss-20b"
     ],
-    "deepseek-deepseek-v4-flash": [
+    "deepseek-deepseek-flash": [
       "deepseek-deepseek-v4-pro"
     ],
     "zai-glm-5-2": [
-      "groq-llama-3.3-70b-versatile"
+      "groq-openai-gpt-oss-120b"
+    ],
+    "zai-glm-5-3": [
+      "groq-openai-gpt-oss-120b"
+    ],
+    "zai-glm-5-3-flash": [
+      "groq-openai-gpt-oss-120b"
     ],
     "moonshot-kimi-k3": [
-      "groq-llama-3.3-70b-versatile"
+      "groq-openai-gpt-oss-120b"
     ],
     "xai-grok-4-6": [
-      "groq-llama-3.3-70b-versatile"
+      "groq-openai-gpt-oss-120b"
+    ],
+    "xai-grok-4-7": [
+      "groq-openai-gpt-oss-120b"
     ]
   },
   "contextWindows": {
@@ -1136,41 +1277,46 @@
     "basic": {
       "gemini": "gemini-3.5-flash-lite",
       "claude": "claude-haiku-4-5",
-      "groq": "groq-llama-3.1-8b-instant",
+      "groq": "groq-openai-gpt-oss-20b",
       "openai": "openai-gpt-4.1-mini",
       "azure": "azure-gpt-4o-mini",
-      "deepseek": "deepseek-deepseek-v4-flash",
+      "deepseek": "deepseek-deepseek-flash",
       "ollama": "ollama-gemma4-e4b-it-q4-k-m",
-      "zai": "zai-glm-5-2"
+      "zai": "zai-glm-5-3-flash"
     },
     "advanced": {
       "gemini": "gemini-3.1-pro-preview",
-      "claude": "claude-sonnet-4-6",
-      "groq": "groq-llama-3.3-70b-versatile",
+      "claude": "claude-fable-5",
+      "groq": "groq-openai-gpt-oss-120b",
       "openai": "openai-gpt-4.1",
       "azure": "azure-gpt-4.1",
       "deepseek": "deepseek-deepseek-v4-pro",
       "ollama": "ollama-gemma4-e4b-it-q4-k-m",
-      "zai": "zai-glm-5-2"
+      "zai": "zai-glm-5-3"
     }
   },
+  "_pricing_provenance": "Anthropic pricing page (platform.claude.com/docs/en/about-claude/pricing), read 2026-10-05; standard global Claude API $/MTok (t/3941#4). Cache reads are 0.1x input EXCEPT claude-fable-5-1 (0.025x = 0.25) and claude-opus-5-5 (0.05x = 0.20); claude-fable-5 cache read is 1.00. Sonnet 5 is 2/10 standard — the scheduled 2026-09-01 rise to 3/15 was CANCELLED (pricing-page footnote); the prior stored 3/15 was Sonnet 4.6's price. Schema has no cache-write field; 5m/1h cache-write prices are intentionally not stored (adding one is a schema change). t/3946 BACKFILL (2026-10-05, PR #2840): priced all reachable models, re-keyed orphans, and filled cache rates from live provider pages. PROMO (ends 2026-12-31): gemini-3.8-flash and gemini-3.6-flash are at promotional 0.75/3.75/0.075 (in/out/cache) that DOUBLES on 2027-01-01 to 1.50/7.50/0.15 per ai.google.dev/gemini-api/docs/pricing; refresh tracked in t/3974 (due 2026-12-31). CONTEXT TIER: openai-gpt-5.5 (5/30/0.50) and openai-gpt-5.5-pro (30/180; cachedInputPer1M=input, as no cache price is published) are stored at the <272K-token SHORT-context rate — long context (>272K) is roughly 2x and is NOT modelled (schema has no per-context-tier field). TIER DETAIL (Shared Lib p/726#29): gemini-3.1-pro-preview (2/12/0.20) is stored at the <=200k-token tier, so long context is under-costed; deepseek-flash (t/4174: replaces the delisted legacy alias deepseek-v4-flash, same Flash price, DeepSeek pricing page read 2026-10-14) and deepseek-v4-pro are stored at the standard/PEAK rate — the off-peak 50% discount (UTC window, weekends/holidays) is not modelled. HAIKU 5.5 (t/4086, Anthropic pricing page read 2026-10-07): claude-haiku-5-5 is priced BY PROMPT LENGTH; the stored value is the base <=100K-token tier (input 0.10, output 0.50, cache-read 0.01). The >100K-token tier is 5x (input 0.50, output 2.50, cache-read 0.05) and is NOT modelled (schema has no per-context-tier field). Cache read is the standard 0.1x of base input. Haiku 5.5 has a 1M context window (Models API max_input_tokens=1000000) but, like every other Claude model here, inherits the claude backend capabilityDefault (200000) with no per-model override — a pre-existing Claude context-modeling gap, not changed in this ticket.",
   "pricing": {
-    "_comment": "USD per 1M tokens. cachedInputPer1M is the reduced rate for cache-hit input tokens. Updated 2026-05-03.",
+    "_comment": "USD per 1M tokens. cachedInputPer1M is the reduced rate for cache-hit input tokens. Updated 2026-10-05.",
     "gemini-3.1-pro-preview": {
-      "inputPer1M": 3,
-      "outputPer1M": 15
+      "inputPer1M": 2,
+      "outputPer1M": 12,
+      "cachedInputPer1M": 0.2
     },
     "gemini-3.5-flash": {
-      "inputPer1M": 0.75,
-      "outputPer1M": 3
+      "inputPer1M": 1.5,
+      "outputPer1M": 9,
+      "cachedInputPer1M": 0.15
     },
     "gemini-3.5-flash-lite": {
-      "inputPer1M": 0.375,
-      "outputPer1M": 1.5
+      "inputPer1M": 0.3,
+      "outputPer1M": 2.5,
+      "cachedInputPer1M": 0.3
     },
     "gemini-3.1-flash-lite": {
-      "inputPer1M": 0.375,
-      "outputPer1M": 1.5
+      "inputPer1M": 0.25,
+      "outputPer1M": 1.5,
+      "cachedInputPer1M": 0.025
     },
     "gemini-2.5-pro": {
       "inputPer1M": 1.25,
@@ -1187,22 +1333,62 @@
       "outputPer1M": 0.4,
       "cachedInputPer1M": 0.025
     },
+    "claude-fable-5-1": {
+      "inputPer1M": 10,
+      "outputPer1M": 50,
+      "cachedInputPer1M": 0.25
+    },
+    "claude-fable-5": {
+      "inputPer1M": 10,
+      "outputPer1M": 50,
+      "cachedInputPer1M": 1.0
+    },
+    "claude-opus-5-5": {
+      "inputPer1M": 4,
+      "outputPer1M": 20,
+      "cachedInputPer1M": 0.2
+    },
     "claude-opus-5": {
       "inputPer1M": 5,
       "outputPer1M": 25,
       "cachedInputPer1M": 0.5
-    },
-    "claude-sonnet-5": {
-      "inputPer1M": 3,
-      "outputPer1M": 15,
-      "cachedInputPer1M": 0.3
     },
     "claude-opus-4-8": {
       "inputPer1M": 5,
       "outputPer1M": 25,
       "cachedInputPer1M": 0.5
     },
+    "claude-opus-4-7": {
+      "inputPer1M": 5,
+      "outputPer1M": 25,
+      "cachedInputPer1M": 0.5
+    },
+    "claude-opus-4-6": {
+      "inputPer1M": 5,
+      "outputPer1M": 25,
+      "cachedInputPer1M": 0.5
+    },
+    "claude-opus-4-5": {
+      "inputPer1M": 5,
+      "outputPer1M": 25,
+      "cachedInputPer1M": 0.5
+    },
+    "claude-sonnet-5-5": {
+      "inputPer1M": 2,
+      "outputPer1M": 10,
+      "cachedInputPer1M": 0.2
+    },
+    "claude-sonnet-5": {
+      "inputPer1M": 2,
+      "outputPer1M": 10,
+      "cachedInputPer1M": 0.2
+    },
     "claude-sonnet-4-6": {
+      "inputPer1M": 3,
+      "outputPer1M": 15,
+      "cachedInputPer1M": 0.3
+    },
+    "claude-sonnet-4-5": {
       "inputPer1M": 3,
       "outputPer1M": 15,
       "cachedInputPer1M": 0.3
@@ -1212,17 +1398,10 @@
       "outputPer1M": 5,
       "cachedInputPer1M": 0.1
     },
-    "groq-llama-3.3-70b-versatile": {
-      "inputPer1M": 0.59,
-      "outputPer1M": 0.79
-    },
-    "groq-llama-3.1-8b-instant": {
-      "inputPer1M": 0.05,
-      "outputPer1M": 0.08
-    },
-    "groq-llama-4-scout-17b-16e": {
-      "inputPer1M": 0.11,
-      "outputPer1M": 0.34
+    "claude-haiku-5-5": {
+      "inputPer1M": 0.1,
+      "outputPer1M": 0.5,
+      "cachedInputPer1M": 0.01
     },
     "groq-openai-gpt-oss-120b": {
       "inputPer1M": 0.15,
@@ -1233,27 +1412,39 @@
       "outputPer1M": 0.3
     },
     "openai-gpt-5.5": {
-      "inputPer1M": 2,
-      "outputPer1M": 8
+      "inputPer1M": 5,
+      "outputPer1M": 30,
+      "cachedInputPer1M": 0.5
     },
     "openai-gpt-5.5-pro": {
-      "inputPer1M": 10,
-      "outputPer1M": 40
+      "inputPer1M": 30,
+      "outputPer1M": 180,
+      "cachedInputPer1M": 30
     },
-    "deepseek-chat": {
-      "inputPer1M": 0.27,
-      "outputPer1M": 1.1,
-      "cachedInputPer1M": 0.07
+    "deepseek-deepseek-flash": {
+      "inputPer1M": 0.3,
+      "outputPer1M": 1.2,
+      "cachedInputPer1M": 0.006
     },
-    "deepseek-reasoner": {
-      "inputPer1M": 0.55,
-      "outputPer1M": 2.19,
-      "cachedInputPer1M": 0.14
+    "deepseek-deepseek-v4-pro": {
+      "inputPer1M": 1.32,
+      "outputPer1M": 3.96,
+      "cachedInputPer1M": 0.044
     },
     "zai-glm-5-2": {
       "inputPer1M": 1.4,
       "outputPer1M": 4.4,
       "cachedInputPer1M": 0.26
+    },
+    "zai-glm-5-3": {
+      "inputPer1M": 1.4,
+      "outputPer1M": 4.4,
+      "cachedInputPer1M": 0.26
+    },
+    "zai-glm-5-3-flash": {
+      "inputPer1M": 0.15,
+      "outputPer1M": 0.5,
+      "cachedInputPer1M": 0.03
     },
     "moonshot-kimi-k3": {
       "inputPer1M": 3,
@@ -1264,7 +1455,67 @@
       "inputPer1M": 2,
       "outputPer1M": 6,
       "cachedInputPer1M": 0.5
+    },
+    "openai-gpt-4o": {
+      "inputPer1M": 2.5,
+      "outputPer1M": 10,
+      "cachedInputPer1M": 1.25
+    },
+    "openai-gpt-4o-mini": {
+      "inputPer1M": 0.15,
+      "outputPer1M": 0.6,
+      "cachedInputPer1M": 0.075
+    },
+    "openai-gpt-4.1": {
+      "inputPer1M": 2,
+      "outputPer1M": 8,
+      "cachedInputPer1M": 0.5
+    },
+    "openai-gpt-4.1-mini": {
+      "inputPer1M": 0.4,
+      "outputPer1M": 1.6,
+      "cachedInputPer1M": 0.1
+    },
+    "xai-grok-4-7": {
+      "inputPer1M": 2,
+      "outputPer1M": 6,
+      "cachedInputPer1M": 0.5
+    },
+    "gemini-3.8-flash": {
+      "inputPer1M": 0.75,
+      "outputPer1M": 3.75,
+      "cachedInputPer1M": 0.075
+    },
+    "gemini-3.6-flash": {
+      "inputPer1M": 0.75,
+      "outputPer1M": 3.75,
+      "cachedInputPer1M": 0.075
+    },
+    "ollama-gemma4-e4b-it-q4-k-m": {
+      "inputPer1M": 0,
+      "outputPer1M": 0,
+      "cachedInputPer1M": 0
+    },
+    "azure-gpt-4o": {
+      "inputPer1M": 2.5,
+      "outputPer1M": 10,
+      "cachedInputPer1M": 1.25
+    },
+    "azure-gpt-4o-mini": {
+      "inputPer1M": 0.15,
+      "outputPer1M": 0.6,
+      "cachedInputPer1M": 0.075
+    },
+    "azure-gpt-4.1": {
+      "inputPer1M": 2,
+      "outputPer1M": 8,
+      "cachedInputPer1M": 0.5
+    },
+    "azure-gpt-4.1-mini": {
+      "inputPer1M": 0.4,
+      "outputPer1M": 1.6,
+      "cachedInputPer1M": 0.1
     }
   },
-  "lastRefreshed": "2026-08-13T16:58:37.846Z"
+  "lastRefreshed": "2026-09-22T21:08:31.752Z"
 }

@@ -1,0 +1,38 @@
+{
+  "_comment": [
+    "t/3646 — SSOT MIRROR of main's required status checks. This file is a DESCRIPTION, not",
+    "the source of truth. GitHub branch protection is AUTHORITATIVE:",
+    "  gh api repos/AI-Rosetta-Stone/ai-triad-research/branches/main/protection/required_status_checks",
+    "Hand-editing this file changes NOTHING real — it only changes what workflow-lint enforces.",
+    "operations/devops/Test-RequiredContextsListDrift.ps1 validates this list against the live",
+    "API; that drift-guard MUST be green on main BEFORE the workflow-lint required-context rule",
+    "is promoted from warn-only to blocking (a lint enforcing a stale mirror is worse than none).",
+    "CodeQL (t/3691): the 'CodeQL' required check is posted by the GitHub CodeQL App as an AGGREGATE,",
+    "not by a job in codeql.yml (whose jobs are 'analyze' + 'record-base-ref'). So its entry names the",
+    "file AND carries \"posts\": \"app-aggregate\": the FILE-level rules (R1/R3/R4) DO lint codeql.yml",
+    "(closing the t/2025 anti-strand gap that was previously protected by a comment alone), while the",
+    "JOB-level rules (R2/R5 — look up a job whose posted name == the context) are N/A and skipped.",
+    "'posts' is a VERIFIABLE claim, not a bare opt-out (app-posted = a bare /runs/<id> status; a workflow",
+    "job = /actions/runs/.../job/); an UNMARKED context with no matching job still HARD-FAILS R2 (typo",
+    "catch preserved). The R2/R5 job lookup is name-then-id (workflow-lint _find_reporting_job, t/3691).",
+    "t/3804 PR-1: 'strict' is the SSOT's declared expectation for required_status_checks.strict —",
+    "Test-RequiredContextsListDrift.ps1 reads this field and compares it against the live API (already",
+    "present in the payload it queries; no endpoint change). Expected false: a stale-base PR must stay",
+    "mergeable without being forced to rebase against every main push (t/3686). strict:true here would",
+    "be a REGRESSION, not a hardening someone forgot to declare.",
+    "t/3804 PR-2: 'enforce_admins' is the SSOT's declared expectation for the PARENT /protection",
+    "endpoint's enforce_admins.enabled (NOT present in required_status_checks — a second gh api call",
+    "reads it; see Test-RequiredContextsListDrift.ps1). Expected true: per root AGENTS.md Pre-Self-Merge",
+    "Verification, this setting currently substitutes for two inert feedback rules (pre-self-merge-verify,",
+    "auto-merge-jointgv-guard; t/3695) by binding branch protection to admins too. enforce_admins:false",
+    "here would be a REGRESSION that silently re-opens both incident classes (t/3804)."
+  ],
+  "strict": false,
+  "enforce_admins": true,
+  "required_contexts": [
+    { "context": "ci-gate", "workflow": ".github/workflows/ci.yml" },
+    { "context": "joint-gv-guard", "workflow": ".github/workflows/joint-gv-guard.yml" },
+    { "context": "CodeQL", "workflow": ".github/workflows/codeql.yml", "posts": "app-aggregate" },
+    { "context": "consult-hold-guard", "workflow": ".github/workflows/consult-hold-guard.yml" }
+  ]
+}

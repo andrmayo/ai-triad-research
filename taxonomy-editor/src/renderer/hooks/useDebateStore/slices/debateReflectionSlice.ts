@@ -3,7 +3,10 @@
 
 import type { StateCreator } from 'zustand';
 import type { DebateStore } from '../types';
-import type { ReflectionEdit, ReflectionResult } from '../types';
+import type { ReflectionEdit, ReflectionResult, ReflectionDecision } from '../types';
+import { withReflectionDecision, appliedDecision, dismissedDecision } from './reflectionDecisions';
+import { loadPovTagRegistry, validatePovTags } from '@lib/schema/povTags';
+import { annotateTagChecks, evaluateTagGate, TAG_GATE_ENFORCED, tagsFingerprint, CUSTODIAN_CHECK_BACKEND } from './reflectionTagGate';
 import type {
   DebateSession,
   SpeakerId,
@@ -13,7 +16,7 @@ import type {
   GapInjection,
   CrossCuttingProposal,
 } from '../../../types/debate';
-import { POVER_INFO, AI_POVERS, POV_KEYS } from '../../../types/debate';
+import { POVER_INFO, AI_POVERS } from '../../../types/debate';
 import type { PovNode, CrossCuttingNode as SituationNode, GraphAttributes, Category, Pov, Edge } from '../../../types/taxonomy';
 import type { ModeratorState, SelectionResult, ModeratorIntervention, InterventionMetadata, DebatePhase } from '@lib/debate/types';
 import type { PoverResponseMeta, MoveAnnotation } from '@lib/debate/helpers';
@@ -39,11 +42,18 @@ import {
   midDebateGapPrompt,
   crossCuttingNodePrompt,
 } from '../../../prompts/debate';
-import { newItemSuggestionsToProposals } from '@lib/debate/confidenceEvolution';
+import { newItemSuggestionsToProposals, filterNoOpReflectionEdits } from '@lib/debate/confidenceEvolution';
 import type { RawNewItemSuggestion } from '@lib/debate/confidenceEvolution';
 import type { NewPovItemProposal } from '@lib/debate/types/session';
 import { checkDolceCompliance } from '../../../utils/dolceCompliance';
 import { nodeTypeFromId } from '@lib/debate/nodeIdUtils';
+import {
+  computeNodeEngagement,
+  validateEditEvidence,
+  type NodeEngagement,
+  type EngagementTranscriptEntry,
+} from '@lib/debate/reflectionScope';
+import type { ReflectionTaxonomyNode } from '@lib/debate/prompts/reflection';
 import { computeQbafStrengths } from '@lib/debate/qbaf';
 import type { QbafNode, QbafEdge } from '@lib/debate/qbaf';
 import { factCheckToBaseStrength } from '@lib/debate/argumentNetwork';
@@ -81,6 +91,7 @@ import { computeBeliefConfidence } from '@lib/debate/beliefConfidence';
 import { computeTreePriority } from '@lib/debate/desirePriority';
 import { computeOperationality } from '@lib/debate/intentionOperationality';
 import { useTaxonomyStore } from '../../useTaxonomyStore';
+import { allPovNodeIds, resolveNodeId } from '../../useTaxonomyStore/superseded'; // t/4355
 import { usePromptConfigStore } from '../../usePromptConfigStore';
 import { mapErrorToUserMessage } from '../../../utils/errorMessages';
 import { getConfiguredModel, getSpeakerModel } from '../shared/modelConfig';
@@ -88,18 +99,29 @@ import { generateTextWithProgress, phaseGuardedSet, summarizeTranscriptEntry, ma
 import { createDebateGuard, newAbortController, _abortController, claimDebateDriver, releaseDebateDriver, isDailyLimitError, DAILY_LIMIT_MESSAGE, isCancellationError } from '../shared/guards';
 import { pushWarning, recordDiagnostic, recordSignalHistory, getSignalValue, movingAverageSignal, incrementGapInjectionCount, _gapInjectionCount } from '../shared/diagnostics';
 import { runNeutralCheckpoint } from '../shared/neutralCheckpoint';
+import { seatSouls } from '../shared/seatSouls';
 import { enrichPolicyRefs, serializeNodeSourceMap, formatEdgeContext, formatDebaterEdgeContext, getRelevantTaxonomyContext, getAllKnownNodeIds, getAllPolicyIds, findNodeMetaInStore, getTaxonomyContext } from '../shared/taxonomyContext';
 import { extractClaimsAndUpdateAN, commitAnNodes, detectZeroClaims } from '../shared/argumentNetwork';
 
 export interface DebateReflectionSlice {
-  requestReflections: () => Promise<void>;
-  applyReflectionEdit: (pover: string, editIndex: number, overrides?: { label?: string; description?: string }, options?: { regeneratePhrases?: boolean }) => Promise<{ ok: boolean; error?: string; enrichNodeId?: string }>;
+  /** `fullTaxonomySweep` (t/3512) additionally offers the camp's never-engaged nodes — opt-in,
+   *  because the debate provides no evidence about them. Default: engaged nodes only. */
+  requestReflections: (options?: { fullTaxonomySweep?: boolean }) => Promise<void>;
+  /** `allowUnsupportedEvidence` (t/3512) applies an edit the evidence check flagged — the caller
+   *  must be an explicit human override; without it such an edit is refused. */
+  /** `allowCrossTag` (t/4214 R-3) applies an edit the tag gate flagged (foreign, conflict, unchecked or a stale
+   *  check) — again only on an explicit, confirmed human override, which is recorded. While TAG_GATE_ENFORCED is
+   *  off, a flagged edit applies and `note` carries the would-block reason. */
+  applyReflectionEdit: (pover: string, editIndex: number, overrides?: { label?: string; description?: string }, options?: { regeneratePhrases?: boolean; allowUnsupportedEvidence?: boolean; allowCrossTag?: boolean }) => Promise<{ ok: boolean; error?: string; enrichNodeId?: string; note?: string; refusedBy?: ApplyRefusal }>;
   retryReflectionEditAfterFix: (pover: string, editIndex: number) => Promise<{ ok: boolean; error?: string }>;
   dismissReflectionEdit: (pover: string, editIndex: number) => void;
   /** Apply a `propose_new` proposal (t/1773): create the new POV node AND persist its
    *  proposed edges atomically (one save) — no orphaned node. Edge targets are
    *  re-validated against live node ids at apply time. */
-  applyReflectionProposal: (pover: string, proposalIndex: number) => Promise<{ ok: boolean; error?: string; createdNodeId?: string }>;
+  /** `povTags` (t/4214 R-6b) is the reviewer's choice of tags for the new node; omitted, the seat's own tag applies
+   *  (R-4). An empty array leaves the node untagged, which takes it out of every wing's Scope (t/3955), so it is
+   *  recorded as a coverage gap. */
+  applyReflectionProposal: (pover: string, proposalIndex: number, options?: { povTags?: string[] }) => Promise<{ ok: boolean; error?: string; createdNodeId?: string }>;
   dismissReflectionProposal: (pover: string, proposalIndex: number) => void;
   retryEnrichment: (nodeId: string, pov: 'accelerationist' | 'safetyist' | 'skeptic') => Promise<void>;
 }
@@ -149,11 +171,6 @@ function assignProvisionalWeight(povKey: Pov, nodeId: string, category: Category
   }
 }
 
-/** Map a full POV key to its 3-letter short form used by the embeddings API. */
-function povShort(povKey: Pov): 'acc' | 'saf' | 'skp' {
-  return povKey === 'accelerationist' ? 'acc' : povKey === 'safetyist' ? 'saf' : 'skp';
-}
-
 /**
  * Merge an AI enrichment response into a node's existing graph attributes — each field
  * copied only when present. Shared by the reflection-apply enrichment path and the
@@ -173,33 +190,6 @@ function buildEnrichedGraphAttributes(currentAttrs: GraphAttributes | undefined,
     ...(enriched.node_scope && { node_scope: enriched.node_scope }),
     ...(enriched.attribution_text && { attribution_text: enriched.attribution_text }),
   };
-}
-
-/**
- * Compute synthetic embeddings for a node's attribution + synthetic phrases and persist
- * them. Per-phrase failures are tolerated (resilience); the caller's outer catch records a
- * whole-enrichment failure. Shared by the reflection-apply and retry enrichment paths.
- */
-async function embedSyntheticPhrases(nodeId: string, povKey: Pov, enriched: any): Promise<void> {
-  const phrasesToEmbed: string[] = [];
-  if (enriched.attribution_text) phrasesToEmbed.push(enriched.attribution_text);
-  if (Array.isArray(enriched.synthetic_phrases)) {
-    for (const p of enriched.synthetic_phrases) {
-      if (typeof p === 'string' && p.length > 0) phrasesToEmbed.push(p);
-    }
-  }
-  if (phrasesToEmbed.length === 0) return;
-  const vectors: number[][] = [];
-  for (const phrase of phrasesToEmbed) {
-    try {
-      const { vector } = await api.computeQueryEmbedding(phrase.slice(0, 500));
-      if (vector?.length > 0) vectors.push(vector);
-    // eslint-disable-next-line local/require-flight-recorder-in-catch -- per-phrase resilience: individual embedding failures are expected; outer catch records if entire enrichment fails
-    } catch { /* per-phrase resilience */ }
-  }
-  if (vectors.length > 0) {
-    await api.updateSyntheticEmbeddings(nodeId, povShort(povKey), vectors);
-  }
 }
 
 /**
@@ -235,6 +225,169 @@ function markReflectionEditApproved(pover: string, editIndex: number, set: Refle
     };
   });
   set({ reflections: updated });
+}
+
+/**
+ * Save a reflection decision into the debate file's reflection snapshot (t/4214 R-5), so the M2 override rate
+ * can be measured from saved debates. A missing snapshot (an older debate) is logged and skipped; the
+ * in-memory decision stands either way.
+ */
+async function persistReflectionDecision(
+  pover: string, target: { kind: 'edit' | 'proposal'; index: number }, decision: ReflectionDecision,
+  set: ReflectionSet, get: ReflectionGet,
+): Promise<void> {
+  const debate = get().activeDebate;
+  const updated = debate ? withReflectionDecision(debate, pover, target, decision) : null;
+  if (!updated) {
+    getGlobalRecorder()?.record({
+      type: 'state.error', component: 'reflection-decision', level: 'warn',
+      message: 'reflection decision not saved: the debate has no reflection snapshot for this seat',
+      data: { pover, ...target, outcome: decision.outcome },
+    });
+    return;
+  }
+  set({ activeDebate: updated });
+  await get().saveDebate('reflectionDecision');
+}
+
+/**
+ * Mark an applied edit approved and save the decision (shared by apply and retry-after-fix). An edit the evidence
+ * check flagged can only have been applied through the evidence override, so it is recorded as `overridden`.
+ */
+async function recordEditApplied(pover: string, editIndex: number, edit: ReflectionEdit, crossTagOverridden: boolean, set: ReflectionSet, get: ReflectionGet): Promise<void> {
+  markReflectionEditApproved(pover, editIndex, set, get);
+  const overrides: ('evidence' | 'cross_tag')[] = [];
+  if (edit.evidence_supported === false) overrides.push('evidence');
+  if (crossTagOverridden) overrides.push('cross_tag');
+  await persistReflectionDecision(pover, { kind: 'edit', index: editIndex }, appliedDecision(overrides), set, get);
+}
+
+/** A node's live `pov_tags` from the taxonomy store. */
+function liveNodeTags(pov: string, nodeId: string): string[] | undefined {
+  const file = useTaxonomyStore.getState()[pov as Pov] as { nodes?: { id: string; pov_tags?: string[] }[] } | undefined;
+  return file?.nodes?.find(n => n.id === nodeId)?.pov_tags;
+}
+
+/**
+ * R-3 tag gate (t/4214, spec t/4211 §3): refuse a flagged edit unless `allowCrossTag`, recording either the
+ * refusal or the override. Returns the refusal message, or whether the gate was overridden. While
+ * TAG_GATE_ENFORCED is off, a block is recorded as a would-block WARN and returned as a non-blocking note.
+ */
+function applyTagGate(
+  pover: string, editIndex: number, edit: ReflectionEdit, finalLabel: string, finalDescription: string, allowCrossTag: boolean,
+): { refusal: string | null; overridden: boolean; note?: string } {
+  const gate = evaluateTagGate(edit, pover, edit.node_id ? liveNodeTags(pover, edit.node_id) : undefined, finalLabel, finalDescription);
+  if (!gate.block) return { refusal: null, overridden: false };
+  const data = { pover, editIndex, node_id: edit.node_id, block: gate.block, relation: edit.tag_check?.relation, custodians: edit.tag_check?.custodians, verdicts: edit.tag_check?.verdicts };
+  if (!TAG_GATE_ENFORCED) {
+    getGlobalRecorder()?.record({ type: 'state.change', component: 'reflection-edit', level: 'warn', message: 'applyReflectionEdit.cross_tag_would_block', data: { ...data, reason: gate.reason } });
+    return { refusal: null, overridden: false, note: gate.reason };
+  }
+  if (!allowCrossTag) {
+    getGlobalRecorder()?.record({ type: 'state.error', component: 'reflection-edit', level: 'warn', message: 'applyReflectionEdit.refused_cross_tag', data });
+    return { refusal: `${gate.reason} Review it; apply anyway to override.`, overridden: false };
+  }
+  getGlobalRecorder()?.record({ type: 'state.change', component: 'reflection-edit', level: 'warn', message: 'applyReflectionEdit.cross_tag_overridden', data });
+  return { refusal: null, overridden: true };
+}
+
+/** Which apply-time gate refused an edit; the panel arms the matching override (t/4214 R-6). */
+export type ApplyRefusal = 'evidence' | 'cross_tag';
+
+/**
+ * The apply-time gates, in order: the evidence gate (t/3512) and the tag gate (t/4214 R-3). Each refuses a flagged
+ * edit unless its own override is set, and records the refusal or the override. Returns the text to write.
+ */
+function runApplyGates(
+  pover: string, editIndex: number, edit: ReflectionEdit,
+  overrides: { label?: string; description?: string } | undefined,
+  options: { allowUnsupportedEvidence?: boolean; allowCrossTag?: boolean } | undefined,
+): { refusal: string | null; refusedBy?: ApplyRefusal; finalLabel: string; finalDescription: string; crossTagOverridden: boolean; tagNote?: string } {
+  const finalLabel = overrides?.label ?? edit.proposed_label;
+  const finalDescription = overrides?.description ?? edit.proposed_description;
+  // Evidence gate (t/3512): an edit whose cited claims do not reference the node it edits is not
+  // applied. The debate did not test that node, so the edit has no warrant — the human can still
+  // override deliberately (ReflectionsPanel asks first), which is recorded.
+  if (edit.evidence_supported === false) {
+    if (!options?.allowUnsupportedEvidence) {
+      getGlobalRecorder()?.record({
+        type: 'state.error', component: 'reflection-edit', level: 'warn',
+        message: 'applyReflectionEdit.refused_unsupported_evidence',
+        data: { pover, editIndex, node_id: edit.node_id, evidence_entries: edit.evidence_entries, engagement: edit.engagement, note: edit.evidence_note },
+      });
+      return { refusal: `Unsupported by debate evidence — ${edit.evidence_note ?? 'no cited claim references this node'}. Review the rationale; apply anyway to override.`, refusedBy: 'evidence', finalLabel, finalDescription, crossTagOverridden: false };
+    }
+    getGlobalRecorder()?.record({
+      type: 'state.change', component: 'reflection-edit', level: 'warn',
+      message: 'applyReflectionEdit.unsupported_evidence_overridden',
+      data: { pover, editIndex, node_id: edit.node_id, note: edit.evidence_note },
+    });
+  }
+  const tagGate = applyTagGate(pover, editIndex, edit, finalLabel, finalDescription, !!options?.allowCrossTag);
+  return { refusal: tagGate.refusal, ...(tagGate.refusal ? { refusedBy: 'cross_tag' as const } : {}), finalLabel, finalDescription, crossTagOverridden: tagGate.overridden, tagNote: tagGate.note };
+}
+
+/** The DOLCE compliance retries, then the t/4214 R-2 tag check on the final text. True when the run went stale. */
+async function runReflectionPostChecks(
+  edits: ReflectionEdit[], povKey: string, model: string, info: { label: string }, activeDebate: DebateSession,
+  set: ReflectionSet, isStillValid: () => boolean,
+): Promise<boolean> {
+  if (await runDolceComplianceRetries(edits, model, info, activeDebate, set, isStillValid)) return true;
+  set({ debateActivity: `${info.label}: checking edits against the other wings…` });
+  await annotateTagChecks(edits, {
+    pov: povKey,
+    seatTag: activeDebate.seat_tags?.[povKey as SpeakerId]?.pov_tag ?? null,
+    nodeTags: (nodeId) => liveNodeTags(povKey, nodeId),
+    generateText: (prompt, m, timeoutMs, temperature) => api.generateText(prompt, m, timeoutMs, temperature),
+    hasCheckKey: () => api.hasApiKey(CUSTODIAN_CHECK_BACKEND),
+    debateId: activeDebate.id,
+  }, isStillValid);
+  return !isStillValid();
+}
+
+/** Fire-and-forget form for the synchronous dismiss actions; a failure is recorded, never thrown. */
+function persistReflectionDecisionInBackground(
+  pover: string, target: { kind: 'edit' | 'proposal'; index: number }, decision: ReflectionDecision,
+  set: ReflectionSet, get: ReflectionGet,
+): void {
+  persistReflectionDecision(pover, target, decision, set, get).catch((err: unknown) => {
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'reflection-decision', level: 'error',
+      message: 'saving a dismissed reflection decision failed',
+      data: { pover, ...target },
+      error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+    });
+  });
+}
+
+/**
+ * The tag a new node from this seat gets (t/4214 R-4, spec t/4211 §3.1): the tagged seat's own tag. An untagged
+ * seat on a POV that has tags leaves the node untagged and records a coverage-gap WARN, so the node can't drop
+ * out of Scope unnoticed. A POV with no tags (Accelerationist, Safetyist today) is unaffected.
+ */
+function proposalNodeTags(povKey: Pov, nodeId: string, pover: string, get: ReflectionGet): string[] | undefined {
+  const seatTag = get().activeDebate?.seat_tags?.[pover as SpeakerId]?.pov_tag;
+  const povHasTags = (loadPovTagRegistry().povs[povKey as keyof ReturnType<typeof loadPovTagRegistry>['povs']] ?? []).length > 0;
+  if (!seatTag) {
+    if (povHasTags) {
+      getGlobalRecorder()?.record({
+        type: 'state.change', component: 'reflection-proposal', level: 'warn',
+        message: 'reflection.new_node_untagged: an untagged seat created a node on a POV that has tags; it is a coverage gap for the tag-proposal pipeline',
+        data: { node_id: nodeId, pov: povKey, pover },
+      });
+    }
+    return undefined;
+  }
+  const problems = validatePovTags(nodeId, [seatTag]);
+  if (problems.length > 0) {
+    getGlobalRecorder()?.record({
+      type: 'state.error', component: 'reflection-proposal', level: 'warn',
+      message: 'reflection.new_node_tag_invalid: the seat tag failed validatePovTags; the node is left untagged',
+      data: { node_id: nodeId, pov: povKey, seat_tag: seatTag, problems },
+    });
+    return undefined;
+  }
+  return [seatTag];
 }
 
 type TaxStore = ReturnType<typeof useTaxonomyStore.getState>;
@@ -283,15 +436,38 @@ async function createReflectionAddNode(
   return { ok: true, nodeId: newId };
 }
 
+/** Inverse of idGenerator's CATEGORY_SLUG — maps the genus word used in the mandated
+ *  genus-differentia description format (Line 1: "A Belief/Desire/Intention within...")
+ *  back to the taxonomy's plural Category value. */
+const GENUS_TO_CATEGORY: Record<string, Category> = {
+  belief: 'Beliefs',
+  desire: 'Desires',
+  intention: 'Intentions',
+};
+
+/** Parse the proposed category out of a reflection edit's description text (t/3492).
+ *  `edit.category` reflects the node's CURRENT category for edit_existing edits — the
+ *  reflection prompt never updates it when a QUALIFY/REVISE changes the genus word — so the
+ *  only signal for a category change is the mandated Line 1 genus-differentia opening.
+ *  Returns null when the description doesn't match the format (graceful no-op, not an error). */
+function parseProposedCategory(description: string): Category | null {
+  const match = description.trimStart().match(/^An?\s+(Belief|Desire|Intention)\b/i);
+  if (!match) return null;
+  return GENUS_TO_CATEGORY[match[1].toLowerCase()] ?? null;
+}
+
 /**
  * The `edit_existing` branch of applyReflectionEdit: revise/qualify updates label+description;
  * deprecate prefixes a `[DEPRECATED]` marker when no explicit description is supplied.
+ * If the proposed description's genus word implies a different BDI category than the node's
+ * current one, cascades the rename via `movePovNodeCategory` (t/3492) and returns the new node
+ * id so the caller can enrich/track the renamed node instead of the now-stale old id.
  */
 function applyReflectionEditToExistingNode(
   povKey: Pov, edit: ReflectionEdit, finalLabel: string, finalDescription: string,
   taxStore: TaxStore, get: ReflectionGet,
-): void {
-  if (!edit.node_id) return;
+): string | null {
+  if (!edit.node_id) return null;
   const reflectionSource = { source: 'debate_reflection' as const, debateId: get().activeDebateId ?? undefined, reason: edit.rationale || undefined };
   if (edit.edit_type === 'deprecate') {
     const deprecatedDesc = finalDescription || `[DEPRECATED] ${edit.current_description || ''}`;
@@ -299,21 +475,24 @@ function applyReflectionEditToExistingNode(
       label: finalLabel || edit.current_label || '',
       description: deprecatedDesc,
     }, reflectionSource);
-  } else {
-    taxStore.updatePovNode(povKey, edit.node_id, {
-      label: finalLabel || edit.current_label || '',
-      description: finalDescription,
-    }, reflectionSource);
+    return null;
   }
+  taxStore.updatePovNode(povKey, edit.node_id, {
+    label: finalLabel || edit.current_label || '',
+    description: finalDescription,
+  }, reflectionSource);
+
+  const proposedCategory = parseProposedCategory(finalDescription);
+  if (proposedCategory && proposedCategory !== edit.category) {
+    return taxStore.movePovNodeCategory(povKey, edit.node_id, proposedCategory);
+  }
+  return null;
 }
 
 /** Gather all live node ids (every POV file, plus situations when requested) for anti-orphan edge validation / collision detection. */
 function collectKnownNodeIds(includeSituations = true): Set<string> {
-  const ids = new Set<string>();
-  for (const p of POV_KEYS) {
-    const f = useTaxonomyStore.getState()[p];
-    if (f) for (const n of f.nodes) ids.add(n.id);
-  }
+  // Full set, superseded included (t/4355): a cited superseded id is known, then resolved to its survivor.
+  const ids = allPovNodeIds(useTaxonomyStore.getState());
   if (includeSituations) {
     const situations = useTaxonomyStore.getState().situations;
     if (situations) for (const n of situations.nodes) ids.add(n.id);
@@ -329,7 +508,13 @@ function collectKnownNodeIds(includeSituations = true): Set<string> {
  */
 async function createProposalNode(
   povKey: Pov, proposal: NewPovItemProposal, taxStore: TaxStore, get: ReflectionGet, pover: string, proposalIndex: number,
+  reviewerTags?: string[],
 ): Promise<AddNodeResult> {
+  const tagProblems = reviewerTagProblems(povKey, reviewerTags);
+  if (tagProblems) {
+    getGlobalRecorder()?.record({ type: 'state.error', component: 'reflection-proposal', level: 'warn', message: 'applyReflectionProposal.result', data: { ok: false, error: 'invalid reviewer pov_tags', pover, proposalIndex, pov_tags: reviewerTags, problems: tagProblems } });
+    return { ok: false, error: `Those tags can't be applied: ${tagProblems.join('; ')}` };
+  }
   // Create the new POV node (mirrors the add path; t/1564 collision backstop).
   const preExistingIds = collectKnownNodeIds(false);
   let newId = taxStore.createPovNode(povKey, proposal.category);
@@ -346,11 +531,13 @@ async function createProposalNode(
     return { ok: false, error: `Generated ID ${newId} already exists — refusing to overwrite. Please retry.` };
   }
   const debateId = get().activeDebateId;
+  const povTags = reviewerTags !== undefined ? reviewerNodeTags(povKey, newId, pover, reviewerTags, get) : proposalNodeTags(povKey, newId, pover, get);
   taxStore.updatePovNode(povKey, newId, {
     label: proposal.label,
     description: proposal.description,
     graph_attributes: defaultGraphAttributes(povKey, proposal.category),
     debate_refs: debateId ? [debateId] : [],
+    ...(povTags ? { pov_tags: povTags } : {}),
   }, { source: 'debate_reflection', debateId: debateId ?? undefined, reason: proposal.rationale || undefined });
   assignProvisionalWeight(povKey, newId, proposal.category);
   return { ok: true, nodeId: newId };
@@ -401,10 +588,6 @@ async function startReflectionNodeEnrichment(
       // Keep dirty flag until embeddings are also done
       currentTaxStore.updatePovNode(povKey, nodeId, { graph_attributes: buildEnrichedGraphAttributes(currentNode.graph_attributes, enriched) });
       await currentTaxStore.save();
-
-      if (regeneratePhrases) {
-        await embedSyntheticPhrases(nodeId, povKey, enriched);
-      }
 
       // Clear dirty flag only after attributes + embeddings are fully done
       await clearPhraseRegenPending(povKey, nodeId);
@@ -476,6 +659,112 @@ function buildReflectionContextBlocks(
  * current_label/current_description against the live taxonomy to prevent hallucinated labels
  * (t/1564). propose_new entries are excluded upstream; `add` node_ids are cleared (t/1564).
  */
+/** Camp → node-id prefix (the inverse of POV_PREFIXES, which is keyed by prefix). */
+const POV_PREFIX_BY_KEY: Record<Pov, string> = {
+  accelerationist: 'acc-',
+  safetyist: 'saf-',
+  skeptic: 'skp-',
+};
+
+/** Problems with the reviewer's tags for a new node of this POV (t/4214 R-6b), checked before the node is created. */
+function reviewerTagProblems(povKey: Pov, reviewerTags: string[] | undefined): string[] | null {
+  if (!reviewerTags || reviewerTags.length === 0) return null;
+  const problems = validatePovTags(`${POV_PREFIX_BY_KEY[povKey]}new`, reviewerTags);
+  return problems.length > 0 ? problems : null;
+}
+
+/** The reviewer's (already validated) tags for the new node; a choice that differs from the seat's tag is recorded. */
+function reviewerNodeTags(povKey: Pov, nodeId: string, pover: string, reviewerTags: string[], get: ReflectionGet): string[] | undefined {
+  const seatTag = get().activeDebate?.seat_tags?.[pover as SpeakerId]?.pov_tag;
+  const seatDefault = seatTag ? [seatTag] : [];
+  if (tagsFingerprint(reviewerTags) !== tagsFingerprint(seatDefault)) {
+    getGlobalRecorder()?.record({
+      type: 'state.change', component: 'reflection-proposal', level: 'info',
+      message: 'reflection.new_node_tags_set_by_reviewer',
+      data: { node_id: nodeId, pov: povKey, pover, seat_tag: seatTag ?? null, pov_tags: reviewerTags },
+    });
+  }
+  if (reviewerTags.length > 0) return [...reviewerTags];
+  // Untagged is out of every wing's Scope, not shared ground (CL #3315): the same coverage-gap WARN as R-4 (spec §3.1).
+  getGlobalRecorder()?.record({
+    type: 'state.change', component: 'reflection-proposal', level: 'warn',
+    message: 'reflection.new_node_untagged: the reviewer cleared every wing tag; the node is out of Scope for every wing and is a coverage gap for the tag-proposal pipeline',
+    data: { node_id: nodeId, pov: povKey, pover, reviewer_choice: true },
+  });
+  return undefined;
+}
+
+/**
+ * t/4214 R-1 (D-3): the seat's tag and the POV's tag labels for the reflection prompt's tag guidance. A POV with
+ * no registry tags gets neither, so its prompt carries no tag lines at all.
+ */
+export function reflectionTagArgs(activeDebate: DebateSession, povKey: Pov): { seatTag?: string | null; povTagLabels?: Map<string, string> } {
+  const entries = loadPovTagRegistry().povs[povKey] ?? [];
+  if (entries.length === 0) return {};
+  return {
+    seatTag: activeDebate.seat_tags?.[povKey as SpeakerId]?.pov_tag ?? null,
+    povTagLabels: new Map(entries.map(e => [e.id, e.label])),
+  };
+}
+
+/**
+ * Build the reflector's node list (t/3512). Only nodes THIS debate engaged — injected, cited, or
+ * referenced by an argument-network claim — ranked by engagement, each carrying its debate record.
+ * `fullTaxonomySweep` additionally passes the never-engaged remainder as a clearly-marked block.
+ *
+ * Fallback: a camp with zero engaged nodes (nothing injected or cited — e.g. a debate that failed
+ * relevance selection) falls back to the full taxonomy and records a WARN, since reflecting on
+ * nothing is worse than reflecting unscoped.
+ */
+function buildReflectionNodes(
+  activeDebate: DebateSession,
+  povNodes: PovNode[],
+  povPrefix: string,
+  fullTaxonomySweep: boolean,
+): { nodes: ReflectionTaxonomyNode[]; unengaged?: ReflectionTaxonomyNode[]; engagementById: Map<string, NodeEngagement> } {
+  const engagements = computeNodeEngagement({
+    transcript: activeDebate.transcript as unknown as EngagementTranscriptEntry[],
+    anNodes: activeDebate.argument_network?.nodes ?? [],
+    anEdges: activeDebate.argument_network?.edges ?? [],
+  }, povPrefix);
+  const engagementById = new Map(engagements.map(e => [e.nodeId, e]));
+  const byId = new Map(povNodes.map(n => [n.id, n]));
+  const toPromptNode = (n: PovNode, e?: NodeEngagement): ReflectionTaxonomyNode => ({
+    id: n.id,
+    category: n.category,
+    label: n.label,
+    description: n.description,
+    // t/4214 R-1: rendered only when the POV has registry tags (D-3); `[]` shows as "none".
+    pov_tags: n.pov_tags ?? [],
+    ...(e ? { engagement: { injected: e.injected, citations: e.citations, claimIds: e.claimIds, attackedClaimIds: e.attackedClaimIds, strongestAttack: e.strongestAttack } } : {}),
+  });
+
+  // Engaged, in rank order; skip ids that no longer exist in the POV file.
+  const nodes = engagements
+    .map(e => { const n = byId.get(e.nodeId); return n ? toPromptNode(n, e) : null; })
+    .filter((n): n is ReflectionTaxonomyNode => n !== null);
+
+  if (nodes.length === 0) {
+    getGlobalRecorder()?.record({
+      type: 'state.change', component: 'debate-store', level: 'warn',
+      message: 'Reflection scope: no engaged nodes for this camp — falling back to the full taxonomy',
+      data: { pov_prefix: povPrefix, debate_id: activeDebate.id, pov_node_count: povNodes.length, reason: 'no_injected_or_cited_nodes' },
+    });
+    return { nodes: povNodes.map(n => toPromptNode(n)), engagementById };
+  }
+
+  const unengaged = fullTaxonomySweep
+    ? povNodes.filter(n => !engagementById.has(n.id)).map(n => toPromptNode(n))
+    : undefined;
+
+  getGlobalRecorder()?.record({
+    type: 'state.change', component: 'debate-store', level: 'info',
+    message: `Reflection scope: ${nodes.length} engaged node(s) of ${povNodes.length}${unengaged ? ` (+${unengaged.length} swept)` : ''}`,
+    data: { pov_prefix: povPrefix, engaged: nodes.length, total: povNodes.length, swept: unengaged?.length ?? 0, top_engaged: nodes.slice(0, 5).map(n => n.id) },
+  });
+  return { nodes, unengaged, engagementById };
+}
+
 function mapRawEditsToReflectionEdits(rawEdits: RawReflectionEdit[], taxState: TaxStore): ReflectionEdit[] {
   return rawEdits.filter(e => e.disposition !== 'propose_new').map(e => {
     // Ground-truth: override AI-provided current_label/current_description
@@ -507,6 +796,36 @@ function mapRawEditsToReflectionEdits(rawEdits: RawReflectionEdit[], taxState: T
 }
 
 /**
+ * Attach the evidence check + engagement record to each edit (t/3512). An edit whose cited claims
+ * do not reference the node it edits is FLAGGED (`evidence_supported: false`), not dropped — the
+ * reflection may still be right, but `applyReflectionEdit` refuses it without an explicit override.
+ */
+function annotateEditEvidence(
+  edits: ReflectionEdit[],
+  anNodes: ArgumentNetworkNode[],
+  engagementById: Map<string, NodeEngagement>,
+  pover: string,
+): ReflectionEdit[] {
+  for (const edit of edits) {
+    const check = validateEditEvidence(edit.node_id, edit.evidence_entries, anNodes);
+    edit.evidence_supported = check.supported;
+    edit.evidence_note = check.reason;
+    const e = edit.node_id ? engagementById.get(edit.node_id) : undefined;
+    edit.engagement = e
+      ? { injected: e.injected, citations: e.citations, claim_count: e.claimIds.length, attacked_count: e.attackedClaimIds.length }
+      : { injected: false, citations: 0, claim_count: 0, attacked_count: 0 };
+    if (!check.supported) {
+      getGlobalRecorder()?.record({
+        type: 'state.change', component: 'debate-store', level: 'warn',
+        message: `Reflection edit flagged unsupported: ${edit.node_id ?? '(new node)'} — ${check.reason}`,
+        data: { pover, node_id: edit.node_id, edit_type: edit.edit_type, evidence_entries: edit.evidence_entries, unrelated_claims: check.unrelatedClaimIds, unresolved: check.unresolvedEntries, engagement: edit.engagement },
+      });
+    }
+  }
+  return edits;
+}
+
+/**
  * Generate validated propose_new node proposals (t/1773). Edges are validated against real
  * node ids; a proposal with no valid edge is dropped (anti-orphan, t/1725). NON-FATAL: this
  * must never break the edit_existing flow — on any failure it returns no proposals.
@@ -518,6 +837,7 @@ function generateNewItemProposals(rawEdits: RawReflectionEdit[], povKey: Pov, de
       pov: povKey,
       debateId,
       knownNodeIds: collectKnownNodeIds(true),
+      resolveRef: (id) => resolveNodeId(useTaxonomyStore.getState(), id),
     });
   } catch (genErr) {
     getGlobalRecorder()?.record({ type: 'system.error', component: 'debate-store', level: 'warn', message: 'propose_new proposal generation failed (non-fatal)', error: { name: (genErr as Error).name ?? 'Error', message: String(genErr), stack: (genErr as Error).stack } });
@@ -602,9 +922,10 @@ async function enrichAppliedEditNode(
 }
 
 export const createDebateReflectionSlice: StateCreator<DebateStore, [], [], DebateReflectionSlice> = (set, get) => ({
-  requestReflections: async () => {
+  requestReflections: async (options) => {
     const { activeDebate, saveDebate } = get();
     if (!activeDebate) return;
+    const fullTaxonomySweep = options?.fullTaxonomySweep ?? false;
 
     const isStillValid = createDebateGuard(get);
     set({ debateError: null, debateWarnings: [], reflections: [], newItemProposalStatus: {} });
@@ -616,20 +937,23 @@ export const createDebateReflectionSlice: StateCreator<DebateStore, [], [], Deba
 
     for (const pover of povers) {
       if (!isStillValid()) return;
-      const info = POVER_INFO[pover];
-      if (!info) continue;
+      if (!POVER_INFO[pover]) continue;
+      const info = seatSouls(activeDebate, pover).soul; // t/3975
 
       set({ debateGenerating: pover as SpeakerId, debateStepStartedAt: Date.now() });
 
       const taxState = useTaxonomyStore.getState();
       const povKey = info.pov as 'accelerationist' | 'safetyist' | 'skeptic';
       const povFile = taxState[povKey];
-      const nodes = (povFile?.nodes ?? []).map(n => ({
-        id: n.id,
-        category: n.category,
-        label: n.label,
-        description: n.description,
-      }));
+      // t/3512 — the reflector sees the nodes THIS debate engaged, ranked, with their debate
+      // record; the full taxonomy is an opt-in sweep. Previously it received every node in the
+      // camp (207-361), so it edited nodes the debate never touched.
+      const { nodes, unengaged, engagementById } = buildReflectionNodes(
+        activeDebate,
+        povFile?.nodes ?? [],
+        POV_PREFIX_BY_KEY[povKey],
+        fullTaxonomySweep,
+      );
 
       const { anBlock, commitBlock, convBlock } = buildReflectionContextBlocks(activeDebate, pover);
 
@@ -643,6 +967,7 @@ export const createDebateReflectionSlice: StateCreator<DebateStore, [], [], Deba
         })),
       }));
 
+      const { seatTag, povTagLabels } = reflectionTagArgs(activeDebate, povKey);
       const prompt = reflectionPrompt(
         info.label,
         info.pov,
@@ -655,6 +980,10 @@ export const createDebateReflectionSlice: StateCreator<DebateStore, [], [], Deba
         convBlock,
         activeDebate.audience,
         priorReflections.length > 0 ? priorReflections : undefined,
+        unengaged,
+        info, // t/3975: the seat's resolved soul (base soul when untagged)
+        seatTag,
+        povTagLabels,
       );
 
       try {
@@ -672,7 +1001,16 @@ export const createDebateReflectionSlice: StateCreator<DebateStore, [], [], Deba
         // routed to newItemSuggestionsToProposals below. `add` is retired at the prompt
         // (t/1820), so edit_existing is revise/qualify/deprecate only.
         const rawEdits = parsed?.edits ?? [];
-        const edits: ReflectionEdit[] = mapRawEditsToReflectionEdits(rawEdits, useTaxonomyStore.getState());
+        // t/3813: drop edit_existing proposals whose description is unchanged from current
+        // (whitespace-normalized) before they reach the UI — the QUALIFY/REVISE generator has
+        // no way to decline, so it can emit a no-op proposal that renders as fully approvable.
+        const filteredRawEdits = filterNoOpReflectionEdits(rawEdits, activeDebate.id);
+        const edits: ReflectionEdit[] = annotateEditEvidence(
+          mapRawEditsToReflectionEdits(filteredRawEdits, useTaxonomyStore.getState()),
+          activeDebate.argument_network?.nodes ?? [],
+          engagementById,
+          pover,
+        );
 
         // Validated new-node proposals (t/1773 front-half): wire the shared generator
         // (previously zero production callers) so propose_new suggestions actually
@@ -680,8 +1018,8 @@ export const createDebateReflectionSlice: StateCreator<DebateStore, [], [], Deba
         // edge is dropped (anti-orphan, t/1725). Accept/apply + UI land in the follow-on.
         const newItemProposals = generateNewItemProposals(rawEdits, povKey, activeDebate.id);
 
-        // DOLCE compliance retry — fix non-compliant descriptions up to 3 times
-        if (await runDolceComplianceRetries(edits, model, info, activeDebate, set, isStillValid)) return;
+        // DOLCE compliance retry (up to 3 times), then the t/4214 R-2 tag check on the final text
+        if (await runReflectionPostChecks(edits, povKey, model, info, activeDebate, set, isStillValid)) return;
 
         results.push({
           pover: povKey,
@@ -750,7 +1088,7 @@ export const createDebateReflectionSlice: StateCreator<DebateStore, [], [], Deba
     await saveDebate('requestReflections');
   },
 
-  applyReflectionEdit: async (pover: string, editIndex: number, overrides?: { label?: string; description?: string }, options?: { regeneratePhrases?: boolean }) => {
+  applyReflectionEdit: async (pover: string, editIndex: number, overrides?: { label?: string; description?: string }, options?: { regeneratePhrases?: boolean; allowUnsupportedEvidence?: boolean; allowCrossTag?: boolean }) => {
     const startTime = performance.now();
     const { reflections } = get();
     const reflection = reflections.find(r => r.pover === pover);
@@ -758,8 +1096,9 @@ export const createDebateReflectionSlice: StateCreator<DebateStore, [], [], Deba
     getGlobalRecorder()?.record({ type: 'state.change', component: 'reflection-edit', level: 'info', message: 'applyReflectionEdit.called', data: { pover, editIndex, edit_type: edit?.edit_type, node_id: edit?.node_id, hasOverrides: !!overrides } });
     if (!reflection || !edit) { getGlobalRecorder()?.record({ type: 'state.error', component: 'reflection-edit', level: 'warn', message: 'applyReflectionEdit.result', data: { ok: false, error: 'Edit not found', pover, editIndex } }); return { ok: false, error: 'Edit not found' }; }
 
-    const finalLabel = overrides?.label ?? edit.proposed_label;
-    const finalDescription = overrides?.description ?? edit.proposed_description;
+    const gates = runApplyGates(pover, editIndex, edit, overrides, options);
+    if (gates.refusal) return { ok: false, error: gates.refusal, refusedBy: gates.refusedBy };
+    const { finalLabel, finalDescription } = gates;
     const taxStore = useTaxonomyStore.getState();
     const povKey = pover as 'accelerationist' | 'safetyist' | 'skeptic';
 
@@ -769,7 +1108,7 @@ export const createDebateReflectionSlice: StateCreator<DebateStore, [], [], Deba
       if (!addResult.ok) return { ok: false, error: addResult.error };
       createdNodeId = addResult.nodeId;
     } else if (edit.node_id) {
-      applyReflectionEditToExistingNode(povKey, edit, finalLabel, finalDescription, taxStore, get);
+      createdNodeId = applyReflectionEditToExistingNode(povKey, edit, finalLabel, finalDescription, taxStore, get);
     }
 
     await taxStore.save();
@@ -794,8 +1133,8 @@ export const createDebateReflectionSlice: StateCreator<DebateStore, [], [], Deba
 
     getGlobalRecorder()?.record({ type: 'state.change', component: 'reflection-edit', level: 'info', message: 'applyReflectionEdit.result', data: { ok: true, pover, editIndex, edit_type: edit.edit_type, node_id: edit.node_id, enrichNodeId, duration_ms: duration } });
     trackDebateExtraction(get().activeDebateId ?? undefined, edit.edit_type, edit.node_id ?? '');
-    markReflectionEditApproved(pover, editIndex, set, get);
-    return { ok: true, enrichNodeId: enrichNodeId ?? undefined };
+    await recordEditApplied(pover, editIndex, edit, gates.crossTagOverridden, set, get);
+    return { ok: true, enrichNodeId: enrichNodeId ?? undefined, ...(gates.tagNote ? { note: gates.tagNote } : {}) };
   },
 
   // "Fix it" recovery: a prior applyReflectionEdit already mutated the node in memory but
@@ -820,7 +1159,11 @@ export const createDebateReflectionSlice: StateCreator<DebateStore, [], [], Deba
     }
 
     getGlobalRecorder()?.record({ type: 'state.change', component: 'reflection-edit', level: 'info', message: 'retryReflectionEditAfterFix.result', data: { ok: true, pover, editIndex, edit_type: edit.edit_type, node_id: edit.node_id } });
-    markReflectionEditApproved(pover, editIndex, set, get);
+    // The tag gate ran on the first apply, which already changed the node; a flagged edit can only have got
+    // this far through the override, so record it as one. (Re-derived from the proposed text: a reviewer
+    // text override on that first apply isn't known here, which can only over-report, never hide, an override.)
+    const crossTagOverridden = evaluateTagGate(edit, pover, edit.node_id ? liveNodeTags(pover, edit.node_id) : undefined, edit.proposed_label, edit.proposed_description).block !== null;
+    await recordEditApplied(pover, editIndex, edit, crossTagOverridden, set, get);
     return { ok: true };
   },
 
@@ -834,11 +1177,12 @@ export const createDebateReflectionSlice: StateCreator<DebateStore, [], [], Deba
       };
     });
     set({ reflections: updated });
+    persistReflectionDecisionInBackground(pover, { kind: 'edit', index: editIndex }, dismissedDecision(), set, get);
   },
 
   // Apply a propose_new proposal (t/1773, ruling B): create the new POV node AND persist
   // its proposed edges atomically — per-camp, independent, no consensus integration.
-  applyReflectionProposal: async (pover: string, proposalIndex: number) => {
+  applyReflectionProposal: async (pover: string, proposalIndex: number, options?: { povTags?: string[] }) => {
     const startTime = performance.now();
     const { reflections } = get();
     const reflection = reflections.find(r => r.pover === pover);
@@ -853,7 +1197,9 @@ export const createDebateReflectionSlice: StateCreator<DebateStore, [], [], Deba
     // The generator validated against a snapshot; a target could have been deleted/renamed
     // since. Keep only edges whose target still resolves to a persisted node (pov/situation).
     const knownNodeIds = collectKnownNodeIds(true);
-    const liveEdges = proposal.proposed_edges.filter(e => knownNodeIds.has(e.target_node_id));
+    // t/4355: a target superseded since generation is re-pointed at its survivor (new edges never cite history).
+    const liveEdges = proposal.proposed_edges.filter(e => knownNodeIds.has(e.target_node_id))
+      .map(e => ({ ...e, target_node_id: resolveNodeId(useTaxonomyStore.getState(), e.target_node_id) }));
     if (liveEdges.length < 1) {
       getGlobalRecorder()?.record({ type: 'state.error', component: 'reflection-proposal', level: 'warn', message: 'applyReflectionProposal.result', data: { ok: false, error: 'no live edge targets', pover, proposalIndex } });
       return { ok: false, error: 'All proposed edge targets no longer exist — cannot create an unconnected node.' };
@@ -875,7 +1221,7 @@ export const createDebateReflectionSlice: StateCreator<DebateStore, [], [], Deba
       return { ok: false, error: 'Edges file not loaded — cannot persist proposed edges.' };
     }
 
-    const createResult = await createProposalNode(povKey, proposal, taxStore, get, pover, proposalIndex);
+    const createResult = await createProposalNode(povKey, proposal, taxStore, get, pover, proposalIndex, options?.povTags);
     if (!createResult.ok) return { ok: false, error: createResult.error };
     const newId = createResult.nodeId;
 
@@ -940,11 +1286,13 @@ export const createDebateReflectionSlice: StateCreator<DebateStore, [], [], Deba
     getGlobalRecorder()?.record({ type: 'state.change', component: 'reflection-proposal', level: 'info', message: 'applyReflectionProposal.result', data: { ok: true, pover, proposalIndex, createdNodeId: newId, edges: newEdges.length, duration_ms: duration } });
     trackDebateExtraction(get().activeDebateId ?? undefined, 'propose_new', newId);
     set({ newItemProposalStatus: { ...get().newItemProposalStatus, [proposalStatusKey(pover, proposalIndex)]: 'approved' } });
+    await persistReflectionDecision(pover, { kind: 'proposal', index: proposalIndex }, appliedDecision(undefined), set, get);
     return { ok: true, createdNodeId: newId };
   },
 
   dismissReflectionProposal: (pover: string, proposalIndex: number) => {
     set({ newItemProposalStatus: { ...get().newItemProposalStatus, [proposalStatusKey(pover, proposalIndex)]: 'dismissed' } });
+    persistReflectionDecisionInBackground(pover, { kind: 'proposal', index: proposalIndex }, dismissedDecision(), set, get);
   },
 
   retryEnrichment: async (nodeId: string, pov: 'accelerationist' | 'safetyist' | 'skeptic') => {
@@ -979,8 +1327,6 @@ export const createDebateReflectionSlice: StateCreator<DebateStore, [], [], Deba
       // Keep dirty flag until embeddings are also done
       useTaxonomyStore.getState().updatePovNode(pov, nodeId, { graph_attributes: buildEnrichedGraphAttributes(currentNode.graph_attributes, enriched) });
       await useTaxonomyStore.getState().save();
-
-      await embedSyntheticPhrases(nodeId, pov, enriched);
 
       // Clear dirty flag only after attributes + embeddings are fully done
       await clearPhraseRegenPending(pov, nodeId);

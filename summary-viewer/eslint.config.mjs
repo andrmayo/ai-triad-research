@@ -12,10 +12,17 @@
 import tseslint from 'typescript-eslint';
 import reactHooks from 'eslint-plugin-react-hooks';
 import requireFlightRecorderInCatch from '../lib/eslint-rules/require-flight-recorder-in-catch.js';
+import complexityBudget from '../lib/eslint-rules/complexity-budget.js';
+import requireWindowsHide from '../lib/eslint-rules/require-windows-hide.js';
+import requireWindowsHideDisableReason from '../lib/eslint-rules/require-windows-hide-disable-reason.js';
 
 const localPlugin = {
   rules: {
     'require-flight-recorder-in-catch': requireFlightRecorderInCatch,
+    'complexity-budget': complexityBudget,
+    'require-windows-hide': requireWindowsHide,
+    'require-windows-hide-unverifiable': requireWindowsHide,
+    'require-windows-hide-disable-reason': requireWindowsHideDisableReason,
   },
 };
 
@@ -33,6 +40,20 @@ export default tseslint.config(
       // at full parity across all three renderer apps (t/2299). exhaustive-deps is left
       // off deliberately to avoid warning noise; rules-of-hooks alone covers the crash class.
       'react-hooks/rules-of-hooks': 'error',
+      // Built-in stays at 'warn' (SO e/240 condition 1): advisory per-function signal.
+      // complexity-budget below is the gate: per-file ratchet against the recorded baseline.
+      'complexity': ['warn', { max: 15 }],
+      // Per-file cyclomatic complexity budget gate (t/3848, t/3821).
+      // Baseline generated from this tree: summary-viewer/complexity-baseline.json
+      'local/complexity-budget': ['error', { baseline: './complexity-baseline.json', threshold: 15 }],
+      // Flashing-console prevention (t/3914, t/3922): child_process calls need windowsHide: true.
+      // Blocking since t/4238 (T2: warn-first from 2026-10-05, then 0 hits in every package for a full CI
+      // cycle). Demoting it back to 'warn' is itself a gate change.
+      'local/require-windows-hide': ['error', { report: 'missing' }],
+      // An unverifiable options object (a wrapper or cross-module options) warns only: no merge is blocked
+      // when no fix is available (TL e/351#2). A disable needs a reason + ticket (disable-reason rule).
+      'local/require-windows-hide-unverifiable': ['warn', { report: 'unverifiable' }],
+      'local/require-windows-hide-disable-reason': 'error',
     },
   },
   {

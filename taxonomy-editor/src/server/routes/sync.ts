@@ -25,6 +25,9 @@ import { setRuntimeCredentials, clearRuntimeCredentials, getCredentials } from '
 import { diffNodes, changedFields } from '../storage/editMeta.js';
 import { computeNodeConflicts } from '../community/nodeConflicts.js';
 import type { TaxNode, NodeConflict } from '../community/nodeConflicts.js';
+import { getOverlayCommitStatus } from '../storage/overlayCommitScheduler.js';
+import { isSessionBranchRef, stripSessionBranchPrefix } from '../storage/sessionBranchManager.js';
+import type { GitHubAPIBackend, CompareResult } from '../storage/githubAPIBackend.js';
 
 type RawBodyReq = IncomingMessage & { __rawBody?: string };
 
@@ -50,9 +53,11 @@ function isValidWebhookSignature(raw: string, sigHeader: string, secret: string)
   return sigBuf.length === expBuf.length && crypto.timingSafeEqual(sigBuf, expBuf);
 }
 
-/** On a PR merged into main, delete the matching `api-session/*` branch (best-effort;
- *  a failed delete is logged, never thrown). No-op for other actions/branches. */
-function handleMergedPrBranchCleanup(
+/** On a PR merged into main, delete the matching session branch (best-effort; a failed
+ *  delete is logged, never thrown). No-op for other actions/branches. The branch must be
+ *  under THIS deployment's configured prefix (t/4446 C1), so a staging webhook never
+ *  matches a prod `api-session/*` ref. Exported for tests. */
+export function handleMergedPrBranchCleanup(
   parsed: Record<string, unknown>,
   sessionManager: ReturnType<ServerCtx['getSessionManager']>,
 ): void {
@@ -60,10 +65,10 @@ function handleMergedPrBranchCleanup(
   const pr = parsed.pull_request as { merged?: boolean; base?: { ref?: string }; head?: { ref?: string } } | undefined;
   if (action === 'closed' && pr?.merged === true && pr.base?.ref === 'main') {
     log.github.info('Webhook: PR merged into main');
-    // Post-merge cleanup: delete the session branch if it was an api-session branch
+    // Post-merge cleanup: delete the session branch if it is one of this deployment's
     const headRef = pr.head?.ref ?? '';
-    if (headRef.startsWith('api-session/') && sessionManager) {
-      const branchUserId = headRef.slice('api-session/'.length);
+    if (isSessionBranchRef(headRef) && sessionManager) {
+      const branchUserId = stripSessionBranchPrefix(headRef);
       void branchUserId;
       // Find the user whose sanitized branch name matches
       const activeBranches = sessionManager.getActiveBranches();
@@ -77,6 +82,40 @@ function handleMergedPrBranchCleanup(
         }
       }
     }
+  }
+}
+
+interface SyncBranchState { unsyncedCount: number; behindBy: number; hasConflicts: boolean }
+
+/** t/4324: a session branch with no unique commits of its own (ahead_by === 0) that's
+ *  fallen behind main just carries stale data forever — nothing else ever moves it.
+ *  Lossless fast-forward: ahead_by === 0 means there's nothing of the user's to lose,
+ *  and cmp.merge_base_sha is exactly the branch's own current head in that case (it
+ *  has no commits main doesn't already have). On success, returns the post-fast-
+ *  forward state (all clear). Degrades gracefully (records a system.error WARN,
+ *  returns the pre-fast-forward state) on failure or when fast-forward doesn't apply. */
+async function resolveSyncBranchState(
+  githubBackend: GitHubAPIBackend, branch: string, cmp: CompareResult,
+): Promise<SyncBranchState> {
+  const stale = { unsyncedCount: cmp.files.length, behindBy: cmp.behind_by, hasConflicts: cmp.status === 'diverged' && cmp.behind_by > 0 };
+  if (cmp.ahead_by !== 0 || cmp.behind_by <= 0) return stale;
+  const oldSha = cmp.merge_base_sha;
+  try {
+    const mergeResult = await githubBackend.mergeBranch(branch);
+    if (!mergeResult.ok) return stale;
+    const newSha = mergeResult.sha || githubBackend.getMainSha();
+    log.server.warn(
+      { branch, oldSha, newSha, behindBy: cmp.behind_by },
+      'Auto-fast-forwarded stale session branch to main (t/4324)',
+    );
+    return { unsyncedCount: 0, behindBy: 0, hasConflicts: false };
+  } catch (ffErr) {
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'sync', level: 'warn',
+      message: `Auto-fast-forward of stale session branch ${branch} failed`,
+      error: { name: (ffErr as Error).name ?? 'Error', message: String(ffErr), stack: (ffErr as Error).stack },
+    });
+    return stale;
   }
 }
 
@@ -130,7 +169,7 @@ export function registerSyncRoutes(r: Router, ctx: ServerCtx): void {
     const sessionManager = ctx.getSessionManager();
     try {
       if (!githubBackend || !sessionManager) {
-        json(res, { enabled: false, unsynced_count: 0, session_branch: null, pr_number: null, pr_url: null, push_pending: false, github_configured: false, main_updated_available: false, rebase_in_progress: false });
+        json(res, { enabled: false, unsynced_count: 0, session_branch: null, pr_number: null, pr_url: null, push_pending: false, github_configured: false, main_updated_available: false, rebase_in_progress: false, overlay_commit: null });
         return;
       }
       const userId = getCurrentUserId();
@@ -142,10 +181,14 @@ export function registerSyncRoutes(r: Router, ctx: ServerCtx): void {
       let hasConflicts = false;
       if (branch) {
         const cmp = await githubBackend.compareBranches('main', branch);
-        unsyncedCount = cmp.files.length;
-        behindBy = cmp.behind_by;
-        hasConflicts = cmp.status === 'diverged' && cmp.behind_by > 0;
+        ({ unsyncedCount, behindBy, hasConflicts } = await resolveSyncBranchState(githubBackend, branch, cmp));
       }
+
+      // t/4258/t/4276 (C3 wiring): a write outside taxonomyDataSlice.save() (edges status/
+      // swap/bulk, conflicts, cruxes evidence, policy-registry recount) schedules a debounced
+      // overlay commit rather than awaiting one inline — surface its state here so the UI can
+      // show "not yet saved to GitHub" instead of implying the write is already durable.
+      const overlayCommit = getOverlayCommitStatus(userId) ?? null;
 
       const full = {
         enabled: true,
@@ -158,6 +201,7 @@ export function registerSyncRoutes(r: Router, ctx: ServerCtx): void {
         github_configured: true,
         main_updated_available: behindBy > 0,
         rebase_in_progress: false,
+        overlay_commit: overlayCommit,
         main_sha: githubBackend.getMainSha(),
         behind_by: behindBy,
         has_conflicts: hasConflicts,
@@ -419,6 +463,18 @@ export function registerSyncRoutes(r: Router, ctx: ServerCtx): void {
       const result = await githubBackend.commitOverlay(userId, message);
       if (!result) {
         json(res, { ok: true, commitSha: null, filesCommitted: 0, message: 'No pending changes' });
+        return;
+      }
+      // t/4312 (SO condition F5, e/333#4): a conflict is a normal return, not
+      // a throw — filesCommitted is 0 and the edit is still staged, never
+      // committed. Reporting ok:true here would show the user a successful
+      // save while nothing actually landed; unlike the pre-t/4312 silent
+      // overwrite (at least recoverable from git history), a restart then
+      // loses the edit unrecoverably. This 409 applies regardless of
+      // OVERLAY_CONFLICT_STATE_ENABLED — it's not gated on the resolution
+      // UI being ready, only on never reporting a false success.
+      if (result.conflictedPaths?.length) {
+        error(res, 'Save conflicted — see conflictedPaths', 409, undefined, { code: 'OVERLAY_CONFLICT', conflictedPaths: result.conflictedPaths });
         return;
       }
       json(res, { ok: true, commitSha: result.commitSha, filesCommitted: result.filesCommitted });

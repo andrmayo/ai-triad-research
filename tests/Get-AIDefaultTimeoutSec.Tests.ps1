@@ -30,7 +30,7 @@ Describe 'Get-AIDefaultTimeoutSec — base timeouts' -Tag 'enrichment' {
     }
 
     It 'Returns 120 for groq backend' {
-        Invoke-DefaultTimeout 'groq-llama-3.1-8b-instant' | Should -Be 120
+        Invoke-DefaultTimeout 'groq-openai-gpt-oss-20b' | Should -Be 120
     }
 
     It 'Returns 180 for openai backend' {
@@ -42,15 +42,15 @@ Describe 'Get-AIDefaultTimeoutSec — base timeouts' -Tag 'enrichment' {
     }
 
     It 'Returns 180 for deepseek backend' {
-        Invoke-DefaultTimeout 'deepseek-deepseek-v4-flash' | Should -Be 180
+        Invoke-DefaultTimeout 'deepseek-deepseek-flash' | Should -Be 180
     }
 
     It 'Returns 300 for ollama backend' {
         Invoke-DefaultTimeout 'ollama-gemma4-e4b-it-q4-k-m' | Should -Be 300
     }
 
-    It 'Returns 240 for zai backend' {
-        Invoke-DefaultTimeout 'zai-glm-5-2' | Should -Be 240
+    It 'Returns 300 for zai backend' {
+        Invoke-DefaultTimeout 'zai-glm-5-2' | Should -Be 300
     }
 
     It 'Returns 240 for moonshot backend' {
@@ -65,9 +65,9 @@ Describe 'Get-AIDefaultTimeoutSec — base timeouts' -Tag 'enrichment' {
 Describe 'Get-AIDefaultTimeoutSec — frontier 2x tier (requires ai-models.json debateTiers)' -Tag 'enrichment' {
 
     It 'Returns 360 for the claude advanced-tier model (2x base)' {
-        # claude advanced = claude-sonnet-4-6 (from ai-models.json debateTiers.advanced.claude)
+        # claude advanced = claude-fable-5 (from ai-models.json debateTiers.advanced.claude)
         # claude basic    = claude-haiku-4-5  — different, so 2x applies
-        $result = Invoke-DefaultTimeout 'claude-sonnet-4-6'
+        $result = Invoke-DefaultTimeout 'claude-fable-5'
         $result | Should -Be 360
     }
 
@@ -77,9 +77,9 @@ Describe 'Get-AIDefaultTimeoutSec — frontier 2x tier (requires ai-models.json 
         $result | Should -Be 240
     }
 
-    It 'Returns 120 for groq advanced-tier (2x base)' {
-        # groq advanced = groq-llama-3.3-70b-versatile; basic = groq-llama-3.1-8b-instant
-        $result = Invoke-DefaultTimeout 'groq-llama-3.3-70b-versatile'
+    It 'Returns 240 for groq advanced-tier (2x base)' {
+        # groq advanced = groq-openai-gpt-oss-120b; basic = groq-openai-gpt-oss-20b (t/4159)
+        $result = Invoke-DefaultTimeout 'groq-openai-gpt-oss-120b'
         $result | Should -Be 240
     }
 
@@ -87,15 +87,20 @@ Describe 'Get-AIDefaultTimeoutSec — frontier 2x tier (requires ai-models.json 
         Invoke-DefaultTimeout 'ollama-gemma4-e4b-it-q4-k-m' | Should -Be 300
     }
 
-    It 'Returns base (240) for zai — same model in both tiers, no 2x' {
-        Invoke-DefaultTimeout 'zai-glm-5-2' | Should -Be 240
+    It 'Returns 600 for the zai advanced-tier model (2x base)' {
+        # zai advanced = zai-glm-5-3; basic = zai-glm-5-3-flash — different, so 2x applies
+        Invoke-DefaultTimeout 'zai-glm-5-3' | Should -Be 600
+    }
+
+    It 'Returns base (300) for zai basic-tier model, no 2x' {
+        Invoke-DefaultTimeout 'zai-glm-5-3-flash' | Should -Be 300
     }
 }
 
 Describe 'Invoke-AIApi — TimeoutSec sentinel wiring' -Tag 'enrichment' {
 
     It 'Get-AIDefaultTimeoutSec returns > 120 for frontier model — sentinel produces model-aware timeout above hardcoded 120' {
-        Invoke-DefaultTimeout 'claude-sonnet-4-6' | Should -BeGreaterThan 120
+        Invoke-DefaultTimeout 'claude-fable-5' | Should -BeGreaterThan 120
     }
 
     It 'Get-AIDefaultTimeoutSec returns base (not 2x) for basic-tier model — sentinel does not over-extend' {

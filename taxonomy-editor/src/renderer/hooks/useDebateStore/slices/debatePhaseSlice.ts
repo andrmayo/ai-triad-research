@@ -5,6 +5,7 @@ import type { StateCreator } from 'zustand';
 import type { DebateStore } from '../types';
 import type { ReflectionEdit, ReflectionResult } from '../types';
 import { formatGapHint } from '../shared/prompts';
+import { seatSouls } from '../shared/seatSouls';
 import type {
   DebateSession,
   SpeakerId,
@@ -72,7 +73,7 @@ import {
   detectCruxNodes,
   buildPhaseContext,
   buildSignalTelemetry,
-  initAdaptiveDiagnostics,
+  initAdaptiveDiagnostics, effectiveRoundCap,
 } from '@lib/debate/phaseTransitions';
 import { runTurnPipeline, assemblePipelineResult } from '@lib/debate/turnPipeline';
 import { evaluateLookaheadPerClaim, buildClaimAnalysis } from '@lib/debate/lookaheadGate';
@@ -87,19 +88,20 @@ import { mapErrorToUserMessage } from '../../../utils/errorMessages';
 import { classifyAiRetry, parseRetryAfterMs } from '../../../utils/retryClassifier';
 import { cosineSimilarity, scoreNodesLexical } from '../../../utils/taxonomyRelevance';
 import { getConfiguredModel, getSpeakerModel } from '../shared/modelConfig';
-import { generateTextWithProgress, phaseGuardedSet, summarizeTranscriptEntry, makeStageGenerate, routeTurnValidatorHintsIntoSuggestions, getSourceEvidenceIndex, getDocTitles } from '../shared/generation';
+import { generateTextWithProgress, phaseGuardedSet, summarizeTranscriptEntry, makeStageGenerate, servedTurnRecorder, routeTurnValidatorHintsIntoSuggestions, getSourceEvidenceIndex, getDocTitles } from '../shared/generation';
 import { createDebateGuard, newAbortController, _abortController, claimDebateDriver, releaseDebateDriver, isDailyLimitError, DAILY_LIMIT_MESSAGE, isCancellationError } from '../shared/guards';
 import { pushWarning, recordDiagnostic, recordSignalHistory, getSignalValue, movingAverageSignal, incrementGapInjectionCount, _gapInjectionCount } from '../shared/diagnostics';
 import { runNeutralCheckpoint } from '../shared/neutralCheckpoint';
-import { enrichPolicyRefs, serializeNodeSourceMap, formatEdgeContext, formatDebaterEdgeContext, getRelevantTaxonomyContext, getAllKnownNodeIds, getAllPolicyIds, findNodeMetaInStore, getTaxonomyContext } from '../shared/taxonomyContext';
+import { updateNarrativeSimilarity } from '../shared/narrativeVoicing';
+import { enrichPolicyRefs, serializeNodeSourceMap, formatEdgeContext, formatDebaterEdgeContext, getRelevantTaxonomyContext, getAllKnownNodeIds, getSelectableNodeIds, getAllPolicyIds, findNodeMetaInStore, getTaxonomyContext } from '../shared/taxonomyContext';
 import { extractClaimsAndUpdateAN, commitAnNodes, detectZeroClaims } from '../shared/argumentNetwork';
 
 export interface DebatePhaseSlice {
-  crossRespond: () => Promise<void>;
+  _crossRespondLeased: () => Promise<void>; // the unguarded turn body; call `crossRespond` (runLeaseSlice, t/3917), never this
 }
 
 export const createDebatePhaseSlice: StateCreator<DebateStore, [], [], DebatePhaseSlice> = (set, get) => ({
-  crossRespond: async () => {
+  _crossRespondLeased: async () => {
 
     const { activeDebate, addTranscriptEntry, saveDebate } = get();
     if (!activeDebate) {
@@ -389,6 +391,8 @@ export const createDebatePhaseSlice: StateCreator<DebateStore, [], [], DebatePha
         await summarizeTranscriptEntry(lastEntry.id, statement, info.label, model, get, set);
 
         await detectPositionDrift(get, set, addTranscriptEntry, activeDebate, responderPover, info, crossRespondRound, statement);
+        // h3: similarity to the speaker's own camp narrative (drift from the opening baseline)
+        await updateNarrativeSimilarity(get, set, lastEntry.id, responderPover, statement);
       }
       // ── Neutral evaluation: midpoint checkpoint ──
       try {
@@ -649,7 +653,7 @@ function recordPhaseSignals(
 /** Apply the phase-transition result (transcript entries + persist UI fields); skipped in step mode. */
 function applyPhaseTransitionResult(
   get: _Get, set: _Set, addTranscriptEntry: _AddEntry,
-  advanced: PhaseState, result: any, config: PhaseTransitionConfig, isStepMode: boolean | undefined,
+  advanced: PhaseState, result: any, config: PhaseTransitionConfig, isStepMode: boolean | undefined, speakers: number,
 ): void {
   const prevPhase = advanced.current_phase;
   const newState = isStepMode ? advanced : applyTransition(advanced, result);
@@ -688,7 +692,7 @@ function applyPhaseTransitionResult(
     const asObj = freshPostDebate.adaptive_staging as Record<string, unknown>;
     asObj.current_phase = newState.current_phase;
     asObj.rounds_in_phase = newState.rounds_in_phase;
-    asObj.phase_progress = newState.total_rounds_elapsed / config.maxTotalRounds;
+    asObj.phase_progress = newState.total_rounds_elapsed / effectiveRoundCap(config, speakers); // t/3937: the engine's cap, not the preset
     asObj.approaching_transition = result.action === 'transition' || result.action === 'force_transition';
     asObj.rationale = result.reason;
     set({ activeDebate: { ...freshPostDebate } });
@@ -771,7 +775,7 @@ function evaluateAdaptiveStaging(get: _Get, set: _Set, addTranscriptEntry: _AddE
   }
 
   // Apply transition (skipped in step mode — user controls phase manually)
-  applyPhaseTransitionResult(get, set, addTranscriptEntry, advanced, result, config, postDebate.adaptive_staging!.step_mode);
+  applyPhaseTransitionResult(get, set, addTranscriptEntry, advanced, result, config, postDebate.adaptive_staging!.step_mode, aiPovers.length);
 }
 
 function runPostRoundProcessing(get: _Get, set: _Set, addTranscriptEntry: _AddEntry, aiPovers: _AiPover[], crossRespondRound: number): void {
@@ -967,19 +971,18 @@ function computeRoundAndPhase(activeDebate: DebateSession, aiPovers: _AiPover[],
     if (adaptiveStaging?.enabled) {
       const weights = loadProvisionalWeights();
       const pacingPreset = weights.pacing_presets[adaptiveStaging.pacing] ?? weights.pacing_presets.moderate;
-      totalRoundsForPhase = pacingPreset.maxTotalRounds;
-      // Initialize phase state on first round if not present
-      if (!adaptiveStaging.phase_state) {
-        const config: PhaseTransitionConfig = {
-          useAdaptiveStaging: true,
-          maxTotalRounds: pacingPreset.maxTotalRounds,
-          pacing: adaptiveStaging.pacing,
-          dialecticalStyle: 'adversarial',
-          argumentationExitThreshold: pacingPreset.argumentationExit,
-          concludingExitThreshold: pacingPreset.concludingExit,
-          allowEarlyTermination: true,
-          phaseBoundsOverride: adaptiveStaging.phase_bounds_override,
-        };
+      const config: PhaseTransitionConfig = {
+        useAdaptiveStaging: true,
+        maxTotalRounds: pacingPreset.maxTotalRounds,
+        pacing: adaptiveStaging.pacing,
+        dialecticalStyle: 'adversarial',
+        argumentationExitThreshold: pacingPreset.argumentationExit,
+        concludingExitThreshold: pacingPreset.concludingExit,
+        allowEarlyTermination: true,
+        phaseBoundsOverride: adaptiveStaging.phase_bounds_override,
+      };
+      totalRoundsForPhase = effectiveRoundCap(config, aiPovers.length); // t/3937: the engine's cap, in turns
+      if (!adaptiveStaging.phase_state) { // initialize phase state on first round
         adaptiveStaging.phase_state = initPhaseState(config);
         set({ activeDebate: { ...activeDebate } });
       }
@@ -1100,7 +1103,7 @@ async function buildPostTerminationPipelineInput(
     .filter(e => e.speaker === responderPover && e.type !== 'opening')
     .slice(-2)
     .flatMap(e => (e.taxonomy_refs ?? []).map(r => r.node_id));
-  const availablePovNodeIds = [...getAllKnownNodeIds()];
+  const availablePovNodeIds = [...getSelectableNodeIds()]; // t/4355: offer selectable ids only
   const debaterGapHint = formatGapHint(activeDebate.gap_injections);
   const [evidenceIndex, docTitles] = await Promise.all([getSourceEvidenceIndex(), getDocTitles()]);
   const ptTurnsSinceLastConcession = countTurnsSinceLastConcession(activeDebate, responderPover);
@@ -1110,6 +1113,7 @@ async function buildPostTerminationPipelineInput(
     label: info.label,
     pov: info.pov,
     personality: info.personality,
+    ...seatSouls(activeDebate, responderPover), // t/3975: soul + opponentSouls
     topic,
     taxonomyContext: taxonomyBlock,
     commitmentContext: commitBlock,
@@ -1134,7 +1138,6 @@ async function buildPostTerminationPipelineInput(
     citeModel: stageModels.citeModel,
     sourceEvidenceIndex: evidenceIndex as TurnPipelineInput['sourceEvidenceIndex'],
     docTitles: docTitles as TurnPipelineInput['docTitles'],
-    doctrinalBoundaries: info.doctrinal_boundaries,
     background: activeDebate.topic?.background || undefined,
   };
   return { pipelineInput, taxonomyBlock, commitBlock };
@@ -1181,12 +1184,12 @@ async function runPostTerminationTurn(activeDebate: DebateSession, aiPovers: _Ai
   const addressingLabel = 'all';
   set({ debateGenerating: responderPover, debateActivity: `${POVER_INFO[responderPover].label} is preparing...`, debateStepStartedAt: Date.now() });
 
-  const info = POVER_INFO[responderPover];
+  const info = seatSouls(activeDebate, responderPover).soul; // t/3975
   const currentTranscript = formatRecentTranscript(get().activeDebate!.transcript, 8, get().activeDebate!.context_summaries);
   const ctx = await getRelevantTaxonomyContext(info.pov, topic, currentTranscript);
   const { pipelineInput, taxonomyBlock, commitBlock } = await buildPostTerminationPipelineInput(activeDebate, responderPover, info, topic, model, currentTranscript, ctx, phase, focusPoint, addressingLabel, get);
 
-  const stageGenerate = makeStageGenerate(set as (partial: Record<string, unknown>) => void, getSpeakerModel(activeDebate, responderPover, model));
+  const stageGenerate = makeStageGenerate(set as (partial: Record<string, unknown>) => void, getSpeakerModel(activeDebate, responderPover, model), servedTurnRecorder(get, set, responderPover));
   const pipelineResult = await runTurnPipeline(pipelineInput, stageGenerate);
   if (!isStillValid()) { releaseDebateDriver(); set({ debateGenerating: null }); getGlobalRecorder()?.record({ type: 'debate.lifecycle', component: 'debate-store', level: 'info', debate_id: activeDebate.id, message: 'debate.ended', data: { reason: 'debate_switched' } }); return true; }
 
@@ -1225,7 +1228,8 @@ async function buildTurnPipelineContext(responderPover: _ModResult['responder'],
     // Step 2: Generate the cross-response
     set({ debateGenerating: responderPover, debateActivity: `${POVER_INFO[responderPover].label} is preparing...`, debateStepStartedAt: Date.now() });
 
-    const info = POVER_INFO[responderPover];
+    const crSouls = seatSouls(activeDebate, responderPover); // t/3975
+    const info = crSouls.soul;
     const currentTranscript = formatRecentTranscript(get().activeDebate!.transcript, 8, get().activeDebate!.context_summaries);
     const ctx = await getRelevantTaxonomyContext(info.pov, topic, currentTranscript);
     const speakerClaims = (activeDebate.argument_network?.nodes || []).filter(n => n.speaker === responderPover);
@@ -1280,7 +1284,7 @@ async function buildTurnPipelineContext(responderPover: _ModResult['responder'],
       .slice(-2)
       .flatMap(e => (e.taxonomy_refs ?? []).map(r => r.node_id));
 
-    const availablePovNodeIds = [...getAllKnownNodeIds()];
+    const availablePovNodeIds = [...getSelectableNodeIds()]; // t/4355: offer selectable ids only
 
     // ── 4-stage pipeline: BRIEF → PLAN → DRAFT → CITE ──
     const debaterGapHint = formatGapHint(activeDebate.gap_injections);
@@ -1326,6 +1330,7 @@ async function buildTurnPipelineContext(responderPover: _ModResult['responder'],
       label: info.label,
       pov: info.pov,
       personality: info.personality,
+      ...crSouls, // t/3975: soul + opponentSouls
       topic,
       taxonomyContext: taxonomyBlock,
       commitmentContext: commitBlock,
@@ -1350,14 +1355,13 @@ async function buildTurnPipelineContext(responderPover: _ModResult['responder'],
       citeModel: activeDebate.stage_models?.cite || undefined,
       sourceEvidenceIndex: evidenceIndex as TurnPipelineInput['sourceEvidenceIndex'],
       docTitles: docTitles as TurnPipelineInput['docTitles'],
-      doctrinalBoundaries: info.doctrinal_boundaries,
       background: activeDebate.topic?.background || undefined,
       topicScope: activeDebate.topic?.scope ?? undefined,
       preCheckModel: resolveTurnValidationConfig(undefined).preCheckModel,
       lastOpponentStatement,
     };
 
-    const stageGenerate = makeStageGenerate(set as (partial: Record<string, unknown>) => void, getSpeakerModel(activeDebate, responderPover, model));
+    const stageGenerate = makeStageGenerate(set as (partial: Record<string, unknown>) => void, getSpeakerModel(activeDebate, responderPover, model), servedTurnRecorder(get, set, responderPover));
   return { info, ctx, taxonomyBlock, commitBlock, concessionCandidateIds, pipelineInput, stageGenerate };
 }
 
@@ -1407,6 +1411,7 @@ function buildModeratorTrace(activeDebate: DebateSession, aiPovers: _AiPover[], 
       health_components: healthScore.components,
       health_trend: healthScore.trend,
       intervention_recommended: selectionResult?.intervene ?? false,
+      intervention_source: selectionResult?.intervene ? (selectionResult.trigger_source ?? 'moderator') : null,
       intervention_move: selectionResult?.suggested_move ?? null,
       intervention_validated: engineValidation?.proceed ?? false,
       intervention_suppressed_reason: engineValidation?.suppressed_reason ?? null,

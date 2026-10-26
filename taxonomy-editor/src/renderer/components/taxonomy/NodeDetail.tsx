@@ -8,6 +8,9 @@ import type { Pov, PovNode, Category, TabId } from '../../types/taxonomy';
 import { useTaxonomyStore } from '../../hooks/useTaxonomyStore';
 import type { AggregatedCrux } from '../../hooks/useTaxonomyStore';
 import { useDebateStore } from '../../hooks/useDebateStore';
+import { useAuthStatus } from '../../hooks/useAuthStatus';
+import { countDanglingReferences, formatDanglingWarning } from '../../utils/danglingReferences';
+import { useLongPressContextMenu } from '../../hooks/useLongPressContextMenu';
 import { DeleteConfirmDialog } from '../shared/DeleteConfirmDialog';
 import { DescriptionSection, type DescriptionMention } from './NodeDescriptionSection';
 import { TypeaheadSelect } from '../shared/TypeaheadSelect';
@@ -26,6 +29,9 @@ import type { SourceFact } from '../analysis/FactsPanel';
 import type { SourceDocumentResolution } from '../../bridge/types';
 import { ConflictsPanel, conflictsForNode } from '../conflict';
 import { NodeEditHistory } from './NodeEditHistory';
+import { PovTagEditor } from './PovTagEditor';
+import { useCanEditPovTags } from '../../hooks/useCanEditPovTags';
+import { PovMoveTagNotice } from './PovMoveTagNotice';
 import { nodeTypeFromId, nodePovFromId } from '@lib/debate/nodeIdUtils';
 import { POV_KEYS } from '@lib/debate/types';
 import { api } from '@bridge';
@@ -81,8 +87,9 @@ interface NodeDetailProps {
   onPin?: () => void;
   onSimilarSearch?: () => void;
   onRelated?: () => void;
-  /** Opens the camp Soul Document dialog (t/2827) — rendered in the header icon row, Advanced-view only. */
-  onOpenSoulDoc?: () => void;
+  /** Opens the camp Soul Document dialog (t/2827) — rendered in the header icon row, Advanced-view only.
+   *  Gets the node's pov_tags, so the dialog opens on that tag's soul (t/4200). */
+  onOpenSoulDoc?: (nodeTags?: readonly string[]) => void;
   chipDepth?: number;
   conflict?: NodeConflict;
   resolveUrl?: string | null;
@@ -136,7 +143,8 @@ function NodeLastEditedLine({ node, viewMode }: { node: PovNode; viewMode: 'simp
 }
 
 export function NodeDetail({ pov, node, readOnly, onPin, onSimilarSearch, onRelated, onOpenSoulDoc, chipDepth = 0, conflict, resolveUrl }: NodeDetailProps) {
-  const { updatePovNode, deletePovNode, movePovNodeCategory, movePovNode, validationErrors, getAllNodeIds, getAllConflictIds, runAttributeFilter, showAttributeInfo, navigateToLineage, setToolbarPanel, selectedEdge, relatedNodeId, loadEdges, edgesFile, setSelectedNodeId, getLabelForId, aggregatedCruxes, showCruxDetail, conflicts } = useTaxonomyStore();
+  const { updatePovNode, deletePovNode, movePovNodeCategory, movePovNode, validationErrors, getAllNodeIds, getAllConflictIds, runAttributeFilter, showAttributeInfo, navigateToLineage, setToolbarPanel, selectedEdge, relatedNodeId, loadEdges, edgesFile, setSelectedNodeId, getLabelForId, aggregatedCruxes, showCruxDetail, conflicts, accelerationist, safetyist, skeptic, situations } = useTaxonomyStore();
+  const authInfo = useAuthStatus();
   const viewMode = usePreferencesStore(state => state.viewMode);
   const [descMode, setDescMode] = useDescriptionMode();
   const [showDelete, setShowDelete] = useState(false);
@@ -371,6 +379,7 @@ export function NodeDetail({ pov, node, readOnly, onPin, onSimilarSearch, onRela
 
   return (
     <div ref={formRef} className="node-detail-tabbed">
+      <PovMoveTagNotice nodeId={node.id} />
       <div className="nd-header">
         <NodeDetailHeaderTop
           pov={pov}
@@ -404,7 +413,7 @@ export function NodeDetail({ pov, node, readOnly, onPin, onSimilarSearch, onRela
           {/* Soul-doc bookmark relocated here (t/2827), right of the soul-doc icon; Advanced-view
               only (same bookmark-control gate as t/2826 — not an always-visible control). */}
           {viewMode === 'advanced' && onOpenSoulDoc && (
-            <button className="nd-header-btn" onClick={onOpenSoulDoc} title="Soul document" aria-label="Soul document">&#x1f4dc;</button>
+            <button className="nd-header-btn" onClick={() => onOpenSoulDoc(node.pov_tags)} title="Soul document" aria-label="Soul document">&#x1f4dc;</button>
           )}
           <EditConflictBadge conflict={conflict} resolveUrl={resolveUrl} />
         </div>
@@ -532,16 +541,31 @@ export function NodeDetail({ pov, node, readOnly, onPin, onSimilarSearch, onRela
         )}
       </div>
 
-      {showDelete && !readOnly && (
+      {showDelete && !readOnly && (() => {
+        // t/3852: exhaustive, not sampled — computed fresh at dialog-open time so a stale
+        // closure can't under-report after the user has been editing edges/situations.
+        const danglingCounts = countDanglingReferences(node.id, [accelerationist, safetyist, skeptic], situations, edgesFile);
+        return (
         <DeleteConfirmDialog
           itemLabel={node.label}
+          danglingWarning={formatDanglingWarning(danglingCounts)}
           onConfirm={() => {
             deletePovNode(pov, node.id);
+            void api.logNodeDeletion({
+              nodeId: node.id,
+              pov,
+              label: node.label,
+              user: authInfo?.user || '_anonymous', // AuthInfo is web-only; Electron falls back to '_anonymous' here (t/3859's writer can supplement with the OS username)
+              danglingEdges: danglingCounts.edges,
+              danglingSituationRefs: danglingCounts.situationRefs,
+              danglingChildren: danglingCounts.children,
+            });
             setShowDelete(false);
           }}
           onCancel={() => setShowDelete(false)}
         />
-      )}
+        );
+      })()}
     </div>
   );
 }
@@ -583,6 +607,11 @@ function NodeDetailHeaderTop({ pov, node, readOnly, err, update, onSimilarSearch
         {/* t/2813: Search entry point in the POV detail header — opens the search panel (previousView captured for Back). */}
         <button className="nd-header-btn" onClick={() => useTaxonomyStore.getState().setToolbarPanel('search')} title="Search taxonomy" aria-label="Search taxonomy">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        </button>
+        {/* t/3470: BDI grounding panel had no mount point anywhere in the app — surfaces
+            debate_grounding (t/3466) + concept/entity/logical-form links for this node. */}
+        <button className="nd-header-btn" onClick={() => useTaxonomyStore.getState().setToolbarPanel('bdiGrounding')} title="BDI grounding, concepts & entities" aria-label="BDI grounding, concepts & entities">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
         </button>
         {nodeTypeFromId(node.id) === 'pov' && (
           <CopyLinkButton hash={publicPovSharePath(node.id)} title="Copy public link" />
@@ -710,19 +739,24 @@ function NodeDetailTabBar({ activeTab, setActiveTab, conflictCount, cruxCount, f
   );
 }
 
-// ── Content tab: Beliefs metrics row (extracted from NodeDetail for complexity) ──
+// ── Content tab: node metrics row (extracted from NodeDetail for complexity) ──
+// t/3393: Debate Tested must show on every BDI category, not only Beliefs — the underlying
+// debate_tested record is populated on Desires/Intentions nodes too (confirmed against live
+// data), so this row itself is no longer Beliefs-exclusive. Confidence stays Beliefs-gated: it's
+// a genuinely Beliefs-specific metric (empirical-claim confidence) that's only sparsely populated
+// elsewhere (legacy/cross-cutting data), and the ticket didn't ask to change its visibility.
 
-interface BeliefsMetricsRowProps {
+interface NodeMetricsRowProps {
   node: PovNode;
   showDtDrilldown: boolean;
   setShowDtDrilldown: React.Dispatch<React.SetStateAction<boolean>>;
 }
 
-function BeliefsMetricsRow({ node, showDtDrilldown, setShowDtDrilldown }: BeliefsMetricsRowProps) {
+function NodeMetricsRow({ node, showDtDrilldown, setShowDtDrilldown }: NodeMetricsRowProps) {
   return (
     <>
       <div className="nd-metrics-row">
-        {node.confidence != null && (
+        {node.category === 'Beliefs' && node.confidence != null && (
           <span className="nd-metric" title="Confidence score">
             Confidence: <strong>{node.confidence.toFixed(2)}</strong>
           </span>
@@ -824,21 +858,48 @@ interface IntellectualLineageSectionProps {
   showAttributeInfo: (field: string, value: string) => void;
 }
 
+// t/3382: touch devices never fire `contextmenu` on a long-press — extracted so
+// useLongPressContextMenu can be called once per chip instance (can't call a hook inside .map()).
+function LineageChip({ label, selected, onSelect, onShowInfo }: {
+  label: string;
+  selected: boolean;
+  onSelect: () => void;
+  onShowInfo: () => void;
+}) {
+  const longPress = useLongPressContextMenu(useCallback((e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    onShowInfo();
+  }, [onShowInfo]));
+  return (
+    <span
+      className={`ga-promoted-chip ga-promoted-chip-interactive${selected ? ' ga-promoted-chip-selected' : ''}`}
+      onClick={(e) => { e.stopPropagation(); onSelect(); }}
+      onContextMenu={longPress.onContextMenu}
+      onTouchStart={longPress.onTouchStart}
+      onTouchMove={longPress.onTouchMove}
+      onTouchEnd={longPress.onTouchEnd}
+      onTouchCancel={longPress.onTouchCancel}
+      title={`Click to view lineage info: "${label}"`}
+    >
+      {label}
+    </span>
+  );
+}
+
 function IntellectualLineageSection({ node, expandedLineage, setExpandedLineage, showAttributeInfo }: IntellectualLineageSectionProps) {
   return (
     <div className="form-group">
       <label>Intellectual Lineage</label>
       <div className="ga-promoted-list">
         {[...node.graph_attributes!.intellectual_lineage!].map(v => typeof v === 'string' ? v : (v as { name?: string })?.name).filter((v): v is string => typeof v === 'string' && v.length > 0).sort((a, b) => a.localeCompare(b)).map((l, i) => (
-          <span
+          <LineageChip
             key={i}
-            className={`ga-promoted-chip ga-promoted-chip-interactive${expandedLineage === l ? ' ga-promoted-chip-selected' : ''}`}
-            onClick={(e) => { e.stopPropagation(); setExpandedLineage(expandedLineage === l ? null : l); }}
-            onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); showAttributeInfo('intellectual_lineage', l); }}
-            title={`Click to view lineage info: "${l}"`}
-          >
-            {l}
-          </span>
+            label={l}
+            selected={expandedLineage === l}
+            onSelect={() => setExpandedLineage(expandedLineage === l ? null : l)}
+            onShowInfo={() => showAttributeInfo('intellectual_lineage', l)}
+          />
         ))}
       </div>
       {expandedLineage && (() => {
@@ -910,15 +971,19 @@ interface NodeDetailContentTabProps {
 }
 
 function NodeDetailContentTab({ pov, node, readOnly, err, descMode, setDescMode, update, updatePovNode, showDtDrilldown, setShowDtDrilldown, expandedLineage, setExpandedLineage, showAttributeInfo, hasGraphAttrs, descriptionMention, plainDescriptionMention }: NodeDetailContentTabProps) {
+  const canEditPovTags = useCanEditPovTags();
   return (
     <>
-      {node.category === 'Beliefs' && (
-        <BeliefsMetricsRow node={node} showDtDrilldown={showDtDrilldown} setShowDtDrilldown={setShowDtDrilldown} />
-      )}
+      {/* t/3393: Debate Tested must show on every BDI category, not only Beliefs. */}
+      <NodeMetricsRow node={node} showDtDrilldown={showDtDrilldown} setShowDtDrilldown={setShowDtDrilldown} />
 
       {!readOnly && err('label') && (
         <div className="error-text">{err('label')}</div>
       )}
+
+      {/* t/3961: POV tags (registry tags only; hidden when the POV has none and the node carries none). */}
+      {/* t/4167: tags are admin-only; the rest of the node stays editable. */}
+      <PovTagEditor pov={pov} tags={node.pov_tags} readOnly={!!readOnly || !canEditPovTags} error={err('pov_tags')} onChange={(next) => update({ pov_tags: next })} />
 
       <DescriptionSection
         pov={pov}

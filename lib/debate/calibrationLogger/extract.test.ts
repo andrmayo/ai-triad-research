@@ -5,7 +5,10 @@ import { describe, it, expect } from 'vitest';
 import type { DebateSession } from '../types.js';
 import { extractCalibrationData } from './extract.js';
 import type { CalibrationDataPoint } from './schema.js';
-import { computeConvergenceWithCensoring, computeSituationAlignment } from './extract-metrics.js';
+import { computeConvergenceWithCensoring, computeSituationAlignment, computeAifB5Metrics, AIF_B5_METRIC_DEF_VERSION } from './extract-metrics.js';
+import type { ArgumentNetworkNode } from '../types.js';
+import type { ConflictFile } from '../taxonomyLoader.js';
+import type { ConvergenceSignals } from '../types/convergence.js';
 
 // ── Minimal session factory ───────────────────────────────────────────────────
 
@@ -90,20 +93,46 @@ describe('extractCalibrationData termination_reason golden set', () => {
     expect(dp.termination_reason).toBe('api_ceiling');
   });
 
-  it('unknown: no adaptive_staging_diagnostics → unknown', () => {
+  it('first_round_exit: no adaptive_staging_diagnostics, rounds=0 → first_round_exit', () => {
+    // makeSession() has no transcript entries — rounds=0, triggers first_round_exit (t/3502)
     const dp = extractCalibrationData(makeSession(), 'local');
+    expect(dp.termination_reason).toBe('first_round_exit');
+  });
+
+  it('first_round_exit: no adaptive_staging_diagnostics, rounds=1 → first_round_exit', () => {
+    const session = makeSession({
+      transcript: [{ type: 'statement', content: 'Opening argument.', speaker: 'accelerationist', taxonomy_refs: [] }],
+    });
+    const dp = extractCalibrationData(session, 'local');
+    expect(dp.termination_reason).toBe('first_round_exit');
+  });
+
+  it('unknown preserved: no asd, rounds=2 → unknown (not first_round_exit)', () => {
+    const session = makeSession({
+      transcript: [
+        { type: 'statement', content: 'Round 1.', speaker: 'accelerationist', taxonomy_refs: [] },
+        { type: 'statement', content: 'Round 2.', speaker: 'safetyist', taxonomy_refs: [] },
+      ],
+    });
+    const dp = extractCalibrationData(session, 'local');
     expect(dp.termination_reason).toBe('unknown');
   });
 
-  it('unknown: phases[] present but force_active absent (legacy row) → unknown', () => {
+  it('unknown: phases[] present but force_active absent (legacy row, rounds=8+) → unknown', () => {
+    // Must have rounds>1 so the first_round_exit guard does not fire (t/3502).
+    const transcript = Array.from({ length: 8 }, (_, i) => ({
+      type: 'statement' as const, content: `Round ${i + 1}.`,
+      speaker: 'accelerationist', taxonomy_refs: [],
+    }));
     const session = makeSession({
+      transcript,
       adaptive_staging_diagnostics: {
         enabled: true,
         // No force_active field — legacy shape
-        phases: [{ phase: 'synthesis', rounds: [1], exit_reason: 'Old reason format' }],
+        phases: [{ phase: 'synthesis', rounds: [1, 2, 3, 4, 5, 6, 7, 8], exit_reason: 'Old reason format' }],
         signal_telemetry: [],
         regressions: [],
-        total_predicate_evaluations: 1,
+        total_predicate_evaluations: 8,
         confidence_deferrals: 0,
         vetoes_fired: 0,
       },
@@ -309,5 +338,96 @@ describe('computeSituationAlignment', () => {
     const result = computeSituationAlignment(session, undefined);
     expect(result.sitNodesInjected).toBe(2);
     expect(result.sitNodesReferenced).toBe(1);
+  });
+});
+
+// ── computeAifB5Metrics (t/3715) ─────────────────────────────────────────────
+
+function makeAnNode(id: string, speaker: string, round: number, ref: string): ArgumentNetworkNode {
+  return {
+    id,
+    speaker,
+    turn_number: round,
+    claim_taxonomy_attribution: { primary_ref: ref },
+  } as unknown as ArgumentNetworkNode;
+}
+
+function makeConflict(claimId: string, nodeA: string, nodeB: string): ConflictFile {
+  return {
+    claim_id: claimId,
+    linked_taxonomy_nodes: [nodeA, nodeB],
+  } as unknown as ConflictFile;
+}
+
+function makeSignal(outcome: 'taken' | 'missed' | 'none'): ConvergenceSignals {
+  return {
+    concession_opportunity: { strong_attacks_faced: 1, concession_used: outcome === 'taken', outcome },
+  } as unknown as ConvergenceSignals;
+}
+
+describe('computeAifB5Metrics', () => {
+  it('carries AIF_B5_METRIC_DEF_VERSION', () => {
+    const result = computeAifB5Metrics([], [], undefined);
+    expect(result.metric_def_version).toBe(AIF_B5_METRIC_DEF_VERSION);
+  });
+
+  it('zero nodes → crux_count 0, crux_set empty', () => {
+    const result = computeAifB5Metrics([], [], undefined);
+    expect(result.crux_count).toBe(0);
+    expect(result.crux_set).toEqual([]);
+  });
+
+  it('total_turns = 0 (empty array) → convergence_score null, never NaN', () => {
+    const result = computeAifB5Metrics([], [], []);
+    expect(result.convergence_score).toBeNull();
+  });
+
+  it('total_turns = 0 (undefined signals) → convergence_score null', () => {
+    const result = computeAifB5Metrics([], [], undefined);
+    expect(result.convergence_score).toBeNull();
+  });
+
+  it('opposition spanning only 1 round → not a crux', () => {
+    const nodes = [
+      makeAnNode('n1', 'accelerationist', 2, 'acc-bel-001'),
+      makeAnNode('n2', 'safetyist', 2, 'saf-bel-001'),
+    ];
+    const conflicts = [makeConflict('c1', 'acc-bel-001', 'saf-bel-001')];
+    const result = computeAifB5Metrics(nodes, conflicts, []);
+    expect(result.crux_count).toBe(0);
+    expect(result.crux_set).toEqual([]);
+  });
+
+  it('opposition spanning ≥2 rounds → crux detected', () => {
+    const nodes = [
+      makeAnNode('n1', 'accelerationist', 1, 'acc-bel-001'),
+      makeAnNode('n2', 'safetyist', 2, 'saf-bel-001'),
+    ];
+    const conflicts = [makeConflict('c1', 'acc-bel-001', 'saf-bel-001')];
+    const result = computeAifB5Metrics(nodes, conflicts, []);
+    expect(result.crux_count).toBe(1);
+    expect(result.crux_set).toEqual(['c1']);
+  });
+
+  it('convergence_score: all taken → 1.0', () => {
+    // Signal A = 2/2 = 1.0, Signal B = 1 - 0/2 = 1.0 → 0.5*1 + 0.5*1 = 1.0
+    const signals = [makeSignal('taken'), makeSignal('taken')];
+    const result = computeAifB5Metrics([], [], signals);
+    expect(result.convergence_score).toBe(1.0);
+  });
+
+  it('convergence_score: all missed → 0', () => {
+    // Signal A = 0/2 = 0, Signal B = 1 - 2/2 = 0 → 0
+    const signals = [makeSignal('missed'), makeSignal('missed')];
+    const result = computeAifB5Metrics([], [], signals);
+    expect(result.convergence_score).toBe(0);
+  });
+
+  it('convergence_score: mixed signals → 0.5', () => {
+    // 1 taken, 1 missed, 2 none (total 4)
+    // Signal A = 1/4 = 0.25, Signal B = 1 - 1/4 = 0.75 → 0.5*0.25 + 0.5*0.75 = 0.5
+    const signals = [makeSignal('taken'), makeSignal('missed'), makeSignal('none'), makeSignal('none')];
+    const result = computeAifB5Metrics([], [], signals);
+    expect(result.convergence_score).toBe(0.5);
   });
 });

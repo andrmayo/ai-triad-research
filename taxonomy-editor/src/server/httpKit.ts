@@ -9,6 +9,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'http';
 import { getGlobalRecorder } from '../../../lib/flight-recorder/index.js';
+import { ActionableError } from '../../../lib/debate/errors.js';
 import { log, getRequestId } from './logger.js';
 import { clientSafeMessage } from './security/accessControl.js';
 
@@ -26,37 +27,133 @@ export function json(res: ServerResponse, data: unknown, status = 200): void {
   res.end(JSON.stringify(data));
 }
 
-/** t/3165: serialize a large array or plain object to a JSON Buffer WITHOUT a single un-yielded
- *  JSON.stringify. A ~4144-entry synthetic-embeddings map (or a big number[][]) stringified at once
- *  blocked the prod event loop ~3s. This builds the JSON incrementally, yielding to the loop every
- *  `yieldEvery` top-level items. Output is byte-identical to JSON.stringify for arrays / plain objects
- *  of JSON-safe values (same key order, no whitespace, undefined/function-valued keys omitted, array
- *  holes → null). Non-array/non-object values fall back to a direct stringify.
+const OPEN_BRACKET = Buffer.from('[');
+const CLOSE_BRACKET = Buffer.from(']');
+const OPEN_BRACE = Buffer.from('{');
+const CLOSE_BRACE = Buffer.from('}');
+const COMMA = Buffer.from(',');
+const COLON = Buffer.from(':');
+
+const yieldToLoop = (): Promise<void> => new Promise<void>((r) => setImmediate(r));
+
+// t/4286 (canary re-run, p/793#39): item-COUNT yielding (every `yieldEvery` entries) doesn't
+// bound the WORK between yields when items vary wildly in size — the synthetic-embeddings
+// corpus's 831 nodes range from a handful of vectors to 90, so 256 node-entries between yields
+// could still be ~700ms of synchronous JSON.stringify work (the exact block the canary kept
+// finding after load/extract/concat were all ruled out and fixed). Same class of bug Shared
+// Lib fixed in extractNodeVectorsAsync (node-count → float-count yielding, t/4286#22) — this is
+// the equivalent fix one level up, in the stringify loop itself: yield on cumulative OUTPUT
+// BYTES as well as item count, whichever comes first, so one big item can't blow the budget.
+const YIELD_BYTES_THRESHOLD = 2 * 1024 * 1024; // ~2MB — small enough to keep any single gap well under the gate's margin
+
+/** Filled by jsonStringifyChunked when passed: how the work was sliced (t/4286 diagnosis,
+ *  same shape as lib/npy.ts's ExtractStats). */
+export interface SerializeStats {
+  /** Number of synchronous slices (yields + 1). */
+  slices: number;
+  /** The longest synchronous slice, in ms: the event-loop block this call can cause. */
+  maxSliceMs: number;
+}
+
+/** t/4286 (canary re-run, p/793#25): `Buffer.concat(chunks)` is ONE synchronous native memcpy
+ *  over the full output size — for the ~300MB synthetic-embeddings payload that alone measured
+ *  ~700ms (canary: window-gate max 732ms at prod size, after t/3165/t/3415's stringify-loop and
+ *  string-join fixes had already landed). `Buffer.concat` is a single call; there's no way to
+ *  yield mid-call, so this copies each chunk into a preallocated buffer itself, in the SAME
+ *  yielding cadence as the caller's stringify loop. Byte-identical output to `Buffer.concat`. */
+export async function concatChunked(chunks: readonly Buffer[], yieldEvery: number): Promise<Buffer> {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const out = Buffer.allocUnsafe(total);
+  let offset = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    offset += chunks[i].copy(out, offset);
+    if ((i + 1) % yieldEvery === 0) await yieldToLoop();
+  }
+  return out;
+}
+
+/** t/3165/t/4286: serialize a large array or plain object to a JSON Buffer WITHOUT a single
+ *  un-yielded JSON.stringify, string-join, OR buffer-concat. A ~4144-entry synthetic-
+ *  embeddings map (or a big number[][]) stringified at once blocked the prod event loop ~3s —
+ *  t/3165 fixed that by chunk-yielding the per-item JSON.stringify calls, but still assembled
+ *  the final payload with ONE synchronous `parts.join(',')` + string concatenation over the
+ *  full ~400MB result. V8 string concatenation at that size is itself a multi-second, un-
+ *  yieldable block (t/4286: canary found 1.7-3.8s depending on vCPU) — chunking the stringify
+ *  loop did nothing to shrink it. t/3415 fixed that by converting each item straight to a UTF-8
+ *  Buffer as it's built (already inside the yielding loop) — but the one remaining
+ *  `Buffer.concat(chunks)` assembly step is ITSELF a single un-yielded native copy over the
+ *  whole output; `concatChunked` (above) replaces it with the same yielding cadence. Output is
+ *  byte-identical to JSON.stringify for arrays / plain objects of JSON-safe values (same key
+ *  order, no whitespace, undefined/function-valued keys omitted, array holes → null). Non-array/
+ *  non-object values fall back to a direct stringify.
  *  CAVEAT (t/3237): assumes a PLAIN top-level array/object — a top-level `toJSON()` is NOT honored
  *  (the top level is iterated by entries/elements directly). Nested `toJSON()` IS honored (handled by
  *  the inner JSON.stringify of each value). Callers with a custom top-level toJSON should use json(). */
-export async function jsonStringifyChunked(value: unknown, yieldEvery = 256): Promise<Buffer> {
-  const yieldToLoop = (): Promise<void> => new Promise<void>((r) => setImmediate(r));
-  if (Array.isArray(value)) {
-    if (value.length === 0) return Buffer.from('[]');
-    const parts: string[] = new Array(value.length);
-    for (let i = 0; i < value.length; i++) {
-      parts[i] = JSON.stringify(value[i]) ?? 'null'; // array slot of undefined/function → null
-      if ((i + 1) % yieldEvery === 0) await yieldToLoop();
-    }
-    return Buffer.from('[' + parts.join(',') + ']');
+/** Tracks slice timing for `SerializeStats` (t/4286) and decides, after each chunk is pushed,
+ *  whether the stringify loop should yield now — every `yieldEvery` items (unchanged behavior
+ *  for uniform-size payloads) OR whenever cumulative bytes since the last yield cross
+ *  `YIELD_BYTES_THRESHOLD` (bounds the worst case for wildly uneven item sizes). Extracted out of
+ *  jsonStringifyChunked's two branches so each branch's own complexity stays within budget. */
+class SliceTracker {
+  private bytesSinceYield = 0;
+  private sliceStart = performance.now();
+  constructor(private readonly stats?: SerializeStats) {
+    if (stats) { stats.slices = 1; stats.maxSliceMs = 0; }
   }
-  if (value !== null && typeof value === 'object') {
-    const entries = Object.entries(value as Record<string, unknown>);
-    const parts: string[] = [];
-    for (let i = 0; i < entries.length; i++) {
-      const sv = JSON.stringify(entries[i][1]);
-      if (sv === undefined) continue; // undefined/function/symbol values are omitted, like JSON.stringify
-      parts.push(JSON.stringify(entries[i][0]) + ':' + sv);
-      if ((i + 1) % yieldEvery === 0) await yieldToLoop();
-    }
-    return Buffer.from('{' + parts.join(',') + '}');
+  /** Call after pushing one chunk. Yields (and starts a new slice) if this chunk's position or
+   *  the accumulated bytes cross either threshold. */
+  async afterChunk(itemIndex1Based: number, yieldEvery: number, chunkBytes: number): Promise<void> {
+    this.bytesSinceYield += chunkBytes;
+    if (itemIndex1Based % yieldEvery !== 0 && this.bytesSinceYield < YIELD_BYTES_THRESHOLD) return;
+    if (this.stats) { this.stats.maxSliceMs = Math.max(this.stats.maxSliceMs, performance.now() - this.sliceStart); this.stats.slices++; }
+    await yieldToLoop();
+    this.sliceStart = performance.now();
+    this.bytesSinceYield = 0;
   }
+  /** Call once after the loop ends, to capture the final (possibly never-yielded) slice. */
+  finish(): void {
+    if (this.stats) this.stats.maxSliceMs = Math.max(this.stats.maxSliceMs, performance.now() - this.sliceStart);
+  }
+}
+
+async function stringifyArrayChunked(value: unknown[], yieldEvery: number, tracker: SliceTracker): Promise<Buffer> {
+  if (value.length === 0) return Buffer.from('[]');
+  const chunks: Buffer[] = [OPEN_BRACKET];
+  for (let i = 0; i < value.length; i++) {
+    if (i > 0) chunks.push(COMMA);
+    const chunk = Buffer.from(JSON.stringify(value[i]) ?? 'null', 'utf-8'); // array slot of undefined/function → null
+    chunks.push(chunk);
+    await tracker.afterChunk(i + 1, yieldEvery, chunk.length);
+  }
+  chunks.push(CLOSE_BRACKET);
+  tracker.finish();
+  return concatChunked(chunks, yieldEvery);
+}
+
+async function stringifyObjectChunked(value: Record<string, unknown>, yieldEvery: number, tracker: SliceTracker): Promise<Buffer> {
+  const entries = Object.entries(value);
+  const chunks: Buffer[] = [OPEN_BRACE];
+  let emitted = 0;
+  for (let i = 0; i < entries.length; i++) {
+    const sv = JSON.stringify(entries[i][1]);
+    if (sv === undefined) continue; // undefined/function/symbol values are omitted, like JSON.stringify
+    if (emitted > 0) chunks.push(COMMA);
+    const keyChunk = Buffer.from(JSON.stringify(entries[i][0]), 'utf-8');
+    const valChunk = Buffer.from(sv, 'utf-8');
+    chunks.push(keyChunk, COLON, valChunk);
+    emitted++;
+    await tracker.afterChunk(i + 1, yieldEvery, keyChunk.length + valChunk.length);
+  }
+  chunks.push(CLOSE_BRACE);
+  tracker.finish();
+  return concatChunked(chunks, yieldEvery);
+}
+
+export async function jsonStringifyChunked(value: unknown, yieldEvery = 256, stats?: SerializeStats): Promise<Buffer> {
+  const tracker = new SliceTracker(stats);
+  if (Array.isArray(value)) return stringifyArrayChunked(value, yieldEvery, tracker);
+  if (value !== null && typeof value === 'object') return stringifyObjectChunked(value as Record<string, unknown>, yieldEvery, tracker);
   return Buffer.from(JSON.stringify(value) ?? 'null');
 }
 
@@ -95,6 +192,41 @@ function recordServerError(route: string, status: number, message: string, cause
     error: { name: (cause as Error)?.name ?? 'Error', message, stack: (cause as Error)?.stack },
     data: { response_status: status },
   });
+}
+
+/** t/4185: map a thrown ActionableError's `httpStatus` (e.g. 409 on a storage write conflict) to
+ *  the HTTP response status, falling back when the error didn't set one (an ordinary unexpected
+ *  failure stays a 500). Server-side counterpart to the renderer's existing bridge convention —
+ *  chatStream.ts/electron-bridge.ts already set `err.httpStatus` from `res.status` on the client
+ *  side; this makes the same field load-bearing end to end instead of server-only dead code. */
+export function statusForError(err: unknown, fallback = 500): number {
+  return err instanceof ActionableError && err.httpStatus ? err.httpStatus : fallback;
+}
+
+/** t/4185: pull a machine-readable `code` (e.g. 'WRITE_CONFLICT') off a thrown ActionableError for
+ *  the `extra` param of `error()` below — the UI branches on `code`, never on the transport status,
+ *  because the same HTTP status can mean different things across routes. Returns undefined when
+ *  the error didn't set one, so callers can spread it without adding a stray `code: undefined` key. */
+export function codeForError(err: unknown): { code: string } | undefined {
+  return err instanceof ActionableError && err.code ? { code: err.code } : undefined;
+}
+
+/** t/4187/t/4189/t/4190/t/4192: the If-Match precondition shared by every GitHub-backed save
+ *  route (taxonomy, edges, conflicts, proposals) — a missing header means the client loaded the
+ *  file before this contract existed (or skipped the version-returning read), so there's no base
+ *  version to protect against a lost update. Returns the unquoted baseSha on success, or
+ *  undefined after already writing the 428 response. */
+export function requireBaseVersion(req: IncomingMessage, res: ServerResponse): string | undefined {
+  const ifMatch = req.headers?.['if-match'];
+  // t/4184 GV (TL, p/775#56): strip a leading weak-validator `W/` marker before the quotes — a
+  // client that forwards the GET's ETag verbatim (RFC 7232 allows either strength) must still
+  // match, since this route compares the raw git blob SHA, not validator semantics.
+  const baseSha = typeof ifMatch === 'string' ? ifMatch.replace(/^W\//, '').replace(/^"|"$/g, '') : undefined;
+  if (!baseSha) {
+    error(res, 'Save requires an If-Match header carrying the base version read before editing.', 428, undefined, { code: 'BASE_VERSION_REQUIRED' });
+    return undefined;
+  }
+  return baseSha;
 }
 
 export function error(res: ServerResponse, message: string, status = 500, cause?: unknown, extra?: Record<string, unknown>): void {
@@ -195,13 +327,54 @@ export function normalizedRequestPath(req: IncomingMessage): string {
   }
 }
 
-/** Best-effort client IP: first X-Forwarded-For hop (behind the Azure ingress
- *  proxy), else the raw socket address. Used for per-IP rate-limit keys. */
-export function getClientIp(req: IncomingMessage): string {
-  const xff = req.headers['x-forwarded-for'];
-  if (typeof xff === 'string' && xff.length > 0) return xff.split(',')[0].trim();
-  return req.socket.remoteAddress || 'unknown';
+/** True for loopback, RFC 1918, CGNAT (100.64/10), link-local and IPv6 ULA
+ *  addresses: a peer that can only be our own proxy hop, never a real client. */
+export function isPrivateOrLoopback(addr: string): boolean {
+  const a = addr.startsWith('::ffff:') ? addr.slice(7) : addr;
+  const v4 = a.match(/^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/);
+  if (v4) return isPrivateV4(Number(v4[1]), Number(v4[2]));
+  const v6 = a.toLowerCase();
+  return v6 === '::1' || /^f[cd]/.test(v6) || /^fe[89ab]/.test(v6);
 }
+
+/** [first octet, second-octet min, second-octet max] for each private/loopback IPv4 range. */
+const PRIVATE_V4: ReadonlyArray<readonly [number, number, number]> = [
+  [127, 0, 255], [10, 0, 255], [172, 16, 31], [192, 168, 168], [100, 64, 127], [169, 254, 254],
+];
+function isPrivateV4(o1: number, o2: number): boolean {
+  return PRIVATE_V4.some(([first, lo, hi]) => o1 === first && o2 >= lo && o2 <= hi);
+}
+
+const warnedClientIp = new Set<string>();
+function warnClientIpOnce(reason: string, fields: Record<string, unknown>): void {
+  if (warnedClientIp.has(reason)) return;
+  warnedClientIp.add(reason);
+  log.security.warn({ component: 'client-ip', reason, ...fields }, `getClientIp fallback: ${reason}`);
+}
+
+/** Client IP for per-IP rate-limit and quota keys (t/4410).
+ *
+ *  Captured on staging behind ACA ingress + the Easy Auth sidecar: the socket peer is
+ *  always 127.0.0.1, and the ingress APPENDS the real client IP as the LAST
+ *  X-Forwarded-For entry. Anything to its left (and X-Real-IP / Forwarded) is whatever
+ *  the client sent, so the old first-entry read let any caller pick its own bucket.
+ *
+ *  So: trust exactly one proxy hop — the rightmost XFF entry — and only when the peer
+ *  is a private/loopback proxy. A direct (public) peer is the client itself; its XFF is
+ *  ignored. */
+export function getClientIp(req: IncomingMessage): string {
+  const peer = req.socket?.remoteAddress || '';
+  if (!peer || !isPrivateOrLoopback(peer)) return peer || 'unknown';
+  const xff = req.headers['x-forwarded-for'];
+  const raw = Array.isArray(xff) ? xff.join(',') : xff;
+  const last = raw ? raw.split(',').map(s => s.trim()).filter(Boolean).pop() : undefined;
+  if (last) return last;
+  warnClientIpOnce('proxy peer without X-Forwarded-For; keying on the proxy address', { peer });
+  return peer;
+}
+
+/** Test seam: reset the once-per-process warnings. */
+export function _resetClientIpWarningsForTest(): void { warnedClientIp.clear(); }
 
 // ── Route registrar (t/1295) ──
 // The surface extracted cluster modules (routes/*.ts) use to register routes into

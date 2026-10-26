@@ -19,8 +19,9 @@ import type { ServerCtx } from './context.js';
 import { json, error, param, getClientIp, withEndpointTimeout } from '../httpKit.js';
 import { getGlobalRecorder } from '../../../../lib/flight-recorder/index.js';
 import { callerTierIdentity, missingApiKeyError, expiredAuthCookies } from '../security/accessControl.js';
-import { getCurrentUser, getCurrentUserId } from '../security/userContext.js';
-import type { GenerateTextProgress } from '../ai/aiBackends.js';
+import { getCurrentUser, getCurrentUserId, getStorageUserId } from '../security/userContext.js';
+import * as allowlistStore from '../storage/allowlistStore.js';
+import { EMBEDDING_COMPUTE_CHUNK, EMBEDDINGS_REQUEST_TIMEOUT_MS, type GenerateTextProgress } from '../ai/aiBackends.js';
 import { log, getRequestContext, getRequestId } from '../logger.js';
 import { DEFAULT_MODEL } from '../../../../lib/ai-client/index.js';
 import { hasApiKey, getPaidGeminiFallbackKey, type AIBackend } from '../config.js';
@@ -28,6 +29,11 @@ import * as proxyTiers from '../ai/proxyTiers.js';
 import * as rateLimiter from '../security/rateLimiter.js';
 import * as ai from '../ai/aiBackends.js';
 import { resolveGenerationContext, enforceBackendAllowed, enforceAnonDebateGate } from './generationContext.js';
+import { getFreePoolKeys } from '../ai/freePoolKeyAccess.js';
+import {
+  reserveFreePoolCall, commitFreePoolCall, releaseFreePoolCall, getFreePoolHeadroomSnapshot,
+  admitOrDrawDownDebateCall, reconcileDebateDrawDown, FREE_POOL_CALL_TOKEN_ESTIMATE,
+} from '../ai/freePoolBudgetGate.js';
 
 import * as fileIO from '../storage/fileIO.js';
 import { beginEmbeddingCompute, endEmbeddingCompute, embeddingLoadSnapshot, evaluateEmbeddingLoadShed, isEmbeddingModelWarm, markEmbeddingModelWarm } from '../embeddingsLoad.js';
@@ -101,22 +107,108 @@ function enforceAiRateLimits(res: http.ServerResponse, isFree: boolean, limitKey
   return false;
 }
 
-/** Resolve the key to inject: free tier → server FREE_TIER_GEMINI_KEY (503 if none);
- *  platform → undefined (server-side keys); BYOK → client key, with a free-tier Gemini
- *  fallback for a BYOK user with no key for the pinned backend (t/945). Returns
- *  `{ ok: false }` after sending a 503 when the free tier is unavailable. */
-function resolveExplicitAiKey(res: http.ServerResponse, tier: ResolvedTier, clientKey: string | undefined, backend: AIBackend):
-  { ok: true; key: string | string[] | undefined } | { ok: false } {
+/** t/4485#5: the debate-admission requester scope — the signed-in principal, or the correctly-
+ *  derived IP for anonymous callers. Deliberately called ONLY from the debate branch below, not
+ *  unconditionally — `getClientIp` has logging side effects (a proxy-without-XFF WARN) that a
+ *  platform/BYOK call has no reason to trigger just to compute a value it won't use. */
+function requesterIdFor(req: http.IncomingMessage): string {
+  return callerIdentity().principalName || `ip:${getClientIp(req)}`;
+}
+
+type AdmitFreePoolCallResult =
+  | { ok: true; reservationId: string | null; debateReservationId: string | null }
+  | { ok: false };
+
+/** t/4485 phase 2: admits (first call) or draws down (later calls) a free-tier debate's budget
+ *  when `debateId` is present, else falls back to a normal per-call reservation. Keeps this
+ *  branch out of resolveExplicitAiKey's own body so its complexity doesn't grow (t/3821
+ *  baseline) — same reasoning as trackFreePoolReservation below. `reservationId` (fallback or
+ *  plain per-call) and `debateReservationId` (covered-by-the-debate's-own-reservation) are
+ *  mutually exclusive — trackFreePoolReservation below dispatches on which one is set. */
+async function admitFreePoolCall(req: http.IncomingMessage, res: http.ServerResponse, budgetKey: string, debateId: string | undefined): Promise<AdmitFreePoolCallResult> {
+  if (!debateId) {
+    const result = await reserveFreePoolCall(res, budgetKey);
+    if (!result.ok) return { ok: false };
+    return { ok: true, reservationId: result.reservationId, debateReservationId: null };
+  }
+  const debateResult = await admitOrDrawDownDebateCall(res, requesterIdFor(req), debateId);
+  if (!debateResult.ok) return { ok: false };
+  return { ok: true, reservationId: debateResult.fallbackReservationId, debateReservationId: debateResult.debateReservationId };
+}
+
+/** Resolve the key to inject: free tier → server FREE_TIER_GEMINI_KEY, gated by the free-pool
+ *  geo restriction (t/4486) — 403 `free_pool_region` when the caller's IP is EEA/CH/UK or
+ *  unresolvable, 503 if the pool has no keys configured; platform → undefined (server-side
+ *  keys); BYOK → client key, with a free-tier Gemini fallback for a BYOK user with no key for
+ *  the pinned backend (t/945) — **also geo-gated** (t/4486#4, TL review: this fallback used to
+ *  read the pool directly, a fourth bypass of the restriction). **Also budget-gated** (t/4485):
+ *  both free-pool paths go through `admitFreePoolCall` — a debate's calls admit/draw-down
+ *  server-side (phase 2, t/4485#5); any other call reserves 1 call against the daily budget.
+ *  429 `free_pool_exhausted`/`free_pool_debate_limit` or 503 `free_pool_unavailable` when
+ *  refused. The debate-admission requester scope is the signed-in principal, or the correctly-
+ *  derived IP for anonymous callers (t/4485#5 — never the per-tier `limitKey`, which free-tier
+ *  rate limiting keys on IP even for signed-in users). Returns `{ ok: false }` after sending the
+ *  error response on any refusal; on success, `reservationId`/`debateReservationId` are
+ *  mutually exclusive and non-null only when the caller still has something to settle later
+ *  (trackFreePoolReservation dispatches on which one is set). */
+async function resolveExplicitAiKey(req: http.IncomingMessage, res: http.ServerResponse, tier: ResolvedTier, clientKey: string | undefined, backend: AIBackend, debateId: string | undefined):
+  Promise<{ ok: true; key: string | string[] | undefined; reservationId: string | null; debateReservationId: string | null } | { ok: false }> {
+  const budgetKey = debateId ?? 'generate';
   if (tier.serverProvidedKey) {
+    // t/4486: the ONLY injection-path reader of the free pool — applies the geo gate.
+    const poolResult = await getFreePoolKeys(req, res);
+    if (!poolResult.ok) return { ok: false }; // 403 free_pool_region already written
     // t/846: FREE_TIER_GEMINI_KEY may be a comma-separated list; >1 key round-robins
     // across server keys via callWithKeyRotation in generateText.
-    const freeKeys = proxyTiers.parseFreeTierKeys(process.env.FREE_TIER_GEMINI_KEY);
+    const freeKeys = poolResult.keys;
     if (freeKeys.length === 0) { res.writeHead(503); res.end(JSON.stringify({ error: 'Free tier is not available' })); return { ok: false }; }
-    return { ok: true, key: freeKeys.length === 1 ? freeKeys[0] : freeKeys };
+    const budgetResult = await admitFreePoolCall(req, res, budgetKey, debateId); // t/4485: 429/503 already written on refusal
+    if (!budgetResult.ok) return { ok: false };
+    return { ok: true, key: freeKeys.length === 1 ? freeKeys[0] : freeKeys, reservationId: budgetResult.reservationId, debateReservationId: budgetResult.debateReservationId };
   }
   let explicitKey: string | string[] | undefined = tier.level === 'platform' ? undefined : (clientKey || undefined);
-  explicitKey = explicitKey ?? proxyTiers.byokGeminiFallbackKey(tier.level, backend, explicitKey);
-  return { ok: true, key: explicitKey };
+  if (!explicitKey && proxyTiers.byokGeminiFallbackApplies(tier.level, backend, explicitKey)) {
+    const poolResult = await getFreePoolKeys(req, res);
+    if (!poolResult.ok) return { ok: false }; // 403 free_pool_region already written
+    if (poolResult.keys.length > 0) {
+      explicitKey = poolResult.keys.length === 1 ? poolResult.keys[0] : poolResult.keys;
+      const budgetResult = await admitFreePoolCall(req, res, budgetKey, debateId); // t/4485: same budget as the free tier itself
+      if (!budgetResult.ok) return { ok: false };
+      return { ok: true, key: explicitKey, reservationId: budgetResult.reservationId, debateReservationId: budgetResult.debateReservationId };
+    }
+    // An empty pool is NOT an error for this branch — unlike the free tier's own 503, a BYOK
+    // user with no fallback available just proceeds with no key, same as pre-t/4486 behavior.
+    // No budget reservation either — there's no free-pool key to reserve against.
+  }
+  return { ok: true, key: explicitKey, reservationId: null, debateReservationId: null };
+}
+
+/** t/4485 (+ t/4485#9 debate reconciliation): tracks one free-pool budget reservation's
+ *  lifecycle so the generate handler doesn't need its own `if (reservationId)` / `if
+ *  (!committed)` branches at each of its several commit/release points (that inline branching is
+ *  what pushed the handler's cyclomatic complexity over its baseline, t/3821) — `commit`/
+ *  `releaseIfUnsettled` absorb the null-checks and the settled-or-not bookkeeping internally.
+ *  `reservationId` and `debateReservationId` are mutually exclusive: a plain/fallback
+ *  reservation commits/releases normally; a debate-covered call instead reconciles the real
+ *  token count via `reconcileDebateDrawDown` (its estimate was already drawn down up front) and
+ *  has nothing to release (there's no partial amount to undo once drawn down). A no-op
+ *  throughout when both are null (budget enforcement off, the common case today, or a BYOK call
+ *  with no free-pool key). */
+function trackFreePoolReservation(reservationId: string | null, debateReservationId: string | null = null) {
+  let settled = false;
+  return {
+    async commit(usage: { inputTokens: number; outputTokens: number } | undefined): Promise<void> {
+      settled = true;
+      const tokens = usage ? usage.inputTokens + usage.outputTokens : FREE_POOL_CALL_TOKEN_ESTIMATE;
+      if (debateReservationId) { await reconcileDebateDrawDown(debateReservationId, tokens); return; }
+      if (!reservationId) return;
+      await commitFreePoolCall(reservationId, { calls: 1, tokens });
+    },
+    async releaseIfUnsettled(): Promise<void> {
+      if (settled || debateReservationId || !reservationId) return;
+      await releaseFreePoolCall(reservationId);
+    },
+  };
 }
 
 /** 422 fast-fail (t/896) when there's no usable key for the target backend — before
@@ -172,10 +264,13 @@ export async function generateWithPaidFallback(
   } catch (genErr) {
     const paidKey = (ai.is429Error(genErr) && isFree) ? await getPaidGeminiFallbackKey() : null;
     if (!paidKey) throw genErr; // non-free, non-429, or no paid key → outer 429 mapping records it
+    // e/134 #6: a fallback path must record at WARN, not info (Fallback-Path Logging rule,
+    // docs/error-handling.md) — at info it's below the default filter and the free-pool-exhausted
+    // → paid-key degradation goes unseen. The search path (generateWithSearch) already does this.
     getGlobalRecorder()?.record({
-      type: 'ai.fallback', component: 'ai-generate', level: 'info',
+      type: 'ai.fallback', component: 'ai-generate', level: 'warn',
       message: 'Free-tier keys exhausted — waiting 3s before paid fallback',
-      data: { model: requestModel, backend, fallback: 'paid', delayMs: 3000, freeKeyCount: proxyTiers.parseFreeTierKeys(process.env.FREE_TIER_GEMINI_KEY).length },
+      data: { model: requestModel, backend, fallback: 'paid', delayMs: 3000, freeKeyCount: proxyTiers.freeTierKeyCount() },
     });
     // Throttle: caps paid-key throughput (~20/min) and gives free keys time to exit
     // cooldown so the next request reverts to the free pool.
@@ -262,7 +357,7 @@ export async function generateWithSearch(
     getGlobalRecorder()?.record({
       type: 'ai.fallback', component: 'ai-generate', level: 'warn',
       message: 'Free-tier search keys exhausted (429) — falling back to paid key after 3s throttle',
-      data: { model: requestModel, backend, fallback: 'paid', delayMs: 3000, search: true, freeKeyCount: proxyTiers.parseFreeTierKeys(process.env.FREE_TIER_GEMINI_KEY).length },
+      data: { model: requestModel, backend, fallback: 'paid', delayMs: 3000, search: true, freeKeyCount: proxyTiers.freeTierKeyCount() },
     });
     await new Promise(r => setTimeout(r, 3000));
     try {
@@ -397,6 +492,10 @@ export function registerAiRoutes(r: Router, ctx: ServerCtx): void {
     const t0 = Date.now();
     const abort = new AbortController();
     let finished = false;
+    // t/4485: a no-op tracker until resolveExplicitAiKey resolves a real reservationId below.
+    // `finally` always calls releaseIfUnsettled() — covers every early-return/catch path
+    // without duplicating release() calls at each one.
+    let freePoolBudget = trackFreePoolReservation(null);
     res.on('close', () => { if (shouldAbortOnClientClose(finished, res.writableEnded)) abort.abort(); });
     try {
       // Free-tier cost is bounded by tokensPerDay + per-IP rate limits; the redundant
@@ -412,11 +511,34 @@ export function registerAiRoutes(r: Router, ctx: ServerCtx): void {
       // Rate limiting: per-IP RPM (free tier) / per-user RPM + daily token budget (429 on breach).
       if (enforceAiRateLimits(res, isFree, limitKey, tier, backend)) return;
 
-      // Key injection: free tier → server FREE_TIER_GEMINI_KEY (503 if none); platform
-      // → server-side keys; BYOK → client key, with a free-tier Gemini fallback (t/945).
-      const keyResult = resolveExplicitAiKey(res, tier, clientKey, backend);
+      // Key injection: free tier → server FREE_TIER_GEMINI_KEY, geo-gated (t/4486, 403 if no
+      // keys or restricted region); platform → server-side keys; BYOK → client key, with a
+      // free-tier Gemini fallback (t/945).
+      // t/4485#5: the debate-admission requester scope — the signed-in principal, or the
+      const keyResult = await resolveExplicitAiKey(req, res, tier, clientKey, backend, debateId);
       if (!keyResult.ok) return;
-      const explicitKey = keyResult.key;
+      let explicitKey = keyResult.key;
+      freePoolBudget = trackFreePoolReservation(keyResult.reservationId, keyResult.debateReservationId);
+
+      // t/3498 (t/3495 epic): an allowlisted user running Gemini with no personal
+      // key gets the admin's registered paid key injected server-side — never
+      // echoed to the client. Membership is keyed on the derived storage userId
+      // (SO cond 4, t/3495#2) — the same id `/api/user/profile` exposes as
+      // `userId` and t/3497's allowlistStore expects. Falls through to the
+      // existing 422 below if the admin hasn't registered a key yet — no
+      // special-cased error for that edge (t/3498#1).
+      const noExplicitKey = !explicitKey || (Array.isArray(explicitKey) && explicitKey.length === 0);
+      if (backend === 'gemini' && noExplicitKey && allowlistStore.isAllowlisted(getStorageUserId())) {
+        const allowlistKey = await getPaidGeminiFallbackKey();
+        if (allowlistKey) {
+          explicitKey = allowlistKey;
+          // SO-required audit event (financial accountability + forensic trail, e/169#3).
+          log.server.info(
+            { userId: getStorageUserId(), timestamp: new Date().toISOString(), model: effectiveModel ?? DEFAULT_MODEL },
+            'allowlist-key-used',
+          );
+        }
+      }
 
       // t/896: fail fast with a clear 422 when there's no usable key for the target
       // backend — before the request reaches the AI adapter (opaque upstream 401/403).
@@ -439,7 +561,11 @@ export function registerAiRoutes(r: Router, ctx: ServerCtx): void {
       };
 
       if (search) {
-        json(res, await generateWithSearch(prompt, effectiveModel, explicitKey, { isFree, backend, requestModel, t0 }));
+        // generateWithSearch returns { text, searchQueries?, citations? } — no servedModel.
+        // Speaker turns never use search=true; servedModel is not required on this path (t/4125 AC).
+        const searchResult = await generateWithSearch(prompt, effectiveModel, explicitKey, { isFree, backend, requestModel, t0 });
+        await freePoolBudget.commit((searchResult as { tokenUsage?: { inputTokens: number; outputTokens: number } }).tokenUsage);
+        json(res, searchResult);
       } else {
         const result = await generateWithPaidFallback(prompt, usageOverrides, explicitKey, {
           isFree, backend, requestModel, t0,
@@ -454,8 +580,12 @@ export function registerAiRoutes(r: Router, ctx: ServerCtx): void {
           data: { model: requestModel, backend, responseLength: result.text?.length ?? 0, usage: result.tokenUsage },
         });
 
+        // t/4485: commit() records actual usage unconditionally (t/4484's own contract) —
+        // reconciles the upfront estimate to the real token count now that it's known.
+        await freePoolBudget.commit(result.tokenUsage);
+
         applyTokenBudgetHeaders(res, result, limitKey, tier);
-        json(res, { text: result.text, tokenUsage: result.tokenUsage });
+        json(res, { text: result.text, tokenUsage: result.tokenUsage, servedModel: result.servedModel }); // t/4125: forward registry id so the renderer can track failover
       }
     } catch (err) {
       const modelLabel = model ?? 'default';
@@ -488,6 +618,9 @@ export function registerAiRoutes(r: Router, ctx: ServerCtx): void {
       error(res, String(err), 500, err);
     } finally {
       finished = true; // clean-arm: any later 'close' (normal completion) won't abort
+      // t/4485: a no-op if commit() already settled it (or there was never a reservation) —
+      // otherwise returns the unused budget (early return, abort, or any error path above).
+      await freePoolBudget.releaseIfUnsettled();
     }
   });
 
@@ -509,6 +642,10 @@ export function registerAiRoutes(r: Router, ctx: ServerCtx): void {
       });
       if (ai.isContextTooLongError(err)) log.server.warn({ component: 'ai-search', model: model ?? 'default' }, 'AI search input exceeds model context window');
       else if (ai.is429Error(err)) log.server.warn({ component: 'ai-search', model: model ?? 'default', retryAfterMs: ai.retryAfterMs(err) }, 'AI search upstream rate-limited — returning 429');
+      // e/134 #5: an UNEXPECTED failure is a genuine 500 — always log at error level to Pino/stdout so
+      // it's visible in `az containerapp logs show` (the FR record above is ring-buffer only). Mirrors
+      // the /api/ai/generate catch. The two expected sub-cases above already log their own WARN.
+      else log.server.error({ component: 'ai-search', model: model ?? 'default', err }, 'AI search failed');
       respondAiSearchError(res, err);
     }
   });
@@ -539,10 +676,14 @@ export function registerAiRoutes(r: Router, ctx: ServerCtx): void {
     }
   });
 
-  get('/api/proxy/tier', (_req, res) => {
+  get('/api/proxy/tier', async (_req, res) => {
     const { principalName, idp } = callerIdentity(); // t/848: verified context, not raw headers
     const tier = proxyTiers.resolveTier(principalName, idp);
-    json(res, { ...tier, principalName: principalName || null });
+    // t/4485 item 4: the free-pool headroom gauge. 'not-enforced' while the budget-enforcement
+    // flag is off (today's default); 'unknown' — never a zeroed number — when enforcement is on
+    // but the store can't be read. Also fires the once-a-day 80% WARN as a side effect.
+    const freePoolHeadroom = await getFreePoolHeadroomSnapshot();
+    json(res, { ...tier, principalName: principalName || null, freePoolHeadroom });
   });
 
   get('/api/proxy/usage', (_req, res) => {
@@ -602,7 +743,19 @@ export function registerAiRoutes(r: Router, ctx: ServerCtx): void {
   // mode). Two rungs of the same ladder, different meanings.
   const LARGE_RECOMPUTE_WARN_ITEMS = 64;
 
-  post('/api/embeddings/compute', (req, res, body) => withEndpointTimeout(res, 50_000, 'embeddings-compute', async () => {
+  post('/api/embeddings/compute', (req, res, body) => {
+    // t/4287: chunks run SEQUENTIALLY inside resolveEmbeddingsChunked, not in parallel — a
+    // flat single-chunk endpoint timeout guarantees a 504 for any batch needing more than one
+    // EMBEDDING_COMPUTE_CHUNK-sized chunk once a chunk's wall time approaches its own
+    // EMBEDDINGS_REQUEST_TIMEOUT_MS budget under concurrent load (canary finding: a 128-text
+    // chunk took ~45s at 2 vCPU). Scale the endpoint guard by the chunk count this batch will
+    // need instead. For itemCount within one chunk this is exactly today's flat 50_000
+    // (1×45_000 + 5_000 margin) — no behavior change for the common case.
+    const preview = (body as { texts?: unknown } | null)?.texts;
+    const itemCount = Array.isArray(preview) ? preview.length : 0;
+    const numChunks = Math.max(1, Math.ceil(itemCount / EMBEDDING_COMPUTE_CHUNK));
+    const endpointTimeoutMs = numChunks * EMBEDDINGS_REQUEST_TIMEOUT_MS + 5_000;
+    return withEndpointTimeout(res, endpointTimeoutMs, 'embeddings-compute', async () => {
     const { texts, ids } = body as { texts: string[]; ids?: string[] };
     // t/3074 Gap 1: reject oversized batches before they enter the compute path.
     // Client (t/3072) chunks to ≤MAX_EMBED_BATCH; this is the server-side backstop.
@@ -708,7 +861,8 @@ export function registerAiRoutes(r: Router, ctx: ServerCtx): void {
       }
       error(res, String(err), 500, err);
     }
-  }));
+    });
+  });
 
   // t/1171: same free-tier exemption + rate limiting + key as /compute, so anonymous
   // semantic search finishes the cheap query-embedding step (not just the corpus one).
@@ -739,9 +893,15 @@ export function registerAiRoutes(r: Router, ctx: ServerCtx): void {
       // anon callers get [] → fail. Embeddings stay key-free (true local ONNX, no fallback).
       const gate = freeTierEmbeddingGate(req, res);
       if (gate.blocked) return;
-      const nliKeys = proxyTiers.freeTierEnabled()
-        ? proxyTiers.parseFreeTierKeys(process.env.FREE_TIER_GEMINI_KEY)
-        : undefined;
+      // t/4486: the ONLY other injection site besides resolveExplicitAiKey — must go through
+      // the same geo-gated accessor (TL review, t/4486#2: this route bypassed
+      // resolveGenerationContext entirely, so a guard placed only there would miss it).
+      let nliKeys: string[] | undefined;
+      if (proxyTiers.freeTierEnabled()) {
+        const poolResult = await getFreePoolKeys(req, res);
+        if (!poolResult.ok) return; // 403 free_pool_region already written
+        nliKeys = poolResult.keys;
+      }
       const results = await ai.classifyNli(pairs, nliKeys && nliKeys.length > 0 ? nliKeys : undefined);
       json(res, { results });
     } catch (err) { getGlobalRecorder()?.record({ type: 'system.error', component: 'server', level: 'error', message: 'Failed to classify NLI pairs', error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } }); error(res, String(err), 500, err); }

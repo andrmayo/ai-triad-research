@@ -20,7 +20,7 @@ import type { Router } from '../httpKit.js';
 import type { ServerCtx } from './context.js';
 import { json, error, param } from '../httpKit.js';
 import { getGlobalRecorder } from '../../../../lib/flight-recorder/index.js';
-import { getDataRoot, getStateRoot, getProjectRoot, STORAGE_MODE } from '../config.js';
+import { getStateRoot, getProjectRoot, STORAGE_MODE } from '../config.js';
 import { writeDump, isValidDumpId, readMergedDump } from '../flightRecorderDumps.js';
 import { escapeForInlineScript } from '../flightRecorderViewer.js';
 import { clientSafeMessage } from '../security/accessControl.js';
@@ -30,6 +30,52 @@ import { getRequestId } from '../logger.js';
 import { log } from '../logger.js';
 import * as fileIO from '../storage/fileIO.js';
 import { getWarmupStatus, computeEmbedding } from '../../../../lib/embeddings/onnxEmbedding.js';
+import { tagSoulFileName } from '../../../../lib/schema/povTags.js';
+
+/**
+ * Tag souls for /api/health/oped-files: every registry-listed tag must have its
+ * soul file present in soul-docs/ (spec §3: `<pov>.<tag>.soul.json`), and no
+ * unlisted tag soul may exist there either. Uses tagSoulFileName — single source.
+ */
+function checkTagSouls(
+  soulDocsDir: string, _basePovs: readonly string[], missing: string[], present: string[],
+): void {
+  const povTagsPath = path.join(soulDocsDir, 'pov-tags.json');
+  const expectedTagFiles = new Set<string>();
+  try {
+    const reg = JSON.parse(fs.readFileSync(povTagsPath, 'utf-8')) as {
+      povs?: Record<string, Array<{ id: string }>>
+    };
+    for (const [pov, entries] of Object.entries(reg.povs ?? {})) {
+      for (const entry of (entries ?? [])) {
+        const fname = tagSoulFileName(pov, entry.id);
+        expectedTagFiles.add(fname);
+        const rel = `lib/debate/soul-docs/${fname}`;
+        if (fs.existsSync(path.join(soulDocsDir, fname))) { present.push(rel); }
+        else { missing.push(rel); }
+      }
+    }
+  } catch (err) {
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'server', level: 'warn',
+      message: 'pov-tags.json unreadable — tag soul checks skipped',
+      error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+    });
+    missing.push('lib/debate/soul-docs/pov-tags.json (unreadable or missing)');
+    return;
+  }
+
+  // Stray detection: .soul.json files in soul-docs/ with a dot in the stem are tag
+  // souls; report any not covered by the registry.
+  for (const f of fs.readdirSync(soulDocsDir)) {
+    if (!f.endsWith('.soul.json')) continue;
+    const stem = f.slice(0, -'.soul.json'.length);
+    if (!stem.includes('.')) continue; // base soul (e.g. 'skeptic.soul.json') — skip
+    if (!expectedTagFiles.has(f)) {
+      missing.push(`lib/debate/soul-docs/${f} (stray — not in pov-tags.json registry)`);
+    }
+  }
+}
 
 export function registerDiagnosticsRoutes(r: Router, ctx: ServerCtx): void {
   const { get, post, put, del } = r;
@@ -77,7 +123,7 @@ export function registerDiagnosticsRoutes(r: Router, ctx: ServerCtx): void {
       // legacy timestamped behavior.
       if (dumpId !== undefined) {
         if (!isValidDumpId(dumpId)) { error(res, 'dumpId must be a UUID-safe string', 400); return; }
-        const filePath = await writeDump(getDataRoot(), 'client', dumpId, ndjson);
+        const filePath = await writeDump(getStateRoot(), 'client', dumpId, ndjson); // t/4372 (t/4264): class-A writable state, never getDataRoot()
 
         // t/3049: auto-write paired server FR dump.
         // t/3067: filter ring buffer to requesting session (fail-CLOSED: anon/no-session
@@ -89,7 +135,7 @@ export function registerDiagnosticsRoutes(r: Router, ctx: ServerCtx): void {
           if (sessionBranch !== undefined) {
             const rawNdjson = serverRecorder.buildDump('manual').ndjson;
             const filteredNdjson = filterSessionEvents(rawNdjson, sessionBranch);
-            await writeDump(getDataRoot(), 'server', dumpId, filteredNdjson);
+            await writeDump(getStateRoot(), 'server', dumpId, filteredNdjson); // t/4372 (t/4264): class-A writable state, never getDataRoot()
             serverDumpWritten = true;
           }
           // sessionBranch undefined → fail-CLOSED: anon session gets client-only dump
@@ -169,7 +215,7 @@ export function registerDiagnosticsRoutes(r: Router, ctx: ServerCtx): void {
     // t/3081: derive why server is absent so the merged header is never silently missing it.
     const serverOmissionReason = !includeServer ? 'anonymous-session' : undefined;
     try {
-      const merged = await readMergedDump(getDataRoot(), dumpId, { includeServer, serverOmissionReason });
+      const merged = await readMergedDump(getStateRoot(), dumpId, { includeServer, serverOmissionReason }); // t/4372: must match the writeDump root above
       if (merged === null) {
         // Actionable, copy-pasteable diagnostics (ADR-001 shape) instead of a bare
         // "failed" — relative paths only, no secrets/absolute fs layout.
@@ -314,11 +360,14 @@ document.addEventListener('DOMContentLoaded', function() {
       const missing: string[] = [];
       const present: string[] = [];
 
-      for (const pov of ['accelerationist', 'safetyist', 'skeptic']) {
+      const BASE_POVS = ['accelerationist', 'safetyist', 'skeptic'] as const;
+      for (const pov of BASE_POVS) {
         const rel = `lib/debate/soul-docs/${pov}.soul.json`;
         if (fs.existsSync(path.join(soulDocsDir, `${pov}.soul.json`))) { present.push(rel); }
         else { missing.push(rel); }
       }
+
+      checkTagSouls(soulDocsDir, BASE_POVS, missing, present);
 
       if (!fs.existsSync(promptsDir)) {
         missing.push('lib/oped/prompts/ (directory missing)');

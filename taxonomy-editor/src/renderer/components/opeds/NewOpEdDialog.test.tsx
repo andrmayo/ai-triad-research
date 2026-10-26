@@ -4,6 +4,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { NewOpEdDialog } from './NewOpEdDialog';
+import outletsData from '@lib/oped/outlets.json';
+import { useTaxonomyStore } from '../../hooks/useTaxonomyStore';
 
 // ── Bridge / hook mocks ───────────────────────────────────────────────────────
 
@@ -64,6 +66,47 @@ describe('NewOpEdDialog — visibility', () => {
     open();
     expect(screen.getByRole('dialog')).toBeTruthy();
     expect(screen.getByText('New op-ed')).toBeTruthy();
+  });
+});
+
+describe('NewOpEdDialog — refresh models (t/4317)', () => {
+  it('asks for a dry run explicitly, so the server never has to coerce it', async () => {
+    open();
+    fireEvent.click(screen.getByRole('button', { name: /More options/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /^Model\b/ })); // the settings dialog's Model section
+    fireEvent.click(await screen.findByRole('button', { name: 'Refresh models' }));
+    await waitFor(() => expect(h.refreshAIModels).toHaveBeenCalledTimes(1));
+    expect(h.refreshAIModels).toHaveBeenCalledWith({ dryRun: true });
+  });
+});
+
+describe('NewOpEdDialog — outlet dropdown (t/3818)', () => {
+  it('includes Tech Policy Press as an option', () => {
+    open();
+    const select = screen.getByLabelText('Outlet') as HTMLSelectElement;
+    const values = Array.from(select.options).map(o => o.value);
+    expect(values).toContain('TechPolicyPress');
+    expect(screen.getByRole('option', { name: 'Tech Policy Press' })).toBeTruthy();
+  });
+
+  it('defaults the selection to TechPolicyPress, matching the backend default', () => {
+    open();
+    const select = screen.getByLabelText('Outlet') as HTMLSelectElement;
+    expect(select.value).toBe('TechPolicyPress');
+  });
+
+  // t/3864: the exact failure t/3796 caused — the dropdown rendered fine but offered a
+  // DIFFERENT set from the backend. Assert against the real SSOT, not a mirrored literal,
+  // so a future outlet added to outlets.json without a presentation-map entry still fails
+  // loudly here if the option set ever drifts.
+  it('offers exactly the SSOT outlet key set, and defaults to the SSOT default', () => {
+    open();
+    const select = screen.getByLabelText('Outlet') as HTMLSelectElement;
+    const values = Array.from(select.options).map(o => o.value);
+    const ssotKeys = Object.keys(outletsData.outlets);
+    expect(values.sort()).toEqual(ssotKeys.sort());
+    expect(values).toHaveLength(9);
+    expect(select.value).toBe(outletsData.defaultOutlet);
   });
 });
 
@@ -275,5 +318,59 @@ describe('NewOpEdDialog — draft + progress + cancel', () => {
     await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
     expect(screen.getByText('The generator could not be reached.')).toBeTruthy();
     expect(screen.getByText('Check that PowerShell is installed')).toBeTruthy();
+  });
+});
+
+// t/3992: one optional POV tag for one member, carried as params.tagSelection; refused at setup when
+// the tag is too thin (TL t/3957#7 B(a)). Uses the committed registry (skeptic "critical", t/3956).
+describe('NewOpEdDialog — POV tag (t/3992)', () => {
+  const setSkepticNodes = (n: number) => useTaxonomyStore.setState({
+    skeptic: { nodes: Array.from({ length: n }, (_, i) => ({ id: `skp-beliefs-${i}`, pov_tags: ['critical'] })) },
+  } as never);
+  const pickCritical = (mode: 'Scope' | 'Prioritize' = 'Scope') => {
+    fireEvent.change(screen.getByLabelText('POV wing (optional)'), { target: { value: 'skeptic' } });
+    fireEvent.change(screen.getByLabelText('Tag for skeptic'), { target: { value: 'critical' } });
+    if (mode === 'Prioritize') fireEvent.click(screen.getByLabelText('Prioritize'));
+  };
+
+  it('sends params.tagSelection for the tagged voice', async () => {
+    setSkepticNodes(6);
+    createOpEdSet.mockReturnValue(new Promise(() => { /* never resolves */ }));
+    open();
+    fireEvent.change(screen.getByLabelText(/Topic/), { target: { value: 'Licensing' } });
+    pickCritical();
+    fireEvent.click(screen.getByRole('button', { name: /Draft/ }));
+    await waitFor(() => expect(createOpEdSet).toHaveBeenCalledTimes(1));
+    expect(createOpEdSet.mock.calls[0][0].params.tagSelection).toEqual({ pov: 'skeptic', tag: 'critical', mode: 'scope' });
+  });
+
+  it('an untagged set sends no tagSelection', async () => {
+    createOpEdSet.mockReturnValue(new Promise(() => { /* never resolves */ }));
+    open();
+    fireEvent.change(screen.getByLabelText(/Topic/), { target: { value: 'Licensing' } });
+    fireEvent.click(screen.getByRole('button', { name: /Draft/ }));
+    await waitFor(() => expect(createOpEdSet).toHaveBeenCalledTimes(1));
+    expect(createOpEdSet.mock.calls[0][0].params).not.toHaveProperty('tagSelection');
+  });
+
+  it('Draft is disabled while a Scope tag is below the minimum', () => {
+    setSkepticNodes(3);
+    open();
+    fireEvent.change(screen.getByLabelText(/Topic/), { target: { value: 'Licensing' } });
+    pickCritical();
+    expect((screen.getByRole('button', { name: /Draft/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByRole('alert').textContent).toMatch(/minimum 5/);
+  });
+
+  it('deselecting the tagged voice drops the tag from the request', async () => {
+    setSkepticNodes(6);
+    createOpEdSet.mockReturnValue(new Promise(() => { /* never resolves */ }));
+    open();
+    fireEvent.change(screen.getByLabelText(/Topic/), { target: { value: 'Licensing' } });
+    pickCritical();
+    fireEvent.click(screen.getByRole('button', { name: 'Skeptic' }));
+    fireEvent.click(screen.getByRole('button', { name: /Draft/ }));
+    await waitFor(() => expect(createOpEdSet).toHaveBeenCalledTimes(1));
+    expect(createOpEdSet.mock.calls[0][0].params).not.toHaveProperty('tagSelection');
   });
 });

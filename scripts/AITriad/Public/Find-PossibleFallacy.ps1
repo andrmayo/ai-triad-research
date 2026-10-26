@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
+# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 # Licensed under the MIT License. See LICENSE file in the project root.
 
 function Find-PossibleFallacy {
@@ -24,7 +24,7 @@ function Find-PossibleFallacy {
     .PARAMETER Model
         AI model to use. Defaults to 'gemini-3.5-flash-lite'.
     .PARAMETER ApiKey
-        AI API key. If omitted, resolved via backend-specific env var or AI_API_KEY.
+        AI API key. If omitted, resolved via the backend-specific env var (AI_API_KEY is a fallback for gemini models only).
     .PARAMETER Temperature
         Sampling temperature (0.0-1.0). Default: 0.2.
     .PARAMETER DryRun
@@ -90,7 +90,7 @@ function Find-PossibleFallacy {
     $ErrorActionPreference = 'Stop'
 
     if (-not $Model) {
-        if ($env:AI_MODEL) { $Model = $env:AI_MODEL } else { $Model = 'gemini-3.5-flash-lite' }
+        if ($env:AI_MODEL) { $Model = $env:AI_MODEL } else { $Model = (Get-AITierModel -Tier basic) }
     }
 
     # ── Validate environment ──
@@ -103,14 +103,10 @@ function Find-PossibleFallacy {
     }
 
     if (-not $DryRun) {
-        if     ($Model -match '^gemini') { $Backend = 'gemini' }
-        elseif ($Model -match '^claude') { $Backend = 'claude' }
-        elseif ($Model -match '^groq')   { $Backend = 'groq'   }
-        elseif ($Model -match '^openai') { $Backend = 'openai' }
-        else                             { $Backend = 'gemini'  }
-        $ResolvedKey = Resolve-AIApiKey -ExplicitKey $ApiKey -Backend $Backend
-        if ([string]::IsNullOrWhiteSpace($ResolvedKey)) {
-            Write-Fail 'No API key found. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or AI_API_KEY.'
+        # Backend from ai-models.json, never guessed; only the user's -ApiKey is forwarded (t/4087).
+        $KeyStatus = Get-AIModelKeyStatus -Model $Model -ApiKey $ApiKey
+        if (-not $KeyStatus.HasKey) {
+            Write-Fail "No API key found for the $($KeyStatus.Backend) backend. Set $($KeyStatus.EnvHint), or pass -ApiKey."
             throw 'No API key configured'
         }
     }
@@ -163,9 +159,10 @@ function Find-PossibleFallacy {
         }
 
         Write-Step "Loading $PovKey"
-        $FileData = Get-Content -Raw -Path $FilePath | ConvertFrom-Json
+        $FileData = Read-PovTaxonomyFile -Path $FilePath   # shape-preserving read for the canonical write (t/4356)
 
-        $AllNodes = @($FileData.nodes)
+        # Work list only: superseded nodes get no AI call; $FileData (the written file) keeps them (t/4356).
+        $AllNodes = @(Select-SelectableTaxonomyNode -Nodes @($FileData.nodes) -Pov $PovKey)
 
         # Filter by -Id if specified
         if ($Id -and $Id.Count -gt 0) {
@@ -279,7 +276,7 @@ $SchemaPrompt
                 $Result = Invoke-AIApi `
                     -Prompt $FullPrompt `
                     -Model $Model `
-                    -ApiKey $ResolvedKey `
+                    -ApiKey $ApiKey `
                     -Temperature $Temperature `
                     -MaxTokens 16384 `
                     -JsonMode
@@ -415,9 +412,8 @@ $SchemaPrompt
         if ($TotalProcessed -gt 0 -or $Force) {
             if ($PSCmdlet.ShouldProcess($FilePath, 'Write updated taxonomy file with fallacy analysis')) {
                 $FileData.last_modified = (Get-Date).ToString('yyyy-MM-dd')
-                $Json = $FileData | ConvertTo-Json -Depth 20
                 try {
-                    Write-Utf8NoBom -Path $FilePath -Value $Json 
+                    Write-PovTaxonomyFile -Path $FilePath -Data $FileData   # canonical TS format (t/4356)
                     Write-OK "Saved $PovKey ($FilePath)"
                 }
                 catch {

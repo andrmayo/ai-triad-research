@@ -1,7 +1,9 @@
-﻿// Copyright (c) 2026 Jeffrey Snover. All rights reserved.
+// Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 // Licensed under the MIT License. See LICENSE file in the project root.
 
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
+// Isolated runtime is 2.7–3.1s; raise timeout so parallel-load runs don't hit the 5s default (t/4112).
+vi.setConfig({ testTimeout: 15_000 });
 import { DebateEngine, modelTierRank } from './debateEngine.js';
 import type { ExtendedAIAdapter } from './aiAdapter.js';
 import { createMockAdapter, createMinimalTaxonomy, createDefaultConfig } from './debateEngine.testHelpers.js';
@@ -90,6 +92,30 @@ describe('Per-speaker model routing', () => {
     }
   });
 
+  it('single-model run: modelTier set but speakerModels absent → model_api_id, no model_pool (t/4040)', () => {
+    // Every preset sets modelTier even for single-model runs.
+    // The gate in _computeModelFingerprint must check speakerModels, not modelTier,
+    // so that the debateTiers entry is not used as a pool fingerprint for single-model runs.
+    const adapter: ExtendedAIAdapter = {
+      async generateText() { return '{}'; },
+      registry: {
+        backends: [],
+        models: [{ id: 'claude-sonnet-5', apiModelId: 'claude-sonnet-5-20251101', backend: 'claude' }],
+        debateTiers: { basic: { claude: 'claude-sonnet-5' } },
+      },
+    } as unknown as ExtendedAIAdapter;
+    const config = createDefaultConfig({
+      model: 'claude-sonnet-5',
+      modelTier: 'basic',
+      // speakerModels intentionally absent — this is a single-model run
+    });
+    const engine = new DebateEngine(config, adapter, createMinimalTaxonomy());
+    (engine as any).initSession();
+    const session = (engine as any).session;
+    expect(session.model_api_id).toBe('claude-sonnet-5:claude-sonnet-5-20251101');
+    expect(session.model_pool).toBeUndefined();
+  });
+
   it('routes per-speaker model to adapter during openings', async () => {
     const callLog: Array<{ model: string }> = [];
     const adapter: ExtendedAIAdapter = {
@@ -111,6 +137,7 @@ describe('Per-speaker model routing', () => {
           disagreement_type: 'empirical', position_update: null,
         });
       },
+      registry: { backends: [], models: [] },
     };
 
     const config = createDefaultConfig({
@@ -159,6 +186,7 @@ describe('Per-speaker model routing', () => {
           disagreement_type: 'empirical', position_update: null,
         });
       },
+      registry: { backends: [], models: [] },
     };
 
     const config = createDefaultConfig({
@@ -406,6 +434,7 @@ describe('maxModelId cap on failover chain (t/1164)', () => {
         attemptedModels.push(model);
         throw new Error('500 Internal Server Error');
       },
+      registry: { backends: [], models: [] },
     };
 
     const config = createDefaultConfig({
@@ -426,6 +455,7 @@ describe('maxModelId cap on failover chain (t/1164)', () => {
   it('without maxModelId, fallback chain escalation proceeds normally', () => {
     const adapter: ExtendedAIAdapter = {
       async generateText() { return '{}'; },
+      registry: { backends: [], models: [] },
     };
 
     const config = createDefaultConfig({
@@ -443,6 +473,7 @@ describe('maxModelId cap on failover chain (t/1164)', () => {
   it('maxModelId at flash tier allows flash but blocks sonnet', () => {
     const adapter: ExtendedAIAdapter = {
       async generateText() { return '{}'; },
+      registry: { backends: [], models: [] },
     };
 
     const config = createDefaultConfig({

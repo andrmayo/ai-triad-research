@@ -11,10 +11,18 @@ function Repair-ResolvedBackfill {
         automatically promoted into the pov_summaries key_points arrays.
 
         This cmdlet scans every summary's unmapped_concepts for entries that
-        have a resolved_node_id, checks whether that node already appears in
+        have a resolved_node_id, checks whether that concept already appears in
         the corresponding POV's key_points, and if not, creates a new
         key_point entry with extraction_confidence 0.7 and
         excerpt_context "unmapped_concept_backfill".
+
+        t/3900: a resolved_node_id that no longer names a LIVE taxonomy node is
+        skipped (logged, never written) -- a t/3595-style cleanup can null a
+        backfilled key_point's taxonomy_node_id (intentionally unlinked) while
+        leaving THIS field, the origin pointer, dead. "Already appears" counts a
+        null-linked backfill entry with the same point text as already
+        represented, regardless of its current taxonomy_node_id -- null means
+        intentionally unlinked, not missing, so it must not be re-backfilled.
 
         POV mapping:
           - suggested_pov "accelerationist" -> pov_summaries.accelerationist.key_points
@@ -89,18 +97,19 @@ function Repair-ResolvedBackfill {
     Write-Info "        appears in pov_summaries key_points. If not, create a new entry."
     Write-Info ""
 
-    $TotalBackfilled    = 0
-    $TotalAlreadyLinked = 0
-    $TotalSkippedPov    = 0
-    $TotalSkippedNoPov  = 0
-    $FilesModified      = 0
+    $TotalBackfilled      = 0
+    $TotalAlreadyLinked   = 0
+    $TotalSkippedPov      = 0
+    $TotalSkippedNoPov    = 0
+    $TotalSkippedDeadNode = 0
+    $FilesModified        = 0
     $AllBackfills       = [System.Collections.Generic.List[PSObject]]::new()
     $AllSkipped         = [System.Collections.Generic.List[PSObject]]::new()
     $AllClaimCandidates = [System.Collections.Generic.List[PSObject]]::new()
 
     foreach ($File in $SummaryFiles) {
         try {
-            $Summary = Get-Content -Raw -Path $File.FullName | ConvertFrom-Json
+            $Summary = ConvertFrom-JsonPreserveShape -Json (Get-Content -Raw -Path $File.FullName)   # whole-file rewrite (t/4425)
         }
         catch {
             Write-Warn "Failed to parse $($File.Name): $_"
@@ -115,8 +124,15 @@ function Repair-ResolvedBackfill {
         $Unmapped = @($HasUnmapped.Value)
         if ($Unmapped.Count -eq 0) { continue }
 
-        # Filter to only resolved concepts
+        # Filter to only resolved concepts. t/3907: a bare `null` element (writer
+        # artifact from chunk-merge) must not reach PSObject.Properties under
+        # StrictMode -- it throws "The property 'Properties' cannot be found".
+        $NullConceptCount = @($Unmapped | Where-Object { $null -eq $_ }).Count
+        if ($NullConceptCount -gt 0) {
+            Write-Warn "$DocName — skipping $NullConceptCount null entry/entries in unmapped_concepts (t/3907)"
+        }
         $ResolvedConcepts = @($Unmapped | Where-Object {
+            $null -ne $_ -and
             $_.PSObject.Properties['resolved_node_id'] -and
             -not [string]::IsNullOrWhiteSpace($_.resolved_node_id)
         })
@@ -130,21 +146,11 @@ function Repair-ResolvedBackfill {
         }
         $PovSummaries = $Summary.pov_summaries
 
-        # ── Build a set of existing key_point taxonomy_node_ids per POV ──
-        $ExistingNodeIds = @{}
-        foreach ($Pov in $ValidPovs) {
-            $ExistingNodeIds[$Pov] = [System.Collections.Generic.HashSet[string]]::new()
-            if ($PovSummaries.PSObject.Properties[$Pov] -and $PovSummaries.$Pov) {
-                $PovSection = $PovSummaries.$Pov
-                if ($PovSection.PSObject.Properties['key_points'] -and $PovSection.key_points) {
-                    foreach ($Kp in @($PovSection.key_points)) {
-                        if ($Kp.PSObject.Properties['taxonomy_node_id'] -and $Kp.taxonomy_node_id) {
-                            $null = $ExistingNodeIds[$Pov].Add($Kp.taxonomy_node_id)
-                        }
-                    }
-                }
-            }
-        }
+        # ── Build per-POV dedupe sets (t/3900: node-id set + text-based backfill
+        #    set, so a null-linked backfill entry still counts as represented) ──
+        $LinkSets = Get-BackfillLinkSets -PovSummaries $PovSummaries -ValidPovs $ValidPovs
+        $ExistingNodeIds = $LinkSets.NodeIds
+        $ExistingBackfillPoints = $LinkSets.BackfillPoints
 
         # ── Collect factual_claims for candidate matching ────────────────
         $FactualClaims = @()
@@ -216,8 +222,31 @@ function Repair-ResolvedBackfill {
                 continue
             }
 
+            # ── Never write a dead id (t/3900) ───────────────────────────
+            # A t/3595-style cleanup nulls the key_point's taxonomy_node_id but leaves
+            # unmapped_concepts[].resolved_node_id pointing at the now-dead id. Without
+            # this check, backfill re-derives a fresh key_point from that dead source
+            # pointer every run. Fallback-path logging (root AGENTS.md): this is a
+            # degraded/skip path, so it's logged, not silent.
+            if (-not (Test-TaxonomyNodeId -NodeId $NodeId)) {
+                $TotalSkippedDeadNode++
+                $null = $AllSkipped.Add([PSCustomObject]@{
+                    DocId     = $DocName
+                    NodeId    = $NodeId
+                    Pov       = $SuggestedPov
+                    Label     = $Label
+                    Reason    = 'dead_node_id'
+                })
+                Write-Warn "$DocName — SKIP '$Label' ($NodeId): resolved_node_id is not a live taxonomy node (t/3900)"
+                continue
+            }
+
             # ── Check if node already exists in key_points ───────────────
-            if ($ExistingNodeIds[$SuggestedPov].Contains($NodeId)) {
+            # t/3900: a backfill entry whose point text already appears for this POV
+            # counts as already represented REGARDLESS of its current taxonomy_node_id
+            # (null included) -- null means intentionally unlinked, not missing.
+            if ($ExistingNodeIds[$SuggestedPov].Contains($NodeId) -or
+                $ExistingBackfillPoints[$SuggestedPov].Contains($ConceptText)) {
                 $TotalAlreadyLinked++
                 Write-Info "$DocName — ALREADY LINKED '$Label' ($NodeId) in $SuggestedPov key_points"
                 continue
@@ -270,6 +299,7 @@ function Repair-ResolvedBackfill {
             if ($PovPrefixes.ContainsKey($SuggestedPov)) {
                 $Prefix = $PovPrefixes[$SuggestedPov]
                 foreach ($Claim in $FactualClaims) {
+                    if ($null -eq $Claim) { continue }
                     if (-not $Claim.PSObject.Properties['linked_taxonomy_nodes'] -or -not $Claim.linked_taxonomy_nodes) {
                         continue
                     }
@@ -333,6 +363,9 @@ function Repair-ResolvedBackfill {
     if ($TotalSkippedNoPov -gt 0) {
         Write-Warn "$TotalSkippedNoPov concept(s) skipped — POV section missing or unrecognized"
     }
+    if ($TotalSkippedDeadNode -gt 0) {
+        Write-Warn "$TotalSkippedDeadNode concept(s) skipped — resolved_node_id is not a live taxonomy node (t/3900)"
+    }
 
     # ── Factual claims candidate report ──────────────────────────────────
     if ($AllClaimCandidates.Count -gt 0) {
@@ -356,11 +389,12 @@ function Repair-ResolvedBackfill {
         Skipped         = $AllSkipped
         ClaimCandidates = $AllClaimCandidates
         Statistics      = [PSCustomObject]@{
-            TotalBackfilled    = $TotalBackfilled
-            TotalAlreadyLinked = $TotalAlreadyLinked
-            TotalSkippedPov    = $TotalSkippedPov
-            TotalSkippedNoPov  = $TotalSkippedNoPov
-            FilesModified      = $FilesModified
+            TotalBackfilled      = $TotalBackfilled
+            TotalAlreadyLinked   = $TotalAlreadyLinked
+            TotalSkippedPov      = $TotalSkippedPov
+            TotalSkippedNoPov    = $TotalSkippedNoPov
+            TotalSkippedDeadNode = $TotalSkippedDeadNode
+            FilesModified        = $FilesModified
         }
     }
 }

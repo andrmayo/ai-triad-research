@@ -4,6 +4,7 @@
 import type { PovNode, CrossCuttingNode as SituationNode } from '../../../types/taxonomy';
 import { POV_KEYS } from '../../../types/debate';
 import { useTaxonomyStore } from '../../useTaxonomyStore';
+import { allNodesById, allPovNodeIds, isSuperseded, povOfNode } from '../../useTaxonomyStore/superseded'; // t/4355
 // Circular import — safe because all references are at call-time, never at module init
 import { useDebateStore } from '../store';
 import type { NodeScoringSource, RelevanceSourceEntry } from '../types';
@@ -89,7 +90,20 @@ export function enrichPolicyRefs(
   });
 }
 
+/**
+ * Every real node id, superseded POV nodes included (t/4355#7). For VALIDATING ids the model returned:
+ * an id outside this set goes to fuzzyCorrectNodeId, whose suffix match can rewrite it to a different node,
+ * so a cited superseded id must count as known. To offer ids to the model, use getSelectableNodeIds.
+ */
 export function getAllKnownNodeIds(): Set<string> {
+  const state = useTaxonomyStore.getState();
+  const s = allPovNodeIds(state);
+  for (const n of state.situations?.nodes ?? []) s.add(n.id);
+  return s;
+}
+
+/** Ids the model may be OFFERED as citable: selectable POV nodes (superseded excluded) plus situations. */
+export function getSelectableNodeIds(): Set<string> {
   const s = new Set<string>();
   const state = useTaxonomyStore.getState();
   for (const pov of POV_KEYS) {
@@ -97,6 +111,14 @@ export function getAllKnownNodeIds(): Set<string> {
   }
   for (const n of state.situations?.nodes ?? []) s.add(n.id);
   return s;
+}
+
+/** The edges debate context may use: none with a superseded endpoint (matches lib's selectable `edges`). */
+function selectableEdgesFile(): { edges: NonNullable<ReturnType<typeof useTaxonomyStore.getState>['edgesFile']>['edges'] } | null {
+  const state = useTaxonomyStore.getState();
+  const edges = state.edgesFile?.edges;
+  if (!edges) return null;
+  return { edges: edges.filter(e => !isSuperseded(state, e.source) && !isSuperseded(state, e.target)) };
 }
 
 export function getAllPolicyIds(): Set<string> {
@@ -107,10 +129,10 @@ export function getAllPolicyIds(): Set<string> {
 
 export function findNodeMetaInStore(nodeId: string): { label: string; pov: string; description: string } | undefined {
   const state = useTaxonomyStore.getState();
-  for (const pov of POV_KEYS) {
-    const n = state[pov]?.nodes.find(x => x.id === nodeId);
-    if (n) return { label: n.label, pov, description: n.description };
-  }
+  // Exact node, superseded included: this labels an id the debate already cited (t/4355).
+  const n = allNodesById(state).get(nodeId);
+  const pov = povOfNode(state, nodeId);
+  if (n && pov) return { label: n.label, pov, description: n.description };
   const sit = state.situations?.nodes.find(x => x.id === nodeId);
   if (sit) return { label: sit.label, pov: 'situations', description: sit.description };
   return undefined;
@@ -256,7 +278,7 @@ function recordLineageBoostCheck(lineageFrame: { cluster_id: string }[] | undefi
 function surfaceGreatestHitsWarning(outcome: { requested: boolean; applied: boolean }): void {
   if (!outcome.requested || outcome.applied) return;
   const s = useDebateStore.getState();
-  const warning = 'Greatest-hits exclusion is On, but the exclusion list is unavailable — retread nodes were NOT filtered for this debate.';
+  const warning = 'Well-tested exclusion is On, but the curated greatest-hits list is unavailable — well-tested nodes are still excluded, but the list\'s extra nodes were NOT filtered for this debate.';
   if (s.debateWarnings.length < 50 && !s.debateWarnings.includes(warning)) {
     useDebateStore.setState({ debateWarnings: [...s.debateWarnings, warning] });
   }
@@ -273,6 +295,41 @@ function logLineageBoostResult(injectionManifest: Record<string, unknown>, total
     level: lb.promoted > 0 ? 'info' : 'debug',
     message: lb.promoted > 0 ? `Lineage boost promoted ${lb.promoted} nodes` : 'Lineage boost applied but promoted 0 nodes',
     data: { boosted_count: lb.boosted, promoted_count: lb.promoted, promoted_node_ids: lb.promotedNodeIds?.slice(0, 10), total_selected: totalSelected, total_candidates: totalCandidates },
+  });
+}
+
+/** t/4369 gap 3: WARN when per-turn selection skipped label twins. Each `label_dedup` entry, set by
+ *  lib's selectRelevantTaxonomy, names the skipped id, the twin it duplicates and their shared label.
+ *  The skip is correct; the WARN is how duplicate taxonomy nodes stay visible until they're merged (t/4278). */
+export function logLabelDedup(injectionManifest: Record<string, unknown>): void {
+  const skipped = injectionManifest.label_dedup;
+  if (!Array.isArray(skipped) || skipped.length === 0) return;
+  getGlobalRecorder()?.record({
+    type: 'state.change',
+    component: 'debate-store',
+    level: 'warn',
+    message: `Relevance selection skipped ${skipped.length} node(s) with a duplicate label: ${skipped.slice(0, 3).join('; ')}${skipped.length > 3 ? ` + ${skipped.length - 3} more` : ''}`,
+    data: { label_dedup: skipped.slice(0, 20), skipped_count: skipped.length },
+  });
+}
+
+/** Log what the exclude-well-tested mode did, from the manifest's `testing_selection`. WARN when the
+ *  mode was on but well-tested nodes are still the majority of the selection (re-eligible leak-in). */
+function logTestingSelection(injectionManifest: Record<string, unknown>, totalSelected: number): void {
+  const ts = injectionManifest.testing_selection as {
+    selected_tiers: Record<string, number>;
+    well_tested_excluded: number;
+    greatest_hits_excluded: number;
+    under_tested_promoted: number;
+  } | undefined;
+  if (!ts) return;
+  const wellTestedSelected = ts.selected_tiers.well_tested ?? 0;
+  getGlobalRecorder()?.record({
+    type: 'turn.taxonomy_inject',
+    component: 'debate-store',
+    level: wellTestedSelected * 2 > totalSelected ? 'warn' : 'info',
+    message: `Exclude-well-tested: ${ts.well_tested_excluded} well-tested + ${ts.greatest_hits_excluded} greatest-hits pre-filtered, ${ts.under_tested_promoted} under-tested promoted; ${wellTestedSelected}/${totalSelected} selected are well-tested`,
+    data: { ...ts },
   });
 }
 
@@ -413,6 +470,8 @@ export async function getRelevantTaxonomyContext(
 
     console.log(`[taxonomy] Relevance-filtered: ${filteredPov.length} POV nodes (from ${allPovNodes.length}), ${filteredCC.length} CC nodes (from ${allCCNodes.length})`);
     logLineageBoostResult(result.injectionManifest, filteredPov.length, allPovNodes.length);
+    logLabelDedup(result.injectionManifest);
+    logTestingSelection(result.injectionManifest, result.povNodes.length);
     recordSituationDivergence(filteredCC, allCCNodes);
 
     return { povNodes: filteredPov, situationNodes: filteredCC, policyRegistry: result.policyRegistry, nodeScores, nodeSourceMap, injectionManifest: result.injectionManifest };
@@ -430,8 +489,8 @@ export async function getRelevantTaxonomyContext(
 
 /** Format cross-POV tensions for injection into a specific debater's prompt */
 export function formatDebaterEdgeContext(debaterPov: string): string {
-  const edgesFile = useTaxonomyStore.getState().edgesFile;
-  if (!edgesFile?.edges) return '';
+  const edgesFile = selectableEdgesFile();
+  if (!edgesFile) return '';
 
   const povPrefixes: Record<string, string> = {
     accelerationist: 'acc-', safetyist: 'saf-', skeptic: 'skp-',
@@ -493,8 +552,8 @@ export function formatDebaterEdgeContext(debaterPov: string): string {
 
 /** Format relevant edges between active debaters' nodes for the moderator */
 export function formatEdgeContext(activePovers: string[]): string {
-  const edgesFile = useTaxonomyStore.getState().edgesFile;
-  if (!edgesFile?.edges) return '';
+  const edgesFile = selectableEdgesFile();
+  if (!edgesFile) return '';
 
   // Map pover labels to POV prefixes
   const povPrefixes: Record<string, string> = {

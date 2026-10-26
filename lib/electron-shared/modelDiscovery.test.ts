@@ -9,7 +9,8 @@ vi.mock('fs', () => ({
   },
 }));
 
-import { curateGeminiModels, curateClaudeModels, discoverClaudeModels, refreshAIModels } from './modelDiscovery.js';
+import { curateGeminiModels, curateClaudeModels, discoverClaudeModels, refreshAIModels, mergeDiscoveredModels } from './modelDiscovery.js';
+import type { ModelEntry } from './modelDiscovery.js';
 
 function model(name: string, displayName: string, methods = ['generateContent']) {
   return { name: `models/${name}`, displayName, supportedGenerationMethods: methods };
@@ -230,6 +231,41 @@ describe('refreshAIModels — merge, not replace + write on clean (t/1711 / t/20
   });
 });
 
+// ── refreshAIModels: claude offline fallback is registry-derived, not hardcoded (t/3661) ────────
+describe('refreshAIModels — claude fallback derives from ai-models.json (t/3661)', () => {
+  beforeEach(() => {
+    // no network → claude probe fails → the no-key/error fallback path is exercised
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('no network in test'); }));
+  });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it('a claude model added to the registry appears in the offline fallback (proves future additions work)', async () => {
+    const cfg = clone(VALID_CONFIG);
+    cfg.backends.push({ id: 'claude', label: 'Claude' });
+    // an id that was never in any hardcoded catalog — it can ONLY appear if the fallback derives from the registry
+    cfg.models.push({ id: 'claude-future-99', apiModelId: 'claude-future-99', label: 'Claude Future 99', backend: 'claude' });
+    fileContent = JSON.stringify(cfg);
+
+    await refreshAIModels({ loadApiKey: () => null, repoRoot: '/fake' });
+    const savedClaude = JSON.parse(fileContent).models
+      .filter((m: { backend: string }) => m.backend === 'claude')
+      .map((m: { id: string }) => m.id);
+    expect(savedClaude).toContain('claude-future-99');
+    expect(savedClaude).not.toContain('claude-opus-4-8'); // a former hardcoded id, absent from this fixture
+  });
+
+  it('a registry with NO claude models yields an EMPTY claude fallback — the removed hardcoded catalog does not resurface', async () => {
+    const cfg = clone(VALID_CONFIG); // no claude models
+    cfg.backends.push({ id: 'claude', label: 'Claude' });
+    fileContent = JSON.stringify(cfg);
+
+    await refreshAIModels({ loadApiKey: () => null, repoRoot: '/fake' });
+    const savedClaude = JSON.parse(fileContent).models.filter((m: { backend: string }) => m.backend === 'claude');
+    // pre-t/3661 getKnownClaudeModels() returned [claude-opus-4-8, claude-sonnet-4-5, claude-haiku-4-5] here.
+    expect(savedClaude).toEqual([]);
+  });
+});
+
 // ── refreshAIModels: repair pass + validate-before-write guard (t/2039) ─────────────
 describe('refreshAIModels — repair + guard (t/2039)', () => {
   beforeEach(() => {
@@ -252,17 +288,21 @@ describe('refreshAIModels — repair + guard (t/2039)', () => {
     expect(saved.defaults.gemini).toBe('gemini-2.5-flash');
   });
 
-  it('repairs a dangling default by repointing to a surviving same-backend model that has a chain', async () => {
+  it('t/3553: a dangling default is NEVER silently repointed — refused as needs-human, file byte-unchanged', async () => {
+    // Pre-t/3553 this repointed defaults.gemini to gemini-2.5-flash on its own: exactly the silent re-point
+    // TL t/3553#1 and CL #2 forbid. `gemini-gone` was never a registry entry, so it has no family to succeed.
     const cfg = clone(VALID_CONFIG);
-    cfg.defaults.gemini = 'gemini-gone'; // dangling; gemini-2.5-flash survives WITH a chain
-    fileContent = JSON.stringify(cfg);
+    cfg.defaults.gemini = 'gemini-gone';
+    const original = JSON.stringify(cfg);
+    fileContent = original;
 
     const result = await refreshAIModels({ loadApiKey: () => null, repoRoot: '/fake' });
-    const saved = JSON.parse(fileContent);
 
-    expect(result.written).toBe(true);
-    expect(saved.defaults.gemini).toBe('gemini-2.5-flash'); // repointed to the chain-bearing model
-    expect(result.configWarning).toMatch(/repointed dangling default/);
+    expect(result.written).toBe(false);
+    expect(result.refusal?.reason).toBe('needs-human');
+    expect(result.proposal?.changes).toEqual([{ slot: 'defaults.gemini', from: 'gemini-gone', to: null, family: null, reason: 'vendor-absent' }]);
+    expect(result.configWarning).toContain('gemini-gone');
+    expect(fileContent).toBe(original);
   });
 
   it('AC-b: REFUSES to write an unrepairable dangling default; on-disk file byte-unchanged', async () => {
@@ -417,5 +457,91 @@ describe('discoverClaudeModels — live catalog', () => {
 
     const result = await discoverClaudeModels('test-key');
     expect(Array.isArray(result)).toBe(true);
+  });
+});
+
+describe('mergeDiscoveredModels — attribute-preserving refresh (t/3551; guards the t/3518 floors)', () => {
+  const probed = new Set(['gemini', 'claude', 'groq', 'openai', 'deepseek', 'ollama']);
+
+  // The registry carries curated fields the live catalog NEVER returns (discovery is {id,apiModelId,
+  // label,backend} only). A bare replace wiped these, invisibly to verify:config (they're unreferenced).
+  const existing = [
+    { id: 'claude-fable-5',  apiModelId: 'claude-fable-5',  label: 'Claude Fable 5',  backend: 'claude', minTimeoutMs: 300000, picker: { order: 9 } },
+    { id: 'claude-opus-5',   apiModelId: 'claude-opus-5',   label: 'Claude Opus 5',   backend: 'claude', minTimeoutMs: 300000, picker: { order: 5 } },
+    { id: 'claude-sonnet-5', apiModelId: 'claude-sonnet-5', label: 'Claude Sonnet 5', backend: 'claude', minTimeoutMs: 300000, picker: { order: 7 } },
+    { id: 'claude-retired-4', apiModelId: 'claude-retired-4', label: 'Retired', backend: 'claude' }, // de-listed: absent from discovery below
+    { id: 'moonshot-kimi',   apiModelId: 'kimi', label: 'Kimi', backend: 'moonshot', fixedTemperature: 1 }, // non-probed backend
+  ] as unknown as ModelEntry[];
+
+  // Live catalog: minimal entries, same ids (label refreshed) + one brand-new model; retired-4 gone.
+  const discovered = [
+    { id: 'claude-fable-5',  apiModelId: 'claude-fable-5',  label: 'Claude Fable 5 (live)',  backend: 'claude' },
+    { id: 'claude-opus-5',   apiModelId: 'claude-opus-5',   label: 'Claude Opus 5 (live)',   backend: 'claude' },
+    { id: 'claude-sonnet-5', apiModelId: 'claude-sonnet-5', label: 'Claude Sonnet 5 (live)', backend: 'claude' },
+    { id: 'claude-new-6',    apiModelId: 'claude-new-6',    label: 'Claude New 6',           backend: 'claude' },
+  ] as ModelEntry[];
+
+  const merged = mergeDiscoveredModels(existing, discovered, probed);
+  const byId = (id: string) => merged.find(m => m.id === id) as unknown as Record<string, unknown> | undefined;
+
+  it('the 3 Claude-5 minTimeoutMs floors SURVIVE the refresh (t/3518 regression guard — a naive replace re-opens the P1)', () => {
+    for (const id of ['claude-fable-5', 'claude-opus-5', 'claude-sonnet-5']) {
+      expect(byId(id)?.minTimeoutMs).toBe(300000);
+    }
+  });
+
+  it('picker ordering survives too (all 22 real entries carry it)', () => {
+    expect(byId('claude-fable-5')?.picker).toEqual({ order: 9 });
+  });
+
+  it('the live catalog still WINS on core fields (label refreshed from discovery)', () => {
+    expect(byId('claude-fable-5')?.label).toBe('Claude Fable 5 (live)');
+  });
+
+  it('a brand-new discovered model is added with no synthetic extras', () => {
+    expect(byId('claude-new-6')).toBeDefined();
+    expect(byId('claude-new-6')?.minTimeoutMs).toBeUndefined();
+  });
+
+  it('non-probed backends survive untouched (moonshot fixedTemperature kept)', () => {
+    expect(byId('moonshot-kimi')?.fixedTemperature).toBe(1);
+  });
+
+  it('a genuinely de-listed model (absent from the live catalog) DROPS', () => {
+    expect(byId('claude-retired-4')).toBeUndefined();
+    expect(merged.map(m => m.id).sort()).toEqual(
+      ['claude-fable-5', 'claude-new-6', 'claude-opus-5', 'claude-sonnet-5', 'moonshot-kimi'],
+    );
+  });
+});
+
+describe('mergeDiscoveredModels — ADDITIVE mode (t/3551 decision 2; drops nothing)', () => {
+  const probed = new Set(['gemini', 'claude', 'groq', 'openai', 'deepseek', 'ollama']);
+  const existing = [
+    { id: 'claude-fable-5', apiModelId: 'claude-fable-5', label: 'Fable 5', backend: 'claude', minTimeoutMs: 300000 },
+    { id: 'gemini-2.5-pro', apiModelId: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro', backend: 'gemini', picker: { order: 3 } },
+    { id: 'groq-old', apiModelId: 'old', label: 'Old', backend: 'groq' },
+  ] as unknown as ModelEntry[];
+  const discovered = [
+    { id: 'claude-fable-5', apiModelId: 'claude-fable-5', label: 'Fable 5 (live)', backend: 'claude' }, // already present
+    { id: 'claude-new-6',   apiModelId: 'claude-new-6',   label: 'New 6',          backend: 'claude' }, // NEW
+    { id: 'groq-new',       apiModelId: 'gnew',           label: 'GNew',           backend: 'groq' },   // NEW
+  ] as ModelEntry[];
+
+  const merged = mergeDiscoveredModels(existing, discovered, probed, true);
+  const byId = (id: string) => merged.find(m => m.id === id) as unknown as Record<string, unknown> | undefined;
+
+  it('adds only NEW discovered ids and drops NOTHING', () => {
+    expect(merged.map(m => m.id).sort()).toEqual(['claude-fable-5', 'claude-new-6', 'gemini-2.5-pro', 'groq-new', 'groq-old']);
+  });
+
+  it('every existing entry survives untouched — minTimeoutMs + picker kept, existing WINS (label not overwritten)', () => {
+    expect(byId('claude-fable-5')?.minTimeoutMs).toBe(300000);
+    expect(byId('claude-fable-5')?.label).toBe('Fable 5'); // additive does NOT replace existing — surface-only
+    expect(byId('gemini-2.5-pro')?.picker).toEqual({ order: 3 });
+  });
+
+  it('cannot drop a model → cannot dangle a default / empty a chain (guard-refusal class gone by construction)', () => {
+    for (const m of existing) expect(byId(m.id)).toBeDefined();
   });
 });

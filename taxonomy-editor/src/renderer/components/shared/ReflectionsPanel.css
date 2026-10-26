@@ -17,8 +17,10 @@
 .rp-row-6-2 { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; }
 .rp-row-6 { display: flex; align-items: center; gap: 6px; }
 .rp-row-between { display: flex; align-items: center; justify-content: space-between; }
-.rp-actions-row { display: flex; gap: 6px; }
+.rp-actions-row { display: flex; gap: 6px; align-items: center; }
 .rp-flex-1 { flex: 1; }
+/* t/3814: visible "no change proposed" state in place of a live Approve & Apply. */
+.rp-no-op-notice { flex: 1; color: var(--text-muted); font-size: 0.8rem; font-style: italic; }
 .rp-bold { font-weight: 700; }
 .rp-accent-text { color: var(--color-acc, #3b82f6); }
 .rp-no-margin { margin: 0; }
@@ -204,6 +206,26 @@
 .rp-rationale-mb6 { font-size: var(--text-2xs); color: var(--text-primary); font-style: italic; margin-bottom: 6px; }
 
 .rp-evidence-label { font-size: var(--text-2xs); color: var(--text-muted); margin-bottom: 8px; }
+
+/* Evidence check (t/3512) — edit whose cited claims do not reference the node it edits. */
+.rp-evidence-unsupported {
+  font-size: var(--text-2xs);
+  color: var(--text-primary);
+  background: rgba(220, 38, 38, 0.08);
+  border: 1px solid rgba(220, 38, 38, 0.3);
+  border-radius: 4px;
+  padding: 6px 8px;
+  margin-bottom: 8px;
+}
+
+.rp-evidence-unsupported-badge {
+  display: inline-block;
+  font-weight: 700;
+  color: #dc2626;
+  margin-bottom: 2px;
+}
+
+.rp-evidence-unsupported-record { color: var(--text-muted); margin-top: 2px; }
 
 /* Evidence toggle button — bg/color/text-decoration depend on whether this entry is expanded */
 .rp-evidence-btn {
@@ -396,3 +418,4 @@
   background: var(--bg-secondary);
   border-radius: 4px;
 }
+.rp-bulk-summary { font-size: 0.7rem; color: var(--text-muted); }

@@ -10,10 +10,13 @@ import { ipcMain } from 'electron';
 import fs from 'fs';
 import path from 'path';
 import { PROJECT_ROOT, getDataRootPath } from '../fileIO.js';
-import { computeEmbeddings, computeQueryEmbedding, generateText, generateTextWithSearch, generateChatStream, updateNodeEmbeddings, classifyNli, setDebateTemperature, getEmbeddingInfo } from '../embeddings.js';
+import { computeEmbeddings, computeQueryEmbedding, generateText, generateTextWithSearch, generateChatStream, updateNodeEmbeddings, classifyNli, setDebateTemperature, getEmbeddingInfo, resolveAiCallLogContext, resolveRegistry } from '../embeddings.js';
 import type { ChatMessage, NodeEmbeddingInput, NliPair } from '../embeddings.js';
 import { refreshAIModels } from '../modelDiscovery.js';
-import { ActionableError } from '../../../../lib/debate/errors.js';
+import type { RefreshResult } from '../modelDiscovery.js';
+import { refreshModelsRequestSchema } from './refreshModelsRequestSchema.js';
+import type { RefreshModelsRequestInput } from './refreshModelsRequestSchema.js';
+import { ActionableError, errorMessage } from '../../../../lib/debate/errors.js';
 import { getGlobalRecorder } from '../../../../lib/flight-recorder/index.js';
 import { DEFAULT_TEMPERATURE, resolveBackend, DEFAULT_MODEL } from '../../../../lib/ai-client/index.js';
 import type { UrlContextMetadata } from '../../../../lib/ai-client/index.js';
@@ -21,6 +24,81 @@ import { DEFAULT_RELEVANCE_THRESHOLD } from '../../../../lib/debate/constants.js
 import { buildEmbeddingFailureError } from '../embeddingErrors.js';
 import { fetchUrlForPrompt } from '../../../../lib/url-fetch/fetchUrlForPrompt.js';
 import { extractHttpUrls } from '../../../../lib/url-fetch/extractHttpUrls.js';
+import { writeAICallLogEntry } from '../aiCallLog.js';
+
+// AI call-log status classifier (t/3370). Duplicated from src/server/ai/aiBackends.ts'
+// deriveCallLogStatus — that copy is unexported, and main-process code depending on
+// server code is the wrong dependency direction (separate deployment targets).
+function deriveCallLogStatus(err: unknown): string {
+  const e = err as { statusCode?: number; status?: number; name?: string; message?: string };
+  const code = e?.statusCode ?? e?.status;
+  if (typeof code === 'number' && Number.isFinite(code)) return String(code);
+  const msg = (e?.message ?? '').toLowerCase();
+  if (e?.name === 'AbortError' || msg.includes('abort')) return 'aborted';
+  if (msg.includes('timeout') || msg.includes('timed out')) return 'timeout';
+  return 'error';
+}
+
+// t/3417: AbortSignal.timeout() (the per-attempt fetch deadline, ai-client's
+// makeFetchSignal) fires with .name === 'TimeoutError', NOT 'AbortError' — it doesn't
+// match generate-text's cancel check, so without this it fell through to the generic
+// ActionableError, which tells the user to check their API key / rate limits —
+// misleading for a request that simply took too long to respond.
+function buildTimeoutError(err: unknown, elapsedMs: number): ActionableError {
+  return new ActionableError({
+    goal: 'Generate text via AI backend',
+    problem: `The AI backend did not respond within the allotted timeout for this request (${elapsedMs}ms elapsed).`,
+    location: 'ipcHandlers.generateText',
+    nextSteps: [
+      'Retry — a single slow response does not necessarily mean the backend is down',
+      'If this recurs, the prompt may be too large or complex for the current model — try a shorter prompt or a faster model',
+      'Try a different AI backend if the current one is consistently slow',
+    ],
+    innerError: err,
+  });
+}
+
+// t/3528: single payload object for the 'generate-text' IPC channel, replacing six
+// positional params that preload.cts/electron.d.ts/electron-bridge.ts each had to
+// restate in the same order by hand.
+interface GenerateTextIpcPayload {
+  prompt: string;
+  model?: string;
+  timeoutMs?: number;
+  temperature?: number;
+  requestId?: string;
+  maxTokens?: number;
+}
+
+// t/3524: maxTokens crosses an IPC trust boundary (renderer → main → provider) and directly
+// scales spend, so the main process clamps/validates rather than trusting the caller (SO
+// condition, t/3524#2). Non-integer/non-positive input is dropped (provider default applies);
+// values above the ceiling are clamped down. Either case is logged so a silent drop/clamp is
+// diagnosable from a flight recorder dump (root AGENTS.md fallback-path logging rule).
+const MAX_TOKENS_CEILING = 32_000;
+
+function clampMaxTokens(raw: number | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  if (!Number.isInteger(raw) || raw < 1) {
+    getGlobalRecorder()?.record({
+      type: 'system.info',
+      component: 'ipc-handlers',
+      level: 'warn',
+      message: `generate-text: ignoring invalid maxTokens (${JSON.stringify(raw)}) — must be a positive integer; falling back to provider default`,
+    });
+    return undefined;
+  }
+  if (raw > MAX_TOKENS_CEILING) {
+    getGlobalRecorder()?.record({
+      type: 'system.info',
+      component: 'ipc-handlers',
+      level: 'warn',
+      message: `generate-text: clamping maxTokens from ${raw} to ceiling ${MAX_TOKENS_CEILING}`,
+    });
+    return MAX_TOKENS_CEILING;
+  }
+  return raw;
+}
 
 // ── Per-request AbortController map (t/2509) ──────────────────────────────
 
@@ -42,6 +120,21 @@ interface AppFetchEvent {
   urlContextMetadata: UrlContextMetadata;
 }
 
+// t/4232 (SO e/297#4 C6): every path into refreshAIModels must refuse to write without an
+// explicit accept. t/4161 predates the ruling and let a bare/no-accept call through as a live
+// write (opts.dryRun only defaults to falsy); this closes that gap at the IPC boundary. A caller
+// that didn't explicitly ask for dryRun:true is coerced into one — accept is untouched, since the
+// lib's own hash/fingerprint recheck (t/4160) already governs whether an accept actually writes.
+async function refreshModelsEnforcingAccept(opts: RefreshModelsRequestInput): Promise<RefreshResult & { coerced?: boolean }> {
+  if (opts.accept || opts.dryRun === true) return refreshAIModels(opts);
+  getGlobalRecorder()?.record({
+    type: 'system.info', component: 'ipc-handlers', level: 'warn',
+    message: 'refresh-ai-models: no accept supplied — coercing to a dry run (SO e/297#4 C6)',
+  });
+  const result = await refreshAIModels({ ...opts, dryRun: true });
+  return { ...result, coerced: true };
+}
+
 export function registerAiHandlers(): void {
   ipcMain.handle('load-ai-models', () => {
     try {
@@ -60,8 +153,26 @@ export function registerAiHandlers(): void {
     }
   });
 
-  ipcMain.handle('refresh-ai-models', async () => {
-    return refreshAIModels();
+  ipcMain.handle('refresh-ai-models', async (_event, opts?: unknown) => {
+    if (opts === undefined) return refreshModelsEnforcingAccept({});
+    let parsed;
+    try {
+      parsed = refreshModelsRequestSchema.parse(opts);
+    } catch (err) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'ipc-handlers', level: 'warn',
+        message: `refresh-ai-models: malformed payload rejected — ${errorMessage(err)}`,
+        error: { name: (err as Error).name ?? 'Error', message: errorMessage(err), stack: (err as Error).stack },
+      });
+      throw new ActionableError({
+        goal: 'Refresh the AI model registry',
+        problem: err instanceof ActionableError ? err.problem : `refresh-ai-models payload is malformed: ${errorMessage(err)}`,
+        location: 'ipc/aiHandlers.ts refresh-ai-models',
+        nextSteps: ['Retry a plain refresh (no options)', 'If accepting a proposal, resend the exact proposal shown by a prior dry run'],
+        innerError: err,
+      });
+    }
+    return refreshModelsEnforcingAccept(parsed);
   });
 
   ipcMain.handle('get-embedding-info', () => {
@@ -157,16 +268,23 @@ export function registerAiHandlers(): void {
     }
   });
 
-  ipcMain.handle('generate-text', async (event, prompt: string, model?: string, timeoutMs?: number, temperature?: number, requestId?: string) => {
+  ipcMain.handle('generate-text', async (event, payload: GenerateTextIpcPayload) => {
+    const { prompt, model, timeoutMs, temperature, requestId, maxTokens } = payload;
     const t0 = Date.now();
     const controller = requestId ? new AbortController() : undefined;
     if (requestId && controller) activeGenerations.set(requestId, controller);
+    const clampedMaxTokens = clampMaxTokens(maxTokens);
+    let retryCount = 0;
+    // t/4088: computed once and reused for every log entry below — the desktop path has no
+    // fallback chain (t/4048), so the requested model is always the model actually called.
+    const { model: logModel, backend, keySource } = resolveAiCallLogContext(model);
     try {
-      return {
-        text: await generateText(prompt, model, (progress) => {
-          event.sender.send('generate-text-progress', progress);
-        }, timeoutMs, temperature, controller?.signal),
-      };
+      const { text, stopReason, diagnostics, servedModel } = await generateText(prompt, model, (progress) => {
+        retryCount = progress.attempt;
+        event.sender.send('generate-text-progress', progress);
+      }, { timeoutMs, temperature, signal: controller?.signal, maxTokens: clampedMaxTokens });
+      writeAICallLogEntry({ scenario: 'Debate', promptId: '', promptStart: prompt, retryCount, status: '200', model: logModel, backend, keySource });
+      return { text, stopReason, diagnostics, servedModel };
     } catch (err) {
       if ((err as Error).name === 'AbortError' || controller?.signal.aborted) {
         getGlobalRecorder()?.record({
@@ -176,7 +294,18 @@ export function registerAiHandlers(): void {
           message: 'ai.cancelled',
           data: { requestId, elapsed_ms: Date.now() - t0 },
         });
+        writeAICallLogEntry({ scenario: 'Debate', promptId: '', promptStart: prompt, retryCount, status: deriveCallLogStatus(err), model: logModel, backend, keySource });
         throw err;
+      }
+      if ((err as Error).name === 'TimeoutError') {
+        const elapsedMs = Date.now() - t0;
+        getGlobalRecorder()?.record({
+          type: 'system.error', component: 'ipc-handlers', level: 'warn',
+          message: `generate-text timed out after ${elapsedMs}ms`,
+          error: { name: 'TimeoutError', message: String((err as Error).message ?? err) },
+        });
+        writeAICallLogEntry({ scenario: 'Debate', promptId: '', promptStart: prompt, retryCount, status: deriveCallLogStatus(err), model: logModel, backend, keySource });
+        throw buildTimeoutError(err, elapsedMs);
       }
       const problem = err instanceof ActionableError ? err.problem : (err instanceof Error ? err.message : String(err));
       getGlobalRecorder()?.record({
@@ -187,6 +316,7 @@ export function registerAiHandlers(): void {
         error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
       });
       console.error('[IPC] generate-text failed:', problem);
+      writeAICallLogEntry({ scenario: 'Debate', promptId: '', promptStart: prompt, retryCount, status: deriveCallLogStatus(err), model: logModel, backend, keySource });
       throw new ActionableError({
         goal: 'Generate text via AI backend',
         problem: `AI generation failed: ${problem}`,
@@ -219,7 +349,9 @@ export function registerAiHandlers(): void {
 
     // Fetch-and-inject: when model lacks native URL grounding, fetch URLs from
     // the last user message and prepend content as an ephemeral system block.
-    const isUrlCapable = resolveBackend(model ?? DEFAULT_MODEL) === 'gemini' && urlContext === true;
+    // registry passed explicitly (t/4196): resolveBackend's registry param is becoming
+    // required — an omission here would route to a provider the registry didn't name.
+    const isUrlCapable = resolveBackend(model ?? DEFAULT_MODEL, resolveRegistry()) === 'gemini' && urlContext === true;
     let effectiveSystem = systemInstruction;
     let appFetchEvent: AppFetchEvent | undefined;
 

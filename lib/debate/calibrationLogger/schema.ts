@@ -56,6 +56,20 @@ export interface CalibrationDataPoint {
   /** Git working-tree state when the run executed; 'unknown' when git is unavailable (e.g. server/Azure) */
   working_tree_state: 'clean' | 'dirty' | 'unknown';
   /**
+   * Hash of declared behaviour-bearing source files, generated at build time (t/4166).
+   * First 12 hex chars of SHA-256 over normalized (comments+whitespace stripped) content
+   * of all files in behaviourRevisionFiles.ts, sorted by path. Changes when behaviour
+   * changes; immune to comment or whitespace edits. Absent on legacy rows — those pool
+   * under the empty-string segment of fixedConfigKey.
+   *
+   * Provenance field, not a config knob — widening fixedConfigKey with this is correct
+   * (different behaviour hash = different instrument). Does NOT violate t/1668#2's bar
+   * against temperature/situation_cap (those are run-varying params; this is instrument
+   * identity). T1 additive-optional: no consumer may branch on this field until the
+   * exemption lapses (the moment a consumer reads it for logic, not logging/display).
+   */
+  behaviour_revision?: string;
+  /**
    * Model that produced this entry's neutral-evaluator metrics (t/1846). Crux metrics are
    * evaluator-model-relative (t/1835: MAD 0.625 across evaluator families), so the optimizer
    * only compares rows sharing this id. ABSENT on legacy rows, whose evaluator was the
@@ -63,6 +77,19 @@ export interface CalibrationDataPoint {
    * (evaluator-mixed by construction; TL t/1846#3).
    */
   evaluator_model_id?: string;
+
+  // ── Multi-provider model tracking (t/4040) ──
+  /** Speaker model assignments at session init (multi-provider runs only). Absent on single-model rows and pre-t/4040 entries. */
+  speaker_models?: Record<string, string>;
+  /** Last failover per speaker (speaker → replacement model). Presence ⇒ excluded from replication count.
+   *  Full failover history is in FR `ai.fallback` events. Absent when no failover occurred. */
+  speaker_model_failovers?: Record<string, string>;
+  /** Multi-provider model pool fingerprint: `"tierName|b1=registryId1:apiModelId1,..."` sorted by backend. Absent on single-model rows. */
+  model_pool?: string;
+  /** Single-model run fingerprint: `"registryId:apiModelId"` resolved at run time. Absent on multi-provider rows. */
+  model_api_id?: string;
+  /** Whether failover tracking was available for this run. 'tracked' = engine-path (failovers visible); 'unavailable' = renderer-path (failover below bridge, invisible). Absent on pre-t/4040 rows — treated as legacy (unchecked). */
+  failover_tracking?: 'tracked' | 'unavailable';
 
   // ── Parameter 1: Exploration exit threshold ──
   /** Saturation score from the last signal_telemetry entry at debate end (unconditional last-round value; null when no telemetry). Field name is historical — the extraction is not transition-gated. */
@@ -449,6 +476,18 @@ export interface CalibrationDataPoint {
   /** Number of AN nodes primed from exploration. */
   seeded_an_node_count?: number;
 
+  // ── POV tag selection (t/3957) ──
+  /** POV tag active for this debate's accelerationist seat (absent ⇒ untagged). */
+  pov_tag?: string;
+  /** Tag mode for the active tag ('scope' | 'prioritize'). */
+  tag_mode?: string;
+  /** POV nodes that carried the active tag (SCOPE pre-filter count). */
+  in_scope_count?: number;
+  /** Selected POV nodes that carried the active tag. */
+  tagged_selected_count?: number;
+  /** POV nodes excluded because they lacked the active tag (SCOPE mode only; 0 in PRIORITIZE). */
+  excluded_untagged_count?: number;
+
   // ── Over-generate/select/rewrite pipeline (t/1581) ──
   /** Whether a coherence gate miss occurred (rewrite failed to preserve ≥3/4 selected claims). */
   coherence_gate_miss?: boolean;
@@ -460,10 +499,11 @@ export interface CalibrationDataPoint {
    * 'max_iterations': force_active=true AND exit_reason matches /Max total rounds/i.
    * 'situation_cap': force_active=true, any other forced cap (health, synthesis stall, etc.).
    * 'api_ceiling': API hard ceiling hit (detected via transcript content; overrides force_active).
+   * 'first_round_exit': debate exited with ≤1 statement, no ASD phases — early failure before convergence logic ran (t/3502).
    * 'unknown': legacy rows without force_active — excluded from censoring pools.
    * Absent on pre-t/1671 rows; treated as 'unknown' by computeConvergenceWithCensoring.
    */
-  termination_reason?: 'natural_conclusion' | 'max_iterations' | 'situation_cap' | 'api_ceiling' | 'unknown';
+  termination_reason?: 'natural_conclusion' | 'max_iterations' | 'situation_cap' | 'api_ceiling' | 'first_round_exit' | 'unknown';
   /**
    * Last composite convergence_score from adaptive_staging_diagnostics.signal_telemetry.
    * Same extraction point as argumentative_saturation_at_transition. Null when no telemetry.
@@ -499,4 +539,58 @@ export interface CalibrationDataPoint {
    * Null when all speakers have null persistence. Stipulated.
    */
   frame_survival?: number | null;
+
+  // ── Drift telemetry shadow log (t/3603) ──
+  /**
+   * Per-turn drift telemetry series. Shadow mode — NO behaviour change. Additive-optional.
+   * Three reachable, distinct states (TL ruling t/3603#3):
+   *   - `undefined` (absent) — pre-t/3603 entry; NO instrumentation ran. Do NOT treat as
+   *     zero drift — using `series ?? []` collapses this with null and silently biases any
+   *     aggregate computed over historical entries.
+   *   - `null` — t/3603+ session where instrumentation ran but zero turns were recorded
+   *     (e.g. debate ended before any cross-responses). Distinct from absent: this entry
+   *     WAS produced by instrumented code.
+   *   - `DriftTelemetryEntry[]` — one entry per completed debater turn.
+   * CL field definitions confirmed at t/3603#2.
+   */
+  drift_telemetry_series?: DriftTelemetryEntry[] | null;
+
+  // ── AIF B5 metrics (t/3715) ──────────────────────────────
+  /**
+   * AIF-derived B5 metrics: crux-from-AIF (§1) + 2-signal convergence_score (§2).
+   * Provisional / shadow only — gates nothing (AC6, b5-build-spec.md).
+   * Additive-optional:
+   *   - `undefined` (absent) — pre-t/3715 entry; B5 did not run.
+   *   - `null` — B5 ran but no argument-network nodes were available.
+   *   - `AifB5Metrics` — computed values with metric_def_version (AC5).
+   */
+  aif_b5_metrics?: AifB5Metrics | null;
 }
+
+/**
+ * AIF B5 metric bundle (t/3715, b5-build-spec.md). Provisional / shadow (AC6).
+ */
+export interface AifB5Metrics {
+  /** Definition version for cross-time comparison (AC5). Change when metric definition changes. */
+  metric_def_version: string;
+  /**
+   * Count of sustained cross-agent CA-nodes (crux-from-AIF, spec §1).
+   * A crux = a cross-agent opposition (conflict_claim_id) that recurs across ≥2 distinct rounds.
+   * Aggregate only — t/3587 over-determination constraint: per-crux claims are unreliable.
+   */
+  crux_count: number;
+  /** conflict_claim_ids of the crux set (one per sustained CA opposition). */
+  crux_set: string[];
+  /**
+   * 2-signal convergence score (spec §2). Signal A = concession accumulation (rising);
+   * Signal B = retained-hold reduction (falling). Stipulated equal 0.5/0.5 weighting.
+   * Null when convergence_signals is absent or empty (total_turns = 0 → no valid denominator).
+   */
+  convergence_score: number | null;
+}
+
+// DriftTelemetryEntry lives in types/session.ts (session-side type; avoids the
+// calibrationLogger → neutralEvaluator → aiAdapter transitive import into the
+// renderer-safe comments.ts graph — importGraph test guard t/2550).
+import type { DriftTelemetryEntry } from '../types/session.js';
+export type { DriftTelemetryEntry } from '../types/session.js';

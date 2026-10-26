@@ -225,14 +225,41 @@ function isActionableErrorLike(e: unknown): e is { goal: string; problem: string
 }
 
 /**
+ * t/3515 (CodeQL js/stack-trace-exposure #5707): remove V8 stack-frame lines from a string.
+ * A frame is `    at <site> (path:line:col)` or `    at path:line:col` — keyed on the
+ * `:line:col` numeric signature, NOT a bare `at ` prefix, so legitimate prose that merely
+ * starts with "at " ("at least 3 nodes required") survives untouched (TL t/3515#2).
+ * This is the sanitizer barrier on the client-error path: even if a stack ever leaked into
+ * an error `message` (e.g. a caller passing `String(err)` where err.stack bled into it), it
+ * is scrubbed before `clientSafeMessage` returns it toward an HTTP response body.
+ */
+export function stripStackFrames(s: string): string {
+  const stripped = s
+    .split('\n')
+    .filter(line => !/\bat\s+.*:\d+:\d+\)?\s*$/.test(line))
+    .join('\n')
+    .trimEnd();
+  // If the input was nothing but frames, don't return an empty body — give a generic floor.
+  return stripped.trim() ? stripped : 'Request failed';
+}
+
+/**
  * t/853: produce a client-safe error string for production. ActionableError
  * carries `location`, `Resolve:` steps, and stacks that reveal server internals
  * (source paths, function names) — in production keep only the user-actionable
  * `goal: problem`. Handles an ActionableError `cause` and a message that is
  * already a serialized ActionableError dump. Outside production the full message
  * is returned unchanged (dev/debug ergonomics).
+ *
+ * t/3515: every return is routed through `stripStackFrames` — a single, CodeQL-visible
+ * sanitizer barrier on the flow from the caught error toward the response body, so
+ * js/stack-trace-exposure (#5707) closes structurally rather than via per-line suppression.
  */
 export function clientSafeMessage(message: string, cause?: unknown, isProduction = process.env.NODE_ENV === 'production'): string {
+  return stripStackFrames(rawClientMessage(message, cause, isProduction));
+}
+
+function rawClientMessage(message: string, cause: unknown, isProduction: boolean): string {
   if (!isProduction) return message;
   if (isActionableErrorLike(cause)) return `${cause.goal}: ${cause.problem}`;
   if (/\n\s*Location:/.test(message)) {
@@ -340,6 +367,28 @@ const ANON_SAFE_POST_PATHS = [
   '/debug/events',
 ];
 
+// t/3480: anon POST for the community op-ed public-link mint. Parameterized path
+// (per-id), so it can't live in the exact-match ANON_SAFE_POST_PATHS above — a
+// dedicated regex list instead. Mint only — DELETE (revoke) stays authed via the
+// existing `method === 'DELETE' → false` branch below; no regex check runs for
+// DELETE, so revoke on the same path is unaffected by this list. TL auth ruling
+// (t/3479): mint is idempotent (one stable shareId per item, repeat calls are
+// cheap), rate-limited, and the public copy strips community_metadata.
+//
+// Rate-bucket note (t/3480, TL-confirmed p/602#6): `community-oped-share:<userId>`
+// collapses to ONE shared 20/min bucket across all anon callers (getStorageUserId()
+// returns '_local' for every anonymous request — see userContext.ts). Accepted as
+// documented rather than IP-keyed: mint is idempotent so the failure mode of the
+// shared cap is "anon minting pauses briefly," not data exposure or per-caller
+// unfairness with lasting effect. Revisit (switch to IP-keying in community.ts,
+// Server Community's scope) if telemetry shows the shared bucket actually
+// exhausting under real anon traffic — i.e. anon callers observing 429s on
+// /api/community/opeds/*/share in production, not merely a theoretical shared-cap
+// concern.
+const ANON_SAFE_POST_REGEXES = [
+  /^\/api\/community\/opeds\/[^/]+\/share$/,
+];
+
 /** t/3259: the debate-only ~400MB synthetic-embeddings corpus GET — anon access is gated on the
  *  anon-debates flag rather than the blanket GET-allow below. */
 const SYNTHETIC_EMBEDDINGS_PATH = '/api/taxonomy/synthetic-embeddings';
@@ -379,5 +428,6 @@ export function isAnonAllowedRoute(method: string, urlPath: string): boolean {
   if (method === 'PUT' || method === 'DELETE') return false;
 
   // POST: allowlist read-like operations, block everything else
-  return ANON_SAFE_POST_PATHS.some(p => urlPath === p);
+  return ANON_SAFE_POST_PATHS.some(p => urlPath === p)
+    || ANON_SAFE_POST_REGEXES.some(r => r.test(urlPath));
 }

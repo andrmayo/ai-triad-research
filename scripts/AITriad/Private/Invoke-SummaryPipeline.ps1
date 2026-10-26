@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
+# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 # Licensed under the MIT License. See LICENSE file in the project root.
 
 # Shared pipeline worker for POV summary extraction.
@@ -58,7 +58,7 @@ function Invoke-SummaryPipeline {
         [Parameter(Mandatory)][string]$SnapshotText,
         [Parameter(Mandatory)][string]$DocId,
         [Parameter(Mandatory)][object]$Metadata,
-        [Parameter(Mandatory)][string]$ApiKey,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ApiKey,
         [Parameter(Mandatory)][string]$Model,
         [double]$Temperature = 0.1,
         [Parameter(Mandatory)][string]$TaxonomyVersion,
@@ -93,14 +93,48 @@ function Invoke-SummaryPipeline {
         $TaxDir = Get-TaxonomyDir
         foreach ($F in $TaxFiles) {
             $P = Join-Path $TaxDir $F
-            if (Test-Path $P) { $TaxContext[$F] = Get-Content $P -Raw | ConvertFrom-Json }
+            if (Test-Path $P) {
+                $TaxContext[$F] = Get-Content $P -Raw | ConvertFrom-Json
+                Set-TaxonomyDocumentSelectable -Document $TaxContext[$F] -Name $F   # prompt only (t/4356)
+            }
         }
         $TaxonomyJson = $TaxContext | ConvertTo-Json -Depth 20 -Compress:$false
         Write-Verbose "Pipeline: full taxonomy injected"
     }
     else {
-        $QueryWords = ($SnapshotText -split '\s+') | Select-Object -First 500
-        $QueryText = "$($Metadata.title). $($QueryWords -join ' ')"
+        $RagQueryText = "$($Metadata.title). $SnapshotText"
+
+        # Window + embed the WHOLE document once (t/4468), and reuse the same windows/vectors for both
+        # CHESS's classification sample (t/4477) and the RAG candidate set below — one model load, not two.
+        $DocSplit = Split-RagQueryWindows -Text $RagQueryText
+        if ($DocSplit.SkippedSections -gt 0) { Write-Verbose "Pipeline: skipped $($DocSplit.SkippedSections) back-matter section(s)" }
+        $DocWindowTexts = @($DocSplit.Windows)
+        $DocWindowEmb = if ($DocWindowTexts.Count -gt 0) { Invoke-BatchEmbeddings -Texts $DocWindowTexts } else { @{} }
+        $DocWindowVectors = [System.Collections.Generic.List[double[]]]::new()
+        foreach ($T in $DocWindowTexts) { if ($DocWindowEmb.ContainsKey($T)) { $DocWindowVectors.Add([double[]]$DocWindowEmb[$T]) } }
+
+        # CHESS classification sample: an evenly spaced, section-stratified sample across the WHOLE
+        # document (t/4477), not just its opening 500 words. Same ~500-word budget, same 1 billed call.
+        $ChessSample = if ($DocWindowTexts.Count -gt 0) { Get-PovClassificationSample -Windows $DocWindowTexts } else { '' }
+        if (-not $ChessSample) {
+            # Windowing produced nothing (e.g. all-back-matter or unparseable text) — fall back to the
+            # former opening-words query rather than sending CHESS an empty string.
+            Write-Warning "Pipeline: CHESS sample was empty after windowing; falling back to the opening-words query (t/4477)."
+            $QueryWords = ($SnapshotText -split '\s+') | Select-Object -First 500
+            $ChessSample = ($QueryWords -join ' ')
+        }
+        $QueryText = "$($Metadata.title). $ChessSample"
+
+        # Forensic-only cross-check (T0 exemption: nothing branches on it, logged for observability).
+        if ($DocWindowVectors.Count -gt 0) {
+            $PovCheck = Get-PovWindowSimilarityCheck -WindowVectors $DocWindowVectors.ToArray()
+            if ($PovCheck) {
+                foreach ($Camp in $PovCheck.Keys) {
+                    $Mean = [Math]::Round((($PovCheck[$Camp] | Measure-Object -Average).Average), 3)
+                    Write-Verbose "Pipeline: window/camp cross-check — $Camp mean cosine $Mean (forensic only, t/4477)"
+                }
+            }
+        }
 
         try {
             $__ChessSw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -110,10 +144,19 @@ function Invoke-SummaryPipeline {
             Write-Verbose "Pipeline: CHESS classified POVs: $($RelevantPovs -join ', ')"
 
             $AllPovs = @('accelerationist', 'safetyist', 'skeptic')
-            $TaxonomyJson = Get-RelevantTaxonomyNodes -Query $QueryText `
-                -MaxTotal $RagMaxTotal -MinPerCategory 3 `
-                -POV $AllPovs -IncludeSituations -Format context `
-                -CrossEncoderRerank:$CrossEncoderRerank
+            if ($DocWindowVectors.Count -gt 0) {
+                $TaxonomyJson = Get-RelevantTaxonomyNodes -Query $RagQueryText -QueryVectors $DocWindowVectors.ToArray() `
+                    -MaxTotal $RagMaxTotal -MinPerCategory 3 `
+                    -POV $AllPovs -IncludeSituations -Format context `
+                    -CrossEncoderRerank:$CrossEncoderRerank
+            }
+            else {
+                # Windowing produced nothing; Get-RelevantTaxonomyNodes falls back to its own single-encode path.
+                $TaxonomyJson = Get-RelevantTaxonomyNodes -Query $RagQueryText `
+                    -MaxTotal $RagMaxTotal -MinPerCategory 3 `
+                    -POV $AllPovs -IncludeSituations -Format context `
+                    -CrossEncoderRerank:$CrossEncoderRerank
+            }
             Write-Verbose "Pipeline: RAG selected ~$([int]($TaxonomyJson.Length / 4)) tokens of taxonomy"
         }
         catch {
@@ -185,6 +228,9 @@ $SnapshotText
     # ── Stage 4: AI extraction ────────────────────────────────────────────────
     $SummaryObject = $null
     $FireStats = $null
+    # The extraction call's output budget (single-shot and FIRE's initial call), returned as MaxTokens
+    # so Finalize-Summary records the value actually used (t/4079).
+    $ExtractionMaxTokens = 32768
     $AiBackend = ''
     $DensityCheck = $null
 
@@ -192,7 +238,7 @@ $SnapshotText
         Write-Verbose "Pipeline: using FIRE iterative extraction"
         $FireResult = Invoke-IterativeExtraction `
             -Prompt $FullPrompt -SystemInstruction $SysInstruction `
-            -Model $Model -ApiKey $ApiKey -Temperature $Temperature
+            -Model $Model -ApiKey $ApiKey -Temperature $Temperature -MaxTokens $ExtractionMaxTokens
 
         $SummaryObject = $FireResult.Summary
         $AiBackend = $FireResult.Backend
@@ -219,7 +265,7 @@ $SnapshotText
                 -Model       $Model `
                 -ApiKey      $ApiKey `
                 -Temperature $Temperature `
-                -MaxTokens   32768 `
+                -MaxTokens   $ExtractionMaxTokens `
                 -JsonMode `
                 -TimeoutSec  600
             $__SsSw.Stop()
@@ -281,7 +327,7 @@ $SnapshotText
         if ($Sniff2.ShouldFire) {
             Write-Verbose "Pipeline AutoFire Stage 2: $($Sniff2.Reason) — re-running with FIRE"
             $FireResult = Invoke-IterativeExtraction `
-                -Prompt $FullPrompt -Model $Model -ApiKey $ApiKey -Temperature $Temperature
+                -Prompt $FullPrompt -Model $Model -ApiKey $ApiKey -Temperature $Temperature -MaxTokens $ExtractionMaxTokens
             if ($FireResult.Summary) {
                 $SummaryObject = $FireResult.Summary
                 $AiBackend = $FireResult.Backend
@@ -325,31 +371,12 @@ $SnapshotText
     }
 
     # ── Stage 6: Unmapped concept resolution ──────────────────────────────────
-    $UnmappedRaw = if ($SummaryObject.PSObject.Properties['unmapped_concepts']) { $SummaryObject.unmapped_concepts } else { $null }
-    if ($UnmappedRaw -and @($UnmappedRaw).Count -gt 0) {
-        try {
-            $Resolution = Resolve-UnmappedConcepts -UnmappedConcepts @($UnmappedRaw)
-            if ($Resolution.Resolved.Count -gt 0) {
-                $SummaryObject.unmapped_concepts = @($Resolution.Remaining)
-                Write-Verbose "Pipeline: resolved $($Resolution.Resolved.Count) unmapped concept(s)"
-            }
-        }
-        catch {
-            Write-Verbose "Pipeline: unmapped resolution failed — $($_.Exception.Message)"
-        }
-    }
+    Resolve-PipelineUnmappedConcepts -SummaryObject $SummaryObject -DocId $DocId
 
     # ── Stage 7: Collect stats and return ─────────────────────────────────────
     $Elapsed = (Get-Date) - $PipelineStart
-    $Camps = @('accelerationist', 'safetyist', 'skeptic')
-    $TotalPoints = 0; $NullNodes = 0
-    foreach ($Camp in $Camps) {
-        $CampData = $SummaryObject.pov_summaries.$Camp
-        if ($CampData -and $CampData.PSObject.Properties['key_points'] -and $CampData.key_points) {
-            $TotalPoints += @($CampData.key_points).Count
-            $NullNodes += @($CampData.key_points | Where-Object { $null -eq $_.taxonomy_node_id }).Count
-        }
-    }
+    $KpCounts = Get-SummaryKeyPointNodeCount -SummaryObject $SummaryObject -Context "Invoke-SummaryPipeline ($DocId)"
+    $TotalPoints = $KpCounts.TotalPoints; $NullNodes = $KpCounts.NullNodes
     $FactualRaw = if ($SummaryObject.PSObject.Properties['factual_claims']) { $SummaryObject.factual_claims } else { $null }
     if ($FactualRaw) { $FactualCount = @($FactualRaw).Count } else { $FactualCount = 0 }
     $UnmappedRaw2 = if ($SummaryObject.PSObject.Properties['unmapped_concepts']) { $SummaryObject.unmapped_concepts } else { $null }
@@ -387,7 +414,72 @@ $SnapshotText
         UnmappedCount  = $UnmappedCount
         ElapsedSeconds = [Math]::Round($Elapsed.TotalSeconds, 1)
         FireStats      = $FireStats
+        MaxTokens      = $ExtractionMaxTokens
         TaxonomyJson   = $TaxonomyJson
         UsedFire       = [bool]$IterativeExtraction
     }
+}
+
+function Resolve-PipelineUnmappedConcepts {
+    <#
+    .SYNOPSIS
+        Stage 6 of Invoke-SummaryPipeline: cross-POV fuzzy match on the model's unmapped_concepts.
+        When any concept resolves, $SummaryObject.unmapped_concepts becomes the remaining ones.
+    .DESCRIPTION
+        Null entries are skipped with a WARN that names how many (t/4168). Resolve-UnmappedConcepts
+        takes [object[]] without [AllowNull()], so a single null used to fail the whole step with
+        "Cannot bind argument ... because it is null". When nothing resolves, the summary is left as
+        is, nulls included; Finalize-Summary drops them (t/3907).
+        A failure is a fallback (every concept stays unmapped), so it is a WARN, not Verbose (t/4168).
+    #>
+    param([object]$SummaryObject, [string]$DocId)
+    $UnmappedRaw = Get-SummaryProp $SummaryObject 'unmapped_concepts'
+    if (-not $UnmappedRaw -or @($UnmappedRaw).Count -eq 0) { return }
+    $All = @($UnmappedRaw)
+    $Concepts = @($All.Where({ $null -ne $_ }))
+    $NullCount = $All.Count - $Concepts.Count
+    if ($NullCount -gt 0) {
+        Write-Warning "Invoke-SummaryPipeline: skipped $NullCount null unmapped_concepts entry/entries for '$DocId' before unmapped resolution (t/4168)"
+    }
+    if ($Concepts.Count -eq 0) { return }
+    try {
+        $Resolution = Resolve-UnmappedConcepts -UnmappedConcepts $Concepts
+        $ResolvedCount = @($Resolution.Resolved).Count
+        if ($ResolvedCount -gt 0) {
+            $SummaryObject.unmapped_concepts = @($Resolution.Remaining)
+            Write-Verbose "Pipeline: resolved $ResolvedCount unmapped concept(s)"
+        }
+    }
+    catch {
+        Write-Warning "Invoke-SummaryPipeline: unmapped concept resolution failed for '$DocId' — keeping all $($Concepts.Count) unmapped concept(s) unresolved: $($_.Exception.Message)"
+    }
+}
+
+function Get-SummaryKeyPointNodeCount {
+    <#
+    .SYNOPSIS
+        @{ TotalPoints; NullNodes } over the three camps' key_points (summary as PSCustomObject or dictionary).
+    .DESCRIPTION
+        Used by Invoke-SummaryPipeline's Stage 7 and by each chunk in Invoke-ChunkedSummary. Their
+        inline reads of $_.taxonomy_node_id threw under StrictMode on a key point without that field,
+        before Finalize-Summary's guard (Repair-SummaryKeyPointFields) could run (t/4172). A key point
+        with no taxonomy_node_id field, or a null key point, now counts as unmapped like a null node
+        ID, and the missing fields get one WARN per camp naming the count. A missing camp or
+        key_points list counts as no points, as it did.
+    #>
+    param([object]$SummaryObject, [string]$Context)
+    $TotalPoints = 0; $NullNodes = 0
+    $PovSummaries = Get-SummaryProp $SummaryObject 'pov_summaries'
+    foreach ($Camp in $script:AITriadPovCamps) {
+        $KeyPoints = Get-SummaryProp (Get-SummaryProp $PovSummaries $Camp) 'key_points'
+        if (-not $KeyPoints) { continue }
+        $Points = @($KeyPoints)
+        $NoField = @($Points.Where({ $null -eq $_ -or -not (Test-SummaryField $_ 'taxonomy_node_id') })).Count
+        if ($NoField -gt 0) {
+            Write-Warning "${Context}: $NoField key point(s) in pov_summaries.$Camp have no taxonomy_node_id field — counting them as unmapped (t/4172)"
+        }
+        $TotalPoints += $Points.Count
+        $NullNodes += @($Points.Where({ $null -eq (Get-SummaryProp $_ 'taxonomy_node_id') })).Count
+    }
+    @{ TotalPoints = $TotalPoints; NullNodes = $NullNodes }
 }

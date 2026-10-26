@@ -33,7 +33,7 @@ describe('generation helpers thread the abort signal (t/2508)', () => {
     const ctrl = newAbortController();
     generateText.mockResolvedValue({ text: 'hi' });
     await generateTextWithProgress('prompt', 'model-x', 'activity', vi.fn());
-    expect(generateText).toHaveBeenCalledWith('prompt', 'model-x', undefined, undefined, { signal: ctrl.signal });
+    expect(generateText).toHaveBeenCalledWith('prompt', 'model-x', undefined, undefined, { signal: ctrl.signal, purpose: 'activity' });
   });
 
   it('generateTextWithProgress re-throws a tagged cancellation (does not swallow)', async () => {
@@ -47,13 +47,42 @@ describe('generation helpers thread the abort signal (t/2508)', () => {
     generateText.mockResolvedValue({ text: 'out' });
     const gen = makeStageGenerate(vi.fn(), 'base-model');
     await gen('prompt', 'call-model', { temperature: 0.4, timeoutMs: 1234 }, 'label');
-    expect(generateText).toHaveBeenCalledWith('prompt', 'call-model', 1234, 0.4, { signal: ctrl.signal });
+    expect(generateText).toHaveBeenCalledWith('prompt', 'call-model', 1234, 0.4, { signal: ctrl.signal, purpose: 'label' });
   });
 
   it('with no active controller the signal is undefined (no-signal callers unchanged)', async () => {
     cancelAndResetAbort(); // _abortController = null
     generateText.mockResolvedValue({ text: 'hi' });
     await generateTextWithProgress('p', 'm', 'a', vi.fn());
-    expect(generateText).toHaveBeenCalledWith('p', 'm', undefined, undefined, { signal: undefined });
+    expect(generateText).toHaveBeenCalledWith('p', 'm', undefined, undefined, { signal: undefined, purpose: 'a' });
+  });
+});
+
+describe('makeStageGenerate — stop-reason guard (t/3525, mirrors lib/debate/aiAdapter.ts)', () => {
+  beforeEach(() => {
+    generateText.mockReset();
+    cancelAndResetAbort();
+  });
+
+  it('throws an ActionableError instead of returning truncated text on max_tokens', async () => {
+    generateText.mockResolvedValue({ text: '{"incomplete', stopReason: 'max_tokens' });
+    const gen = makeStageGenerate(vi.fn(), 'base-model');
+    await expect(gen('prompt', 'call-model', {}, 'brief')).rejects.toMatchObject({
+      message: expect.stringContaining('truncated at provider output limit'),
+    });
+  });
+
+  it('throws an ActionableError on content_filter instead of returning partial text', async () => {
+    generateText.mockResolvedValue({ text: '', stopReason: 'content_filter' });
+    const gen = makeStageGenerate(vi.fn(), 'base-model');
+    await expect(gen('prompt', 'call-model', {}, 'brief')).rejects.toMatchObject({
+      message: expect.stringContaining('blocked by provider content policy'),
+    });
+  });
+
+  it('returns text normally when stopReason is stop/undefined', async () => {
+    generateText.mockResolvedValue({ text: 'complete response', stopReason: 'stop' });
+    const gen = makeStageGenerate(vi.fn(), 'base-model');
+    await expect(gen('prompt', 'call-model', {}, 'brief')).resolves.toBe('complete response');
   });
 });

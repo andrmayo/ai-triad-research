@@ -5,7 +5,7 @@ import { useState, useMemo, useEffect, useRef } from 'react';
 import { nodePovFromId } from '@lib/debate/nodeIdUtils';
 import { useTaxonomyStore } from '../../hooks/useTaxonomyStore';
 import { useSyncStatus } from '../../hooks/useSyncStatus';
-import { type SyncStatus } from '../../utils/syncApi';
+import { resyncTracked, type SyncStatus } from '../../utils/syncApi';
 import { useOnlineStatus } from '../../hooks/useOnlineStatus';
 import { useFlag } from '../../hooks/useFeatureFlags';
 import { TheoryLink } from '../shared';
@@ -13,6 +13,9 @@ import { UnsyncedChangesDrawer } from './UnsyncedChangesDrawer';
 import { SyncDiagnosticsDialog } from './SyncDiagnosticsDialog';
 import { TaxonomyDiffPanel } from './TaxonomyDiffPanel';
 import { TaxonomyUpdateToast } from './TaxonomyUpdateToast';
+import { mapErrorToUserMessage } from '../../utils/errorMessages';
+import { getGlobalRecorder } from '@lib/flight-recorder/index';
+import type { StaleBranchHint } from '../../hooks/useTaxonomyStore/slices/staleBranchHint';
 import './SaveBar.css';
 
 function formatFileKey(key: string): string {
@@ -22,7 +25,7 @@ function formatFileKey(key: string): string {
 }
 
 export function SaveBar() {
-  const { dirty, save, saveError, dismissSaveError, validationErrors, integrityIssues, fixIntegrityErrors } = useTaxonomyStore();
+  const { dirty, save, saveError, dismissSaveError, validationErrors, integrityIssues, fixIntegrityErrors, staleBranchHint } = useTaxonomyStore();
   const adminFlag = useFlag('permission-admin-features');
   const isOnline = useOnlineStatus();
   const isDirty = dirty.size > 0;
@@ -30,7 +33,45 @@ export function SaveBar() {
   const [syncDrawerOpen, setSyncDrawerOpen] = useState(false);
   const [diffPanelOpen, setDiffPanelOpen] = useState(false);
   const [syncDiagOpen, setSyncDiagOpen] = useState(false);
+  const [resyncing, setResyncing] = useState(false);
+  const [resyncNote, setResyncNote] = useState<{ text: string; ok: boolean } | null>(null);
   const { status: syncStatus, refresh: refreshSync } = useSyncStatus();
+
+  // t/4346: resync the session branch onto main from the save-bar error, when the failure
+  // is a stale-branch shape (t/4325). Conflicts hand off to the drawer's RebaseConflictModal.
+  const onResync = async () => {
+    setResyncing(true);
+    setResyncNote(null);
+    try {
+      const res = await resyncTracked('rebase');
+      if (res.conflicts) {
+        setResyncNote({ text: 'Resync hit conflicts — resolve them in the sync panel.', ok: false });
+        setSyncDrawerOpen(true);
+        return;
+      }
+      // Fix-forward (t/4346, PR #3731 comment 6335280772): the Resync button only ever shows
+      // right after a failed save, so a forced loadAll() here would wipe the user's live
+      // unsaved edits (loadAll resets `dirty`). Keep them; the user retries Save themselves.
+      dismissSaveError();
+      await refreshSync();
+      // t/4439: refresh the stale untouched nodes from the rebased branch without losing edits.
+      // r.message is informational (a multi-line conflict note) when r.ok, and a read-failure
+      // note otherwise (p/580#25) — styled accordingly below.
+      const r = await useTaxonomyStore.getState().reloadKeepingEdits();
+      if (r.message) setResyncNote({ text: r.message, ok: r.ok });
+    } catch (err) {
+      getGlobalRecorder()?.record({
+        type: 'system.error',
+        component: 'save-bar',
+        level: 'error',
+        message: 'Resync from save-bar failed',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+      setResyncNote({ text: mapErrorToUserMessage(err), ok: false });
+    } finally {
+      setResyncing(false);
+    }
+  };
 
   // Refresh sync status after a save completes (dirty transitions non-zero → 0).
   const prevDirtyCountRef = useRef(dirty.size);
@@ -95,6 +136,10 @@ export function SaveBar() {
         fixIntegrityErrors={fixIntegrityErrors}
         dismissSaveError={dismissSaveError}
         groupedErrors={groupedErrors}
+        staleBranchHint={staleBranchHint}
+        resyncing={resyncing}
+        resyncNote={resyncNote}
+        onResync={() => void onResync()}
       />
       <div className="save-bar-right">
         <SaveBarSyncBadges
@@ -221,11 +266,14 @@ function SaveBarSyncBadges({ syncStatus, onOpenDrawer, onOpenDiffPanel }: {
 
 function SaveBarErrorSection({
   saveError, hasErrors, showErrors, setShowErrors, integrityIssues, fixIntegrityErrors, dismissSaveError, groupedErrors,
+  staleBranchHint, resyncing, resyncNote, onResync,
 }: {
   saveError: string | null; hasErrors: boolean; showErrors: boolean;
   setShowErrors: React.Dispatch<React.SetStateAction<boolean>>;
   integrityIssues: unknown[]; fixIntegrityErrors: () => void; dismissSaveError: () => void;
   groupedErrors: Record<string, { path: string; message: string }[]>;
+  staleBranchHint: StaleBranchHint | null; resyncing: boolean;
+  resyncNote: { text: string; ok: boolean } | null; onResync: () => void;
 }) {
   return (
     <>
@@ -248,10 +296,27 @@ function SaveBarErrorSection({
               Fix it
             </button>
           )}
+          {staleBranchHint && (
+            <button
+              type="button"
+              className="save-bar-fix-btn"
+              onClick={(e) => { e.stopPropagation(); onResync(); }}
+              disabled={resyncing}
+              title={`Fetch and merge main into ${staleBranchHint.sessionBranch} (${staleBranchHint.behindBy} commit${staleBranchHint.behindBy === 1 ? '' : 's'} behind)`}
+            >
+              {resyncing ? 'Resyncing…' : 'Resync'}
+            </button>
+          )}
+          {resyncNote && (
+            <span className={resyncNote.ok ? 'save-bar-resync-note' : 'save-bar-resync-error'}>
+              {resyncNote.text}
+            </span>
+          )}
           <button
             type="button"
             className="save-bar-error-dismiss"
             onClick={(e) => { e.stopPropagation(); setShowErrors(false); dismissSaveError(); }}
+            disabled={resyncing}
             title="Dismiss error"
             aria-label="Dismiss error"
           >

@@ -23,6 +23,7 @@ import type { OpEdSet, OpEdMember, OpEdParams } from '../../../../lib/oped/types
 import type { PovKey } from '../../../../lib/oped/types.js';
 import { generateOpEdSet } from '../../../../lib/oped/generate.js';
 import type { GenerateOpEdRequest, OpEdGeneratorDeps } from '../../../../lib/oped/generate.js';
+import { parseOpEdRequest } from '../../../../lib/oped/schemas.js';
 import { makeElectronAIAdapter } from '../electronAIAdapter.js';
 import { validateCreateOpEdPayload } from './opedValidation.js';
 import { parseShimLine, decodeB64Fields, buildConvertStdin, parseShimError } from './opedShimTransport.js';
@@ -122,6 +123,7 @@ function runGetOpEdConvert(
   return new Promise((resolve, reject) => {
     const child = spawn('pwsh', ['-NoProfile', '-NonInteractive', '-File', PREP_SHIM_PATH], {
       stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
     });
 
     let settled = false;
@@ -266,6 +268,9 @@ export function registerOpEdHandlers(): void {
     // Guard extracted to a pure, unit-tested validator (t/2910; regression fixed in t/2908).
     const validationError = validateCreateOpEdPayload({ topic, url, voices });
     if (validationError) throw validationError;
+    // t/3994: reject an unknown/unregistered tag before Stage A fetch work starts, rather than
+    // failing partway through generation (parseOpEdRequest throws ActionableError on its own).
+    parseOpEdRequest({ povs: voices, params });
 
     const setId = crypto.randomUUID();
     const createdAt = new Date().toISOString();
@@ -345,7 +350,7 @@ export function registerOpEdHandlers(): void {
     };
 
     const deps: OpEdGeneratorDeps = {
-      adapter: makeElectronAIAdapter(getVoiceTimeoutMs()),
+      adapter: makeElectronAIAdapter('OpEd Generation', getVoiceTimeoutMs()),
       promptsDir: PROMPTS_DIR,
       repoRoot: PROJECT_ROOT,
     };

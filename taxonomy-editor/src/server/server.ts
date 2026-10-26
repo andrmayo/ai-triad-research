@@ -22,7 +22,10 @@ import { getGlobalRecorder, setGlobalRecorder } from '../../../lib/flight-record
 import { warmup as warmupEmbeddings } from '../../../lib/embeddings/onnxEmbedding.js';
 import { prewarmEmbeddingsCache, getEmbeddingsCacheStatus } from './ai/aiBackends.js';
 import { startEventLoopMonitor } from './eventLoopMonitor.js';
+import { startEmbedQueueDepthMonitor } from './embedQueueDepthMonitor.js';
 import { startGroundingSweep } from './groundingSweepScheduler.js';
+import { enforceReadOnlyGuard, getReadOnlyPrincipalEntries } from './readOnlyGuard.js';
+import { logUnreachableAllowlistEntriesAtBoot } from './identityAllowlistCheck.js';
 
 const require = createRequire(import.meta.url);
 
@@ -34,11 +37,14 @@ import {
   getStoredApiKeys, addApiKey, removeApiKey, resolveDataPath,
   getPaidGeminiFallbackKey, setPaidGeminiFallbackKey, deletePaidGeminiFallbackKey,
   BROKER_SCRIPT, SCRIPTS_DIR, getProjectRoot, type AIBackend,
-  STORAGE_MODE, CACHE_DIR, isEmbeddingWorkerOffloadEnabled, getEmbeddingWorkerPoolSize,
+  STORAGE_MODE, CACHE_DIR, isEmbeddingWorkerOffloadEnabled, getEmbeddingWorkerPoolSize, getMaxReplicas,
 } from './config.js';
+import { effectivePerReplicaRpm } from './ai/rpmLimiter.js';
 import { configureEmbeddingWorkerPool } from '../../../lib/embeddings/offThreadEmbedding.js';
 import { GitHubAPIBackend } from './storage/githubAPIBackend.js';
 import { SessionBranchManager } from './storage/sessionBranchManager.js';
+import { flushOverlaysWithDeadline, FORCE_EXIT_TIMEOUT_MS } from './shutdownOverlayFlush.js';
+import { logRequestMetrics, REQUEST_METRICS_LOG_DELAY_MS } from './requestMetricsLog.js';
 import { runWithUser, getCurrentUserId, getSessionBranchName, setSessionBranchName, deriveStorageUserId, type UserContext } from './security/userContext.js';
 import { isAuthDisabledAllowed, isPathWithinDir, isTerminalAccessAllowed, isAnonAllowedRoute, invalidRouteParam, missingApiKeyError, resolveTestPersonaOverride } from './security/accessControl.js';
 import { sanitizeUserText } from './security/contentSanitizer.js';
@@ -55,6 +61,7 @@ import { parseCookies } from './httpCookies.js';
 import { registerAllRoutes } from './routes/all.js';
 import { invalidateConflictsCache, warmConflictsCache } from './routes/conflicts.js';
 import { anonSessionCookiesWithCreated } from './routes/session.js';
+import { setDataRootReady, setDataRootFailed } from './routes/dataRootReadiness.js'; // t/3309: data-root → /readyz readiness cache
 import { buildLoginPage, FORBIDDEN_PAGE, SW_HEAL_SCRIPT_CSP_HASH, loginPageHeaders } from './loginPage.js';
 import type { ServerCtx } from './routes/context.js';
 import { listFlags, setFlag, deleteFlag, type FlagDef } from './featureFlags.js';
@@ -72,6 +79,7 @@ import * as proxyTiers from './ai/proxyTiers.js';
 import * as rateLimiter from './security/rateLimiter.js';
 import * as analytics from './community/analytics.js';
 import { FlightRecorder } from '../../../lib/flight-recorder/flightRecorder.js';
+import { INQUIRY_BOOT_ID } from './inquiryJobs.js';
 import { log, runWithRequestContext, generateRequestId, getRequestId, getRequestContext } from './logger.js';
 import {
   registerReviewHandler,
@@ -84,6 +92,7 @@ import type { ReviewAction } from './community/admin/types.js';
 import { calibrationReviewHandler } from './community/admin/calibrationHandler.js';
 import { communityReviewHandler } from './community/admin/communityReviewHandler.js';
 import { serveStatic } from './staticServe.js';
+import { normalizePrincipalNameHeader } from './principalName.js';
 
 // Register review domain handlers at startup so the unified admin endpoints
 // (queue/stats/action/detail) can delegate to them (t/646, t/647, t/650).
@@ -188,6 +197,22 @@ if (process.platform === 'win32') {
 }
 
 export { serverRecorder };
+
+// t/3724: one boot event between the last good poll and a first 404 is enough to distinguish
+// a routine process restart from a crash from a scale-to-zero cycle — the discriminating signal
+// the incident that filed this ticket couldn't get from the inquiry events alone. boot_id is
+// shared with inquiryJobs.ts's INQUIRY_BOOT_ID by design (see that file's t/3724 coordination note).
+getGlobalRecorder()?.record({
+  type: 'server.started', component: 'server', level: 'info',
+  message: 'Server process started',
+  data: {
+    pid: process.pid,
+    boot_id: INQUIRY_BOOT_ID,
+    build_date: process.env.BUILD_DATE ?? null,
+    build_commit: process.env.BUILD_COMMIT ?? null,
+    node_version: process.version,
+  },
+});
 
 // Merge the bounded server-log buffer into a server dump's ndjson as `log.line`
 // entries, so a dump is self-contained for offline triage without a Log
@@ -338,9 +363,8 @@ const serverCtx: ServerCtx = {
   emitToUser,
 };
 
-// Best-effort client IP for rate limiting — first X-Forwarded-For hop (Azure
-// ingress sets it) else the socket address. (M7)
-// getClientIp moved to httpKit.ts (t/1347) — shared by server.ts + routes/*.ts.
+// Client IP for rate limiting (M7): the rightmost X-Forwarded-For entry when the
+// peer is our proxy, else the socket address (t/4410). Lives in httpKit.ts (t/1347).
 
 // ── Route registration (t/2749: consolidated into routes/registerAll.ts) ──
 // Order is preserved verbatim — see registerAll.ts for the per-cluster comments.
@@ -543,6 +567,9 @@ async function handleRequestInner(
 
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
+  // Prod incident 2026-10-21: Easy Auth omits -name for GitHub; fill it from the claims
+  // before any reader (here, routes/session.ts) keys "signed in" on it.
+  normalizePrincipalNameHeader(req, AZURE_AUTH_ENABLED);
   const identity = resolvePrincipalIdentity(req, res);
   if (!identity) return;
   const { principalName, idp } = identity;
@@ -602,6 +629,7 @@ async function handleRequestInner(
     const route = matchRoute(req.method!, reqPath);
 
     if (enforceWriteRateLimit(req, res, route, reqPath)) return;
+    if (enforceReadOnlyGuard(req, res, !!route, reqPath, principalName, idp)) return;
 
     if (route) {
       await dispatchMatchedRoute(req, res, route, reqPath);
@@ -1098,6 +1126,7 @@ function isTerminalWebSocketAllowed(req: http.IncomingMessage): boolean {
 }
 
 server.on('upgrade', (req, socket, head) => {
+  normalizePrincipalNameHeader(req, AZURE_AUTH_ENABLED); // GitHub -name fallback (see principalName.ts)
   // S-WS-ORIGIN + t/2532: block cross-origin WS upgrades (WS bypasses CORS); same-origin accepted, allowlist enforced in dev too.
   {
     const origin = (req.headers.origin || '') as string;
@@ -1170,6 +1199,7 @@ function handleTerminalConnection(ws: WebSocket) {
     // in the container (/app/scripts) and dev alike — never a hardcoded path.
     env: { ...safeEnv, TERM: 'xterm-256color', PTY_COLS: '120', PTY_ROWS: '30', AITRIAD_MODULE: path.join(SCRIPTS_DIR, 'AITriad', 'AITriad.psd1') },
     stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
   });
 
   terminalProcess.stdout?.on('data', (data: Buffer) => {
@@ -1232,10 +1262,11 @@ function shutdown(signal: string) {
     fs.writeFileSync(path.join(dumpDir, `server-shutdown-${Date.now()}.jsonl`), ndjson);
   } catch { /* telemetry — silent by design;  best effort */ }
 
-  // 1a. Stop GitHubAPIBackend polling
+  // 1a. Stop GitHubAPIBackend polling (also logs the immediate uncommitted-overlay snapshot, t/4258 Part 1)
   if (githubBackend) {
     githubBackend.shutdown();
   }
+  logRequestMetrics(githubBackend, 'shutdown'); // t/4300: final GitHub-call tally for this process's lifetime
 
   // 1. Kill terminal PTY
   if (terminalProcess) {
@@ -1251,16 +1282,30 @@ function shutdown(signal: string) {
   eventClients.clear();
 
   // 3. Stop accepting new connections and wait for in-flight requests
-  server.close(() => {
-    log.server.info('All connections closed, exiting');
+  const closeDone = new Promise<void>((resolve) => {
+    server.close(() => { log.server.info('All connections closed'); resolve(); });
+  });
+
+  // 2a. Flush debounced overlay commits concurrently with closing connections (t/4258/t/4276 C4).
+  // closeDone is passed through so the flush can catch a write that lands after its first
+  // snapshot but before its connection actually drains (SO e/315#2).
+  const flushDone = flushOverlaysWithDeadline(githubBackend, closeDone).catch((err) => {
+    getGlobalRecorder()?.record({
+      type: 'system.error', component: 'server', level: 'warn', message: 'Overlay flush at shutdown threw',
+      error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+    });
+  });
+
+  void Promise.all([closeDone, flushDone]).then(() => {
+    log.server.info('Graceful shutdown complete, exiting');
     process.exit(0);
   });
 
-  // 4. Force exit after 10s if graceful shutdown stalls
+  // 4. Force exit if graceful shutdown stalls
   setTimeout(() => {
-    log.server.error('Graceful shutdown timed out after 10s, forcing exit');
+    log.server.error(`Graceful shutdown timed out after ${FORCE_EXIT_TIMEOUT_MS / 1000}s, forcing exit`);
     process.exit(1);
-  }, 10_000).unref();
+  }, FORCE_EXIT_TIMEOUT_MS).unref();
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -1293,29 +1338,33 @@ initAnonymousSessionStore({
 
 // ── Start ──
 assertStateRootIsolation(); // t/2643: refuse start if staging's state root wasn't isolated (env drift) — no-op prod/local
-// t/3296 (t/3290 prevention): fail LOUD on an unresolved/misprovisioned data root. Backends are set
-// above; assert taxonomy/ + dictionary/ are present AND non-empty via the ACTIVE backend (validateDataRoot
-// uses listDirectoryStrict — profile-agnostic: fs for local, GitHub Contents for hosted; a transient
-// GitHub blip throws rather than false-empties). On failure: no showErrorBox (server-side) — log the
-// ActionableError to stdout (→ Log Analytics) + exit non-zero so the container crash-loops VISIBLY
-// instead of silently serving empty panels. Before listen, so an un-provisioned revision never serves.
+// t/3296 (t/3290 prevention) → t/3309 Path B (step-3): assert taxonomy/ + dictionary/ are present AND
+// non-empty via the ACTIVE backend (validateDataRoot uses listDirectoryStrict — profile-agnostic: fs
+// local, GitHub Contents hosted; a transient blip throws rather than false-empties). The outcome is
+// cached for the /readyz readiness gate: ready → /readyz 200 (falls through to the embeddings check),
+// failed → /readyz 503 'data-root-failed'. The boot NO LONGER exit(1)s — the /readyz deploy warm-gate
+// (proven to block a misprovisioned promotion by the Arm-B GV, t/3309#21) is now the SOLE data-root
+// deploy protection: a misprovisioned revision never promotes (warm-gate blocks + rolls back) while
+// the old rev keeps serving, so the process stays up (liveness) with no crash-loop (t/2683 class).
 try {
   await fileIO.validateDataRoot();
+  setDataRootReady(); // t/3309: cache data-root readiness for the /readyz gate
 } catch (err) {
-  // t/3296/t/3305: the hard exit(1) is ENFORCE-gated (default WARN-only). A credential-less boot —
-  // the container liveness smoke test (github-api mode, NO GitHub App creds) — MUST still start, so
-  // exit(1) fires ONLY when DATA_ROOT_VALIDATION_ENFORCE is set. DevOps sets it in staging→prod (real
-  // creds + data present) as the gated promotion to prod-blocking (t/2683 real-env-first): staging
-  // proves the exit path against the real backend before prod. Default warn-only is OBSERVABLE (WARN
-  // to stdout→Log_s), never a silent-empty; only the credential-less smoke boot relies on it.
-  const enforce = /^(1|true|yes|on)$/i.test(process.env.DATA_ROOT_VALIDATION_ENFORCE ?? '');
+  // t/3309 step-3: record the definitive failure for the /readyz gate, then CONTINUE (no exit(1)).
+  // The boot exit(1)/DATA_ROOT_VALIDATION_ENFORCE path is REMOVED — after the staging Arm-B GV proved
+  // the /readyz warm-gate blocks a misprovisioned rev (t/3309#21), the readiness gate supersedes the
+  // boot exit. Co-landed with DevOps retiring DATA_ROOT_VALIDATION_ENFORCE from main.bicep (joint-gv).
+  // Failure stays OBSERVABLE via the WARN below → stdout→Log_s (condition 4).
+  setDataRootFailed(err instanceof Error ? err.message : String(err));
   const errObj = err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : String(err);
-  if (enforce) {
-    log.server.error({ err: errObj, enforce }, 'Data root validation failed at boot — refusing to start (DATA_ROOT_VALIDATION_ENFORCE)');
-    process.exit(1);
-  }
-  log.server.warn({ err: errObj, enforce }, 'Data root validation failed at boot — WARN-only (DATA_ROOT_VALIDATION_ENFORCE unset); continuing');
+  log.server.warn({ err: errObj }, 'Data root validation failed at boot — /readyz will report data-root-failed (503); process continues (liveness up), the deploy warm-gate blocks the promotion');
 }
+// t/4298/t/4299/t/4300: WARN-only boot check — github-api's disk cache must never overlap
+// AI_TRIAD_DATA_ROOT (a data-root writer would otherwise silently become what this server
+// serves, with no check against GitHub). Synchronous, never throws, no-op on filesystem mode.
+fileIO.validateCacheDirDisjoint();
+// t/4505 (t/4504 follow-up): WARN-only boot check — an allowlist entry no sign-in can produce under IDENTITY_MAP fails silently (t/4504 ran prod read-write for 2 days unnoticed).
+logUnreachableAllowlistEntriesAtBoot(community.getAdminUsers(), getReadOnlyPrincipalEntries());
 // t/2532 (M12): loopback (127.0.0.1) in dev / 0.0.0.0 in prod; HOST opts into LAN exposure (logged loudly below).
 const BIND_HOST = resolveBindHost(process.env);
 server.listen(PORT, BIND_HOST, () => {
@@ -1329,6 +1378,14 @@ server.listen(PORT, BIND_HOST, () => {
   // so a starvation event (t/3165: 7–8s in-process ONNX froze the loop → ingress-fabricated
   // 500) is directly greppable instead of inferred. Unref'd interval — never holds the process.
   startEventLoopMonitor();
+  // t/4300: logged once ~10min post-boot (past typical warm-up), and again at shutdown.
+  // Unref'd — never holds the process open.
+  setTimeout(() => logRequestMetrics(githubBackend, '10min-post-boot'), REQUEST_METRICS_LOG_DELAY_MS).unref();
+  // t/3373: pre-shed early-warning for the embedding worker-offload pool (t/3211 arm-2's real
+  // trigger). Samples poolStats() and emits ONE stdout WARN (component:'api' → Log Analytics) when
+  // sustained queue depth approaches the dynamic cap — BEFORE a caller eats the 503 queue-shed.
+  // Unref'd interval; inert at K=1 idle (queueDepth 0).
+  startEmbedQueueDepthMonitor();
   // t/3172 (G8b): scheduled full-taxonomy grounding sweep — path-agnostic correctness backstop for
   // batch/PS/Python writes that bypass the inline G8a hook. Gated on GROUNDING_SWEEP_ENABLED
   // (default OFF): inert until the sequenced enable (t/3203 + TL lock-symmetry sign-off). Unref'd.
@@ -1338,6 +1395,13 @@ server.listen(PORT, BIND_HOST, () => {
   // in ACA config but process.env evaluated false" regression (bicep value-form) is then visible
   // immediately, not inferred from a debate's compute path.
   log.server.info({ embeddingWorkerOffload: isEmbeddingWorkerOffloadEnabled() }, 'embedding offload flag at boot');
+  // t/4177: WARN (not info) the effective per-replica Gemini RPM at boot — this is the number a
+  // slow debate is actually paced to, so it must be greppable in Log Analytics without inferring
+  // it from MAX_REPLICAS + the FREE_TIER_RPM_PER_KEY constant.
+  log.server.warn(
+    { maxReplicas: getMaxReplicas(), freeTierRpmPerKey: proxyTiers.FREE_TIER_RPM_PER_KEY, effectivePerReplicaRpm: effectivePerReplicaRpm(proxyTiers.FREE_TIER_RPM_PER_KEY) },
+    'effective per-replica Gemini RPM at boot (t/4177)',
+  );
   // t/3278 Arm-1: log the baked BUILD_SHA at boot so "what SHA is running?" is answerable from LA on
   // every deploy (the durable primitive vs the incidental t/3211 marker). 'unknown' if the build didn't
   // pass --build-arg BUILD_SHA → a visible gap, not a silent one (drift-check reads /health.buildSha).
@@ -1399,6 +1463,8 @@ server.listen(PORT, BIND_HOST, () => {
     log.storage.info('Initializing GitHubAPIBackend');
     githubBackend.initialize().then(async () => {
       log.storage.info('GitHubAPIBackend initialized');
+      // t/4499: same shape as the conflicts-cache warm below (~5.5s cold-start penalty, t/4333#11). Fire-and-forget.
+      fileIO.prewarmNodeSourceIndex();
       // Warm the conflicts cache in the background so the first user request
       // doesn't pay the 5s cold-start penalty (1,242 individual file reads).
       try {
@@ -1416,6 +1482,11 @@ server.listen(PORT, BIND_HOST, () => {
       }
     }).catch((err) => {
       log.storage.error({ err }, 'GitHubAPIBackend initialization failed');
+      // t/4258/t/4281 (Server Storage): serverRecorder.record() alone never
+      // reaches console; alert-fallback-active needs "storage.fallback" in
+      // ContainerAppConsoleLogs_CL. Trivial addition mirroring the storage/
+      // sub-role's fix for the same gap — flagged there, not a design change.
+      log.storage.warn({ err }, 'storage.fallback: GitHubAPIBackend initialization failed');
       serverRecorder.record({
         type: 'storage.fallback', component: 'storage', level: 'warn',
         message: `GitHubAPIBackend init failed: ${err instanceof Error ? err.message : String(err)}`,

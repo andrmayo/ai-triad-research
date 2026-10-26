@@ -45,7 +45,15 @@ function Export-AggregatedCruxes {
         [ValidateRange(1, 10)]
         [int]$MaxLinkedNodes = 5,
 
-        [string]$OutputPath
+        [string]$OutputPath,
+
+        # Run-scoped model override for Phase-5 question_form generation (t/3478). Empty =
+        # use the enrichment.crux-question-form usage default (claude-sonnet-4-6). Set e.g.
+        # -Model gemini-3.5-flash-lite for a cheaper bulk refresh (t/3476) WITHOUT changing
+        # the CL-owned usage default — applied per-call via -Override. Embeddings (Phase 2/4)
+        # are unaffected. Validated only when non-empty.
+        [ValidateScript({ [string]::IsNullOrWhiteSpace($_) -or (Test-AIModelId $_) })]
+        [string]$Model = ''
     )
 
     Set-StrictMode -Version Latest
@@ -303,8 +311,10 @@ function Export-AggregatedCruxes {
     if (Test-Path $EmbPath) {
         $EmbData = Get-Content -Raw $EmbPath | ConvertFrom-Json
         foreach ($Prop in $EmbData.nodes.PSObject.Properties) {
-            # Only include taxonomy nodes (not policies/conflicts)
-            if ($Prop.Name -match '^(acc|saf|skp|sit|cc)-') {
+            # Only include live taxonomy nodes (not policies/conflicts). cc-* is a
+            # RETIRED id-space (migrated to sit-*, t/1308) — excluded so a rebuild can
+            # never re-link a crux to a dead cc-* node (t/3472; see the guard below).
+            if ($Prop.Name -match '^(acc|saf|skp|sit)-') {
                 $NodeVecs[$Prop.Name] = [double[]]@($Prop.Value.vector)
             }
         }
@@ -354,12 +364,20 @@ function Export-AggregatedCruxes {
         Write-Host "  No node embeddings available — skipping node linking" -ForegroundColor Yellow
     }
 
+    # ── cc-* retirement guard (t/3472, migration t/1308) ──────────────────────
+    # linked_node_ids are sourced solely from the current embeddings.json (filtered
+    # to acc/saf/skp/sit above), so a rebuild MUST carry zero retired cc-* refs.
+    # Fail closed if any slip through — a cc-* here means embeddings.json still holds
+    # a retired vector, which would silently degrade downstream corpusCoverage (t/3472).
+    Assert-NoRetiredNodeRefs -Cruxes $AggregatedCruxes -Context 'aggregated-cruxes.json rebuild'
+
     # ── Phase 5: Preserve/generate reviewer-facing fields (t/1507, t/1509, t/1540) ─
     if ($WhatIfPreference) {
         Write-Host 'Phase 5: skipped under -WhatIf (would preserve existing question_form / external_evidence and call AI for new cruxes)' -ForegroundColor Yellow
     } else {
         Write-Host 'Phase 5a: Preserving/generating question_form...' -ForegroundColor Cyan
-        $QfStats = Merge-CruxQuestionForm -Cruxes $AggregatedCruxes -PreviousPath $OutputPath
+        if ($Model) { Write-Host "  question_form model override (run-scoped): $Model" -ForegroundColor Gray }
+        $QfStats = Merge-CruxQuestionForm -Cruxes $AggregatedCruxes -PreviousPath $OutputPath -Model $Model
         Write-Host ("  Preserved: {0} | Generated: {1} | Failed (field omitted): {2}" -f `
             $QfStats.Preserved, $QfStats.Generated, $QfStats.Failed) -ForegroundColor Gray
 

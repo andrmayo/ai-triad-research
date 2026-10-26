@@ -3,11 +3,11 @@
 # AI Triad Taxonomy Editor — Container Image
 # Multi-stage build: compile TypeScript, then copy artifacts to lean runtime.
 #
-# Requires the base image: ghcr.io/jpsnover/ai-triad-base:<date-tag>
+# Requires the base image: ghcr.io/ai-rosetta-stone/ai-triad-base:<date-tag>
 # (see deploy/azure/Dockerfile.base)
 
 # ── Stage 1: Build ──
-FROM node:22.23.2-trixie-slim@sha256:7b8a0c89c54499bee567618f96578e1a12a800f062fbdbfd1fb6a443fa6f6284 AS builder
+FROM node:22.23.3-trixie-slim@sha256:b26b04c123d9ff8ab646ceb18b9d75a1173acf64b9a401094b906d27b29338d4 AS builder
 
 WORKDIR /build
 
@@ -94,7 +94,7 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
 # so onnxEmbedding.ts runs fully offline. Without this, each cold-start downloads
 # from HuggingFace at runtime, hitting the 50s route timeout (t/2784).
 # fp32 is required — quantized output diverges from the stored embeddings.json corpus.
-FROM node:22.23.2-trixie-slim@sha256:7b8a0c89c54499bee567618f96578e1a12a800f062fbdbfd1fb6a443fa6f6284 AS onnx-model
+FROM node:22.23.3-trixie-slim@sha256:b26b04c123d9ff8ab646ceb18b9d75a1173acf64b9a401094b906d27b29338d4 AS onnx-model
 # hadolint ignore=DL3008
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
@@ -108,7 +108,7 @@ RUN mkdir -p /onnx/all-MiniLM-L6-v2 \
          -o /onnx/all-MiniLM-L6-v2/tokenizer_config.json
 
 # ── Stage 2: Production dependencies (with build tools for native modules) ──
-FROM node:22.23.2-trixie-slim@sha256:7b8a0c89c54499bee567618f96578e1a12a800f062fbdbfd1fb6a443fa6f6284 AS prod-deps
+FROM node:22.23.3-trixie-slim@sha256:b26b04c123d9ff8ab646ceb18b9d75a1173acf64b9a401094b906d27b29338d4 AS prod-deps
 
 # node-pty requires make/g++/python3 for compilation when prebuilds
 # are unavailable. The runtime base image is intentionally slim (no
@@ -140,10 +140,21 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store pnpm install --prod 
 # Bumped to :2026-08-31 for the cache-bust security rebuild (t/3137) — the base now
 # genuinely re-runs apt/npm upgrades: openssl 3.5.7-1~deb13u2 (CVE-2026-14456) and
 # npm's bundled tar 7.5.21 (CVE-2026-73566), both proven by the base build tripwires.
+# Bumped to :2026-09-21 for the code-scanning CVE sweep (t/3513) — fresh cache-busted
+# apt-get upgrade clears the fixable OS-package CVEs; node held at 22.23.2 per the
+# Dockerfile.base guardrail (t/2047 P1). Residual no-fix CVEs ride .trivyignore + the
+# weekly-rebuild auto-retirement.
+# Bumped to :2026-09-29 (t/3746) — poppler-utils removed from base (eliminates
+# libX11/libXrender transitive-dep CVE class); glibc CVEs cleared by apt-get upgrade.
+# Bumped to :2026-10-02 (PR #2676) — npm-bundled undici 6.28.1 (CVE-2026-85024), ip-address
+# 10.5.1 (CVE-2026-101910/101913), brace-expansion 5.0.12; proven by the base build tripwire.
 # Gate base bumps on staging /healthz, not CI green.
-FROM ghcr.io/jpsnover/ai-triad-base:2026-09-01@sha256:82fdf56b8dfeefd81fc09d5f69960e6c54d216043adc9a942df179f0ff74f77e AS runtime
+# Bumped to :2026-10-19 — the container.yml Trivy blocking gate caught libexpat1
+# CVE-2026-77214 (fixable high) on :2026-10-06; this tag is base-image.yml's normal weekly
+# rebuild (apt-get upgrade), dispatched a cycle early to unblock a pending container build.
+FROM ghcr.io/ai-rosetta-stone/ai-triad-base:2026-10-19@sha256:242806a9ba51c07b4e1db2398cae19abf780506fe9e79e69e1cd839f33a7edbb AS runtime
 
-LABEL org.opencontainers.image.source="https://github.com/jpsnover/ai-triad-research"
+LABEL org.opencontainers.image.source="https://github.com/AI-Rosetta-Stone/ai-triad-research"
 LABEL org.opencontainers.image.description="AI Triad Taxonomy Editor"
 LABEL org.opencontainers.image.licenses="MIT"
 
@@ -155,11 +166,15 @@ ARG BUILD_SHA=unknown
 ENV BUILD_SHA=${BUILD_SHA}
 
 # Cache dir created at runtime by the app (GitHubAPIBackend).
-# TAXONOMY_CACHE_DIR MUST match AI_TRIAD_DATA_ROOT (t/2061): config.ts's cacheDir
-# defaults to ~/.cache/taxonomy (=/root/.cache/taxonomy in-container) when unset,
-# while getDataRoot() uses AI_TRIAD_DATA_ROOT — the mismatch makes toRepoPath()'s
-# startsWith(cacheDir) check fail, so isDataAvailable() is always false → /healthz
-# 503 → crash-loop (the P1 latent readiness bug, t/2047). Keep these two in sync.
+# Bare/local-run fallback ONLY — every real deployment (main.bicep's baseEnv, both prod and
+# staging) sets both vars explicitly and always wins over these image defaults. Kept in sync
+# with each other here (t/2047: a mismatch makes toRepoPath()'s startsWith(cacheDir) check
+# fail, so isDataAvailable() is always false -> /healthz 503 -> crash-loop) ONLY for the case
+# of a plain `docker run` with no env vars supplied at all. Do NOT read this as the real
+# prod/staging behavior — see main.bicep's baseEnv/stagingEnvOverrides and t/4298/t/4299/t/4300
+# for why the two are deliberately INDEPENDENT there (PR #1078 decoupled them; this Dockerfile
+# default predates that and was never updated to match, since it's unreachable once Bicep sets
+# both explicitly).
 ENV AI_TRIAD_DATA_ROOT=/tmp/taxonomy-cache
 ENV TAXONOMY_CACHE_DIR=/tmp/taxonomy-cache
 ENV PORT=7862
@@ -189,9 +204,9 @@ COPY --chown=aitriad:aitriad scripts/ ./scripts/
 # The op-ed create route resolves promptsDir = getProjectRoot()/lib/oped/prompts
 # (= /app/lib/oped/prompts here); tsc emits no .prompt assets, so copy the source.
 COPY --chown=aitriad:aitriad lib/oped/prompts/ ./lib/oped/prompts/
-# Soul-doc JSON data files for op-ed voice generation (t/2689).
-# soulDocLoader.ts reads these at runtime via fs.readFile from SOUL_DOCS_DIR
-# (= /app/lib/debate/soul-docs/); tsc does not emit .json data files, so copy explicitly.
+# Soul-doc JSON at the repo-root path, for op-ed voice generation (t/2689), which locates
+# soul-docs from getProjectRoot() (= /app/lib/debate/soul-docs/). The compiled loader reads
+# its own copy under dist/server (layer 3 below, t/4245).
 COPY --chown=aitriad:aitriad lib/debate/soul-docs/ ./lib/debate/soul-docs/
 
 # 2b. ONNX model files (baked offline; change only when model contract changes — t/2784)
@@ -205,6 +220,13 @@ COPY --chown=aitriad:aitriad --from=builder /build/taxonomy-editor/dist/server/ 
 COPY --chown=aitriad:aitriad --from=builder /build/taxonomy-editor/dist/renderer/ ./dist/renderer/
 RUN ln -s /app/dist/renderer /app/dist/server/taxonomy-editor/src/renderer \
  && ln -s /app/package.json /app/dist/server/taxonomy-editor/src/package.json
+# Soul-doc JSON for the compiled loader (t/4245). soulDocLoader.ts resolves SOUL_DOCS_DIR from its
+# own compiled location (= /app/dist/server/lib/debate/soul-docs/), and tsc emits only the JSON it
+# imports, so the tag souls were missing there and every tagged run failed on the hosted profile.
+COPY --chown=aitriad:aitriad lib/debate/soul-docs/ ./dist/server/lib/debate/soul-docs/
+# Build-time guard (t/4245): the image build fails if the compiled loader can't load a base soul
+# and a tag soul, so this path can't regress silently again.
+RUN node --input-type=module -e "const m = await import('/app/dist/server/lib/debate/soulDocLoader.js'); m.getSoulDocument('skeptic'); m.getSoulDocument('skeptic', 'critical'); console.log('soul-doc load check: OK (base + tag)');"
 
 # 4. Third-party license notices (generated during build)
 COPY --chown=aitriad:aitriad --from=builder /build/taxonomy-editor/THIRD-PARTY-NOTICES.txt ./taxonomy-editor/THIRD-PARTY-NOTICES.txt
@@ -242,6 +264,15 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && rm /tmp/ms-prod.deb \
     && apt-get update \
     && apt-get install -y --no-install-recommends powershell
+
+# 7b. Security bump: libbrotli1 (t/4504, blocking the container Trivy gate). CVE-2026-111497,
+# HIGH, out-of-bounds write in the Brotli decoder, fixed in 1.1.0-2+deb13u1 -- the base image
+# (ai-triad-base:2026-10-19) baked the vulnerable 1.1.0-2+b7. --only-upgrade pulls just this
+# package from the already-configured apt sources rather than waiting on a full base rebuild.
+# hadolint ignore=DL3008
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install --only-upgrade -y libbrotli1
 
 # 8. Strip global npm from the runtime image (t/3135). npm is NOT reachable at
 # runtime — CMD is a direct `node`; npm/pnpm are used only in the discarded

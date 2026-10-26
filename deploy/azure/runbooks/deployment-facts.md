@@ -14,12 +14,12 @@ This is the single source of truth for the deployment's identity facts. The DevO
 | ACA Environment | `cae-aitriad` (Consumption plan) |
 | App URL | https://taxonomy-editor.yellowbush-aeda037d.eastus.azurecontainerapps.io |
 | Env domain suffix | `yellowbush-aeda037d.eastus.azurecontainerapps.io` |
-| Container Image | `ghcr.io/jpsnover/taxonomy-editor:latest` — **GHCR, not Azure Container Registry** |
+| Container Image | `ghcr.io/ai-rosetta-stone/taxonomy-editor:latest` — **GHCR, not Azure Container Registry** |
 | Storage Account / File Share | `staitriadkvwl3nywge4iw` / `taxonomy-data` |
-| Scale | 0–1 replicas, 1.0 CPU / 2 GiB RAM (scale-to-zero) |
-| Auth | GitHub + Google OAuth via Azure Easy Auth |
-| API keys | BYOK — users supply keys via the app UI (client-side); none in infra (ADR-002) |
-| Cost target | $0–5/month |
+| Scale | 0–1 replicas, 1.5 CPU / 3 GiB RAM (scale-to-zero; t/4263, verified live 2026-10-20) |
+| Auth | GitHub + Google OAuth via Azure Easy Auth. Token store **disabled** on both apps (t/4132; enforced by the t/4133 deploy gate). See [Easy Auth limitations](#easy-auth-limitations). |
+| API keys | BYOK: users supply their own keys through the app UI (ADR-002). **Exception:** two operator-funded Gemini pool secrets, each optional and enabled only when its `main.bicep` param is set: `free-tier-gemini-key` (`FREE_TIER_GEMINI_KEY`, the anonymous free tier) and `gemini-paid-key` (`GEMINI_PAID_KEY`, a last-resort fallback, t/950, [design](../../../docs/design/paid-gemini-fallback.md)). Both are live in prod (verified 2026-10-12). No other provider key belongs in infra. |
+| Cost target | $0–5/month for **Azure** resources. Gemini usage on the two pool keys is billed to the operator's Google account, outside Azure, and is not covered by this target. |
 
 ## Staging
 
@@ -29,6 +29,11 @@ This is the single source of truth for the deployment's identity facts. The DevO
 | Resource Group | `ai-triad` |
 | Region | East US |
 | App URL | https://taxonomy-editor-staging.yellowbush-aeda037d.eastus.azurecontainerapps.io |
+
+## Easy Auth limitations
+
+- **No client-directed GitHub sign-in.** `POST /.auth/login/github` with `{"access_token": …}` returns **500** (sub-status 74) for any token. The ACA Easy Auth middleware (v1.14.4.0) throws `System.NotImplementedException` in `GitHubProvider.HandleClientDirectedLoginAsync`. That's independent of the token store: it reproduced with a blob-backed store on staging (t/4134#25, 2026-10-20). Interactive sign-in (`GET /.auth/login/github` → 302) is unaffected.
+- **Consequence:** an automated *signed-in* smoke can't use GitHub. It would need a provider that implements client-directed sign-in (an Entra test identity, which is a PI accounts decision and hasn't been taken). The hosted auth smoke (`auth-smoke.yml`) covers the **anonymous** surface only. The t/4132 class (a token store enabled without storage) is prevented by the t/4133 deploy gate.
 
 ## Re-verify
 
@@ -48,6 +53,6 @@ The Azure `AGENTS.md` "Current Deployment" block had drifted on four facts; corr
 | App name | `ai-triad-taxonomy-editor` | `taxonomy-editor` |
 | Region | East US 2 | East US |
 | ACA Environment | `ai-triad-prod` | `cae-aitriad` |
-| Registry | Azure Container Registry (Basic) | GHCR (`ghcr.io/jpsnover/taxonomy-editor`) |
+| Registry | Azure Container Registry (Basic) | GHCR (`ghcr.io/ai-rosetta-stone/taxonomy-editor`) |
 
 The DevOps `AGENTS.md` "Live Deployment" block was already correct and matched Azure.

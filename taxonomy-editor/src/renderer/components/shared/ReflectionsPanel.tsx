@@ -5,6 +5,7 @@ import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import { getGlobalRecorder } from '@lib/flight-recorder/index';
 import { useDebateStore } from '../../hooks/useDebateStore';
 import { useTaxonomyStore } from '../../hooks/useTaxonomyStore';
+import { allNodesById } from '../../hooks/useTaxonomyStore/superseded';
 import { useShallow } from 'zustand/react/shallow';
 import type { ReflectionEdit, ReflectionResult } from '../../hooks/useDebateStore';
 import type { NewPovItemProposal } from '@lib/debate/types/session';
@@ -14,6 +15,8 @@ import { checkDolceCompliance, type ComplianceViolation } from '../../utils/dolc
 import { DescriptionToggle, resolveDescription, useDescriptionMode } from './DescriptionToggle';
 import { TheoryLink } from './TheoryLink';
 import { generatePlainPreview } from '../../utils/regeneratePlainDescription';
+import { ProposalTagEditor, povTagOptionsFor } from './ProposalTagEditor';
+import { ReflectionTagCheckBanner, tagCheckFlagged } from './ReflectionTagCheck';
 import './ReflectionsPanel.css';
 
 const PREFIX_TO_POV: Record<string, 'accelerationist' | 'safetyist' | 'skeptic'> = { acc: 'accelerationist', saf: 'safetyist', skp: 'skeptic' };
@@ -56,6 +59,12 @@ const EDIT_TYPE_LABELS: Record<string, { label: string; color: string }> = {
   qualify: { label: 'Qualify', color: '#f59e0b' },
   deprecate: { label: 'Deprecate', color: '#ef4444' },
 };
+
+/** t/3814: compare the generated proposal against the live taxonomy text, ignoring
+ *  incidental whitespace differences that aren't a real edit. */
+function normalizeForNoOpCompare(s: string): string {
+  return s.trim().replace(/\s+/g, ' ');
+}
 
 type DiffSeg = { text: string; type: 'same' | 'added' };
 type RawDiffSeg = { text: string; type: 'same' | 'added' | 'removed' };
@@ -235,7 +244,10 @@ function EditCardCurrentDesc({ edit, currentNode, descMode, setDescMode }: {
   descMode: DescMode;
   setDescMode: SetDescMode;
 }) {
-  if (!(edit.current_description && edit.edit_type !== 'add' && edit.current_description !== edit.proposed_description)) return null;
+  // t/3402: the equality check must gate diff-highlighting (in EditCardProposedBox), not this box's
+  // visibility — a label-only revise has current_description === proposed_description, and hiding the
+  // CURRENT box entirely left the user with no context for what they're approving.
+  if (!(edit.current_description && edit.edit_type !== 'add')) return null;
   const resolved_desc = resolveDescription(
     currentNode ? { description: edit.current_description, plain_description: (currentNode as { plain_description?: string | null }).plain_description } : { description: edit.current_description },
     descMode,
@@ -260,8 +272,22 @@ function EditCardCurrentDesc({ edit, currentNode, descMode, setDescMode }: {
   );
 }
 
-/** Review-mode content for an 'add' proposal: plain preview (with loading/error/retry) or formal fallback. */
-function EditCardAddPlainContent({ edit, descMode, plainLoading, plainError, plainPreview, runPlainPreview }: {
+/** A revise/qualify edit whose description actually changed — the case EditCardProposedBox renders as a
+ *  CURRENT→PROPOSED diff. Shared with EditCard's plain-preview effect so generation fires exactly when
+ *  that branch is on screen (t/3873). */
+function hasProposedDescDiff(edit: ReflectionEdit): edit is ReflectionEdit & { current_description: string } {
+  return !!edit.current_description && edit.edit_type !== 'add' && edit.current_description !== edit.proposed_description;
+}
+
+/** Edits whose PROPOSED box renders a generated plain preview: new ('add') proposals and revise/qualify diffs. */
+function wantsPlainPreview(edit: ReflectionEdit): boolean {
+  return edit.edit_type === 'add' || hasProposedDescDiff(edit);
+}
+
+/** Review-mode PROPOSED content: plain preview (with loading/error/retry) in plain mode, else formal.
+ *  Used for 'add' proposals and for revise/qualify diffs (t/3873); for any other edit EditCard never
+ *  generates, so plain mode falls through to the formal text. */
+function EditCardPlainContent({ edit, descMode, plainLoading, plainError, plainPreview, runPlainPreview }: {
   edit: ReflectionEdit;
   descMode: DescMode;
   plainLoading: boolean;
@@ -269,7 +295,7 @@ function EditCardAddPlainContent({ edit, descMode, plainLoading, plainError, pla
   plainPreview: string | null;
   runPlainPreview: () => Promise<void>;
 }) {
-  if (!(descMode === 'plain' && edit.edit_type === 'add')) return <>{edit.proposed_description}</>;
+  if (descMode !== 'plain') return <>{edit.proposed_description}</>;
   if (plainLoading) return <span className="rp-muted-italic">Generating plain description…</span>;
   if (plainError) {
     return (
@@ -305,22 +331,31 @@ function EditCardProposedBox({ edit, descMode, setDescMode, setEditing, resolved
           /* eslint-disable-next-line local/no-inline-style -- border-left only shown when there is a current-vs-proposed diff to highlight */
           style={{ borderLeft: edit.current_description && edit.edit_type !== 'add' ? '3px solid rgba(34,197,94,0.3)' : undefined }}
         >
-          {edit.current_description && edit.edit_type !== 'add' && edit.current_description !== edit.proposed_description ? (
+          {hasProposedDescDiff(edit) ? (
             <>
               <div className="rp-row-6-2">
                 <span className="rp-label-proposed">PROPOSED</span>
                 {!resolved && (
-                  <button
-                    className="btn btn-sm btn-ghost rp-edit-btn"
-                    onClick={() => setEditing(true)}
-                  >&#9998; Edit</button>
+                  <>
+                    <DescriptionToggle
+                      mode={descMode}
+                      onToggle={setDescMode}
+                      hasPlainDescription={!!plainPreview}
+                    />
+                    <button
+                      className="btn btn-sm btn-ghost rp-edit-btn"
+                      onClick={() => setEditing(true)}
+                    >&#9998; Edit</button>
+                  </>
                 )}
               </div>
               {descMode === 'formal' ? diffWords(edit.current_description, edit.proposed_description).map((seg, i) =>
                 seg.type === 'added'
                   ? <mark key={i} className="rp-diff-added">{seg.text}</mark>
                   : <span key={i}>{seg.text}</span>
-              ) : edit.proposed_description}
+              ) : (
+                <EditCardPlainContent edit={edit} descMode={descMode} plainLoading={plainLoading} plainError={plainError} plainPreview={plainPreview} runPlainPreview={runPlainPreview} />
+              )}
             </>
           ) : (
             <>
@@ -340,7 +375,7 @@ function EditCardProposedBox({ edit, descMode, setDescMode, setEditing, resolved
                   >&#9998; Edit</button>
                 </div>
               )}
-              <EditCardAddPlainContent edit={edit} descMode={descMode} plainLoading={plainLoading} plainError={plainError} plainPreview={plainPreview} runPlainPreview={runPlainPreview} />
+              <EditCardPlainContent edit={edit} descMode={descMode} plainLoading={plainLoading} plainError={plainError} plainPreview={plainPreview} runPlainPreview={runPlainPreview} />
             </>
           )}
         </div>
@@ -450,6 +485,25 @@ function EditCardCompliance({ complianceViolations, complianceErrors, compliance
   );
 }
 
+/** Evidence-check banner (t/3512): the debate record for the edited node, and why the edit was
+ *  flagged when no cited claim references it. */
+function EditCardEvidenceCheck({ edit }: { edit: ReflectionEdit }) {
+  if (edit.evidence_supported !== false) return null;
+  const e = edit.engagement;
+  const record = e
+    ? (e.citations === 0 && e.claim_count === 0 && !e.injected
+        ? 'This debate never offered or cited this node.'
+        : `This debate: cited ${e.citations}x, ${e.claim_count} claim(s) referenced it${e.injected ? ', offered to the debater' : ''}.`)
+    : '';
+  return (
+    <div className="rp-evidence-unsupported" role="note">
+      <span className="rp-evidence-unsupported-badge">Unsupported by debate evidence</span>
+      <div>{edit.evidence_note}</div>
+      {record && <div className="rp-evidence-unsupported-record">{record}</div>}
+    </div>
+  );
+}
+
 function EditCardEvidence({ edit, expandedEvidence, setExpandedEvidence, anNodes }: {
   edit: ReflectionEdit;
   expandedEvidence: Set<string>;
@@ -515,10 +569,51 @@ function EditCardRegenerateToggle({ showRegenerateToggle, regeneratePhrases, set
   );
 }
 
-function EditCardActions({ resolved, editing, isModified, applying, editType, setApplying, setApplyError, setTrackedEnrichNodeId, applyReflectionEdit, editedLabel, editedDescription, regeneratePhrases, pover, editIndex, handleReset, handleCancel, dismissReflectionEdit }: {
+/** The per-edit overrides the reviewer has armed by seeing a gate's refusal (t/3512 evidence, t/4214 R-6 tag). */
+type ArmedOverrides = { evidence: boolean; crossTag: boolean };
+
+function applyOptions(regeneratePhrases: boolean, armed: ArmedOverrides) {
+  return {
+    regeneratePhrases,
+    ...(armed.evidence ? { allowUnsupportedEvidence: true } : {}),
+    ...(armed.crossTag ? { allowCrossTag: true } : {}),
+  };
+}
+
+/** The override a refusal arms, or null when the apply succeeded or its gate's override was already armed. */
+function overrideToArm(result: { ok: boolean; refusedBy?: string }, unsupportedEvidence: boolean, armed: ArmedOverrides): keyof ArmedOverrides | null {
+  if (result.ok) return null;
+  const refusedBy = result.refusedBy ?? (unsupportedEvidence ? 'evidence' : undefined);
+  if (refusedBy === 'evidence') return armed.evidence ? null : 'evidence';
+  if (refusedBy === 'cross_tag') return armed.crossTag ? null : 'crossTag';
+  return null;
+}
+
+function applyButtonLabel(armed: ArmedOverrides): string {
+  if (armed.crossTag) return 'Apply anyway (cross-wing)';
+  return armed.evidence ? 'Apply anyway (no evidence)' : 'Approve & Apply';
+}
+
+/** Approve All applies only edits no gate flagged (t/3512, t/4214 R-6): overriding a check is a per-edit,
+ *  deliberate act, never a side effect of a bulk approve. A stale stamp is still refused by the store. */
+function bulkApplicable(e: ReflectionEdit): boolean {
+  if (e.status !== 'pending' || e.evidence_supported === false) return false;
+  return !(e.tag_check && tagCheckFlagged(e.tag_check));
+}
+
+/** What Approve All did (CL #3314 review): a skipped edit is never silent. */
+function bulkSummaryText(applied: number, skipped: number): string {
+  return skipped > 0
+    ? `Applied ${applied}. Skipped ${skipped} flagged by a check; review them one by one.`
+    : `Applied ${applied}.`;
+}
+
+function EditCardActions({ resolved, editing, isModified, isNoOpEdit, applying, editType, setApplying, setApplyError, setTrackedEnrichNodeId, applyReflectionEdit, editedLabel, editedDescription, regeneratePhrases, pover, editIndex, handleReset, handleCancel, dismissReflectionEdit, unsupportedEvidence }: {
   resolved: boolean;
   editing: boolean;
   isModified: boolean;
+  /** t/3814: generator proposed the current description back unchanged. */
+  isNoOpEdit: boolean;
   applying: boolean;
   editType: string;
   setApplying: React.Dispatch<React.SetStateAction<boolean>>;
@@ -533,11 +628,33 @@ function EditCardActions({ resolved, editing, isModified, applying, editType, se
   handleReset: () => void;
   handleCancel: () => void;
   dismissReflectionEdit: DebateStoreState['dismissReflectionEdit'];
+  /** The evidence check flagged this edit (t/3512) — apply requires an explicit override. */
+  unsupportedEvidence: boolean;
 }) {
+  // Each apply-time gate (evidence t/3512, tag t/4214 R-6) refuses first; the refusal is shown and arms that gate's
+  // explicit override, so the human, not the model, confirms applying a flagged edit. Armed overrides accumulate.
+  const [armed, setArmed] = useState<ArmedOverrides>({ evidence: false, crossTag: false });
   if (resolved) return null;
   const isEmpty = editing && (
     (editType === 'add' && !editedLabel.trim()) || !editedDescription.trim()
   );
+  // t/3814: visible rather than silently suppressed — a disappearing card is the same
+  // invisibility that let 32 of these accumulate unnoticed (t/3813). Editing is still
+  // reachable via the pencil icon in the proposed-description box, so a genuine edit
+  // isn't blocked — only the no-op default path is.
+  if (!editing && isNoOpEdit) {
+    return (
+      <div className="rp-actions-row">
+        <span className="rp-no-op-notice">No change proposed — the suggestion matches the current description.</span>
+        <button
+          className="btn rp-btn-sm"
+          onClick={() => dismissReflectionEdit(pover, editIndex)}
+        >
+          Dismiss
+        </button>
+      </div>
+    );
+  }
   return (
         <div className="rp-actions-row">
           <button
@@ -547,10 +664,14 @@ function EditCardActions({ resolved, editing, isModified, applying, editType, se
               setApplying(true);
               setApplyError(null);
               try {
-                const result = await applyReflectionEdit(pover, editIndex,
-                  editing && isModified ? { label: editedLabel, description: editedDescription } : undefined,
-                  { regeneratePhrases },
-                );
+                const overrides = editing && isModified ? { label: editedLabel, description: editedDescription } : undefined;
+                const result = await applyReflectionEdit(pover, editIndex, overrides, applyOptions(regeneratePhrases, armed));
+                const toArm = overrideToArm(result, unsupportedEvidence, armed);
+                if (toArm) {
+                  setArmed(a => ({ ...a, [toArm]: true }));
+                  setApplyError(result.error ?? (toArm === 'evidence' ? 'Unsupported by debate evidence' : 'Flagged by the tag check'));
+                  return;
+                }
                 if (!result.ok) {
                   setApplyError(result.error ?? 'Save failed — check SaveBar for details');
                 } else if (result.enrichNodeId) {
@@ -564,7 +685,7 @@ function EditCardActions({ resolved, editing, isModified, applying, editType, se
               }
             }}
           >
-            {applying ? 'Saving…' : 'Approve & Apply'}
+            {applying ? 'Saving…' : applyButtonLabel(armed)}
           </button>
           {editing && isModified && (
             <button
@@ -732,11 +853,8 @@ function EditCard({ edit, pover, editIndex }: {
   const [descMode, setDescMode] = useDescriptionMode();
   const currentNode = useTaxonomyStore(useShallow(s => {
     if (!edit.node_id || edit.edit_type === 'add') return null;
-    const prefix = edit.node_id.split('-')[0];
-    const pov = PREFIX_TO_POV[prefix];
-    if (!pov) return null;
-    const file = s[pov];
-    return file?.nodes?.find((n: { id: string }) => n.id === edit.node_id) ?? null;
+    // t/4355: a persisted reflection edit names the node it was about, which may since have been superseded.
+    return allNodesById(s).get(edit.node_id) ?? null;
   }));
   const [fixing, setFixing] = useState(false);
   // Integrity failures (e.g. dangling CONVERGES_WITH edges) are auto-fixable via "Fix it".
@@ -768,18 +886,33 @@ function EditCard({ edit, pover, editIndex }: {
     }
   }, [plainSource]);
 
-  // AC1 (t/1563): trigger generation when a new proposal is *displayed* in plain
+  // AC1 (t/1563): trigger generation when a proposal is *displayed* in plain
   // mode — not only on an explicit toggle click. Skips if already generated, in
   // flight, or previously failed (Retry clears plainError to re-arm this).
+  // t/3873: also revise/qualify edits with a real description diff — the same
+  // predicate EditCardProposedBox uses to pick its diff branch.
+  const needsPlainPreview = wantsPlainPreview(edit);
   useEffect(() => {
-    if (edit.edit_type === 'add' && descMode === 'plain' && !resolved
+    if (needsPlainPreview && descMode === 'plain' && !resolved
         && !plainPreview && !plainLoading && !plainError) {
       void runPlainPreview();
     }
-  }, [edit.edit_type, descMode, resolved, plainPreview, plainLoading, plainError, runPlainPreview]);
+  }, [needsPlainPreview, descMode, resolved, plainPreview, plainLoading, plainError, runPlainPreview]);
 
   const isModified = editedLabel !== edit.proposed_label
                   || editedDescription !== edit.proposed_description;
+
+  // t/3814: the generator can propose the current description back unchanged (QUALIFY gives it
+  // no way to decline — t/3813). Defense-in-depth backstop: don't render that as an actionable
+  // approval regardless of what t/3813 does upstream.
+  //
+  // Gated on BOTH fields, not description alone: a legitimate label-only revise has
+  // current_description === proposed_description by design (t/3402's comment on
+  // EditCardCurrentDesc) — the label change there is a real edit and must stay approvable.
+  const isNoOpEdit = edit.edit_type !== 'add'
+    && edit.current_description != null
+    && normalizeForNoOpCompare(edit.current_description) === normalizeForNoOpCompare(edit.proposed_description)
+    && (edit.current_label == null || normalizeForNoOpCompare(edit.current_label) === normalizeForNoOpCompare(edit.proposed_label));
 
   const complianceViolations = useMemo(
     () => checkDolceCompliance(editing ? editedDescription : edit.proposed_description, edit.node_id || ''),
@@ -835,12 +968,17 @@ function EditCard({ edit, pover, editIndex }: {
 
       <EditCardEvidence edit={edit} expandedEvidence={expandedEvidence} setExpandedEvidence={setExpandedEvidence} anNodes={anNodes} />
 
+      <EditCardEvidenceCheck edit={edit} />
+
+      <ReflectionTagCheckBanner check={edit.tag_check} />
+
       <EditCardRegenerateToggle showRegenerateToggle={showRegenerateToggle} regeneratePhrases={regeneratePhrases} setRegeneratePhrases={setRegeneratePhrases} />
 
       <EditCardActions
         resolved={resolved}
         editing={editing}
         isModified={isModified}
+        isNoOpEdit={isNoOpEdit}
         applying={applying}
         editType={edit.edit_type}
         setApplying={setApplying}
@@ -855,6 +993,7 @@ function EditCard({ edit, pover, editIndex }: {
         handleReset={handleReset}
         handleCancel={handleCancel}
         dismissReflectionEdit={dismissReflectionEdit}
+        unsupportedEvidence={edit.evidence_supported === false}
       />
 
       <EditCardEnrichmentStatus
@@ -940,6 +1079,18 @@ function PoverReflection({ result }: { result: ReflectionResult }) {
 
 const NEW_ITEM_COLOR = '#22c55e';
 
+/**
+ * t/4214 R-6b: the reviewer picks the new node's wing tags, starting from the seat's own tag (R-4). `applyArgs` is
+ * empty for a POV with no tags, so its apply call is unchanged.
+ */
+function useProposalTags(pover: string, pov: string) {
+  const seatTag = useDebateStore(s => s.activeDebate?.seat_tags?.[pover as SpeakerId]?.pov_tag);
+  const tagOptions = useMemo(() => povTagOptionsFor(pov), [pov]);
+  const [povTags, setPovTags] = useState<string[]>(() => (seatTag ? [seatTag] : []));
+  const applyArgs: [] | [{ povTags: string[] }] = tagOptions.length > 0 ? [{ povTags }] : [];
+  return { tagOptions, povTags, setPovTags, applyArgs };
+}
+
 function ProposalCard({ proposal, pover, proposalIndex }: {
   proposal: NewPovItemProposal;
   pover: string;
@@ -958,6 +1109,7 @@ function ProposalCard({ proposal, pover, proposalIndex }: {
   const [createdNodeId, setCreatedNodeId] = useState<string | null>(null);
   const resolved = status === 'approved' || status === 'dismissed';
   const info = POVER_INFO[proposal.pov as Exclude<SpeakerId, 'user'>];
+  const { tagOptions, povTags, setPovTags, applyArgs } = useProposalTags(pover, proposal.pov);
 
   return (
     <div
@@ -1032,8 +1184,9 @@ function ProposalCard({ proposal, pover, proposalIndex }: {
         {proposal.rationale}
       </div>
 
-      {/* Actions */}
-      {!resolved && (
+      {/* Wing tags (t/4214 R-6b) and actions */}
+      {!resolved && (<>
+        <ProposalTagEditor options={tagOptions} value={povTags} onChange={setPovTags} disabled={applying} />
         <div className="rp-actions-row">
           <button
             className="btn btn-primary rp-btn-approve"
@@ -1042,7 +1195,7 @@ function ProposalCard({ proposal, pover, proposalIndex }: {
               setApplying(true);
               setApplyError(null);
               try {
-                const result = await applyReflectionProposal(pover, proposalIndex);
+                const result = await applyReflectionProposal(pover, proposalIndex, ...applyArgs);
                 if (!result.ok) setApplyError(result.error ?? 'Save failed — check SaveBar for details');
                 else if (result.createdNodeId) setCreatedNodeId(result.createdNodeId);
               } catch (err) {
@@ -1058,7 +1211,7 @@ function ProposalCard({ proposal, pover, proposalIndex }: {
             onClick={() => dismissReflectionProposal(pover, proposalIndex)}
           >Dismiss</button>
         </div>
-      )}
+      </>)}
       {applyError && (
         <div className="rp-apply-error">
           {applyError}
@@ -1083,16 +1236,22 @@ export function ReflectionsPanel({ onClose }: { onClose: () => void }) {
     sum + r.edits.filter(e => e.status === 'approved').length
         + (r.new_item_proposals ?? []).filter((_, i) => newItemProposalStatus[`${r.pover}#${i}`] === 'approved').length, 0);
 
+  const [bulkSummary, setBulkSummary] = useState<string | null>(null);
   const approveAll = async () => {
+    let applied = 0;
+    let skipped = 0;
     for (const r of reflections) {
       for (let i = 0; i < r.edits.length; i++) {
-        if (r.edits[i].status === 'pending') await applyReflectionEdit(r.pover, i);
+        if (r.edits[i].status !== 'pending') continue;
+        if (!bulkApplicable(r.edits[i])) { skipped++; continue; }
+        if ((await applyReflectionEdit(r.pover, i)).ok) applied++;
       }
       const proposals = r.new_item_proposals ?? [];
       for (let i = 0; i < proposals.length; i++) {
-        if (proposalIsPending(r.pover, i)) await applyReflectionProposal(r.pover, i);
+        if (proposalIsPending(r.pover, i) && (await applyReflectionProposal(r.pover, i)).ok) applied++;
       }
     }
+    setBulkSummary(bulkSummaryText(applied, skipped));
   };
 
   const dismissAll = () => {
@@ -1168,6 +1327,7 @@ export function ReflectionsPanel({ onClose }: { onClose: () => void }) {
           {totalApproved > 0 && (
             <span className="rp-total-applied">{totalApproved} applied</span>
           )}
+          {bulkSummary && <span className="rp-bulk-summary" role="status">{bulkSummary}</span>}
           <button
             onClick={onClose}
             className="rp-close-btn"

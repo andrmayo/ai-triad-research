@@ -11,15 +11,38 @@ PI-directed populate (t/3162 (B)); gated post-hoc by TL data-model review + a no
 """
 import argparse, json, os, re, sys, time
 sys.stdout.reconfigure(encoding="utf-8")
-REPO = r"C:\Users\jsnov\repos\ai-triad-research"
-D = r"C:\Users\jsnov\repos\ai-triad-data"
+# t/3939: the code checkout is wherever this file lives (so the default prompt is the one shipped
+# with this code, worktrees included), and the data root honours AI_TRIAD_DATA_ROOT like the rest of
+# the toolchain (env var, then default), so a run can target a clean data worktree, not the shared checkout.
+REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+D = os.environ.get("AI_TRIAD_DATA_ROOT") or r"C:\Users\jsnov\repos\ai-triad-data"
 O = os.path.join(D, "taxonomy", "Origin")
 PROMPT_PATH = os.path.join(REPO, "scripts", "AITriad", "Prompts", "logical-form-formalization.prompt")
 POV = {"acc": "acc", "saf": "saf", "skp": "skp"}
 CAT_ATT = {"Beliefs": "belief", "Desires": "desire", "Intentions": "intention"}
 
-ents = json.load(open(os.path.join(O, "entities.json"), encoding="utf-8"))["entities"]
-reg = {e["id"]: {"sort": e.get("dolce_category", "non-agentive-social-object"), "name": e.get("name", "")} for e in ents}
+# t/3940: the entity register is loaded on first use, not at import, so the pure functions
+# (validate, strip_discourse_wrapper, strip_scope_notes, ...) import and test without the data repo.
+# CI has no data repo; an import-time load made every test here either error or skip there.
+_REG = None
+
+
+def _registry():
+    """id -> {sort, name} from taxonomy/Origin/entities.json, loaded once on first use."""
+    global _REG
+    if _REG is None:
+        with open(os.path.join(O, "entities.json"), encoding="utf-8") as f:
+            ents = json.load(f)["entities"]
+        _REG = {e["id"]: {"sort": e.get("dolce_category", "non-agentive-social-object"), "name": e.get("name", "")}
+                for e in ents}
+    return _REG
+
+
+def __getattr__(name):
+    # Back-compat for any caller that read the old module-level `reg` (PEP 562).
+    if name == "reg":
+        return _registry()
+    raise AttributeError(name)
 
 def load_nodes():
     out = []
@@ -33,6 +56,7 @@ def load_nodes():
 
 def refs_block(n):
     lines, allowed = [], {}
+    reg = _registry()
     for r in (n.get("entity_refs") or []):
         eid = r["ref"]; sort = reg.get(eid, {}).get("sort", "non-agentive-social-object")
         ml = r.get("match_level", "exact"); nm = reg.get(eid, {}).get("name", r.get("surface", ""))
@@ -44,10 +68,53 @@ def refs_block(n):
         allowed[cid] = ("universal", "exact")  # distinct from the 5 particular DolceCategory sorts
     return ("\n".join(lines) if lines else "(none)"), allowed
 
+# t/3351 v3 (class B fix): node descriptions verbatim begin "A(n) <Belief|Desire|
+# Intention> within <camp> discourse that <verb>..." (917/959 frames). The model read
+# that literal wrapper as an AGENT ("<camp> discourse"), producing the discourse-as-
+# agent residuals the line-37 ban could not stop, it was being asked to ignore text it
+# was handed. Strip the wrapper at the SOURCE so "discourse" is never a candidate agent;
+# the camp attribution is carried by modality.holder, not by the prose. The exposed
+# content clause (e.g. "advocates X") is re-capitalized. The camp's stance is still
+# handled by the prompt's stance-strip self-check (class A), unchanged here.
+# t/3884: the camp may be multi-word ("within skeptic and safetyist discourse that"), so the
+# camp slot is non-greedy text, not a single \w+ token (the v3 pattern missed skp-desires-075).
+_DISCOURSE_WRAP = re.compile(
+    r"^An?\s+(?:Belief|Desire|Intention)\s+within\s+.+?\s+discourse\s+that\s+", re.IGNORECASE)
+_DISCOURSE_WRAP_V3 = re.compile(
+    r"^An?\s+(?:Belief|Desire|Intention)\s+within\s+\w+\s+discourse\s+that\s+", re.IGNORECASE)
+
+# t/3884: 973/986 node descriptions end in "Encompasses: ..." and "Excludes: ..." scope notes.
+# They bound the node's scope for taxonomy editors; they are not the proposition. Handing them
+# to the formalizer let it pick a predicate from scope text (skp-beliefs-232's live frame
+# formalized the Encompasses phrase "maintaining systems"), and Excludes lists what the node
+# does NOT claim. Cut them at the source, as the wrapper strip does for class B.
+_SCOPE_NOTES = re.compile(r"\s*\b(?:Encompasses|Excludes)\s*:.*\Z", re.IGNORECASE | re.DOTALL)
+
+LEGACY_SOURCE = False  # --legacy-source reproduces the v3 node input exactly (for A/B arms)
+
+
+def strip_discourse_wrapper(desc):
+    """Remove the leading '<cat> within <camp> discourse that ' framing prefix (t/3351).
+    No-op on descriptions that don't carry it. Re-capitalizes the exposed clause."""
+    pat = _DISCOURSE_WRAP_V3 if LEGACY_SOURCE else _DISCOURSE_WRAP
+    stripped = pat.sub("", desc or "")
+    if stripped and stripped != (desc or ""):
+        return stripped[0].upper() + stripped[1:]
+    return desc or ""
+
+
+def strip_scope_notes(desc):
+    """Drop the trailing Encompasses/Excludes scope notes (t/3884). No-op when absent."""
+    if LEGACY_SOURCE:
+        return desc or ""
+    return _SCOPE_NOTES.sub("", desc or "").rstrip()
+
+
 def build_prompt(tmpl, n):
     cat = n.get("category", "Beliefs")
     camp = n["id"].split("-")[0]
-    prop = (n.get("label", "") + ". " + (n.get("description") or n.get("plain_description") or "")).strip()
+    desc = strip_scope_notes(strip_discourse_wrapper(n.get("description") or n.get("plain_description") or ""))
+    prop = (n.get("label", "") + ". " + desc).strip()
     block, allowed = refs_block(n)
     p = (tmpl.replace("{{CLAIM_CATEGORY}}", cat).replace("{{CAMP}}", POV.get(camp, camp))
              .replace("{{PROPOSITION}}", prop[:2400]).replace("{{ENTITY_REFS}}", block))
@@ -63,6 +130,24 @@ def parse_lf(text):
 
 PARTICULAR_SORTS = frozenset({"agentive-physical-object", "non-agentive-functional-artifact",
                               "perdurant", "normative-description", "non-agentive-social-object"})
+# Canonical EntityMatchLevel enum (logical-form-schema.md; PS $script:LogicalFormMatchLevels).
+# `universal` is a valid args[].sort (t/3251) but NEVER a match_level — the t/3379 leak. match_level
+# is enum-clamped here for both about[] and topical_candidates.
+VALID_MATCH_LEVELS = frozenset({"exact", "instance_of", "subclass", "superclass", "related"})
+
+# Option C (t/3389; SO+TL signed off e/145#13-#16). The mixed-convention about[] MISSED the
+# pre-committed concept-anchored floor (0.636 < 0.80, t/3381), so about[] reverts to ent-only and
+# the term: concept refs move to `topical_candidates` — a quality-marked layer whose provenance
+# block makes the unvalidated status legible FROM THE DATA (a consumer sees validated:false + the
+# 0.54 blind-golden precision without reading the register). Stamped by THIS generator; a repaired
+# generator (t/3390) must UPDATE this block or revalidate-and-move the refs to about[] — never
+# fresh refs under stale metadata (e/145#14(c) lifecycle rule).
+TOPICAL_CANDIDATES_PROVENANCE = {
+    "validated": False,
+    "generator": "formalize_node_lf.py",
+    "golden_ref": "t/3381",
+    "blind_golden_precision": 0.54,
+}
 
 
 def _repair_bare(ref, allowed):
@@ -98,16 +183,36 @@ def validate(lf, allowed, camp, cat):
         return a
 
     lf["args"] = [x for x in (fix(a) for a in (lf.get("args") or [])) if x]
-    kept_about = []
+    # A perdurant (event, process, state) is never an `agent`: agency belongs to endurants (DOLCE). It is the
+    # `cause` when it brings the event about, or the `theme` when it is the subject of a stative predicate
+    # ("X constitutes a defect"). The right role depends on the predicate, so this is REFUSED, not relabelled:
+    # the draft is discarded and retried (t/4020). Checked after fix(), so a grounded event entity is caught too.
+    for a in lf["args"]:
+        if a.get("role") == "agent" and a.get("sort") == "perdurant":
+            raise ValueError(f"perdurant agent {a.get('ref')!r}: an event/process cannot be an agent; use cause or theme (t/4020)")
+    # Option C split (t/3389): about[] = ent-* only; term: concept refs -> topical_candidates.
+    # Only grounded refs survive (R6 / t/2294 — a ref not in the node's own entity_refs/concept_refs
+    # is dropped, never minted); the `in allowed` gate enforces the {ent-*|term:*} vocabulary.
+    kept_about, candidate_refs = [], []
     for ab in (lf.get("about") or []):
         if not isinstance(ab, dict):
             continue
-        ab["ref"] = _repair_bare(ab.get("ref", ""), allowed)
-        if ab.get("ref") in allowed:
-            if not ab.get("match_level"):
-                ab["match_level"] = "exact"
-            kept_about.append(ab)
+        ref = _repair_bare(ab.get("ref", ""), allowed)
+        if ref not in allowed:
+            continue
+        ab["ref"] = ref
+        # Authoritative match_level from the ref's register entry (mirrors args[]), never the model's
+        # guess; enum-clamp so a concept's sort=`universal` can never leak into match_level (t/3379).
+        ml = allowed[ref][1]
+        ab["match_level"] = ml if ml in VALID_MATCH_LEVELS else "exact"
+        (kept_about if ref.startswith("ent-") else candidate_refs).append(ab)
     lf["about"] = kept_about
+    # topical_candidates present only when concept refs exist (absent, not null, otherwise —
+    # absent≠null contract, t/2943). Provenance stamped fresh by this generator (lifecycle rule).
+    if candidate_refs:
+        lf["topical_candidates"] = {**TOPICAL_CANDIDATES_PROVENANCE, "refs": candidate_refs}
+    else:
+        lf.pop("topical_candidates", None)
     lf["modality"] = {"holder": f"camp:{POV.get(camp, camp)}", "attitude": CAT_ATT.get(cat, "belief")}
     lf.setdefault("status", "proposed")
     return lf
@@ -115,12 +220,27 @@ def validate(lf, allowed, camp, cat):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cap", type=int, default=0, help="max nodes (0=all grounded)")
+    ap.add_argument("--ids", default="", help="comma-separated node ids to formalize (dry-run subset, e.g. defect nodes)")
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "node_lf_sample.json"))
+    ap.add_argument("--prompt", default=PROMPT_PATH, help="prompt template path (dry-run a candidate prompt; t/3884)")
+    ap.add_argument("--legacy-source", action="store_true", dest="legacy_source",
+                    help="reproduce the v3 node input: single-word camp wrapper strip, scope notes kept (t/3884 A/B arms)")
     args = ap.parse_args()
-    tmpl = open(PROMPT_PATH, encoding="utf-8").read()
+    global LEGACY_SOURCE
+    LEGACY_SOURCE = args.legacy_source
+    if args.apply and (args.legacy_source or os.path.abspath(args.prompt) != os.path.abspath(PROMPT_PATH)):
+        sys.stderr.write("refusing --apply with --legacy-source or a non-shipped --prompt: those are dry-run arms only\n")
+        return 2
+    tmpl = open(args.prompt, encoding="utf-8").read()
     nodes = load_nodes()
+    if args.ids:
+        want = {s.strip() for s in args.ids.split(",") if s.strip()}
+        nodes = [x for x in nodes if x[2]["id"] in want]
+        missing = want - {x[2]["id"] for x in nodes}
+        if missing:
+            sys.stderr.write(f"  [warn] --ids not found among grounded nodes: {sorted(missing)}\n")
     if args.cap: nodes = nodes[:args.cap]
     print(f"grounded nodes to formalize: {len(nodes)}")
 
@@ -139,7 +259,7 @@ def main():
                 if lf and lf.get("predicate"):
                     return (n["id"], lf)
             except Exception as ex:
-                sys.stderr.write(f"  [warn] {n['id']} a{a}: {type(ex).__name__}\n")
+                sys.stderr.write(f"  [warn] {n['id']} a{a}: {type(ex).__name__}: {str(ex)[:160]}\n")  # say WHY a draft was refused
             time.sleep(0.8 * (a + 1))
         return (n["id"], None)
 
@@ -147,9 +267,11 @@ def main():
         results = dict(ex.map(formalize, nodes))
     ok = {k: v for k, v in results.items() if v}
     print(f"formalized: {len(ok)}/{len(nodes)}  (failed: {len(nodes)-len(ok)})")
-    # sample for eyeball
-    sample = {k: results[k] for k in list(ok)[:6]}
-    json.dump({"count": len(ok), "sample": sample}, open(args.out, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+    # Write results: a 6-node eyeball sample for a full run, but ALL formalized frames when a
+    # subset was targeted (--ids/--cap) so a dry-run can be re-scanned for defects (t/3351).
+    subset = bool(args.ids) or (0 < args.cap <= 60)
+    payload = {"count": len(ok), "all" if subset else "sample": ok if subset else {k: results[k] for k in list(ok)[:6]}}
+    json.dump(payload, open(args.out, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
     for k in list(ok)[:4]:
         print(f"\n{k}: pred={ok[k].get('predicate')!r} args={[(a.get('role'),a.get('ref'),a.get('sort')) for a in ok[k].get('args',[])]} conf={ok[k].get('formalization_confidence')} status={ok[k].get('status')}")
 

@@ -138,11 +138,16 @@ function Get-DataRoot {
     <#
     .SYNOPSIS
         Returns the resolved absolute path to the data root directory.
+    .PARAMETER IgnoreEnvOverride
+        Resolve as if $env:AI_TRIAD_DATA_ROOT were unset: the configured (.aitriad.json / fallback)
+        root. The test-run write check protects THIS root (t/4454), so a test that points the env
+        var at a temp dir writes freely, and one that points it at the real root is still caught.
     #>
+    param([switch]$IgnoreEnvOverride)
     Initialize-DataConfig
 
     # Env var takes highest priority
-    if (-not [string]::IsNullOrWhiteSpace($env:AI_TRIAD_DATA_ROOT)) {
+    if (-not $IgnoreEnvOverride -and -not [string]::IsNullOrWhiteSpace($env:AI_TRIAD_DATA_ROOT)) {
         $Resolved = Resolve-Path $env:AI_TRIAD_DATA_ROOT -ErrorAction SilentlyContinue
         if ($Resolved) { return $Resolved.Path }
         return $env:AI_TRIAD_DATA_ROOT
@@ -152,11 +157,19 @@ function Get-DataRoot {
     if ([System.IO.Path]::IsPathRooted($Root)) {
         return [System.IO.Path]::GetFullPath($Root)
     }
-    # Resolve relative to where .aitriad.json was found, then Get-CodeRoot fallback.
+    # Resolve relative to the TRUE main-checkout root (t/3869), not $script:DataConfigDir
+    # directly — $script:DataConfigDir is wherever .aitriad.json was found, which for a
+    # NESTED worktree (.worktrees/<x>) is the worktree's own directory, one level too deep
+    # for a sibling-relative path like "../ai-triad-data" (confirmed empirically: resolved
+    # to "<nested-worktree>/../ai-triad-data", which doesn't exist). Get-WorktreeMainRoot
+    # uses `git rev-parse --git-common-dir`, correct for nested AND sibling worktrees;
+    # falls back to the pre-t/3869 behaviour when unresolvable (non-git / PSGallery installs).
     # Normalize via GetFullPath so the returned path has no embedded '..' segments —
-    # from a sibling worktree the raw Join yields '<wt>\..\ai-triad-data', which is
     # fine for file I/O but breaks path-string comparisons (mirrors Get-SourcesDir; t/2007).
-    if ($script:DataConfigDir) { $Anchor = $script:DataConfigDir } else { $Anchor = Get-CodeRoot }
+    $MainRoot = Get-WorktreeMainRoot -Path $script:RepoRoot
+    if ($MainRoot) { $Anchor = $MainRoot }
+    elseif ($script:DataConfigDir) { $Anchor = $script:DataConfigDir }
+    else { $Anchor = Get-CodeRoot }
     return [System.IO.Path]::GetFullPath((Join-Path $Anchor $Root))
 }
 
@@ -198,7 +211,10 @@ function Get-SourcesDir {
         -not [string]::IsNullOrWhiteSpace($script:DataConfig.sources_root)) {
         $Root = $script:DataConfig.sources_root
         if ([System.IO.Path]::IsPathRooted($Root)) { return $Root }
-        # Resolve relative to config file directory (same as data_root resolution)
+        # t/3869: same anchor fix as Get-DataRoot — see its comment for why
+        # $script:DataConfigDir/$script:RepoRoot is the wrong depth from a nested worktree.
+        $MainRoot = Get-WorktreeMainRoot -Path $script:RepoRoot
+        if ($MainRoot) { return [System.IO.Path]::GetFullPath((Join-Path $MainRoot $Root)) }
         if ($script:DataConfigDir) { return [System.IO.Path]::GetFullPath((Join-Path $script:DataConfigDir $Root)) }
         return [System.IO.Path]::GetFullPath((Join-Path $script:RepoRoot $Root))
     }

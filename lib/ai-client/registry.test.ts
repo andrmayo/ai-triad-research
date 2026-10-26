@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 // Licensed under the MIT License. See LICENSE file in the project root.
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   getModelCapabilities,
   filterByCapabilities,
@@ -9,12 +9,17 @@ import {
   validateModelConfig,
   assertModelConfigValid,
   resolveBackend,
+  inferBackend,
   resolveModel,
   getDefaultTimeout,
+  getModelMinTimeout,
+  resolveTimeout,
   buildModelEntryMap,
   buildModelIdMap,
 } from './registry.js';
 import type { ModelRegistry } from './registry.js';
+import type { FlightRecorder, RecordInput } from '../flight-recorder/index.js';
+import { setGlobalRecorder, clearGlobalRecorder } from '../flight-recorder/index.js';
 
 const TEST_REGISTRY: ModelRegistry = {
   backends: [
@@ -166,12 +171,12 @@ describe('getModelCapabilities', () => {
     expect(caps.maxContextTokens).toBe(128000);
   });
 
-  it('falls back to gemini defaults for unknown models (resolveBackend default)', () => {
+  it('gives an unknown model the plain system defaults, NOT gemini\'s (t/4101: no backend guess)', () => {
     const caps = getModelCapabilities(TEST_REGISTRY, 'unknown-model');
     expect(caps.supportsTools).toBe(true);
-    expect(caps.supportsVision).toBe(true);
+    expect(caps.supportsVision).toBe(false); // gemini would claim vision
     expect(caps.supportsStreaming).toBe(true);
-    expect(caps.maxContextTokens).toBe(1048576);
+    expect(caps.maxContextTokens).toBe(131072); // gemini would claim 1M
   });
 
   it('returns ollama defaults (no tools, no vision) for ollama models', () => {
@@ -346,20 +351,20 @@ describe('validateModelConfig', () => {
     expect(warnings[0].referenceSite).toBe('debateTiers.advanced.openai');
   });
 
-  it('flags a pricing superset key as info (not a warning)', () => {
+  it('flags a pricing key that is not a models[].id as info, including an apiModelId key (t/3946)', () => {
     const registry: ModelRegistry = {
       ...BASE,
       pricing: {
-        'gpt-4o': { inputPer1M: 5, outputPer1M: 15 },       // matches models[].apiModelId
-        'gemini-2.5-pro': { inputPer1M: 1.25, outputPer1M: 10 }, // superset, no matching model
+        'openai-gpt-4o': { inputPer1M: 5, outputPer1M: 15 },  // a models[].id: the contract (t/3946)
+        'gpt-4o': { inputPer1M: 5, outputPer1M: 15 },         // an apiModelId: no longer a valid key
+        'gemini-2.5-pro': { inputPer1M: 1.25, outputPer1M: 10 }, // no matching model at all
       },
     };
     const issues = validateModelConfig(registry);
     expect(issues.filter(i => i.severity === 'warning')).toHaveLength(0);
     const infos = issues.filter(i => i.severity === 'info');
-    expect(infos).toHaveLength(1);
-    expect(infos[0].modelId).toBe('gemini-2.5-pro');
-    expect(infos[0].referenceSite).toBe('pricing.gemini-2.5-pro');
+    expect(infos.map(i => i.modelId).sort()).toEqual(['gemini-2.5-pro', 'gpt-4o']);
+    expect(infos.every(i => /models\[\]\.id/.test(i.message))).toBe(true);
   });
 
   it('skips underscore-prefixed keys (_comment) in defaults, tiers, and pricing', () => {
@@ -401,12 +406,83 @@ describe('assertModelConfigValid', () => {
   });
 });
 
+describe('resolveModel fallback WARN (t/3675)', () => {
+  const record = vi.fn<(e: RecordInput) => void>();
+  beforeEach(() => { record.mockClear(); setGlobalRecorder({ record } as unknown as FlightRecorder); });
+  afterEach(() => { clearGlobalRecorder(); });
+
+  const empty: ModelRegistry = { backends: [], models: [] };
+
+  it('an exact registry match does NOT warn', () => {
+    const reg: ModelRegistry = { backends: [], models: [{ id: 'gemini-3.5-flash-lite', apiModelId: 'gemini-3.5-flash-lite', label: 'x', backend: 'gemini' }] };
+    expect(resolveModel(reg, 'gemini-3.5-flash-lite')).toMatchObject({ apiModelId: 'gemini-3.5-flash-lite', backend: 'gemini' });
+    expect(record).not.toHaveBeenCalled();
+  });
+
+  it('unregistered gemini-prefixed id (the gemini-flash-lite-latest alias case) → prefix passthrough + WARN', () => {
+    // Behaviour is unchanged (verbatim passthrough, gemini backend); the WARN is the only addition.
+    expect(resolveModel(empty, 'gemini-flash-lite-latest')).toEqual({ apiModelId: 'gemini-flash-lite-latest', backend: 'gemini' });
+    expect(record).toHaveBeenCalledTimes(1);
+    const ev = record.mock.calls[0][0];
+    expect(ev.level).toBe('warn');
+    expect(ev.component).toBe('ai-client');
+    expect(ev.message).toContain('gemini-flash-lite-latest');
+    expect(ev.data).toMatchObject({ friendlyId: 'gemini-flash-lite-latest', branch: 'prefix', backend: 'gemini' });
+  });
+
+  it('unregistered non-gemini prefix → prefix branch with the correct backend', () => {
+    expect(resolveModel(empty, 'xai-grok-9')).toEqual({ apiModelId: 'xai-grok-9', backend: 'xai' });
+    expect(record.mock.calls[0][0].data).toMatchObject({ branch: 'prefix', backend: 'xai' });
+  });
+
+  it('unrecognized prefix → THROWS, never a silent gemini call (t/4101 replaced the old default branch)', () => {
+    expect(() => resolveModel(empty, 'totally-made-up-7')).toThrow(/refusing to guess/);
+    expect(record).not.toHaveBeenCalled(); // no fallback WARN: nothing was resolved
+  });
+});
+
+describe('resolveBackend fails closed; no gemini default (t/4101)', () => {
+  it('an id whose prefix names no backend THROWS an ActionableError instead of becoming a gemini call', () => {
+    expect(() => resolveBackend('learnlm-1.5-pro', null)).toThrow(/refusing to guess/);
+    expect(() => resolveBackend('unknown-model', null)).toThrow(/not in ai-models.json/);
+    expect(() => resolveModel(TEST_REGISTRY, 'unknown-model')).toThrow(/refusing to guess/);
+  });
+
+  it('gemini ids still resolve to gemini: they arrived via the old default, now via an explicit prefix', () => {
+    expect(resolveBackend('gemini-2.5-flash', null)).toBe('gemini');
+    expect(resolveBackend('gemini-flash-lite-latest', null)).toBe('gemini');
+  });
+
+  it('PARITY: for every id in the real ai-models.json the PREFIX names its registry backend (cond 3)', async () => {
+    const { readFileSync } = await import('fs');
+    const { fileURLToPath } = await import('url');
+    const path = (await import('path')).default;
+    const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../');
+    const real = JSON.parse(readFileSync(path.join(root, 'ai-models.json'), 'utf-8')) as { models: { id: string; backend: string }[] };
+    expect(real.models.length).toBeGreaterThan(10);
+    // inferBackend, not resolveBackend(id, registry): the registry-first path would agree by construction.
+    const wrong = real.models.filter((m) => inferBackend(m.id) !== m.backend).map((m) => `${m.id} -> ${inferBackend(m.id)} (registry: ${m.backend})`);
+    expect(wrong).toEqual([]);
+  });
+
+  it("REGISTRY FIRST: a registered id resolves to its entry's backend even when its prefix says otherwise", () => {
+    const reg = { models: [{ id: 'gemini-but-served-by-groq', apiModelId: 'x', label: 'x', backend: 'groq' }] };
+    expect(resolveBackend('gemini-but-served-by-groq', reg)).toBe('groq');
+    expect(resolveBackend('gemini-but-served-by-groq', null)).toBe('gemini'); // null registry: the prefix
+    expect(() => resolveBackend('learnlm-1.5-pro', reg)).toThrow(/refusing to guess/); // unregistered + unprefixed
+  });
+
+  it('estimates degrade instead of throwing: an unknown id gets the neutral base timeout', () => {
+    expect(getDefaultTimeout('unknown-model', TEST_REGISTRY)).toBe(120_000);
+  });
+});
+
 describe('moonshot backend routing (t/1945)', () => {
   // The server path (aiBackends.ts generateText) uses the prefix-based
   // resolveBackend(model); without the moonshot branch it fell through to gemini.
   it('resolveBackend maps the moonshot prefix to moonshot, not gemini', () => {
-    expect(resolveBackend('moonshot-kimi-k3')).toBe('moonshot');
-    expect(resolveBackend('moonshot')).toBe('moonshot');
+    expect(resolveBackend('moonshot-kimi-k3', null)).toBe('moonshot');
+    expect(resolveBackend('moonshot', null)).toBe('moonshot');
   });
 
   it('resolveModel resolves the moonshot prefix as a verbatim passthrough', () => {
@@ -418,7 +494,7 @@ describe('moonshot backend routing (t/1945)', () => {
   });
 
   it('getDefaultTimeout uses the moonshot (240s) budget, mirroring zai', () => {
-    expect(getDefaultTimeout('moonshot-kimi-k3')).toBe(240_000);
+    expect(getDefaultTimeout('moonshot-kimi-k3', TEST_REGISTRY)).toBe(240_000);
   });
 
   // Frontier-tier 2× tests (t/2495)
@@ -449,11 +525,171 @@ describe('moonshot backend routing (t/1945)', () => {
 
   it('getDefaultTimeout stays at base for ollama/zai (same model in both tiers)', () => {
     expect(getDefaultTimeout('ollama-llama3', tierRegistry)).toBe(300_000); // 1× — no frontier distinction
-    expect(getDefaultTimeout('zai-model',     tierRegistry)).toBe(240_000); // 1× — no frontier distinction
+    expect(getDefaultTimeout('zai-model',     tierRegistry)).toBe(300_000); // 1× — no frontier distinction
   });
 
-  it('getDefaultTimeout returns base when no registry is passed (back-compat)', () => {
-    expect(getDefaultTimeout('claude-sonnet-4-6')).toBe(180_000);
-    expect(getDefaultTimeout('gemini-3.1-pro-preview')).toBe(120_000);
+  it('getDefaultTimeout returns base when registry is omitted at runtime (untyped caller → backstop, t/3614)', () => {
+    // registry is now a REQUIRED param (t/3614); this exercises the runtime backstop for a JS/untyped
+    // caller that still omits it — the floor is disabled but the tiered/base value is preserved.
+    expect(getDefaultTimeout('claude-sonnet-4-6', undefined as unknown as ModelRegistry)).toBe(180_000);
+    expect(getDefaultTimeout('gemini-3.1-pro-preview', undefined as unknown as ModelRegistry)).toBe(120_000);
+  });
+});
+
+// Per-model minTimeoutMs floor (t/3518 Phase 2, SO e/184). Registry-driven timeout floor replaces
+// the model-substring checks. Floor semantics = Math.max(tiered, floor): it can raise, never shorten.
+describe('getDefaultTimeout — minTimeoutMs floor (t/3518 Phase 2)', () => {
+  const floorRegistry: ModelRegistry = {
+    backends: [],
+    models: [
+      { id: 'claude-opus-5',   apiModelId: 'claude-opus-5',   label: 'Opus 5',   backend: 'claude', minTimeoutMs: 300_000 },
+      { id: 'claude-sonnet-5', apiModelId: 'claude-sonnet-5', label: 'Sonnet 5', backend: 'claude', minTimeoutMs: 300_000 },
+      { id: 'claude-fable-5',  apiModelId: 'claude-fable-5',  label: 'Fable 5',  backend: 'claude', minTimeoutMs: 300_000 },
+      { id: 'claude-haiku-4-5', apiModelId: 'claude-haiku-4-5', label: 'Haiku', backend: 'claude' }, // no floor
+    ],
+    debateTiers: {
+      basic:    { claude: 'claude-haiku-4-5' },
+      advanced: { claude: 'claude-fable-5' }, // fable is the advanced-tier claude (Phase 1)
+    },
+  };
+
+  const record = vi.fn<(e: RecordInput) => void>();
+  beforeEach(() => { record.mockClear(); setGlobalRecorder({ record } as unknown as FlightRecorder); });
+  afterEach(() => { clearGlobalRecorder(); });
+
+  it('applies the floor when it exceeds the tiered value (sonnet-5: base 180s → floored to 300s)', () => {
+    // sonnet-5 is NOT the advanced-tier model → tiered = base 180s; the 300s floor wins.
+    expect(getDefaultTimeout('claude-sonnet-5', floorRegistry)).toBe(300_000);
+    expect(record).not.toHaveBeenCalled(); // entry found → no WARN
+  });
+
+  it('composes with the ×2 tier bump — floor never SHORTENS a larger tiered value (fable-5: 360s wins over 300s floor)', () => {
+    // fable-5 is advanced.claude → tiered = 2×180s = 360s; Math.max(360s, 300s floor) = 360s.
+    expect(getDefaultTimeout('claude-fable-5', floorRegistry)).toBe(360_000);
+  });
+
+  it('a model without a floor is unchanged — pure tiered/base (haiku: basic → 180s)', () => {
+    expect(getDefaultTimeout('claude-haiku-4-5', floorRegistry)).toBe(180_000);
+    expect(record).not.toHaveBeenCalled();
+  });
+
+  it('ALIAS ARM (regression guard, TL AC): claude-opus-latest resolves to opus-5 via the entry map → floor applied', () => {
+    // buildModelEntryMap synthesizes `claude-opus-latest` → the opus-5 entry (with its floor). A plain
+    // models.find() would MISS this alias and silently drop the floor — the exact t/3518 re-open the
+    // SO condition exists to prevent. opus-latest is not the advanced model → tiered 180s, floor 300s.
+    expect(getDefaultTimeout('claude-opus-latest', floorRegistry)).toBe(300_000);
+    expect(record).not.toHaveBeenCalled(); // alias IS in the entry map → no WARN
+  });
+
+  it('unknown/non-registry model → current behavior (base), NOT silently degraded, and emits a WARN', () => {
+    // Not in the entry map (a dated variant or typo). Floor can't be read → falls back to base; the
+    // miss is surfaced via a system.error WARN rather than a silent `?? 0` (SO condition 2).
+    const backend_base = getDefaultTimeout('claude-made-up-9', floorRegistry);
+    expect(backend_base).toBe(180_000); // claude base, unchanged from pre-Phase-2 behavior
+    expect(record).toHaveBeenCalledTimes(1);
+    const ev = record.mock.calls[0][0];
+    expect(ev.type).toBe('system.error');
+    expect(ev.level).toBe('warn');
+    expect(ev.message).toContain('claude-made-up-9');
+    expect(ev.message).toContain('minTimeoutMs floor not applied');
+  });
+
+  it('WARN path is null-safe when no recorder is wired (never throws)', () => {
+    clearGlobalRecorder();
+    expect(() => getDefaultTimeout('claude-made-up-9', floorRegistry)).not.toThrow();
+  });
+
+  it('applies the floor even when the registry has no debateTiers (no default/explicit asymmetry — TL e/185#8)', () => {
+    // Pre-fix, getDefaultTimeout early-returned base before consulting the floor when debateTiers was
+    // absent; now the floor is applied on every path, so a registry with models+floor but no tiers
+    // still floors. (Unreachable with the real registry, which has debateTiers — guards the invariant.)
+    const noTiers: ModelRegistry = {
+      backends: [],
+      models: [{ id: 'claude-sonnet-5', apiModelId: 'claude-sonnet-5', label: 'Sonnet 5', backend: 'claude', minTimeoutMs: 300_000 }],
+    };
+    expect(getDefaultTimeout('claude-sonnet-5', noTiers)).toBe(300_000); // floor, not base 180_000
+  });
+
+  // getModelMinTimeout — the shared floor primitive. Exposed so explicit-timeout call sites (the
+  // opening-brief stage) can enforce the floor themselves, since a `?? explicit` short-circuits
+  // getDefaultTimeout (TL e/185#6 item 1). This is what DebateTool's retirement of
+  // openingBriefTimeoutFloor consumes: Math.max(explicitTimeout, getModelMinTimeout(model, reg)).
+  describe('getModelMinTimeout (explicit-timeout floor primitive)', () => {
+    it('returns the concrete floor for a registry id', () => {
+      expect(getModelMinTimeout('claude-fable-5', floorRegistry)).toBe(300_000);
+    });
+
+    it('returns the floor for a synthesized -latest alias (not just bare ids)', () => {
+      expect(getModelMinTimeout('claude-opus-latest', floorRegistry)).toBe(300_000);
+      expect(record).not.toHaveBeenCalled();
+    });
+
+    it('returns 0 for a model with no floor (no WARN — it IS in the registry)', () => {
+      expect(getModelMinTimeout('claude-haiku-4-5', floorRegistry)).toBe(0);
+      expect(record).not.toHaveBeenCalled();
+    });
+
+    it('returns 0 + WARN for a model absent from the registry map', () => {
+      expect(getModelMinTimeout('claude-made-up-9', floorRegistry)).toBe(0);
+      expect(record).toHaveBeenCalledTimes(1);
+      expect(record.mock.calls[0][0].message).toContain('claude-made-up-9');
+    });
+
+    it('returns 0 + WARN when no registry is supplied (t/3612: this path was silent, dropping every floor)', () => {
+      // registry is REQUIRED (t/3614); the cast reaches the runtime backstop an untyped caller would hit.
+      expect(getModelMinTimeout('claude-fable-5', undefined as unknown as ModelRegistry)).toBe(0);
+      expect(record).toHaveBeenCalledTimes(1);
+      expect(record.mock.calls[0][0].message).toContain('claude-fable-5');
+      expect(record.mock.calls[0][0].message).toContain('no registry');
+    });
+
+    it('enforces the floor on an explicit below-floor timeout via Math.max (the opening-brief pattern)', () => {
+      // The exact narrowing TL flagged: an explicit 60s on a floored model must not undercut 300s.
+      const explicit = 60_000;
+      expect(Math.max(explicit, getModelMinTimeout('claude-fable-5', floorRegistry))).toBe(300_000);
+    });
+  });
+});
+
+// t/3644: resolveTimeout makes the per-model floor UNBYPASSABLE — closes the `explicit ?? getDefaultTimeout`
+// bypass where an explicit value skipped the floor entirely (same failure shape as t/3612, one layer up).
+describe('resolveTimeout — floor is unbypassable (t/3644)', () => {
+  const floorRegistry: ModelRegistry = {
+    backends: [],
+    models: [
+      { id: 'claude-fable-5', apiModelId: 'claude-fable-5', label: 'Fable 5', backend: 'claude', minTimeoutMs: 300_000 },
+      { id: 'claude-haiku-4-5', apiModelId: 'claude-haiku-4-5', label: 'Haiku', backend: 'claude' }, // no floor
+    ],
+  };
+  const record = vi.fn<(e: RecordInput) => void>();
+  beforeEach(() => { record.mockClear(); setGlobalRecorder({ record } as unknown as FlightRecorder); });
+  afterEach(() => { clearGlobalRecorder(); });
+
+  it('raises an explicit timeout BELOW a model floor up to the floor (the bypass, closed)', () => {
+    // fable-5 floor = 300s; a caller passing 60s is raised to 300s, not run at 60s. This is the AC.
+    expect(resolveTimeout(60_000, 'claude-fable-5', floorRegistry)).toBe(300_000);
+  });
+
+  it('honours an explicit timeout ABOVE the floor (a caller can still raise)', () => {
+    expect(resolveTimeout(500_000, 'claude-fable-5', floorRegistry)).toBe(500_000);
+  });
+
+  it('preserves a legitimate sub-default explicit timeout on an UNFLOORED model (why we floor against getModelMinTimeout, not getDefaultTimeout)', () => {
+    // haiku has no floor; base 180s. An explicit 60s is honoured as-is — the floor doesn't over-reach to
+    // force the default. Flooring against getDefaultTimeout (per the ticket's literal snippet) would wrongly raise this to 180s.
+    expect(resolveTimeout(60_000, 'claude-haiku-4-5', floorRegistry)).toBe(60_000);
+  });
+
+  it('no explicit timeout → the (already-floored) default', () => {
+    expect(resolveTimeout(undefined, 'claude-fable-5', floorRegistry)).toBe(300_000); // base 180s → floor 300s
+  });
+
+  it('empty-but-typed registry: a floored model emits the not-found WARN, not a silent 0 (SO observability AC)', () => {
+    // {} models[] has no entry, so the floor is unknown → getModelMinTimeout WARNs + returns 0, and the
+    // timeout falls back to the (unfloored) base rather than a silent 0. Pins the observability the type can't give.
+    const empty: ModelRegistry = { backends: [], models: [] };
+    expect(resolveTimeout(undefined, 'claude-fable-5', empty)).toBe(180_000); // claude base; floor not applied (empty)
+    expect(record).toHaveBeenCalled();
+    expect(record.mock.calls.some(c => String((c[0] as RecordInput).message).includes('no registry entry'))).toBe(true);
   });
 });

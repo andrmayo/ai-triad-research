@@ -1,12 +1,16 @@
 // Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 // Licensed under the MIT License. See LICENSE file in the project root.
 
-import { useState, useEffect, useRef, useMemo, type RefObject, type ReactNode } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback, type RefObject, type ReactNode } from 'react';
 import { POV_META } from '@lib/electron-shared/povMeta';
 import { getGlobalRecorder } from '@lib/flight-recorder/index';
 import type { SituationNode } from '../../types/taxonomy';
 import { interpretationText } from '../../types/taxonomy';
 import { useTaxonomyStore } from '../../hooks/useTaxonomyStore';
+import type { SituationNodeUpdate } from '../../hooks/useTaxonomyStore/slices/taxonomyDataSlice';
+import { useAuthStatus } from '../../hooks/useAuthStatus';
+import { countDanglingReferences, formatDanglingWarning } from '../../utils/danglingReferences';
+import { useLongPressContextMenu } from '../../hooks/useLongPressContextMenu';
 import { usePreferencesStore } from '../../store/preferencesStore';
 import { DeleteConfirmDialog } from '../shared/DeleteConfirmDialog';
 import { HighlightedTextarea } from '../shared/HighlightedField';
@@ -47,8 +51,9 @@ function isPovTab(tab: SitTab): tab is SitPov {
 }
 
 type ErrFn = (field: string) => string | undefined;
-type UpdateFn = (updates: Partial<SituationNode>) => void;
-type UpdateSituationNodeFn = (id: string, updates: Partial<SituationNode>) => void;
+// t/3888: the store's strict write-API type — interpretations can only be written as BDI objects.
+type UpdateFn = (updates: SituationNodeUpdate) => void;
+type UpdateSituationNodeFn = (id: string, updates: SituationNodeUpdate) => void;
 
 const SIT_TABS: { id: SitTab; label: string; color: string }[] = [
   { id: 'overview', label: 'Overview', color: 'var(--text-primary)' },
@@ -256,6 +261,35 @@ function SitDescriptionField({ node, readOnly, descMode, setDescMode, err, updat
   );
 }
 
+// t/3382/t/3384: touch devices never fire `contextmenu` on a long-press — extracted so
+// useLongPressContextMenu can be called once per chip instance (can't call a hook inside .map()).
+function LineageChip({ label, selected, onSelect, onShowInfo }: {
+  label: string;
+  selected: boolean;
+  onSelect: () => void;
+  onShowInfo: () => void;
+}) {
+  const longPress = useLongPressContextMenu(useCallback((e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    onShowInfo();
+  }, [onShowInfo]));
+  return (
+    <span
+      className={`ga-promoted-chip ga-promoted-chip-interactive${selected ? ' ga-promoted-chip-selected' : ''}`}
+      onClick={(e) => { e.stopPropagation(); onSelect(); }}
+      onContextMenu={longPress.onContextMenu}
+      onTouchStart={longPress.onTouchStart}
+      onTouchMove={longPress.onTouchMove}
+      onTouchEnd={longPress.onTouchEnd}
+      onTouchCancel={longPress.onTouchCancel}
+      title={`Click to view lineage info: "${label}"`}
+    >
+      {label}
+    </span>
+  );
+}
+
 interface SitOverviewTabProps {
   node: SituationNode;
   readOnly?: boolean;
@@ -346,15 +380,13 @@ function SitOverviewTab({
           <label>Intellectual Lineage</label>
           <div className="ga-promoted-list">
             {[...node.graph_attributes.intellectual_lineage].map(v => typeof v === 'string' ? v : (v as { name?: string })?.name).filter((v): v is string => typeof v === 'string' && v.length > 0).sort((a, b) => a.localeCompare(b)).map((l, i) => (
-              <span
+              <LineageChip
                 key={i}
-                className={`ga-promoted-chip ga-promoted-chip-interactive${expandedLineage === l ? ' ga-promoted-chip-selected' : ''}`}
-                onClick={(e) => { e.stopPropagation(); setExpandedLineage(expandedLineage === l ? null : l); }}
-                onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); showAttributeInfo('intellectual_lineage', l); }}
-                title={`Click to view lineage info: "${l}"`}
-              >
-                {l}
-              </span>
+                label={l}
+                selected={expandedLineage === l}
+                onSelect={() => setExpandedLineage(expandedLineage === l ? null : l)}
+                onShowInfo={() => showAttributeInfo('intellectual_lineage', l)}
+              />
             ))}
           </div>
           {expandedLineage && (
@@ -428,7 +460,6 @@ interface SitPovTabProps {
   setEditing: (v: boolean) => void;
   err: ErrFn;
   update: UpdateFn;
-  updateInterpretation: (pov: SitPov, value: string) => void;
   allPovIds: string[];
   addLinked: (id: string) => void;
   removeLinked: (id: string) => void;
@@ -437,7 +468,7 @@ interface SitPovTabProps {
 
 /** POV tab (accelerationist/safetyist/skeptic): interpretation editor + supporting evidence. */
 function SitPovTab({
-  node, activeTab, readOnly, editing, setEditing, err, update, updateInterpretation,
+  node, activeTab, readOnly, editing, setEditing, err, update,
   allPovIds, addLinked, removeLinked, chipDepth,
 }: SitPovTabProps) {
   // Filter linked nodes by POV prefix for the supporting evidence sidebar
@@ -466,13 +497,10 @@ function SitPovTab({
                 </div>
               );
             }
+            // t/3888: patch only this POV — the store merges per POV, and spreading every POV
+            // would also re-write any untouched legacy (flat) POV through the strict type.
             const updateBdiField = (field: 'summary' | 'belief' | 'desire' | 'intention', value: string) => {
-              update({
-                interpretations: {
-                  ...node.interpretations,
-                  [activeTab]: { ...bdi, [field]: value },
-                },
-              });
+              update({ interpretations: { [activeTab]: { ...bdi, [field]: value } } });
             };
             const bdiFields: { key: 'summary' | 'belief' | 'desire' | 'intention'; label: string }[] = [
               { key: 'summary', label: 'Summary' },
@@ -482,6 +510,8 @@ function SitPovTab({
             ];
             return (
               <>
+                {/* t/3888: the save gate's refusal for this POV (names the empty fields). */}
+                {err(`interpretations.${activeTab}`) && <div className="error-text">{err(`interpretations.${activeTab}`)}</div>}
                 {!editing && (
                   <div className="situation-detail-bdi-view">
                     {bdiFields.map(({ key, label }) => (
@@ -540,17 +570,12 @@ function SitPovTab({
               </>
             );
           }
-          // Legacy plain-string interpretation
-          if (readOnly) {
-            return <div className="sit-pov-text">{interpretationText(interp)}</div>;
-          }
+          // Legacy flat (non-BDI) interpretation: read-only (t/3888). The free-text editor that
+          // used to be here wrote flat prose back to disk — the source of five hand backfills.
           return (
             <div className={`form-group ${err(`interpretations.${activeTab}`) ? 'has-error' : ''}`}>
-              <HighlightedTextarea
-                value={interpretationText(interp)}
-                onChange={(v) => updateInterpretation(activeTab, v)}
-                rows={8}
-              />
+              <div className="sit-pov-text">{interpretationText(interp)}</div>
+              <div className="sit-legacy-note">Not broken into belief, desire and intention — read-only.</div>
               {err(`interpretations.${activeTab}`) && <div className="error-text">{err(`interpretations.${activeTab}`)}</div>}
             </div>
           );
@@ -592,7 +617,8 @@ function SitPovTab({
 }
 
 export function SituationDetail({ node, readOnly, onPin, onRelated, onDebate, chipDepth = 0 }: SituationDetailProps) {
-  const { updateSituationNode, deleteSituationNode, validationErrors, getAllNodeIds, getAllConflictIds, runAttributeFilter, showAttributeInfo, getLabelForId } = useTaxonomyStore();
+  const { updateSituationNode, deleteSituationNode, validationErrors, getAllNodeIds, getAllConflictIds, runAttributeFilter, showAttributeInfo, getLabelForId, edgesFile, accelerationist, safetyist, skeptic, situations } = useTaxonomyStore();
+  const authInfo = useAuthStatus();
   // Bookmark (Pin-for-comparison) controls are Advanced-view only (t/2826).
   const viewMode = usePreferencesStore(s => s.viewMode);
   const [descMode, setDescMode] = useDescriptionMode();
@@ -645,15 +671,9 @@ export function SituationDetail({ node, readOnly, onPin, onRelated, onDebate, ch
     }
   }, [hasErrors]);
 
-  const update = (updates: Partial<SituationNode>) => {
+  const update = (updates: SituationNodeUpdate) => {
     if (readOnly) return;
     updateSituationNode(node.id, updates);
-  };
-
-  const updateInterpretation = (pov: 'accelerationist' | 'safetyist' | 'skeptic', value: string) => {
-    update({
-      interpretations: { ...node.interpretations, [pov]: value },
-    });
   };
 
   const addLinked = (id: string) => {
@@ -760,7 +780,7 @@ export function SituationDetail({ node, readOnly, onPin, onRelated, onDebate, ch
         )}
 
         {activeTab === 'debate' && (
-          <SituationDebatePanel node={node} onLaunched={() => {}} />
+          <SituationDebatePanel node={node} />
         )}
 
         {isPovTab(activeTab) && (
@@ -772,7 +792,6 @@ export function SituationDetail({ node, readOnly, onPin, onRelated, onDebate, ch
             setEditing={setEditing}
             err={err}
             update={update}
-            updateInterpretation={updateInterpretation}
             allPovIds={allPovIds}
             addLinked={addLinked}
             removeLinked={removeLinked}
@@ -781,16 +800,31 @@ export function SituationDetail({ node, readOnly, onPin, onRelated, onDebate, ch
         )}
       </div>
 
-      {showDelete && !readOnly && (
+      {showDelete && !readOnly && (() => {
+        // t/3852: exhaustive, not sampled — computed fresh at dialog-open time so a stale
+        // closure can't under-report after the user has been editing edges/situations.
+        const danglingCounts = countDanglingReferences(node.id, [accelerationist, safetyist, skeptic], situations, edgesFile);
+        return (
         <DeleteConfirmDialog
           itemLabel={node.label}
+          danglingWarning={formatDanglingWarning(danglingCounts)}
           onConfirm={() => {
             deleteSituationNode(node.id);
+            void api.logNodeDeletion({
+              nodeId: node.id,
+              pov: 'situations',
+              label: node.label,
+              user: authInfo?.user || '_anonymous', // AuthInfo is web-only; Electron falls back to '_anonymous' here (t/3859's writer can supplement with the OS username)
+              danglingEdges: danglingCounts.edges,
+              danglingSituationRefs: danglingCounts.situationRefs,
+              danglingChildren: danglingCounts.children,
+            });
             setShowDelete(false);
           }}
           onCancel={() => setShowDelete(false)}
         />
-      )}
+        );
+      })()}
     </div>
   );
 }

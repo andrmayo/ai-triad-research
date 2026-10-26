@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 // Licensed under the MIT License. See LICENSE file in the project root.
 
-import type { DocumentAnalysis, DebatePhase, DebateAudience, TopicScope } from '../types.js';
+import type { DocumentAnalysis, DebatePhase, DebateAudience, PovInfo, SpeakerId, TopicScope } from '../types.js';
 import type { TopicStructure } from '../topicStructure.js';
 import { documentAnalysisContext } from '../documentAnalysis.js';
 import { getTopicScope, hasMeaningfulScope, formatDebateScopeBlock } from './state.js';
@@ -13,6 +13,7 @@ import {
   getStyleReinforcement,
   getPolicymakerFraming,
   formatDoctrinalBoundaries,
+  gradeTargetPreamble,
 } from './shared-helpers.js';
 import {
   sourceReminder,
@@ -35,6 +36,10 @@ export interface StagePromptInput {
   focusPoint: string;
   addressing: string;
   phase?: DebatePhase;
+  /** Resolved soul for this speaker (t/3988). */
+  soul: PovInfo;
+  /** Resolved souls for the other speakers (t/3988). Keys are SpeakerId. */
+  opponentSouls?: Partial<Record<SpeakerId, PovInfo>>;
   priorMoves?: string[];
   turnsSinceLastConcession?: number;
   priorRefs?: string[];
@@ -122,7 +127,7 @@ export function briefStagePrompt(input: StagePromptInput): string {
 
 Your task is to comprehend the current state of the debate and identify what matters most for ${input.label}'s next response. This is pure analysis — do not write any debate statement or adopt the debater's voice.
 
-${input.explorationPriming ? `${input.explorationPriming}\n` : ''}${input.taxonomyContext}
+${gradeTargetPreamble(input.audience)}${input.explorationPriming ? `${input.explorationPriming}\n` : ''}${input.taxonomyContext}
 ${input.edgeContext ? `\n=== KNOWN CROSS-POV TENSIONS ===\n${input.edgeContext}\n` : ''}${input.topicScope ? `\n${formatDebateScopeBlock(input.topicScope)}\n` : ''}${input.priorCruxContext ? `\n${input.priorCruxContext}\n` : ''}${input.currentCruxContext ? `\n=== IDENTIFIED CRUXES (THIS DEBATE) ===\n${input.currentCruxContext}\n\n` : ''}${formatTopicBlock(input.topic, input.topicStructure)}${input.background ? `\n\n=== BACKGROUND CONTEXT ===\nThe user provided the following supporting context. Use it to inform your analysis, but keep it separate from the debate question itself.\n${input.background}` : ''}
 
 === RECENT DEBATE HISTORY ===
@@ -179,7 +184,7 @@ You are an analytical assistant preparing a situation brief for ${input.label}, 
 
 Your task is to comprehend the current state of the debate and identify what matters most for ${input.label}'s next response. This is pure analysis — do not write any debate statement or adopt the debater's voice.
 
-${input.phase ? PHASE_INSTRUCTIONS[input.phase] : ''}
+${gradeTargetPreamble(input.audience)}${input.phase ? PHASE_INSTRUCTIONS[input.phase] : ''}
 
 ATTRIBUTION FIDELITY: Your analysis of other speakers' positions must be grounded in what they actually said in the RECENT DEBATE HISTORY below. Do not infer, extrapolate, or construct positions that a speaker did not explicitly state. If a speaker did not address a topic, note the absence — do not fill it with assumptions about what they "probably" believe.
 
@@ -302,10 +307,10 @@ Consider how the moderator's point relates to your own position and plan a brief
     : '';
 
   return `You are ${input.label}, planning your argumentative strategy for your next debate turn.
-${getCharacterBlock(input.pov)}
+${getCharacterBlock(input.pov, input.soul)}
 Your perspective: ${input.pov}.
-${formatDoctrinalBoundaries(input.pov)}
-=== SITUATION BRIEF ===
+${formatDoctrinalBoundaries(input.pov, input.soul)}
+${gradeTargetPreamble(input.audience)}=== SITUATION BRIEF ===
 ${brief}
 ${moveHistoryBlock}${flaggedBlock}${phaseContextBlock}${interventionBlock}${strategicHintsBlock}${strongFoundationsBlock}${avoidClaimsBlock}${preserveConcessionsBlock}${cruxBlock}
 === AVAILABLE DIALECTICAL MOVES ===
@@ -407,15 +412,15 @@ Your first sentence should briefly acknowledge the moderator's point as it relat
   }
 
   return `You are ${input.label}, an AI debater representing the ${input.pov} perspective on AI policy.
-${getCharacterBlock(input.pov)}
-${otherDebaters(input.label)}
+${getCharacterBlock(input.pov, input.soul)}
+${otherDebaters(input.label, input.opponentSouls)}
 ${getReadingLevel(input.audience)}
 ${getDetailInstruction(input.audience)}
 ${getPolicymakerFraming(input.audience)}
 ${MUST_CORE_BEHAVIORS}
 
 ${STEELMAN_INSTRUCTION}
-${formatDoctrinalBoundaries(input.pov)}
+${formatDoctrinalBoundaries(input.pov, input.soul)}
 === SITUATION BRIEF ===
 ${brief}
 
@@ -481,6 +486,10 @@ export interface RewriteFromClaimsInput {
   audience?: DebateAudience;
   currentCruxContext?: string;
   topicScope?: TopicScope;
+  /** Resolved soul for this speaker (t/3988). */
+  soul: PovInfo;
+  /** Resolved souls for the other speakers (t/3988). Keys are SpeakerId. */
+  opponentSouls?: Partial<Record<SpeakerId, PovInfo>>;
 }
 
 /**
@@ -498,15 +507,15 @@ export function draftFromSelectedClaimsPrompt(input: RewriteFromClaimsInput): st
     : 'None identified.';
 
   return `You are ${input.label}, an AI debater representing the ${input.pov} perspective on AI policy.
-${getCharacterBlock(input.pov)}
-${otherDebaters(input.label)}
+${getCharacterBlock(input.pov, input.soul)}
+${otherDebaters(input.label, input.opponentSouls)}
 ${getReadingLevel(input.audience)}
 ${getDetailInstruction(input.audience)}
 ${getPolicymakerFraming(input.audience)}
 ${MUST_CORE_BEHAVIORS}
 
 ${STEELMAN_INSTRUCTION}
-${formatDoctrinalBoundaries(input.pov)}
+${formatDoctrinalBoundaries(input.pov, input.soul)}
 === DEBATE TOPIC ===
 ${input.topic}
 

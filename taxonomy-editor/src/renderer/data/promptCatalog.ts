@@ -13,6 +13,7 @@
  */
 
 import { DEFAULT_MODEL } from '@lib/ai-client/defaults';
+import type { PovInfo } from '@lib/debate/types';
 import { researchPrompt, conflictResearchPrompt } from '../prompts/research';
 import { vernacularPrompt } from '../prompts/vernacular';
 import { aphorismPrompt } from '../prompts/aphorism';
@@ -54,9 +55,17 @@ import {
   citeRetryPrompt,
   draftQualityCheckPrompt,
   decomposeResolutionPrompt,
+  narrativeVoicingPrompt,
 } from '@lib/debate/prompts';
 import { critiqueTopicPrompt } from '@lib/debate/topicCritique';
 
+
+/** t/4007: the debate builders now require a soul. These catalog entries are display templates with
+ *  placeholder POVs, which used to resolve to no soul, so the character, boundary and recap blocks
+ *  rendered empty. This placeholder carries only identity fields: no `voice`, `boundaries`,
+ *  `value_hierarchy`, `epistemic_stance` or `anti_patterns`, so those blocks still render empty and the
+ *  templates are unchanged. The cast is deliberate and confined to this display-only use. */
+const CATALOG_TEMPLATE_SOUL = { label: '{debater}', pov: '{pov}', personality: '{personality}' } as unknown as PovInfo;
 export type PromptGroup = 'debate-setup' | 'debate-turns' | 'debate-analysis' | 'moderator' | 'chat' | 'taxonomy' | 'research' | 'powershell' | 'oped';
 export type DataSourceId = 'taxonomyNodes' | 'situationNodes' | 'vulnerabilities' | 'fallacies' | 'policyRegistry' | 'sourceDocument' | 'commitments' | 'argumentNetwork' | 'establishedPoints';
 
@@ -234,7 +243,8 @@ export const PROMPT_CATALOG: PromptCatalogEntry[] = [
     title: 'Debate: Opening Statement',
     description: 'Generates an opening statement for a debater, grounded in taxonomy positions.',
     source: 'prompts/debate.ts',
-    template: openingStatementPrompt('{debater}', '{pov}', '{personality}', '{topic}', '{taxonomy_context}', '', true),
+    template: openingStatementPrompt('{debater}', '{pov}', '{personality}', '{topic}', '{taxonomy_context}', '', true,
+      undefined, undefined, undefined, undefined, undefined, undefined, CATALOG_TEMPLATE_SOUL),
     group: 'debate-turns',
     purpose: 'Fires at the start of each debate. Gives each debater their POV-grounded taxonomy context and asks them to state their position on the topic. The quality of this prompt determines how well-grounded the entire debate will be.',
     phase: 'opening',
@@ -245,7 +255,8 @@ export const PROMPT_CATALOG: PromptCatalogEntry[] = [
     title: 'Debate: Response',
     description: 'Generates a debate response to a question or challenge, engaging with prior history.',
     source: 'prompts/debate.ts',
-    template: debateResponsePrompt('{debater}', '{pov}', '{personality}', '{topic}', '{taxonomy_context}', '{transcript}', '{question}', '{addressing}'),
+    template: debateResponsePrompt('{debater}', '{pov}', '{personality}', '{topic}', '{taxonomy_context}', '{transcript}', '{question}', '{addressing}',
+      undefined, undefined, undefined, undefined, undefined, CATALOG_TEMPLATE_SOUL),
     group: 'debate-turns',
     purpose: 'Fires for each debater turn after the opening. Includes taxonomy context, prior transcript, commitments, and argument network to produce a contextually aware response that engages with specific points from other debaters.',
     phase: 'response',
@@ -256,7 +267,8 @@ export const PROMPT_CATALOG: PromptCatalogEntry[] = [
     title: 'Debate: Cross-Respond',
     description: 'Generates a cross-response between debaters on a specific focus point.',
     source: 'prompts/debate.ts',
-    template: crossRespondPrompt('{debater}', '{pov}', '{personality}', '{topic}', '{taxonomy_context}', '{transcript}', '{focus_point}', '{addressing}'),
+    template: crossRespondPrompt('{debater}', '{pov}', '{personality}', '{topic}', '{taxonomy_context}', '{transcript}', '{focus_point}', '{addressing}',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, CATALOG_TEMPLATE_SOUL),
     group: 'debate-turns',
     purpose: 'Fires during cross-respond turns when the moderator directs a specific debater to address a specific point. Similar to response but with a narrower focus directive.',
     phase: 'cross-respond',
@@ -533,6 +545,20 @@ export const PROMPT_CATALOG: PromptCatalogEntry[] = [
     applicableDataSources: ['taxonomyNodes', 'commitments', 'argumentNetwork'],
   },
   {
+    // EXPOSE (CL t/4214#4): its verdicts can block a reflection edit in the ReflectionsPanel (R-6), so a reviewer
+    // must be able to inspect the prompt behind a block.
+    id: 'debate-reflection-tag-check',
+    title: 'Debate: Reflection Tag Check',
+    description: 'Asks a judge whether a reflection edit to a tagged node stays true to the other wings that hold it: consistent, tension or conflict, with the boundary or value it cites.',
+    source: 'lib/debate/prompts/reflectionTagCheck.ts',
+    template: '(Template requires runtime context — view in Prompt Inspector or Full Prompt tab)',
+    group: 'debate-analysis',
+    purpose: 'Fires after reflection for each revise, qualify or deprecate edit to a node another wing co-owns, or to an untagged node (Skeptic today). One call per edit at temperature 0. The ReflectionsPanel shows each custodian wing\'s verdict and citation; a conflict, and under the interim rule a tension, holds the edit until the reviewer confirms the override (t/4214).',
+    phase: 'concluding',
+    applicableDataSources: ['taxonomyNodes'],
+    builders: ['buildCustodianCheckPrompt'],
+  },
+  {
     id: 'debate-news-report',
     title: 'Debate: News Report',
     description: 'Transforms a completed debate into a 700-900 word news-style explainer article with headline, lede, interleaved perspectives, common ground, crux classification, and policy implications.',
@@ -592,6 +618,23 @@ export const PROMPT_CATALOG: PromptCatalogEntry[] = [
       { name: '-Temperature', type: 'number', default: '0.1', description: 'Sampling temperature (0-2)' },
       { name: '-MaxTokens', type: 'number', default: '32768', description: 'Maximum response tokens' },
       { name: '-TimeoutSec', type: 'number', default: '120', description: 'API call timeout in seconds' },
+    ],
+  },
+  {
+    id: 'ps-debate-grounding',
+    title: 'Debate Grounding',
+    description: 'Generates one first-person, camp-voice grounding statement (1-2 sentences) for a POV node from its label + description.',
+    source: 'AITriad/Prompts/debate-grounding.prompt',
+    template: '(Loading from disk...)',
+    group: 'powershell',
+    purpose: 'Used by Invoke-DebateGroundingBatch (t/3366) to backfill graph_attributes.debate_grounding — the first-person own-voice restatement the debate engine injects as a grounding text (falls back to description when absent). Register matched to the BDI category (Belief/Desire/Intention).',
+    applicableDataSources: ['taxonomyNodes'],
+    promptFiles: ['debate-grounding'],
+    psParameters: [
+      { name: '-Model', type: 'string', default: 'gemini-3.5-flash-lite', description: 'AI model for generation (NOT a thinking model — those truncate; t/3438#6)' },
+      { name: '-Concurrency', type: 'number', default: '10', description: 'Parallel AI calls' },
+      { name: '-Force', type: 'switch', default: 'false', description: 'Regenerate even nodes that already have debate_grounding' },
+      { name: '-Id', type: 'string[]', default: '(all POV nodes)', description: 'Process only the specified node ID(s)' },
     ],
   },
   {
@@ -989,6 +1032,17 @@ export const PROMPT_CATALOG: PromptCatalogEntry[] = [
     promptFiles: ['qbaf-pair-confirm'],
   },
   {
+    id: 'ps-contradiction-classify',
+    title: 'Contradiction Classifier (Fork-B Semantic Opposition)',
+    description: 'Classifies the logical relation (contradict | entail | neutral) between two within-conflict factual assertions.',
+    source: 'AITriad/Prompts/contradiction-classify.prompt',
+    template: '(Loading from disk...)',
+    group: 'powershell',
+    purpose: 'Used by invoke-contradiction-classifier.ps1 (fork-B semantic-opposition edges, t/3302). Per-conflict batch classification of within-conflict assertion pairs — contradict → attack edge, entail → support edge — feeding the QBAF via enrich_conflicts_qbaf.py --semantic-edges.',
+    applicableDataSources: ['taxonomyNodes'],
+    promptFiles: ['contradiction-classify'],
+  },
+  {
     id: 'ps-entity-link-judge',
     title: 'Entity Link Judge',
     description: 'LLM judge prompt that classifies entity_refs as genuine or spurious surface/alias matches in extraction quality audits.',
@@ -1009,6 +1063,28 @@ export const PROMPT_CATALOG: PromptCatalogEntry[] = [
     purpose: 'Used by the logical_form formalization pass (t/3126). Reads a claim + resolved entity_refs and emits schema-valid JSON per docs/logical-form-schema.md — grounding args only from resolved entities, attitude from category, holder from camp.',
     applicableDataSources: ['taxonomyNodes'],
     promptFiles: ['logical-form-formalization'],
+  },
+  {
+    id: 'ps-fol-clause-classify',
+    title: 'FOL-on-Debate Clause Classifier',
+    description: 'Classifies a debate clause into the closed 5-type FOL taxonomy (assertoric-factual/causal, normative-deontic, speech-act/belief-revision-meta, rhetorical-evaluative) plus attribution / anaphora / polarity attributes.',
+    source: 'AITriad/Prompts/fol-clause-classify.prompt',
+    template: '(Loading from disk...)',
+    group: 'powershell',
+    purpose: 'Used by run-fol-debate-eval.ps1 (offline FOL-on-debate eval, t/3354) — types segmented debate clauses so only the assertoric-factual/causal subset reaches FOL extraction. Read-only research eval; INSTRUMENT-PROVISIONAL until validated against CL\'s blind gold set (design §5).',
+    applicableDataSources: ['taxonomyNodes'],
+    promptFiles: ['fol-clause-classify'],
+  },
+  {
+    id: 'ps-fol-clause-coref',
+    title: 'FOL-on-Debate Clause Coreference Resolver',
+    description: 'Resolves cross-turn referential dependencies (demonstratives, topic ellipsis, attributed restatements) in an assertoric debate clause against the debate context, rewriting it into a self-contained proposition.',
+    source: 'AITriad/Prompts/fol-clause-coref.prompt',
+    template: '(Loading from disk...)',
+    group: 'powershell',
+    purpose: 'Used by run-fol-debate-eval.ps1 (offline FOL-on-debate eval, t/3354, design §6 — the hard prerequisite) — makes the assertoric subset self-contained before FOL extraction and reports coverage loss. Read-only research eval; INSTRUMENT-PROVISIONAL (resolutions are measurement inputs, not ground truth).',
+    applicableDataSources: ['taxonomyNodes'],
+    promptFiles: ['fol-clause-coref'],
   },
 
   // === Debate pipeline: Quality & repair prompts ===
@@ -1203,6 +1279,55 @@ export const PROMPT_CATALOG: PromptCatalogEntry[] = [
     applicableDataSources: ['sourceDocument'],
     promptFiles: ['op-ed-source-brief'],
   },
+  {
+    id: 'ps-oped-readability-edit',
+    title: 'Op-Ed Readability Edit Pass',
+    description: 'Copy-editor prompt that rewrites a finished op-ed for readability — sentence and paragraph length, reading grade — without touching the argument, facts, or voice.',
+    source: 'lib/oped/prompts/op-ed-readability-edit.prompt',
+    template: '(Loading from disk...)',
+    group: 'oped' as const,
+    promptDir: 'oped' as const,
+    purpose: 'Conditional post-generation pass (t/3707). Fires only when the measured draft trips a threshold (FK grade > 11, any paragraph > 90 words, or any sentence > 30 words), so a clean draft costs no extra call. Runs after body generation and BEFORE the grounding reflection, since reflection maps grounding nodes to positions in the final body. Accepts {{BODY}} and {{VIOLATIONS}}; returns JSON { body_markdown, changed, edit_notes } and may return the draft unchanged.',
+    applicableDataSources: [],
+    promptFiles: ['op-ed-readability-edit'],
+  },
+  {
+    id: 'ps-oped-coherence-judge',
+    title: 'Op-Ed Coherence Judge',
+    description: 'Adversarial coherence auditor that checks for internal contradictions between thesis, solution, mechanism, and scope — flags with verbatim span quotes.',
+    source: 'lib/oped/prompts/op-ed-coherence-judge.prompt',
+    template: '(Loading from disk...)',
+    group: 'oped' as const,
+    promptDir: 'oped' as const,
+    purpose: 'First half of the coherence pass (t/3826). Runs BEFORE the readability pass. Returns flat {check1, check2, check3} — each check carries flagged + span_a + span_b + why. Empty spans = not flagged. Accepts {{BODY}}, {{THESIS}}, {{VALUE_HIERARCHY}}.',
+    applicableDataSources: [],
+    promptFiles: ['op-ed-coherence-judge'],
+  },
+  {
+    id: 'ps-oped-coherence-rewrite',
+    title: 'Op-Ed Coherence Rewrite',
+    description: 'Bounded rewrite prompt that resolves flagged internal contradictions without changing the argument, voice, or facts.',
+    source: 'lib/oped/prompts/op-ed-coherence-rewrite.prompt',
+    template: '(Loading from disk...)',
+    group: 'oped' as const,
+    promptDir: 'oped' as const,
+    purpose: 'Second half of the coherence pass (t/3826). Fires only when the judge flags at least one valid contradiction. Returns raw Markdown (no JSON wrapper). Accepts {{BODY}}, {{FLAGGED_CONTRADICTIONS}}, {{VALUE_HIERARCHY}}.',
+    applicableDataSources: [],
+    promptFiles: ['op-ed-coherence-rewrite'],
+  },
+
+  // === Opening narrative voicing (h3) ===
+  {
+    id: 'debate-narrative-voicing',
+    title: 'Moderator: Opening Narrative Voicing',
+    description: 'Before the openings, the moderator retells each camp\'s story (what it fears losing, what history it carries) without judgment.',
+    source: 'lib/debate/prompts/narrative.ts',
+    template: narrativeVoicingPrompt('{topic}', [{ pov: '{pov}', label: '{label}', context: '{taxonomy_context}' }]),
+    group: 'moderator',
+    purpose: 'Fires once before the opening statements when "Moderator voices each camp\'s story" is on. The voicing is shown in the transcript, injected into each debater\'s opening brief and draft (where the debater affirms or amends its own camp\'s account), and embedded as each camp\'s drift reference. Hidden from the neutral evaluator and claim extraction.',
+    phase: 'opening',
+    applicableDataSources: ['taxonomyNodes', 'situationNodes'],
+  },
 
   // === Debate turn pipeline (non-opening stages) + analytical builders (t/2834 / CL EXPOSE t/2835#1) ===
   // These builders take runtime StagePromptInput and can't be invoked in a `template` at build time,
@@ -1336,5 +1461,17 @@ export const PROMPT_CATALOG: PromptCatalogEntry[] = [
     phase: 'clarification',
     applicableDataSources: [],
     builders: ['topicScopeExtractionPrompt'],
+  },
+  {
+    id: 'debate-situation-topic-synthesis',
+    title: 'Debate: Situation Topic Synthesis',
+    description: 'Synthesises a situation node\'s BDI disagreement structure into a contestable debate resolution.',
+    source: 'lib/debate/prompts/synthesis.ts',
+    template: '(Template requires runtime context — view in Prompt Inspector or Full Prompt tab)',
+    group: 'debate-setup',
+    purpose: 'Fires during situation debate setup. Produces proposition, framing_rationale, and cruxes from BDI interpretations + disagreement type.',
+    phase: 'clarification',
+    applicableDataSources: ['situationNodes'],
+    builders: ['situationTopicSynthesisPrompt'],
   },
 ];

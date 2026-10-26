@@ -84,21 +84,22 @@ function Register-AIBackend {
     }
 
     # ── Model list ────────────────────────────────────────────────────────────
+    # Every id MUST be registered in ai-models.json — enforced by the picker-registry
+    # guard test (t/3586). The general model-lint can't see this list (it keys on
+    # 'id =', not 'model =' / -Model), so the guard is the backstop against drift.
     $Models = @(
-        @{ id = 'gemini-3.5-flash-lite'; label = 'Gemini 3.1 Flash Lite (default)'; backend = 'gemini' }
-        @{ id = 'gemini-3.5-flash-lite';              label = 'Gemini 2.5 Flash';                backend = 'gemini' }
-        @{ id = 'gemini-3.5-flash-lite-lite';          label = 'Gemini 2.5 Flash Lite';           backend = 'gemini' }
+        @{ id = 'gemini-3.5-flash-lite';          label = 'Gemini 3.5 Flash Lite (default)'; backend = 'gemini' }
         @{ id = 'gemini-2.5-pro';                 label = 'Gemini 2.5 Pro';                  backend = 'gemini' }
-        @{ id = 'claude-opus-4';                  label = 'Claude Opus 4';                   backend = 'claude' }
+        @{ id = 'claude-opus-4-8';                label = 'Claude Opus 4.8';                 backend = 'claude' }
         @{ id = 'claude-sonnet-4-5';              label = 'Claude Sonnet 4.5';               backend = 'claude' }
-        @{ id = 'claude-haiku-3.5';               label = 'Claude Haiku 3.5';                backend = 'claude' }
-        @{ id = 'groq-llama-3.3-70b';             label = 'Groq Llama 3.3 70B';              backend = 'groq' }
-        @{ id = 'groq-llama-4-scout';             label = 'Groq Llama 4 Scout';              backend = 'groq' }
+        @{ id = 'claude-haiku-4-5';               label = 'Claude Haiku 4.5';                backend = 'claude' }
+        @{ id = 'groq-openai-gpt-oss-120b';       label = 'Groq GPT-OSS 120B';               backend = 'groq' }
         @{ id = 'openai-gpt-5.5';                 label = 'OpenAI GPT-5.5';                  backend = 'openai' }
         @{ id = 'openai-gpt-5.5-pro';             label = 'OpenAI GPT-5.5 Pro';              backend = 'openai' }
         @{ id = 'ollama-gemma4-e4b-it-q4-k-m';    label = 'Ollama Gemma 4 E4B';              backend = 'ollama' }
-        # t/1437 — z.ai / GLM-5.2 (OpenAI-compatible, 1M-token context)
-        @{ id = 'zai-glm-5.2';                    label = 'z.ai GLM-5.2';                    backend = 'zai' }
+        # t/1437 — z.ai / GLM (OpenAI-compatible, 1M-token context)
+        @{ id = 'zai-glm-5-3';                    label = 'z.ai GLM-5.3';                    backend = 'zai' }
+        @{ id = 'zai-glm-5-3-flash';              label = 'z.ai GLM-5.3 Flash';              backend = 'zai' }
     )
 
     $ModelsJson = $Models | ConvertTo-Json -Compress
@@ -330,9 +331,9 @@ function Register-AIBackend {
       <li>Sign in or create an account</li>
       <li>Create a new key and paste it above</li>
     </ol>
-    <p>GLM-5.2 exposes an OpenAI-compatible chat/completions endpoint with a
+    <p>GLM exposes an OpenAI-compatible chat/completions endpoint with a
        <strong>1M-token context window</strong> — the largest of any registered backend.</p>
-    <p><strong>Models available:</strong> GLM-5.2 (id: <code>zai-glm-5.2</code>).</p>
+    <p><strong>Models available:</strong> GLM-5.3 (id: <code>zai-glm-5-3</code>), GLM-5.3 Flash (id: <code>zai-glm-5-3-flash</code>).</p>
   </div>
 </div>
 
@@ -530,9 +531,15 @@ init();
         $Listener.Start()
     }
     catch {
-        Write-Fail "Could not start HTTP listener on port $Port — $($_.Exception.Message)"
-        Write-Info 'Try a different port with -Port or close the process using that port.'
-        return
+        # t/3857: this used to Write-Fail + bare `return` -- never rethrow, so a failure to bind
+        # the config UI's port was indistinguishable from the UI having started successfully. No
+        # internal caller relies on this today, but a silent $null on failure is a trap for the
+        # next one.
+        throw (New-ActionableError -AsErrorRecord `
+                -Goal 'Open the AI backend configuration UI' `
+                -Problem "Could not start HTTP listener on port ${Port}: $($_.Exception.Message)" `
+                -Location 'Register-AIBackend' `
+                -NextSteps 'Try a different port with -Port or close the process using that port.')
     }
 
     Write-Step 'AI Backend Configuration'
@@ -689,7 +696,7 @@ init();
                                             'content-type'      = 'application/json'
                                         }
                                         $Payload = @{
-                                            model      = 'claude-3-5-haiku-20241022'
+                                            model      = 'claude-3-5-haiku-20241022'  # model-lint:allow-pin raw Anthropic API liveness-probe id, intentionally not a registry backend
                                             max_tokens = 10
                                             messages   = @(@{ role = 'user'; content = 'Say OK' })
                                         } | ConvertTo-Json -Depth 5
@@ -723,7 +730,7 @@ init();
                                         # t/1437 — z.ai's OpenAI-compatible surface may not expose /v1/models,
                                         # so probe a minimal chat completion (cheap: 5 max tokens).
                                         $Payload = @{
-                                            model       = 'glm-5.2'
+                                            model       = 'glm-5.2'  # model-lint:allow-pin raw ZAI provider model id (registry id: zai-glm-5-2)
                                             messages    = @(@{ role = 'user'; content = 'ping' })
                                             max_tokens  = 5
                                             temperature = 0.0

@@ -10,6 +10,11 @@ function Get-TriadConfig {
         runtime configuration, optionally writing it to a local file. Requires admin
         credentials (GITHUB_TOKEN). Use this to snapshot the deployed config before
         editing and re-uploading with Set-TriadConfig.
+
+        Works against a local server only. A hosted (Easy-Auth-fronted) deployment does not
+        accept the GITHUB_TOKEN bearer header and answers with its sign-in page; the cmdlet
+        then fails with an actionable error instead of saving that page (t/4370). For staging
+        or prod, sign in as an admin and use the Runtime Config panel.
     .PARAMETER OutputPath
         Local path to write the downloaded config JSON. Default: ./runtime-config.json.
     .PARAMETER BaseUrl
@@ -77,7 +82,7 @@ function Get-TriadConfig {
                elseif ($StatusCode) { "HTTP $StatusCode" }
                else { $_.Exception.Message }
 
-        throw (New-ActionableError `
+        throw (New-ActionableError -AsErrorRecord `
             -Goal 'Download runtime config from taxonomy-editor' `
             -Problem "Config API error: $Msg" `
             -Location 'Get-TriadConfig' `
@@ -85,6 +90,9 @@ function Get-TriadConfig {
                          'Verify the server is reachable at the BaseUrl',
                          "Endpoint: $($Params.Uri)"))
     }
+
+    Assert-TriadConfigResponse -Response $Response -Goal 'Download runtime config from taxonomy-editor' `
+        -Uri $Params.Uri -CallerName 'Get-TriadConfig'
 
     if ($Format -eq 'table') {
         $Config = if ($Response.PSObject.Properties['config']) { $Response.config } else { $Response }

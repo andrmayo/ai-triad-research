@@ -10,6 +10,11 @@ function Invoke-TriadConfigReload {
         server re-reads its runtime configuration without a redeploy. Requires admin
         credentials (GITHUB_TOKEN). Use after Set-TriadConfig when you did not pass
         -Reload, or to force the server to pick up an out-of-band config change.
+
+        Works against a local server only. A hosted (Easy-Auth-fronted) deployment does not
+        accept the GITHUB_TOKEN bearer header and answers with its sign-in page; the cmdlet
+        then fails with an actionable error instead of reporting a reload (t/4370). For staging
+        or prod, sign in as an admin and use the Runtime Config panel.
     .PARAMETER BaseUrl
         Base URL of the taxonomy-editor deployment. Defaults to the configured endpoint.
     .PARAMETER PassThru
@@ -66,7 +71,7 @@ function Invoke-TriadConfigReload {
                elseif ($StatusCode) { "HTTP $StatusCode" }
                else { $_.Exception.Message }
 
-        throw (New-ActionableError `
+        throw (New-ActionableError -AsErrorRecord `
             -Goal 'Reload runtime config on taxonomy-editor' `
             -Problem "Config reload error: $Msg" `
             -Location 'Invoke-TriadConfigReload' `
@@ -74,6 +79,9 @@ function Invoke-TriadConfigReload {
                          'Verify the server is reachable at the BaseUrl',
                          "Endpoint: $($Params.Uri)"))
     }
+
+    Assert-TriadConfigResponse -Response $Response -Goal 'Reload runtime config on taxonomy-editor' `
+        -Uri $Params.Uri -CallerName 'Invoke-TriadConfigReload'
 
     if ($Response -and $Response.PSObject.Properties['errors'] -and @($Response.errors).Count -gt 0) {
         Write-Warning "Reload completed with warnings:"

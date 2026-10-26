@@ -102,3 +102,279 @@ Describe 'Save-JsonNodeFieldEdits — durable batch writer (t/2916)' -Tag 'summa
         { Save-JsonNodeFieldEdits -Path $script:path -Edits @(@{ NodeId='sit-001' }) } | Should -Throw
     }
 }
+
+Describe 'Save-JsonNodeFieldEdits — nested Path/Upsert dispatch (t/3438)' -Tag 'summary' {
+
+    BeforeEach {
+        $script:pfx = @'
+{
+  "nodes": [
+    { "id": "acc-001", "graph_attributes": { "type": "belief" }, "label": "keep" },
+    { "id": "acc-002", "label": "no ga" }
+  ]
+}
+'@ -replace "`r`n", "`n"
+        $script:ppath = Join-Path $TestDrive 'pov-fixture.json'
+        [System.IO.File]::WriteAllText($script:ppath, $script:pfx, (New-Object System.Text.UTF8Encoding $false))
+    }
+
+    It 'dispatches Path/Upsert edits (nested insert + container-create) alongside a flat Field edit' {
+        $edits = @(
+            @{ NodeId = 'acc-001'; Path = @('graph_attributes', 'debate_grounding'); Value = 'We hold A.'; Upsert = $true }  # insert into existing ga
+            @{ NodeId = 'acc-002'; Path = @('graph_attributes', 'debate_grounding'); Value = 'We hold B.'; Upsert = $true }  # create ga + leaf
+            @{ NodeId = 'acc-001'; Field = 'label'; Value = 'changed' }                                                       # flat Field still works
+        )
+        $result = Save-JsonNodeFieldEdits -Path $script:ppath -Edits $edits
+        $result.Applied | Should -Be 3
+        $o = @((Get-Content -Raw $script:ppath | ConvertFrom-Json).nodes)
+        $n1 = @($o | Where-Object { $_.id -eq 'acc-001' })[0]
+        $n2 = @($o | Where-Object { $_.id -eq 'acc-002' })[0]
+        $n1.graph_attributes.debate_grounding | Should -Be 'We hold A.'
+        $n1.graph_attributes.type             | Should -Be 'belief'    # sibling preserved
+        $n1.label                             | Should -Be 'changed'   # flat Field edit applied in the same batch
+        $n2.graph_attributes.debate_grounding | Should -Be 'We hold B.'  # container created
+    }
+
+    It 'throws when an edit has BOTH Field and Path' {
+        { Save-JsonNodeFieldEdits -Path $script:ppath -Edits @(@{ NodeId = 'acc-001'; Field = 'label'; Path = @('graph_attributes', 'x'); Value = 'y' }) } | Should -Throw
+    }
+
+    It 'throws when an edit has NEITHER Field nor Path' {
+        { Save-JsonNodeFieldEdits -Path $script:ppath -Edits @(@{ NodeId = 'acc-001'; Value = 'y' }) } | Should -Throw
+    }
+
+    It 'accumulates across SEQUENTIAL same-file writes (read-fresh) — the checkpoint-flush durability guarantee (t/3457)' {
+        # Incremental checkpoint writers (Invoke-DebateGroundingBatch t/3457) call Save-JsonNodeFieldEdits
+        # once per batch on the SAME file with DISJOINT node subsets. Because each call re-reads the file
+        # fresh, a later call must preserve the earlier call's landed edit rather than overwrite it — so a
+        # mid-run kill after batch 1 leaves batch 1 durably on disk.
+        $r1 = Save-JsonNodeFieldEdits -Path $script:ppath -Edits @(
+            @{ NodeId = 'acc-001'; Path = @('graph_attributes', 'debate_grounding'); Value = 'batch-1 statement.'; Upsert = $true }
+        )
+        $r1.Applied | Should -Be 1
+        # Second batch touches a DIFFERENT node in the same file — simulates the next checkpoint flush.
+        $r2 = Save-JsonNodeFieldEdits -Path $script:ppath -Edits @(
+            @{ NodeId = 'acc-002'; Path = @('graph_attributes', 'debate_grounding'); Value = 'batch-2 statement.'; Upsert = $true }
+        )
+        $r2.Applied | Should -Be 1
+
+        $o  = @((Get-Content -Raw $script:ppath | ConvertFrom-Json).nodes)
+        $n1 = @($o | Where-Object { $_.id -eq 'acc-001' })[0]
+        $n2 = @($o | Where-Object { $_.id -eq 'acc-002' })[0]
+        $n1.graph_attributes.debate_grounding | Should -Be 'batch-1 statement.'   # batch-1 survived batch-2's write
+        $n2.graph_attributes.debate_grounding | Should -Be 'batch-2 statement.'
+    }
+}
+
+Describe 'Save-JsonNodeFieldEdits — Remove dispatch (t/3460)' -Tag 'summary' {
+
+    BeforeEach {
+        $script:rfx = @'
+{
+  "nodes": [
+    { "id": "acc-001", "graph_attributes": { "type": "belief", "synthetic_phrases": ["p0", "p1"] }, "label": "keep" },
+    { "id": "acc-002", "note": "keep", "resolved_node_id": "sit-477" }
+  ]
+}
+'@ -replace "`r`n", "`n"
+        $script:rpath = Join-Path $TestDrive 'remove-fixture.json'
+        [System.IO.File]::WriteAllText($script:rpath, $script:rfx, (New-Object System.Text.UTF8Encoding $false))
+    }
+
+    It 'dispatches a Remove edit — deletes graph_attributes.synthetic_phrases; siblings + other nodes preserved' {
+        $result = Save-JsonNodeFieldEdits -Path $script:rpath -Edits @(
+            @{ NodeId = 'acc-001'; Path = @('graph_attributes', 'synthetic_phrases'); Remove = $true }
+        )
+        $result.Applied | Should -Be 1
+        $after = Get-Content -Raw $script:rpath
+        $n1 = @(($after | ConvertFrom-Json).nodes | Where-Object { $_.id -eq 'acc-001' })[0]
+        $n1.graph_attributes.PSObject.Properties['synthetic_phrases'] | Should -BeNullOrEmpty  # removed
+        $n1.graph_attributes.type | Should -Be 'belief'                                        # sibling preserved
+        $after | Should -BeLike '*"resolved_node_id": "sit-477"*'                              # other node byte-identical
+    }
+
+    It 'REFUSES a Remove edit carrying a Value (ambiguous intent) — throws, file untouched' {
+        $before = Get-Content -Raw $script:rpath
+        { Save-JsonNodeFieldEdits -Path $script:rpath -Edits @(@{ NodeId = 'acc-001'; Path = @('graph_attributes', 'synthetic_phrases'); Remove = $true; Value = 'x' }) } | Should -Throw
+        (Get-Content -Raw $script:rpath) | Should -Be $before
+    }
+
+    It 'REFUSES a Remove edit combined with Field, and combined with Upsert' {
+        { Save-JsonNodeFieldEdits -Path $script:rpath -Edits @(@{ NodeId = 'acc-001'; Field = 'label'; Remove = $true }) } | Should -Throw
+        { Save-JsonNodeFieldEdits -Path $script:rpath -Edits @(@{ NodeId = 'acc-001'; Path = @('graph_attributes', 'synthetic_phrases'); Remove = $true; Upsert = $true }) } | Should -Throw
+    }
+
+    It 'REFUSES (strict) an absent-key Remove — throws, batch atomic, file untouched' {
+        $before = Get-Content -Raw $script:rpath
+        { Save-JsonNodeFieldEdits -Path $script:rpath -Edits @(@{ NodeId = 'acc-001'; Path = @('graph_attributes', 'not_there'); Remove = $true }) } | Should -Throw
+        (Get-Content -Raw $script:rpath) | Should -Be $before
+    }
+
+    It 'FAULT-INJECTION: a corrupt splice never reaches disk — file byte-identical after the throw (the verify net at the sink)' {
+        $before = Get-Content -Raw $script:rpath
+        # Doctor the member locator so the splice deletes the wrong bytes; the re-parse-verify inside the
+        # primitive must abort BEFORE Save's guarded write, leaving the file byte-identical.
+        Mock Find-JsonMemberSpan { @{ KeyStart = 5; ValueEnd = 80 } } -ModuleName AITriad
+        { Save-JsonNodeFieldEdits -Path $script:rpath -Edits @(@{ NodeId = 'acc-001'; Path = @('graph_attributes', 'synthetic_phrases'); Remove = $true }) } | Should -Throw
+        (Get-Content -Raw $script:rpath) | Should -Be $before
+    }
+}
+
+Describe 'Save-JsonNodeFieldEdits — batch re-parse-verify (one verify per file, not per edit)' -Tag 'summary' {
+
+    BeforeEach {
+        # Strings carrying braces, escaped quotes and a nested "id" exercise the line-anchored span scanner.
+        $script:bfx = @'
+{
+  "nodes": [
+    { "id": "n-001", "description": "braces { and } in a string", "graph_attributes": { "type": "belief", "old": "x" } },
+    { "id": "n-002", "description": "escaped \"quote\" and \\ backslash", "plain_description": "old" },
+    { "id": "n-003", "description": "nested id below", "refs": [ { "id": "n-001" } ], "label": "keep" },
+    { "id": "n-004", "description": "plain", "graph_attributes": { "type": "desire" } }
+  ]
+}
+'@ -replace "`r`n", "`n"
+        $script:bpath = Join-Path $TestDrive 'batch-fixture.json'
+        [System.IO.File]::WriteAllText($script:bpath, $script:bfx, (New-Object System.Text.UTF8Encoding $false))
+        $script:bedits = @(
+            @{ NodeId = 'n-001'; Field = 'plain_description'; Value = 'p1' }
+            @{ NodeId = 'n-001'; Field = 'plain_description_version'; Value = 'v1' }
+            @{ NodeId = 'n-002'; Field = 'plain_description'; Value = 'has "quotes" and { braces }' }
+            @{ NodeId = 'n-003'; Field = 'plain_description'; Value = 'p3' }
+            @{ NodeId = 'n-004'; Path = @('graph_attributes', 'debate_grounding'); Value = 'We hold D.'; Upsert = $true }
+            @{ NodeId = 'n-003'; Path = @('graph_attributes', 'debate_grounding'); Value = 'We hold C.'; Upsert = $true }
+            @{ NodeId = 'n-001'; Path = @('graph_attributes', 'old'); Remove = $true }
+            @{ NodeId = 'n-004'; Path = @('graph_attributes', 'type'); Value = 'intention' }
+        )
+    }
+
+    It 'writes byte-identical output to the per-edit-verified chain (Field / Upsert / Remove / replace mix)' {
+        $expectedText = InModuleScope AITriad -Parameters @{ Raw = $script:bfx; Edits = $script:bedits } {
+            param($Raw, $Edits)
+            $t = $Raw
+            foreach ($e in $Edits) {
+                if ($e.ContainsKey('Field')) { $t = Update-JsonNodeField -RawText $t -NodeId $e.NodeId -Field $e.Field -Value $e.Value }
+                elseif ($e['Remove']) { $t = Update-JsonNodePath -RawText $t -NodeId $e.NodeId -Path $e.Path -Remove }
+                else { $t = Update-JsonNodePath -RawText $t -NodeId $e.NodeId -Path $e.Path -Value $e.Value -Upsert:([bool]$e['Upsert']) }
+            }
+            $t
+        }
+        $result = Save-JsonNodeFieldEdits -Path $script:bpath -Edits $script:bedits
+        $result.Applied | Should -Be $script:bedits.Count
+        [System.IO.File]::ReadAllText($script:bpath) | Should -BeExactly $expectedText
+    }
+
+    It 'FAILING ARM: -DeferVerify alone lets a wrong-node splice through (so the batch verify is load-bearing)' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:bfx } {
+            param($Raw)
+            # Doctor the span locator to return n-002's object while editing n-004.
+            $start = $Raw.IndexOf('{ "id": "n-002"')
+            $end = $Raw.IndexOf('"old" }', $start) + 6
+            Mock Find-JsonObjectSpan { @{ Start = $start; End = $end } }.GetNewClosure()
+            $out = Update-JsonNodeField -RawText $Raw -NodeId 'n-004' -Field 'plain_description' -Value 'WRONG' -DeferVerify
+            $o = @(($out | ConvertFrom-Json).nodes)
+            (@($o | Where-Object { $_.id -eq 'n-002' })[0]).plain_description | Should -Be 'WRONG'   # corruption returned, unverified
+        }
+    }
+
+    It 'FAULT-INJECTION: the batch verify refuses that wrong-node splice — throws, warns, file byte-identical' {
+        $start = $script:bfx.IndexOf('{ "id": "n-002"')
+        $end = $script:bfx.IndexOf('"old" }', $start) + 6
+        Mock Find-JsonObjectSpan { @{ Start = $start; End = $end } }.GetNewClosure() -ModuleName AITriad
+        { Save-JsonNodeFieldEdits -Path $script:bpath -Edits @(@{ NodeId = 'n-004'; Field = 'plain_description'; Value = 'WRONG' }) -WarningVariable w -WarningAction SilentlyContinue } |
+            Should -Throw '*re-parse-verify FAILED*'
+        [System.IO.File]::ReadAllText($script:bpath) | Should -BeExactly $script:bfx
+    }
+
+    It 'surfaces the batch-verify fallback as a warning before the replay throws' {
+        $start = $script:bfx.IndexOf('{ "id": "n-002"')
+        $end = $script:bfx.IndexOf('"old" }', $start) + 6
+        Mock Find-JsonObjectSpan { @{ Start = $start; End = $end } }.GetNewClosure() -ModuleName AITriad
+        $w = $null
+        try { Save-JsonNodeFieldEdits -Path $script:bpath -Edits @(@{ NodeId = 'n-004'; Field = 'plain_description'; Value = 'WRONG' }) -WarningVariable w -WarningAction SilentlyContinue } catch { }
+        ($w -join "`n") | Should -BeLike '*batch re-parse-verify failed*replaying*'
+    }
+
+    It 'span scanner matches the innermost enclosing object, skipping braces and escaped quotes inside strings' {
+        InModuleScope AITriad -Parameters @{ Raw = $script:bfx } {
+            param($Raw)
+            $idx = $Raw.IndexOf('"id": "n-002"')
+            $span = Find-JsonObjectSpan -Text $Raw -InnerIndex $idx
+            $Raw.Substring($span.Start, $span.End - $span.Start + 1) | Should -BeExactly '{ "id": "n-002", "description": "escaped \"quote\" and \\ backslash", "plain_description": "old" }'
+            Find-JsonObjectSpan -Text '"no object"' -InnerIndex 2 | Should -BeNullOrEmpty
+        }
+    }
+
+    It 'span scanner finds an enclosing { several lines above the id line (pretty-printed, nested siblings, braces in strings)' {
+        InModuleScope AITriad {
+            $text = "{`n  `"nodes`": [`n    {`n      `"label`": `"has } and { inside`",`n      `"graph_attributes`": {`n        `"type`": `"belief`"`n      },`n      `"meta`": { `"a`": 1 },`n      `"id`": `"deep-001`",`n      `"tail`": `"x`"`n    }`n  ]`n}"
+            $idx = Find-JsonIdTokenIndex -Text $text -NodeId 'deep-001'
+            $span = Find-JsonObjectSpan -Text $text -InnerIndex $idx
+            $obj = $text.Substring($span.Start, $span.End - $span.Start + 1)
+            ($obj | ConvertFrom-Json).id | Should -Be 'deep-001'
+            ($obj | ConvertFrom-Json).graph_attributes.type | Should -Be 'belief'
+            $obj.TrimEnd().EndsWith('"tail": "x"' + "`n    }") | Should -BeTrue
+        }
+    }
+
+    It 'id-token locator returns the same index as the regex it replaces' {
+        InModuleScope AITriad {
+            $text = '{ "nodes": [ { "parent": "a-1", "x": "\"id\": \"a-1\"" }, { "id" :  "a-10" }, { "id":"a-1" }, { "id": "a-1" } ] }'
+            foreach ($id in 'a-1', 'a-10', 'missing') {
+                $rx = [regex]::Match($text, '"id"\s*:\s*"' + [regex]::Escape($id) + '"')
+                $expected = if ($rx.Success) { $rx.Index } else { -1 }
+                Find-JsonIdTokenIndex -Text $text -NodeId $id | Should -Be $expected -Because "id '$id'"
+            }
+        }
+    }
+}
+
+Describe 'Save-JsonNodeFieldEdits -- ArrayValue edits (t/3969)' -Tag 'summary' {
+
+    BeforeEach {
+        $script:povFixture = @'
+{
+  "nodes": [
+    { "id": "skp-001", "label": "has tags", "pov_tags": ["old-tag"] },
+    { "id": "skp-002", "label": "no tags yet" }
+  ]
+}
+'@ -replace "`r`n", "`n"
+        $script:povPath = Join-Path $TestDrive 'pov-fixture.json'
+        [System.IO.File]::WriteAllText($script:povPath, $script:povFixture, (New-Object System.Text.UTF8Encoding $false))
+    }
+
+    It 'replaces an existing array leaf via an ArrayValue edit and writes it as an array (not unrolled)' {
+        $edits = @(@{ NodeId = 'skp-001'; Path = @('pov_tags'); Value = @('critical'); ArrayValue = $true })
+        $result = Save-JsonNodeFieldEdits -Path $script:povPath -Edits $edits -Confirm:$false
+        $result.Applied | Should -Be 1
+        $doc = Get-Content -Raw $script:povPath | ConvertFrom-Json -AsHashtable
+        # @(...) before [0]: a single-match Where-Object result is a bare Hashtable here, and
+        # Hashtable implements IDictionary, so an un-wrapped [0] would be a KEY lookup (not
+        # positional indexing) -- @() forces array semantics first.
+        $node = @($doc.nodes | Where-Object { $_.id -eq 'skp-001' })[0]
+        $tags = $node['pov_tags']
+        $tags -is [System.Collections.IList] | Should -BeTrue
+        @($tags).Count | Should -Be 1
+        $tags[0] | Should -Be 'critical'
+    }
+
+    It '-Upsert -ArrayValue creates a new array leaf on a node with none' {
+        $edits = @(@{ NodeId = 'skp-002'; Path = @('pov_tags'); Value = @('a', 'b'); ArrayValue = $true; Upsert = $true })
+        $result = Save-JsonNodeFieldEdits -Path $script:povPath -Edits $edits -Confirm:$false
+        $result.Applied | Should -Be 1
+        $doc = Get-Content -Raw $script:povPath | ConvertFrom-Json -AsHashtable
+        $node = @($doc.nodes | Where-Object { $_.id -eq 'skp-002' })[0]
+        @($node['pov_tags']) -join ',' | Should -Be 'a,b'
+    }
+
+    It 'REFUSES an ArrayValue edit that also sets Field' {
+        $edits = @(@{ NodeId = 'skp-001'; Field = 'label'; Value = @('x'); ArrayValue = $true })
+        { Save-JsonNodeFieldEdits -Path $script:povPath -Edits $edits -Confirm:$false } | Should -Throw
+    }
+
+    It 'REFUSES an ArrayValue edit combined with Remove' {
+        $edits = @(@{ NodeId = 'skp-001'; Path = @('pov_tags'); Remove = $true; ArrayValue = $true })
+        { Save-JsonNodeFieldEdits -Path $script:povPath -Edits $edits -Confirm:$false } | Should -Throw
+    }
+}

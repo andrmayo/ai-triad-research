@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 // Licensed under the MIT License. See LICENSE file in the project root.
 
-import type { TurnStageConfig, StageDiagnostics, DraftWorkProduct, OpeningBriefWorkProduct, OpeningPlanWorkProduct, OpeningCiteWorkProduct, OpeningPipelineResult, TaxonomyRef, DocumentAnalysis } from '../types.js';
+import type { TurnStageConfig, StageDiagnostics, DraftWorkProduct, OpeningBriefWorkProduct, OpeningPlanWorkProduct, OpeningCiteWorkProduct, OpeningPipelineResult, TaxonomyRef, DocumentAnalysis, EditingMeta, PovInfo, SpeakerId } from '../types.js';
 import { ActionableError } from '../errors.js';
 import { getGlobalRecorder } from '../../flight-recorder/index.js';
 import { validateDraftStage, validateCiteStage } from '../turnValidator.js';
@@ -15,11 +15,32 @@ import { buildRepairBlock } from './microFix.js';
 import { stripLeadingHeadings, deduplicateStatement } from './assemble.js';
 import { DEFAULT_STAGE_TEMPERATURES } from './types.js';
 import type { StageGenerateFn, StageProgressFn } from './types.js';
+import { runReadabilityEditPass } from './readabilityEditPass.js';
 
 // ── Opening pipeline ──────────────────────────────────
 
-const DEFAULT_BRIEF_TIMEOUT_MS = 60_000;
+// Stage property, not a model property (t/3518 Phase 2, TL e/185#8): this 120s is the minimum
+// budget for the brief stage's prompt complexity regardless of model speed. Per-model minimums
+// live in ai-models.json minTimeoutMs and compose via Math.max — a slow model on this stage gets
+// the larger. Do not move this into the registry; that would over-broaden non-brief calls.
+export const DEFAULT_BRIEF_TIMEOUT_MS = 120_000;
 const DEFAULT_BRIEF_MAX_RETRIES = 3;
+/** Nominal stage count for the opening pipeline (brief, plan, draft, cite). Repair is conditional and must not extend this. */
+export const OPENING_TOTAL_STAGES = 4;
+
+/** Resolve the max-tokens budget for the brief stage (t/4117).
+ *  Registry-first: if the model is listed, thinks_by_default governs.
+ *  Substring fallback applies only when the model is absent from the registry. */
+export function resolveBriefMaxTokens(
+  model: string,
+  registry?: import('../../ai-client/registry.js').ModelRegistry,
+): number | undefined {
+  const entry = registry?.models.find(m => m.id === model);
+  const thinksDefault = entry
+    ? entry.thinks_by_default === true
+    : (model.includes('opus') || model.includes('fable'));
+  return thinksDefault ? 32_000 : undefined;
+}
 
 function isBriefTimeout(err: unknown): boolean {
   if (err instanceof DOMException && err.name === 'AbortError') return true;
@@ -42,6 +63,8 @@ export interface OpeningPipelineInput {
   taxonomyContext: string;
   priorStatements: string;
   isFirst: boolean;
+  /** Labels of speakers who have already given their opening, in order. */
+  priorSpeakerLabels?: string[];
   sourceContent?: string;
   documentAnalysis?: DocumentAnalysis;
   audience?: import('../types.js').DebateAudience;
@@ -58,8 +81,29 @@ export interface OpeningPipelineInput {
   availablePovNodeIds?: string[];
   /** Timeout per brief-stage AI call (ms). Default: 60,000. */
   briefTimeoutMs?: number;
+  /**
+   * Resolved timeout (ms) for plan/draft/cite generate calls. 0 or absent = use adapter default.
+   * Must be a Math.max(base, floor) value — not the raw floor — so the adapter default is raised,
+   * not replaced. CLI path: set by runOpeningPipelineWithRepair. Desktop: set by the renderer call site.
+   */
+  stageTimeoutMs?: number;
   /** Max brief-stage timeout retries. Default: 3. */
   briefMaxRetries?: number;
+  /** Max output tokens for brief-stage AI call. Default: 32,000 for models that think by default,
+   *  undefined (provider default) for others. Driven from ModelEntry.thinks_by_default (t/4117). */
+  briefMaxTokens?: number;
+  /** Max output tokens for plan/draft/cite stage AI calls. Default: 32,000 for models that think
+   *  by default, undefined (provider default) for others. Driven from thinks_by_default (t/4121). */
+  stageMaxTokens?: number;
+  /** Model registry — used to resolve thinks_by_default for the brief budget (t/4117). When absent
+   *  the budget falls back to the old opus/fable substring check (safe for non-registry callers). */
+  registry?: import('../../ai-client/registry.js').ModelRegistry;
+  /** Moderator's narrative voicing of each camp (h3), pre-formatted by narrativeVoicingDebaterBlock. */
+  narrativeVoicing?: string;
+  /** Resolved soul for this speaker (t/3988). When present, overrides POVER_INFO for prompt building. */
+  soul?: PovInfo;
+  /** Resolved souls for the other speakers (t/3988). Keys are SpeakerId. */
+  opponentSouls?: Partial<Record<SpeakerId, PovInfo>>;
 }
 
 export async function runOpeningPipeline(
@@ -85,25 +129,33 @@ export async function runOpeningPipeline(
     taxonomyContext: input.taxonomyContext,
     priorStatements: input.priorStatements,
     isFirst: input.isFirst,
+    priorSpeakerLabels: input.priorSpeakerLabels,
     sourceContent: input.sourceContent,
     documentAnalysis: input.documentAnalysis,
     audience: input.audience,
     userSeedClaims: input.userSeedClaims,
+    narrativeVoicing: input.narrativeVoicing,
+    soul: input.soul!,
+    opponentSouls: input.opponentSouls,
   };
   const stageDiags: StageDiagnostics[] = [];
   const pipelineStart = Date.now();
+  let step = 0;
+  const totalStages = OPENING_TOTAL_STAGES;
 
   // ── Stage 1: BRIEF (with parse-failure retry and configurable timeout retry) ──
   const isOpeningOuterRetry = (input.repairHints?.length ?? 0) > 0;
   const MAX_OPENING_RETRIES = isOpeningOuterRetry ? 0 : 3;
   const briefTimeoutMs = input.briefTimeoutMs ?? DEFAULT_BRIEF_TIMEOUT_MS;
   const briefMaxRetries = input.briefMaxRetries ?? DEFAULT_BRIEF_MAX_RETRIES;
+  const briefMaxTokens = input.briefMaxTokens ?? resolveBriefMaxTokens(oBriefModel, input.registry);
+  const stageMaxTokens = input.stageMaxTokens ?? resolveBriefMaxTokens(oPlanModel, input.registry);
   let brief: OpeningBriefWorkProduct | undefined;
   let briefJson = '';
   let t0: number = Date.now();
   let elapsed: number = 0;
   for (let briefAttempt = 0; briefAttempt <= MAX_OPENING_RETRIES; briefAttempt++) {
-    onProgress?.('brief', `${input.label} is briefing${briefAttempt > 0 ? ` (retry ${briefAttempt})` : ''}...`);
+    onProgress?.('brief', `${input.label} is briefing${briefAttempt > 0 ? ` (retry ${briefAttempt})` : ''}...`, briefAttempt === 0 ? { step: ++step, total: totalStages } : undefined);
     const briefPrompt = briefOpeningStagePrompt(stageInput);
     let briefRaw!: string;
     for (let tout = 0; tout <= briefMaxRetries; tout++) {
@@ -111,7 +163,7 @@ export async function runOpeningPipeline(
       try {
         briefRaw = await generate(
           briefPrompt, oBriefModel,
-          { temperature: temps.brief_temperature, timeoutMs: briefTimeoutMs },
+          { temperature: temps.brief_temperature, timeoutMs: briefTimeoutMs, maxTokens: briefMaxTokens },
           `${input.label} opening brief`,
         );
         break;
@@ -173,11 +225,13 @@ export async function runOpeningPipeline(
   let plan: OpeningPlanWorkProduct | undefined;
   let planJson = '';
   for (let planAttempt = 0; planAttempt <= MAX_OPENING_RETRIES; planAttempt++) {
-    onProgress?.('plan', `${input.label} is planning${planAttempt > 0 ? ` (retry ${planAttempt})` : ''}...`);
+    onProgress?.('plan', `${input.label} is planning${planAttempt > 0 ? ` (retry ${planAttempt})` : ''}...`, planAttempt === 0 ? { step: ++step, total: totalStages } : undefined);
     const planPromptText = planOpeningStagePrompt(stageInput, briefJson);
     t0 = Date.now();
     const planRaw = await generate(
-      planPromptText, oPlanModel, { temperature: temps.plan_temperature }, `${input.label} opening plan`,
+      planPromptText, oPlanModel,
+      { temperature: temps.plan_temperature, timeoutMs: input.stageTimeoutMs || undefined, maxTokens: stageMaxTokens },
+      `${input.label} opening plan`,
     );
     elapsed = Date.now() - t0;
     const planParsed = parseStageResponse<OpeningPlanWorkProduct>(planRaw, 'plan');
@@ -215,7 +269,7 @@ export async function runOpeningPipeline(
   }
 
   // ── Stage 3: DRAFT ──
-  onProgress?.('draft', `${input.label} is drafting...`);
+  onProgress?.('draft', `${input.label} is drafting...`, { step: ++step, total: totalStages });
   let draftPromptText = draftOpeningStagePrompt(stageInput, briefJson, planJson);
   if (input.repairHints && input.repairHints.length > 0) {
     const openingRepairBlock = buildRepairBlock(input.repairHints);
@@ -231,7 +285,9 @@ export async function runOpeningPipeline(
   }
   t0 = Date.now();
   const draftRaw = await generate(
-    draftPromptText, oDraftModel, { temperature: temps.draft_temperature }, `${input.label} opening draft`,
+    draftPromptText, oDraftModel,
+    { temperature: temps.draft_temperature, timeoutMs: input.stageTimeoutMs || undefined, maxTokens: stageMaxTokens },
+    `${input.label} opening draft`,
   );
   elapsed = Date.now() - t0;
   const draftParsed = parseStageResponse<DraftWorkProduct>(draftRaw, 'draft');
@@ -246,6 +302,27 @@ export async function runOpeningPipeline(
     model: input.model, timestamp: new Date().toISOString(),
   });
   const draftJson = toPromptJson(draft);
+
+  // Emit draft-field coverage event (t/3769) — _covered:true makes absence distinguishable from present-but-zero.
+  if (draft) {
+    getGlobalRecorder()?.record({
+      type: 'debate.stage_draft_fields',
+      component: 'turn-pipeline',
+      level: 'info',
+      speaker: input.label,
+      phase: 'opening',
+      data: {
+        stage: 'draft',
+        claim_sketches: draft.claim_sketches?.length ?? 0,
+        prior_steelmans: draft.prior_steelmans?.length ?? 0,
+        turn_symbols: draft.turn_symbols?.length ?? 0,
+        statement_chars: draft.statement?.length ?? 0,
+        position_update: !!draft.position_update,
+        commitment: !!draft.commitment,
+        _covered: true,
+      },
+    });
+  }
 
   // Per-stage draft validation for openings (Rules 6, 10, 12 — no moves/disagreement for openings)
   if (draft) {
@@ -263,6 +340,7 @@ export async function runOpeningPipeline(
       round: 0,
       priorTurns: [],
       speaker: input.pov as import('../types.js').SpeakerId,
+      soul: input.soul!,
     });
     const lastDiag = stageDiags[stageDiags.length - 1];
     (lastDiag as Record<string, unknown>).stage_validation = {
@@ -270,12 +348,22 @@ export async function runOpeningPipeline(
     };
   }
 
+  // ── Post-draft readability edit pass ──
+  let editingMeta: OpeningPipelineResult['editing_meta'];
+  if (draft?.statement) {
+    const editResult = await runReadabilityEditPass(draft.statement, input.audience, generate, input.model, input.label);
+    (draft as Record<string, unknown>).statement = editResult.statement;
+    editingMeta = editResult.editing_meta;
+  }
+
   // ── Stage 4: CITE ──
-  onProgress?.('cite', `${input.label} is citing...`);
+  onProgress?.('cite', `${input.label} is citing...`, { step: ++step, total: totalStages });
   const citePromptText = citeOpeningStagePrompt(stageInput, briefJson, planJson, draftJson);
   t0 = Date.now();
   const citeRaw = await generate(
-    citePromptText, oCiteModel, { temperature: temps.cite_temperature }, `${input.label} opening cite`,
+    citePromptText, oCiteModel,
+    { temperature: temps.cite_temperature, timeoutMs: input.stageTimeoutMs || undefined, maxTokens: stageMaxTokens },
+    `${input.label} opening cite`,
   );
   elapsed = Date.now() - t0;
   const citeParsed = parseStageResponse<OpeningCiteWorkProduct>(citeRaw, 'cite');
@@ -311,6 +399,7 @@ export async function runOpeningPipeline(
     cite,
     stage_diagnostics: stageDiags,
     total_time_ms: Date.now() - pipelineStart,
+    editing_meta: editingMeta,
   };
 }
 
@@ -324,6 +413,51 @@ export function getOpeningRepairHints(result: OpeningPipelineResult): string[] {
     }
   }
   return hints;
+}
+
+/**
+ * Run the opening pipeline with the brief-timeout floor applied and one
+ * repair-retry on validation failures (t/3521). Single source of truth for
+ * both the engine and renderer paths — a config change here applies everywhere.
+ *
+ * @param getMinTimeout Optional per-model minimum timeout (e.g. from the AI
+ *   registry). Used to compute the floor: Math.max(DEFAULT_BRIEF_TIMEOUT_MS,
+ *   getMinTimeout(model)). Callers that have no registry may omit it.
+ */
+export async function runOpeningPipelineWithRepair(
+  input: OpeningPipelineInput,
+  generate: StageGenerateFn,
+  onProgress?: StageProgressFn,
+  onBriefEvent?: BriefEventFn,
+  getMinTimeout?: (model: string) => number,
+): Promise<OpeningPipelineResult> {
+  const briefModel = input.briefModel ?? input.model;
+  const floored: OpeningPipelineInput = {
+    ...input,
+    briefTimeoutMs: input.briefTimeoutMs ?? Math.max(DEFAULT_BRIEF_TIMEOUT_MS, getMinTimeout?.(briefModel) ?? 0),
+    // stageTimeoutMs is caller-supplied (real registry) or resolved from getMinTimeout on the CLI path.
+    // getMinTimeout returns 0 on the electron stub path → || undefined → adapter default unchanged (no regression).
+    stageTimeoutMs: input.stageTimeoutMs ?? (getMinTimeout?.(input.model) ?? 0),
+  };
+
+  let result = await runOpeningPipeline(floored, generate, onProgress, onBriefEvent);
+
+  const repairHints = getOpeningRepairHints(result);
+  if (repairHints.length > 0) {
+    const issueCount = repairHints.length;
+    onProgress?.('repair', `${input.label} retrying (${issueCount} issue${issueCount > 1 ? 's' : ''})`, { step: OPENING_TOTAL_STAGES, total: OPENING_TOTAL_STAGES });
+    try {
+      result = await runOpeningPipeline({ ...floored, repairHints }, generate, onProgress, onBriefEvent);
+    } catch (err) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'turn-pipeline', level: 'warn',
+        message: 'Opening repair retry failed — using first attempt result',
+        error: { name: (err as Error).name ?? 'Error', message: String(err) },
+      });
+    }
+  }
+
+  return result;
 }
 
 export function assembleOpeningPipelineResult(
@@ -369,12 +503,22 @@ export function assembleOpeningPipelineResult(
     ? rawClaims.filter(c => wordOverlap(c.claim, statement) >= 0.4)
     : rawClaims;
 
+  // Steelman sketches from prior_steelmans — these represent the steelmanned camp's position,
+  // so word-overlap with the speaker's own statement is irrelevant; append unconditionally.
+  const steelmanSeeds = (result.draft.prior_steelmans ?? [])
+    .filter(s => typeof s?.speaker === 'string' && typeof s?.steelman_claim === 'string' && s.steelman_claim.trim())
+    .map(s => ({ claim: s.steelman_claim, targets: [] as string[], steelman_of: s.speaker }));
+
+  const allClaims = steelmanSeeds.length > 0
+    ? [...(groundedClaims ?? []), ...steelmanSeeds]
+    : groundedClaims;
+
   return {
     statement,
     taxonomyRefs,
     meta: {
       key_assumptions: result.draft.key_assumptions?.length ? result.draft.key_assumptions : undefined,
-      my_claims: groundedClaims?.length ? groundedClaims : undefined,
+      my_claims: allClaims?.length ? allClaims : undefined,
       policy_refs: result.cite.policy_refs?.length ? result.cite.policy_refs : undefined,
       turn_symbols: result.draft.turn_symbols?.length ? sanitizeTurnSymbols(result.draft.turn_symbols) : undefined,
     },

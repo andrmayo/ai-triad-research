@@ -15,8 +15,9 @@ import type { Router } from '../httpKit.js';
 import type { ServerCtx } from './context.js';
 import { json, error } from '../httpKit.js';
 import { classifyDataUnavailable, type ReadinessState } from './readiness.js';
+import { getDataRootReadyState } from './dataRootReadiness.js'; // t/3309: cache-once data-root readiness
 import { getGlobalRecorder } from '../../../../lib/flight-recorder/index.js';
-import { getProjectRoot, getDataRoot, hasApiKey, STORAGE_MODE } from '../config.js';
+import { getProjectRoot, getDataRoot, hasApiKey, STORAGE_MODE, isStagingIdentity } from '../config.js';
 import { getConfig } from '../runtimeConfig.js';
 import * as proxyTiers from '../ai/proxyTiers.js';
 import { getEmbeddingsCacheStatus, getEmbeddingsResolution } from '../ai/aiBackends.js';
@@ -24,6 +25,10 @@ import * as community from '../community/community.js';
 import * as fileIO from '../storage/fileIO.js';
 import { log } from '../logger.js';
 import { LLMS_TXT } from '../llmsTxt.js';
+import { getLastEventLoopSample } from '../eventLoopMonitor.js';
+import { findUnreachableAllowlistEntries } from '../identityAllowlistCheck.js';
+import { getReadOnlyPrincipalEntries } from '../readOnlyGuard.js';
+import { getNodeSourceIndexStatus } from '../storage/nodeSourceIndex.js';
 
 // t/2059: throttle the readiness log to state transitions. ACA probes /healthz
 // every few seconds, so logging every not-ready probe would spam the log. Emit
@@ -43,6 +48,24 @@ function logReadinessTransition(readiness: ReadinessState, dataRoot: string): vo
   } else {
     log.server.info({ dataRoot, reason: readiness.reason }, 'Readiness: warming (data load in progress)');
   }
+}
+
+// t/3309: /readyz data-root failure signal (cond 4), throttled to the transition INTO failed —
+// ACA polls /readyz every few seconds, so a per-probe WARN would spam. The message keeps the
+// "Data root validation failed" substring the boot-WARN alert (t/3308) keys on, so the Log_s
+// alert fires whether the failure surfaces at boot or here. Reset by the handler when the state
+// leaves 'failed' (a flap re-logs). The boot exit(1)/WARN path (server.ts) is unchanged — this is
+// the readyz-side signal that carries the migration once exit(1) is removed (step 3).
+let lastReadyzDataRootFailed = false;
+
+function logDataRootReadyzFailure(reason: string | undefined): void {
+  if (lastReadyzDataRootFailed) return;
+  lastReadyzDataRootFailed = true;
+  log.server.warn({ reason }, 'Data root validation failed — /readyz not-ready (t/3309)');
+  getGlobalRecorder()?.record({
+    type: 'system.error', component: 'readyz', level: 'error',
+    message: 'Data root validation failed — /readyz not-ready', data: { reason },
+  });
 }
 
 export function registerMetaRoutes(r: Router, ctx: ServerCtx): void {
@@ -91,6 +114,43 @@ export function registerMetaRoutes(r: Router, ctx: ServerCtx): void {
   // AND DevOps2's resolution deploy-gate (t/3091) both poll GET /readyz — status code 503 = block,
   // no auth (PUBLIC_EXACT_PATHS, anon). Distinct from /api/health/embeddings (ONNX model warmup).
   get('/readyz', (_req, res) => {
+    // t/3309: data-root validation composes into the readiness gate AHEAD of the embeddings
+    // check — a misprovisioned data root means the corpus is absent, so there's nothing for
+    // embeddings to resolve against. State is CACHE-ONCE (dataRootReadiness): validated once at
+    // startup, read here per probe — no per-probe GitHub Contents call (cond 2). A definitive
+    // 'failed' is a hard 503 (not masked as a slow warm-up, cond 3); 'validating' is warming.
+    // The 200-ready body is unchanged (data-root 'ready' falls through to the existing embeddings
+    // gate), preserving the shared warm-gate body-contract fixture (t/3114).
+    // t/3236 (server half tracked t/3340): test-only fault knob — force the DEFINITIVE data-root-FAILED
+    // readiness so DevOps can exercise the deploy warm-gate's FIRE arm (503 'failed' → block traffic-
+    // shift → fail+rollback) against a REAL staging revision with real data, no 700M throwaway repo.
+    // TL cond 1: forces the definitive 'failed' state (NOT 'validating'), so the warm-gate sees a
+    // definitive failure. ENABLE-GUARD (TL re-GV, t/3340#4/#5): gated on isStagingIdentity() — ACA
+    // auto-injects CONTAINER_APP_NAME=/staging/i (drift-proof; prod's app name CANNOT match) — AND the
+    // explicit flag. FAIL-CLOSED: both signals default-absent → inert; prod-excluded by construction
+    // (not a fail-open NODE_ENV/branch check). So DevOps arms it with a SINGLE var on NORMAL staging
+    // (no NODE_ENV flip → none of the HOST/STORAGE_MODE/ALLOWED_ORIGINS confounds). RUNTIME-scoped to
+    // this response only: boot validateDataRoot runs against real data, unaffected — no ENFORCE change.
+    // GATE CO-LOCATION (TL t/3340#6): isStagingIdentity()'s own doc says "used only by the state-root
+    // isolation guard — never an auth/security decision." This call is a DELIBERATE, TL-approved
+    // exception — it's staging-only FEATURE-scoping of a fail-safe test knob (worst case = a self-DoS
+    // behind the flag on staging only), NOT an access-control decision. A future isStagingIdentity
+    // doc-usage sweep should read this as a justified exception, not drift.
+    const forceDataRootFailed = isStagingIdentity() && process.env.READYZ_FORCE_DATA_ROOT_FAILED === '1';
+    const dr = forceDataRootFailed
+      ? { state: 'failed' as const, reason: 'forced (READYZ_FORCE_DATA_ROOT_FAILED test knob, t/3236)' }
+      : getDataRootReadyState();
+    if (dr.state === 'failed') {
+      logDataRootReadyzFailure(dr.reason); // cond 4: WARN→Log_s once per failure episode
+      json(res, { status: 'failed', reason: `data-root-failed: ${dr.reason ?? 'unknown'}` }, 503);
+      return;
+    }
+    // Reset the failure-log throttle so a later re-failure (flap: failed → ready → failed) re-logs.
+    lastReadyzDataRootFailed = false;
+    if (dr.state === 'validating') {
+      json(res, { status: 'warming', reason: 'data-root-validating' }, 503);
+      return;
+    }
     const { present, nodeCount, resolves, canaryId } = getEmbeddingsResolution();
     if (present && (nodeCount ?? 0) > 0 && resolves) {
       json(res, { status: 'ready', nodeCount, resolves: true });
@@ -105,12 +165,23 @@ export function registerMetaRoutes(r: Router, ctx: ServerCtx): void {
     // (versions, storage internals, GitHub rate limits, paths) only for admins.
     // AI key status is always included so deployment gates can verify readiness.
     const geminiReady = await hasApiKey('gemini');
-    const freeKeyPoolSize = proxyTiers.parseFreeTierKeys(process.env.FREE_TIER_GEMINI_KEY).length;
+    const freeKeyPoolSize = proxyTiers.freeTierKeyCount();
     // t/3278 Arm-1: buildSha in the UNAUTH branch — the drift checker (Arm-2) hits /health anonymously
     // to compare the running image's SHA against origin/main HEAD. Public repo → the commit SHA is not
     // secret. `?? null` so a build that didn't bake BUILD_SHA is a visible null (a vacuous compare the
     // checker treats as sha-unavailable), never a crash.
-    if (!community.isAdmin()) { json(res, { status: 'ok', buildSha: process.env.BUILD_SHA ?? null, ai: { geminiKeyConfigured: geminiReady, freeTierKeyPoolSize: freeKeyPoolSize } }); return; }
+    // t/4239/t/4240: eventLoopLagMs in the same unauth branch — the t/4180 load-test harness polls
+    // /health anonymously (same as every VU), so an admin-gated field would be invisible to it.
+    // Lead-approved minor info disclosure (current load state, not data, p/648#240).
+    // t/4505: a count only (never names/reasons — those stay on /api/admin/health and the boot
+    // WARN) so the unauthenticated deploy smoke check can read it with no admin session.
+    const identityAllowlistUnreachable = findUnreachableAllowlistEntries(community.getAdminUsers(), getReadOnlyPrincipalEntries()).length;
+    // t/4521: public /health gets a bare boolean (never built yet → null, same precedent as
+    // t/4505's count-only split) — the full status (indexVersion, summaryReadFailures) stays
+    // admin-only below, since those are operational detail, not a liveness signal.
+    const nodeSourceIndexStatus = getNodeSourceIndexStatus();
+    const nodeSourceIndexComplete = nodeSourceIndexStatus === null ? null : nodeSourceIndexStatus.complete;
+    if (!community.isAdmin()) { json(res, { status: 'ok', buildSha: process.env.BUILD_SHA ?? null, ai: { geminiKeyConfigured: geminiReady, freeTierKeyPoolSize: freeKeyPoolSize }, eventLoopLagMs: getLastEventLoopSample()?.maxMs ?? null, identityAllowlistUnreachable, nodeSourceIndexComplete }); return; }
     const base: Record<string, unknown> = {
       status: 'ok',
       version: ctx.serverVersion,
@@ -141,6 +212,10 @@ export function registerMetaRoutes(r: Router, ctx: ServerCtx): void {
     // t/3086: embeddings cache probe result — surfaces t/3085 condition in /health without FR access.
     const embeddingsStatus = getEmbeddingsCacheStatus();
     base.embeddings = { cachePresent: embeddingsStatus.present, nodeCount: embeddingsStatus.nodeCount };
+
+    // t/4521: full status admin-only (summaryReadFailures is operator diagnostic detail);
+    // public /health above only got the boolean. null (never built) passes through as-is.
+    base.nodeSourceIndex = nodeSourceIndexStatus;
 
     const githubBackend = ctx.getGithubBackend();
     if (githubBackend) {

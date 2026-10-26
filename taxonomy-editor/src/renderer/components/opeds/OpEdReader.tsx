@@ -12,8 +12,10 @@ import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { OpEdSet, OpEdMember, OpEdGroundingRef, PovKey } from '../../../../../lib/oped/types';
 import { resolvePovMeta } from './povResolve';
-import { POV_KEYS } from '@lib/debate/types';
+import { opedTagScopeText, tagLabelFor } from './opedTagScopeText';
+import { registryOrNull } from '../debate/SeatTagPicker';
 import { useTaxonomyStore } from '../../hooks/useTaxonomyStore';
+import { allNodesById, povOfNode } from '../../hooks/useTaxonomyStore/superseded';
 import { NodeDetail } from '../taxonomy/NodeDetail';
 import { SituationDetail } from '../debate/SituationDetail';
 import './OpEdReader.css';
@@ -49,11 +51,11 @@ function GroundingDetailCard({ ref, onClose, claims }: { ref: OpEdGroundingRef; 
   if (ref.node_id?.startsWith('sit-')) {
     const node = state.situations?.nodes.find(n => n.id === ref.node_id);
     if (node) { body = <SituationDetail node={node} readOnly chipDepth={0} />; openTab = 'situations'; }
-  } else {
-    for (const p of POV_KEYS) {
-      const node = state[p]?.nodes.find(n => n.id === ref.node_id);
-      if (node) { body = <NodeDetail pov={p} node={node} readOnly chipDepth={0} />; openTab = p; break; }
-    }
+  } else if (ref.node_id) {
+    // t/4355: an op-ed citation shows the exact node it cited, superseded or not.
+    const node = allNodesById(state).get(ref.node_id);
+    const p = povOfNode(state, ref.node_id);
+    if (node && p) { body = <NodeDetail pov={p} node={node} readOnly chipDepth={0} />; openTab = p; }
   }
 
   return (
@@ -185,10 +187,10 @@ function GroundingSection({ grounding, claims }: { grounding: OpEdGroundingRef[]
                       type="button"
                       className="oped-grounding-id-btn"
                       aria-expanded={isOpen}
-                      title={g.label}
+                      title={g.node_id}
                       onClick={() => setExpandedId(isOpen ? null : g.node_id)}
                     >
-                      {g.node_id}
+                      {g.label || g.node_id}
                     </button>
                   </td>
                   <td>{g.relevance || '—'}</td>
@@ -233,6 +235,12 @@ function OpEdArticle({ member, outlet }: { member: OpEdMember; outlet?: string }
       >
         {metaLine}
       </div>
+      {/* t/3992: a one-wing essay says so, so it never reads as the whole camp's position (TL t/3960#3). */}
+      {member.tag && (
+        <p className="oped-tag-scope" role="note">
+          {opedTagScopeText(meta.label, tagLabelFor(member.tag.pov, member.tag.tag, registryOrNull()), member.tag)}
+        </p>
+      )}
 
       {member.status !== 'complete' ? (
         <div className="oped-article-notice" role="status">
@@ -266,12 +274,28 @@ function OpEdArticle({ member, outlet }: { member: OpEdMember; outlet?: string }
 // Reader (tab strip for multi-voice sets)
 // ──────────────────────────────────────────────
 
-export function OpEdReader({ set }: { set: OpEdSet }) {
+export function OpEdReader({
+  set, initialPov, onPovChange,
+}: {
+  set: OpEdSet;
+  /** t/3486: camp tab a deep link asked to open on — seeds the initial active tab. */
+  initialPov?: string;
+  /** t/3486: fires whenever the active camp tab changes, so the URL can track it. */
+  onPovChange?: (pov: string) => void;
+}) {
   const members = set.opeds;
-  const [activeIdx, setActiveIdx] = useState(0);
+  const [activeIdx, setActiveIdxState] = useState(() => {
+    const idx = initialPov ? members.findIndex(m => m.pov === initialPov) : -1;
+    return idx >= 0 ? idx : 0;
+  });
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
   const active = members[Math.min(activeIdx, members.length - 1)];
+
+  const setActiveIdx = useCallback((idx: number) => {
+    setActiveIdxState(idx);
+    onPovChange?.(members[idx].pov);
+  }, [members, onPovChange]);
 
   const onTabKeyDown = useCallback((e: React.KeyboardEvent, idx: number) => {
     let next = idx;
@@ -283,7 +307,7 @@ export function OpEdReader({ set }: { set: OpEdSet }) {
     e.preventDefault();
     setActiveIdx(next);
     tabRefs.current[next]?.focus();
-  }, [members.length]);
+  }, [members.length, setActiveIdx]);
 
   if (members.length === 0) {
     return <div className="oped-reader oped-reader-empty">This op-ed set has no voices.</div>;

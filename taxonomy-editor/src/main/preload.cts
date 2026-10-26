@@ -3,6 +3,53 @@
 
 import { contextBridge, ipcRenderer } from 'electron';
 import type { OpEdSet, OpEdSetSummary } from '../../../lib/oped/types.js';
+import type { StopReason, ProviderCallDiagnostics } from '../../../lib/ai-client/index.js';
+import type { ExportJobState, ExportErrorCode, BriefPreset, BriefArtifactName } from '../../../lib/brief/types.js';
+// t/3532: these mirror bridge/types.ts's re-exports, imported from their true origin
+// instead — bridge/types.ts is a real .ts (not .d.ts) using renderer-only `@lib/*`
+// aliases that don't resolve under this file's tsconfig.main.json (nodenext), same
+// issue as t/3529's BriefExportJobView/ExportJobState fix.
+import type { Organization, OrganizationEdge } from '../../../lib/organizations/types.js';
+import type { EntityDetail, EntitySummary, EntityListQuery } from '../../../lib/entities/types.js';
+import type { ContainerMentions } from '../../../lib/entities/mentionTypes.js';
+import type { ANClaimInput, RelevantTaxonomyResult } from '../../../lib/debate/relevanceSelection.js';
+import type { ClaimAttributionResult } from '../../../lib/debate/argumentNetwork/attribution.js';
+import type { ClaimTaxonomyAttribution } from '../../../lib/debate/types.js';
+import type { UserPreferences } from '../../../lib/userPreferencesSchema.js';
+import type { PovTagProposalsFile, ApplyProposalDecisionResult } from '../../../lib/schema/povTagProposals.js';
+import type { InquiryRequest, InquiryResult } from '../../../lib/inquiry/index.js';
+import type { NodeDeleteLogEntry } from './nodeDeleteLog.js';
+import type { RecountPolicyMembersResult } from '../../../lib/policy/registryRecount.js';
+import type { RefreshResult } from '../../../lib/electron-shared/modelDiscovery.js';
+import type { SourceReference, SourceCardMeta } from '../../../lib/sourceIndex/types.js';
+
+// t/3532: mirrors bridge/types.ts's FetchRelevantNodesPayload/FetchClaimAttributionPayload/
+// ClaimAttributionResponse structurally (those are defined directly in bridge/types.ts, not
+// re-exported from a lib file, so inlined here rather than imported for the same reason as
+// above). Param sharpening constrains OUR callers (TL reasoning, t/3532#3) — genuinely
+// enforced by tsc at every call site, unlike a return-type claim about data we receive.
+interface FetchRelevantNodesPayload {
+  pov: string;
+  topic: string;
+  recentTranscript: string;
+  threshold?: number;
+  session: {
+    anClaimEmbeddings: ANClaimInput[];
+    lineageFrame?: { cluster_id: string; label?: string }[];
+    sourceType?: string;
+    excludeGreatestHits?: boolean;
+    greatestHitsList?: string[];
+  };
+}
+interface FetchClaimAttributionPayload {
+  pov: string;
+  claims: { id: string; embedding?: number[]; attribution_embedding?: number[] }[];
+  topN?: number;
+}
+interface ClaimAttributionResponse {
+  attributions: Record<string, ClaimTaxonomyAttribution>;
+  summary: ClaimAttributionResult;
+}
 
 // Inlined from preloadBuffer.cts — sandboxed preloads (sandbox:true) cannot
 // require sibling files at runtime; inlining avoids the require('./preloadBuffer.cjs')
@@ -11,6 +58,15 @@ interface LatestValueBuffer<T> {
   onIpc(value: T): void;
   onSubscribe(deliver: (value: T) => void): void;
   onUnsubscribe(): void;
+}
+
+// t/3439 (vitest 5 migration): extracted so the performance.now-missing fallback is
+// unit-testable via a plain function call, not a live dynamic import with a corrupted
+// global — vitest 5's Module Runner needs a working performance.now() DURING the import
+// itself (its own invoke/getModuleInformation RPC path), so nulling the real global for
+// the duration of `await import(...)` throws before preload.cjs's own guard ever runs.
+export function resolvePreloadTimestamp(perf: { now?: unknown } | undefined = typeof performance !== 'undefined' ? performance : undefined): number {
+  return (perf && typeof perf.now === 'function') ? (perf.now as () => number)() : Date.now();
 }
 
 export function createLatestValueBuffer<T>(): LatestValueBuffer<T> {
@@ -48,8 +104,14 @@ let _chatBufferActive = true;
 // pure helper so it's unit-tested (preloadBuffer.test.ts, unblocked by t/2698).
 const _diagnosticsStateBuffer = createLatestValueBuffer<unknown>();
 
-try {
-  contextBridge.exposeInMainWorld('electronAPI', {
+// t/3529: named function (not an inline object literal) so its return shape is capturable
+// via `ReturnType<>` for the compile-time conformance check against the renderer's
+// `ElectronAPI` (`__typecheck__/preloadElectronApiContract.ts`) — closes the gap where this
+// surface and `electron.d.ts` could silently diverge (t/3528 postmortem, t/3529). Still
+// invoked INSIDE the try block below, so construction-time errors are caught exactly as
+// before this change.
+function buildElectronApi() {
+  return {
   // Synchronous system info — available without IPC round-trip
   processVersions: { ...process.versions },
   osRelease: process.getSystemVersion?.() ?? process.platform,
@@ -57,12 +119,16 @@ try {
   osArch: process.arch,
   // t/2766: stamp when contextBridge.exposeInMainWorld ran — lets renderer compute
   // the preload→bridge-available delta for the bridge-available FR lifecycle event.
-  preloadTimestamp: (typeof performance !== 'undefined' && typeof performance.now === 'function') ? performance.now() : Date.now(),
+  preloadTimestamp: resolvePreloadTimestamp(),
   getEmbeddingInfo: (): Promise<{ backend: string; execution_provider?: string; calibration_version?: number }> =>
     ipcRenderer.invoke('get-embedding-info'),
 
   // User preferences (t/2118)
-  getPreferences: (): Promise<unknown> =>
+  // t/3536: was `Promise<unknown>` — narrowed now that the handler validates via the
+  // shared lib/userPreferencesSchema.ts (t/3535) instead of returning the parsed file
+  // contents as-is, making this declared type an enforced claim rather than an
+  // unverified one (the t/3529/t/3532 carve-out reason this was left loose).
+  getPreferences: (): Promise<UserPreferences | null> =>
     ipcRenderer.invoke('get-preferences'),
   setPreferences: (prefs: unknown): Promise<void> =>
     ipcRenderer.invoke('set-preferences', prefs),
@@ -85,11 +151,24 @@ try {
   loadPolicyRegistry: (): Promise<unknown> =>
     ipcRenderer.invoke('load-policy-registry'),
 
+  recountPolicyMembers: (ids: string[]): Promise<RecountPolicyMembersResult> =>
+    ipcRenderer.invoke('recount-policy-members', ids),
+
+  loadPovTagProposals: (): Promise<PovTagProposalsFile | null> =>
+    ipcRenderer.invoke('load-pov-tag-proposals'),
+
+  reviewPovTagProposal: (nodeId: string, decision: unknown, expectedStatus: string): Promise<ApplyProposalDecisionResult> =>
+    ipcRenderer.invoke('review-pov-tag-proposal', nodeId, decision, expectedStatus),
+
   loadLineageCategories: (): Promise<unknown> =>
     ipcRenderer.invoke('load-lineage-categories'),
 
   loadLineageInfo: (): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('load-lineage-info'),
+
+  // t/3859 (Part D of t/3852): durable local audit record for a node deletion.
+  logNodeDeletion: (entry: NodeDeleteLogEntry): Promise<void> =>
+    ipcRenderer.invoke('log-node-deletion', entry),
 
   loadConflictFiles: (): Promise<unknown[]> =>
     ipcRenderer.invoke('load-conflict-files'),
@@ -155,8 +234,9 @@ try {
   loadAIModels: (): Promise<unknown> =>
     ipcRenderer.invoke('load-ai-models'),
 
-  refreshAIModels: (): Promise<unknown> =>
-    ipcRenderer.invoke('refresh-ai-models'),
+  // t/4031: opts pass through untouched (the handler validates them, t/4161); a plain refresh sends no argument.
+  refreshAIModels: (opts?: unknown): Promise<RefreshResult> =>
+    ipcRenderer.invoke('refresh-ai-models', ...(opts === undefined ? [] : [opts])),
 
   validateApiKey: (key: string, backend: string): Promise<{ valid: boolean; error?: string }> =>
     ipcRenderer.invoke('validate-api-key', key, backend),
@@ -194,10 +274,14 @@ try {
   importKeysFromSharing: (payload: unknown, passphrase: string): Promise<string[]> =>
     ipcRenderer.invoke('import-keys-from-sharing', payload, passphrase),
 
-  fetchRelevantNodes: (payload: unknown): Promise<unknown> =>
+  // t/3532: param AND return sharpened — Rosetta verified both handlers delegate to the
+  // real typed functions genuinely returning these shapes (t/3532#2); the param sharpening
+  // additionally constrains our own callers, enforced by tsc regardless of the internal
+  // `as`-cast on the handler side (TL reasoning, t/3532#3).
+  fetchRelevantNodes: (payload: FetchRelevantNodesPayload): Promise<RelevantTaxonomyResult> =>
     ipcRenderer.invoke('fetch-relevant-nodes', payload),
 
-  computeAttribution: (payload: unknown): Promise<unknown> =>
+  computeAttribution: (payload: FetchClaimAttributionPayload): Promise<ClaimAttributionResponse> =>
     ipcRenderer.invoke('compute-attribution', payload),
 
   computeEmbeddings: (texts: string[], ids?: string[]): Promise<{ vectors: number[][] }> =>
@@ -209,8 +293,17 @@ try {
   computeQueryEmbedding: (text: string): Promise<{ vector: number[] }> =>
     ipcRenderer.invoke('compute-query-embedding', text),
 
-  generateText: (prompt: string, model?: string, timeoutMs?: number, temperature?: number, requestId?: string): Promise<{ text: string }> =>
-    ipcRenderer.invoke('generate-text', prompt, model, timeoutMs, temperature, requestId),
+  // t/3528: single payload object, forwarded unchanged — see aiHandlers.ts's
+  // GenerateTextIpcPayload (renderer's electron.d.ts mirrors this shape, Rosetta scope).
+  // t/3525: return type carries the normalized stopReason.
+  // t/3569: return type also carries ProviderCallDiagnostics (t/3566) — FR forensics
+  // only, forwarded verbatim so instrumentBridge.ts can attach it to ai.response/ai.error
+  // (the desktop half of t/3568; renderer FR-event wiring is Rosetta's).
+  // t/4048: servedModel is the registry id the call actually resolved to (after defaulting) —
+  // desktop has no fallback chain, so it always equals the requested/defaulted model; present so
+  // the debate store can mark the run 'tracked' (e/268#6 condition 3; see embeddings.ts).
+  generateText: (payload: { prompt: string; model?: string; timeoutMs?: number; temperature?: number; requestId?: string; maxTokens?: number }): Promise<{ text: string; stopReason?: StopReason; diagnostics?: ProviderCallDiagnostics; servedModel?: string }> =>
+    ipcRenderer.invoke('generate-text', payload),
 
   cancelGenerate: (requestId: string): void =>
     void ipcRenderer.invoke('ai:cancel-generate', requestId),
@@ -431,6 +524,10 @@ try {
   buildPolicySourceIndex: (): Promise<unknown> =>
     ipcRenderer.invoke('build-policy-source-index'),
 
+  // t/4342: per-node source index — Electron leg of t/4335's transport trio.
+  getNodeSources: (nodeId: string): Promise<{ sources: SourceReference[]; cards: Record<string, SourceCardMeta>; indexVersion: number }> =>
+    ipcRenderer.invoke('get-node-sources', nodeId),
+
   // Edges
   loadEdges: (): Promise<unknown> =>
     ipcRenderer.invoke('load-edges'),
@@ -466,15 +563,31 @@ try {
     ipcRenderer.invoke('delete-chat-session', id),
 
   // Source evidence (main process filesystem access)
-  loadSourceEvidenceIndex: (): Promise<unknown> =>
+  // t/3529: was `Promise<unknown>` — tightened to match the handler's real return shape
+  // (`loadEvidenceIndex` in sourceHandlers.ts returns `null` on a missing/corrupt index
+  // file, not just the index object), which the conformance check caught as a mismatch
+  // against `electron.d.ts`'s already-correct `Promise<Record<string, unknown> | null>`.
+  loadSourceEvidenceIndex: (): Promise<Record<string, unknown> | null> =>
     ipcRenderer.invoke('load-source-evidence-index'),
   loadDocTitles: (): Promise<Record<string, string> | null> =>
     ipcRenderer.invoke('load-doc-titles'),
   loadGreatestHits: (): Promise<{ node_ids: string[] } | null> =>
     ipcRenderer.invoke('load-greatest-hits'),
-  getSourceEvidence: (nodeIds: string[], pov: string): Promise<unknown> =>
+  // t/3529: both return types were `Promise<unknown>` — tightened to match the handlers'
+  // real return shapes (sourceHandlers.ts / debateHandlers.ts always resolve one of these
+  // exact shapes, never an arbitrary value), which the conformance check caught as
+  // mismatches against electron.d.ts's already-correct declared types.
+  getSourceEvidence: (nodeIds: string[], pov: string): Promise<{
+    facts: unknown[]; keyPoints: unknown[]; formattedBlock: string;
+    nodesCovered: string[]; totalCandidates: number;
+  }> =>
     ipcRenderer.invoke('get-source-evidence', nodeIds, pov),
-  runEvidenceQbaf: (claimText: string, claimId: string, model?: string): Promise<unknown> =>
+  runEvidenceQbaf: (claimText: string, claimId: string, model?: string): Promise<{
+    computed_strength: number;
+    qbaf_iterations: number;
+    evidence_items: Array<{ id: string; source_doc_id: string; text: string; relation: 'support' | 'contradict'; similarity: number }>;
+    claim_id: string;
+  } | null> =>
     ipcRenderer.invoke('run-evidence-qbaf', claimText, claimId, model),
 
   // Debate sessions
@@ -496,40 +609,49 @@ try {
   printBriefToPdf: (html: string): Promise<{ cancelled: boolean; filePath?: string }> =>
     ipcRenderer.invoke('brief:html-to-pdf', html),
 
+  // t/3529: format union was missing 'json' — the export-chat-to-file handler
+  // (chatHandlers.ts) and bridge/types.ts's AppAPI both already support it; preload's
+  // local type had simply never been updated. Caught by the conformance check, though
+  // electron.d.ts's own (looser `string`/`unknown[]`) declaration for this method is a
+  // separate, pre-existing imprecision not fixed here — flagged to Rosetta alongside t/3532.
   exportChatToFile: (
     entries: { id: string; timestamp: string; speaker: string; content: string; taxonomy_refs: { node_id: string; label?: string; relevance: string }[] }[],
-    format: 'markdown' | 'text' | 'pdf',
+    format: 'markdown' | 'text' | 'pdf' | 'json',
     options: { title: string; mode: 'brainstorm' | 'inform' | 'decide'; pov: 'accelerationist' | 'safetyist' | 'skeptic' },
   ): Promise<{ cancelled: boolean; filePath?: string }> =>
     ipcRenderer.invoke('export-chat-to-file', entries, format, options),
 
   // Organizations (t/1544)
-  listOrganizations: (filters?: { type?: string; pov?: string }): Promise<unknown[]> =>
+  // t/3532: return types were `Promise<unknown[]>`/`Promise<unknown>` — sharpened after
+  // Rosetta verified organizationHandlers.ts delegates to typed functions returning these
+  // exact shapes verbatim (t/3532#2).
+  listOrganizations: (filters?: { type?: string; pov?: string }): Promise<Organization[]> =>
     ipcRenderer.invoke('list-organizations', filters),
-  getOrganization: (id: string): Promise<unknown> =>
+  getOrganization: (id: string): Promise<Organization> =>
     ipcRenderer.invoke('get-organization', id),
-  getOrganizationsByPov: (pov: string): Promise<unknown[]> =>
+  getOrganizationsByPov: (pov: string): Promise<Organization[]> =>
     ipcRenderer.invoke('get-organizations-by-pov', pov),
-  getOrganizationsByTopic: (topicRef: string): Promise<unknown[]> =>
+  getOrganizationsByTopic: (topicRef: string): Promise<Organization[]> =>
     ipcRenderer.invoke('get-organizations-by-topic', topicRef),
-  getOrganizationsByPolicy: (policyId: string): Promise<unknown[]> =>
+  getOrganizationsByPolicy: (policyId: string): Promise<Organization[]> =>
     ipcRenderer.invoke('get-organizations-by-policy', policyId),
-  getOrganizationEdges: (orgId: string): Promise<unknown[]> =>
+  getOrganizationEdges: (orgId: string): Promise<OrganizationEdge[]> =>
     ipcRenderer.invoke('get-organization-edges', orgId),
 
   // Entity ref resolution (t/1809) — desktop transport for getEntity (t/1775).
-  // Returns the EntityDetail union (strongly typed on the renderer side in electron.d.ts).
-  getEntity: (ref: string): Promise<unknown> =>
+  // t/3532: sharpened to EntityDetail — the handler is already explicitly typed this way
+  // (Rosetta, t/3532#2), matching electron.d.ts exactly.
+  getEntity: (ref: string): Promise<EntityDetail> =>
     ipcRenderer.invoke('entity-resolve', ref),
 
   // Entity list (t/1889) — desktop transport for listEntities (entity browser).
-  // Returns EntitySummary[]; strongly typed on the renderer side (electron.d.ts).
-  listEntities: (query?: unknown): Promise<unknown[]> =>
+  // t/3532: sharpened to EntitySummary[] (handler explicitly typed this way).
+  listEntities: (query?: EntityListQuery): Promise<EntitySummary[]> =>
     ipcRenderer.invoke('list-entities', query),
 
   // Container mentions (t/1903) — desktop transport for getContainerMentions.
-  // Returns ContainerMentions | null; strongly typed on the renderer side (electron.d.ts).
-  getContainerMentions: (containerId: string): Promise<unknown> =>
+  // t/3532: sharpened to ContainerMentions | null (handler explicitly typed this way).
+  getContainerMentions: (containerId: string): Promise<ContainerMentions | null> =>
     ipcRenderer.invoke('get-container-mentions', containerId),
 
   loadDebateComments: (debateId: string): Promise<unknown> =>
@@ -546,9 +668,13 @@ try {
     ipcRenderer.invoke('fetch-url-content', url),
 
   // Community submit (from main process to avoid renderer CORS against the remote server)
+  // t/3529: 'oped' was missing here — the IPC schema (communitySubmitSchema.ts) and
+  // bridge/types.ts's AppAPI already accept it (t/2986 fixed those two; this one was
+  // simply never updated), so a desktop op-ed share would have failed only at the type
+  // level while working fine at runtime. Caught by the preload/electron.d.ts conformance check.
   communitySubmit: (
     baseUrl: string,
-    payload: { type: 'chat' | 'debate'; data: unknown; note?: string },
+    payload: { type: 'chat' | 'debate' | 'oped' | 'inquiry'; data: unknown; note?: string },
   ): Promise<{ submissionId: string }> =>
     ipcRenderer.invoke('community-submit', baseUrl, payload),
 
@@ -655,15 +781,73 @@ try {
   // that the electron-bridge wraps into a Blob (Blob-returning AppAPI in both builds).
   createBriefExport: (debateId: string, body: unknown): Promise<{ jobId: string }> =>
     ipcRenderer.invoke('create-brief-export', debateId, body),
-  getBriefExportJob: (jobId: string): Promise<unknown> =>
+  // t/3529: was `Promise<unknown>` — tightened to match the handler's real return shape
+  // (briefExportHandlers.ts's get-brief-export-job always resolves this exact shape or
+  // throws). Mirrors electron.d.ts's `BriefExportJobView` structurally, importing the two
+  // literal-union types from the shared lib/brief/types.js (safe under both tsconfigs)
+  // rather than importing BriefExportJobView itself from renderer/bridge/types.ts — that
+  // file is a real .ts (not .d.ts), so tsconfig.main.json's stricter nodenext resolution
+  // would fully type-check it and hit its renderer-only `@lib/*` path aliases, which don't
+  // resolve under main's config. Caught only under the RENDERER tsconfig, not
+  // tsconfig.main.json — this check must run under both, not just one.
+  getBriefExportJob: (jobId: string): Promise<{
+    status: ExportJobState; progressPct: number; warnings: string[];
+    error: string | null; errorCode: ExportErrorCode | null; exportId: string | null;
+  }> =>
     ipcRenderer.invoke('get-brief-export-job', jobId),
-  listBriefExports: (debateId: string): Promise<unknown[]> =>
+  // t/3532: was `Promise<unknown[]>` — sharpened to mirror electron.d.ts's BriefExportRecord
+  // structurally (defined directly in bridge/types.ts, inlined here for the same reason as
+  // BriefExportJobView in t/3529). narratorModel/narratorModelSource are optional: they're
+  // populated only on the server/web path (src/server/briefExportJobs.ts,
+  // briefExportStore.ts) — this desktop handler never sets them by design, not a gap
+  // (TL ruling, t/3532#3; Rosetta made the shared type optional to match).
+  listBriefExports: (debateId: string): Promise<{
+    exportId: string; debateId: string; title: string; preset: BriefPreset;
+    status: 'done' | 'failed'; errorCode?: ExportErrorCode; reason?: string;
+    narratorModel?: string; narratorModelSource?: string; checkerModel?: string | null;
+    formats: string[]; artifacts: BriefArtifactName[]; traceCoveragePct: number;
+    warnings: string[]; createdAt: string;
+  }[]> =>
     ipcRenderer.invoke('list-brief-exports', debateId),
   downloadBriefArtifact: (exportId: string, name: string): Promise<Uint8Array | null> =>
     ipcRenderer.invoke('download-brief-artifact', exportId, name),
   deleteBriefExport: (exportId: string): Promise<void> =>
     ipcRenderer.invoke('delete-brief-export', exportId),
-  });
+
+  // Inquiry — desktop parity (t/3579). Response field names match the web REST contract's
+  // InquiryStatusResponse verbatim (Rosetta Stone t/3582#2) so the bridge polls both builds
+  // identically. `idempotencyKey` is accepted for signature parity with the web bridge but
+  // unused here — desktop is single-user/single-process, so there is no idempotency window
+  // to dedupe against (mirrors briefExportHandlers.ts dropping server-only concerns).
+  startInquiry: (request: InquiryRequest, _idempotencyKey?: string): Promise<{ jobId: string }> =>
+    ipcRenderer.invoke('start-inquiry', request),
+  getInquiry: (jobId: string): Promise<{
+    jobId: string;
+    status: 'queued' | 'grounding' | 'debating' | 'judging' | 'synthesizing' | 'done' | 'done_truncated' | 'failed';
+    progressPct: number;
+    terminationReason: string | null; resultId: string | null; error: string | null;
+    result?: InquiryResult;
+  } | null> =>
+    ipcRenderer.invoke('get-inquiry', jobId),
+  // "My Questions" history + export (t/3683). listInquiries reads the local persisted index
+  // (survives the get-inquiry job's TTL sweep / an app restart); exportInquiryToFile shows a
+  // native save dialog and writes the requested format (PDF rendered via printToPDF).
+  listInquiries: (): Promise<{
+    jobId: string; question: string; debateId: string | null;
+    truncated: boolean; terminationReason?: string; createdAt: string;
+  }[]> =>
+    ipcRenderer.invoke('list-inquiries'),
+  exportInquiryToFile: (
+    result: InquiryResult, title: string, format: 'json' | 'markdown' | 'pdf',
+  ): Promise<{ cancelled: boolean; filePath?: string }> =>
+    ipcRenderer.invoke('export-inquiry-to-file', result, title, format),
+  };
+}
+
+export type PreloadElectronAPI = ReturnType<typeof buildElectronApi>;
+
+try {
+  contextBridge.exposeInMainWorld('electronAPI', buildElectronApi());
   console.log('[preload] electronAPI exposed');
   ipcRenderer.send('forward-flight-event', {
     type: 'lifecycle', component: 'preload', level: 'info',

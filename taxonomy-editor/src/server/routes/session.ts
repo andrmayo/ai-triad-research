@@ -23,11 +23,15 @@ import { log } from '../logger.js';
 import { deriveStorageUserId } from '../security/userContext.js';
 import { isSafeId } from '../storage/fileIO.js';
 import { getQuotaLimits } from '../security/quotas.js';
+import { resolveReadOnlyFlag } from '../readOnlyGuard.js';
 import { requireAdmin } from '../community/admin/reviewRegistry.js';
 import { isAdmin } from '../community/community.js';
 import * as analytics from '../community/analytics.js';
 import { parseCookies } from '../httpCookies.js';
+import { logAuthPresenceIfEnabled } from '../authPresenceDiag.js';
 import { anonSessionCreatedCookie, readValidCreatedMs } from './anonSessionCreated.js';
+import * as allowlistStore from '../storage/allowlistStore.js';
+import type { UserSession } from '../../../../lib/allowlist/types.js';
 // Re-exported so server.ts's pre-route anon mint sites import it here (keeps the
 // server.ts import list flat / at its max-lines ceiling — t/2493).
 export { anonSessionCookiesWithCreated } from './anonSessionCreated.js';
@@ -41,6 +45,30 @@ export function resolveAnonSessionKey(req: IncomingMessage): string {
 }
 
 const TRACE_MAX_EVENTS_PER_BATCH = 100;
+
+// t/4326 ask 3: per-process dedup for the "signed-in, resolved non-admin" INFO log on
+// /api/auth/me — keyed on storageUserId (derived, never the raw principal), so a user
+// polling this endpoint repeatedly logs once, not once per poll.
+const nonAdminLoggedUserIds = new Set<string>();
+
+/** t/4326 ask 3: resolve admin + storageUserId for /api/auth/me (mirrors
+ *  /api/user/profile's isAdmin(userId) pattern — session.ts:169 — rather than
+ *  re-deriving the logic) and, as a side effect, log one INFO line per process
+ *  per storageUserId the first time a signed-in principal resolves non-admin, so
+ *  "GitHub sign-in isn't admin" (t/4326) is diagnosable from logs without a manual
+ *  query. Per EasyAuth-BestPractices.md §8: derived id only, never the raw
+ *  principal — the dedup Set and the log fields are keyed on storageUserId, never
+ *  principalName. Extracted so the route handler stays under the complexity ceiling. */
+function resolveAuthMeAdmin(principalName: string, idp: string, isAnon: boolean): { admin: boolean; storageUserId: string } {
+  const storageUserId = deriveStorageUserId(principalName || '_local', idp || '_local');
+  const admin = isAdmin(storageUserId);
+  if (!isAnon && !admin && !nonAdminLoggedUserIds.has(storageUserId)) {
+    nonAdminLoggedUserIds.add(storageUserId);
+    log.server.info({ storageUserId, idp, reason: 'non_admin_signed_in' },
+      'Signed-in user resolved non-admin on /api/auth/me');
+  }
+  return { admin, storageUserId };
+}
 
 /** Derive the analytics user id for a request from the Easy Auth principal headers
  *  (only when Azure auth is enabled), falling back to '_local'. */
@@ -83,6 +111,7 @@ export function registerSessionRoutes(r: Router, ctx: ServerCtx): void {
   // ── Analytics ──
 
   get('/api/auth/me', (req, res) => {
+    logAuthPresenceIfEnabled(req); // t/4406 TEMPORARY diagnostic — remove after the re-test
     const azureAuth = process.env.WEBSITE_AUTH_ENABLED === 'True'
       || process.env.WEBSITE_AUTH_ENABLED === 'true';
     const principalName = azureAuth
@@ -93,6 +122,7 @@ export function registerSessionRoutes(r: Router, ctx: ServerCtx): void {
       : '';
     const isAnon = !principalName;
     const authOpt = process.env.AUTH_OPTIONAL === '1';
+    const { admin, storageUserId } = resolveAuthMeAdmin(principalName, idp, isAnon);
 
     // t/2493: session_created_at = the anon session's mint time; for sessions
     // predating this feature (id cookie set, no created marker) it is the
@@ -113,14 +143,22 @@ export function registerSessionRoutes(r: Router, ctx: ServerCtx): void {
       sessionCreatedAt = new Date(createdMs).toISOString();
     }
 
+    // t/4296: a read-only account (e.g. ai-triad-smoke) still passes every other
+    // capability check above — this is an orthogonal axis the smoke test asserts
+    // directly. Shared with server.ts's enforceReadOnlyGuard (same fail-open+WARN default).
+    const readOnly = resolveReadOnlyFlag(principalName, idp);
+
     json(res, {
       user: principalName || resolveAnonSessionKey(req),
       idp: idp || '',
       anonymous: isAnon,
+      admin,
+      storageUserId,
+      readOnly,
       ...(sessionCreatedAt ? { session_created_at: sessionCreatedAt } : {}),
       capabilities: {
         ai: !isAnon || !authOpt,
-        write: !isAnon || !authOpt,
+        write: (!isAnon || !authOpt) && !readOnly,
       },
     });
   });
@@ -136,16 +174,32 @@ export function registerSessionRoutes(r: Router, ctx: ServerCtx): void {
       : '';
     const isAnon = !principalName;
     const userId = deriveStorageUserId(principalName || '_local', idp || '_local');
-    const adminUsers = (process.env.ADMIN_USERS || 'jpsnover,jsnover13-at-gmail-com').split(',').map(s => s.trim());
     const quotaLimits = isAnon ? null : getQuotaLimits(userId);
-    json(res, {
+    // t/3498 (t/3495 epic, SO cond 5): ALWAYS a boolean — `false` for anonymous
+    // callers and on any allowlist-read error, never absent/undefined (a client
+    // reading `undefined` as falsy-but-ambiguous was the exact failure mode SO
+    // cond 5 closes). allowlistStore.isAllowlisted already fails CLOSED to `[]`
+    // internally (t/3497); the try/catch is a second, cheap belt-and-suspenders
+    // layer against any other unexpected throw.
+    let geminiAllowlisted = false;
+    if (!isAnon) {
+      try { geminiAllowlisted = allowlistStore.isAllowlisted(userId); }
+      catch (err) {
+        geminiAllowlisted = false;
+        log.server.warn({ err, userId, cause: 'allowlist-check-unexpected-throw' },
+          'geminiAllowlisted check failed unexpectedly — failing closed to false (t/3498)');
+      }
+    }
+    const profile: UserSession = {
       userId,
       displayName: principalName || 'Anonymous',
       idp: idp || null,
       isAnonymous: isAnon,
-      isAdmin: !isAnon && adminUsers.includes(userId),
+      isAdmin: isAdmin(userId), // t/4229: use the shared helper, not an inline ADMIN_USERS re-parse — isAdmin() already excludes '_local'
       quotas: quotaLimits,
-    });
+      geminiAllowlisted,
+    };
+    json(res, profile);
   });
 
   post('/api/analytics/event', (_req, res, body) => {

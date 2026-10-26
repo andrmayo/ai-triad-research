@@ -23,7 +23,7 @@ Get-Help <CmdletName> -Full                     # full docs for any cmdlet
 | `Get-Policy` | Look up policy actions from the registry |
 | `Get-TaxonomyHealth` | Check node/edge counts, orphans, structural issues |
 | `Compare-Taxonomy` | Diff two taxonomy states |
-| `Test-TaxonomyIntegrity` | Validate referential integrity — dangling refs, edge source/target resolution, self-loop edges, and situation⇄POV reciprocity (`SituationReciprocity`, warn-first); `-Repair` strips bad/self-loop edges (see `Test-OrganizationIntegrity` for the Organization slice) |
+| `Test-TaxonomyIntegrity` | Validate referential integrity — dangling refs, edge source/target resolution, self-loop edges, and situation⇄POV reciprocity (`SituationReciprocity`, warn-first); `-Repair` strips bad/self-loop edges and dangling refs, first writing a restorable audit of every prune (full edge objects) to `<data root>/audit/integrity-repair/` (`-AuditDir` to override) and warning with the missing IDs; an audit-write failure aborts before any file changes; pruning >20 edges requires `-Force` (edges.json left byte-identical if blocked; t/3853) (see `Test-OrganizationIntegrity` for the Organization slice) |
 | `Repair-SituationReciprocity` | Reconcile situation `linked_nodes` ⇄ POV-node `situation_refs` so the two directions are mutual (t/2979); a dry-run-first RECOVERY tool, clean-tree-required, no commit/push. Use when the reciprocity check flags drift |
 | `Add-SituationEvidenceLink` | Commit embedding-proposed situation→POV evidence links from a Stage-1 proposal JSON (WS-B, t/3015): writes both directions + `evidence_provenance` stamp, collision-guards authored links, idempotent, clean-tree-required, no commit/push. `-DryRun` to preview; `-Purge -BatchId <id>` to roll back a machine batch |
 | `Test-TaxonomyDir` | Pre-validate the taxonomy dir against the embed_taxonomy.py loader contract before `Update-TaxEmbeddings` — reports which files would be ingested vs skipped and flags any ingested file whose `nodes` lack `id` (the shape that crashes the embed run, t/2875) |
@@ -50,7 +50,8 @@ Get-Help <CmdletName> -Full                     # full docs for any cmdlet
 | `Get-Entity` | Resolve an entity record (ent-*) from entities.json; follows merge tombstones to the canonical record and stamps `redirected_from` (t/1804) |
 | `Import-Entity` | Curation write: upsert 1-20 proposed/approved/deprecated entity records with a never-reused ent-NNN allocator; person records need a human description to approve (t/1804) |
 | `Update-EntityEmbeddings` | Backfill/refresh entity_embeddings.json to the v2 multi-vector shape ({name_vector, description_vector?}) for all approved entities; idempotent via per-entity `_src_hash` (skips unchanged), batches all re-embeds into one call, `-Force` re-embeds all, `-WhatIf` previews. Use when populating vectors after approvals or a model swap (t/3121) |
-| `Invoke-EntityExtraction` | Phase 1 entity extraction from source_evidence_index.json facts; resolves against existing entities/orgs/taxonomy/dictionary/policy before minting only the unmatched remainder (t/1806) |
+| `Invoke-EntityExtraction` | Phase 1 entity extraction from source_evidence_index.json facts; resolves against existing entities/orgs/taxonomy/dictionary/policy before minting only the unmatched remainder (t/1806). Existing-entity name similarity is advisory only and never links (t/4075) |
+| `Get-EntityExtractionCandidates` | Review the advisory existing-entity candidates `Invoke-EntityExtraction` recorded (similarity, rank, `VersionSibling`); confirm a real duplicate with `Import-Entity` `merged_into`. `VersionSibling = $false` is not "safe to merge" (t/4075) |
 | `Get-EntityReport` | Maintenance reports: near-duplicate entities, provenance orphans, dictionary-collision candidates, merge-chain defects, `relation-dag` invariants (acyclic + depth≤3 over persisted `relations[]`, t/3170) (t/1806) |
 | `Update-EntityMentionIndex` | Phase 2-B batch re-index: rebuilds the derived `entity_mentions.json` by alias-first, deterministic matching of entities against **`{sei:*, summary:*}`** container text (SEI facts + summary key-points/claims). **`node:*` grounding moved to CL's Python reconciler** (t/3160 G7 disjoint-scope contract); this cmdlet never emits a `node:*` key. Indexes `-Status` entities only (default `approved`, per §5 / the D1 caller-filters-to-approved contract); widen to `-Status approved,proposed` for an explicit preview. Populated statuses recorded in the envelope's `indexed_status`. Idempotent via per-container `text_sha256`, human mentions win, normalization mirrors the D1 parity contract (t/1894, t/1982, t/3122, t/3160) |
 | `Update-ClaimEntityRef` | Claim-side entity grounding: writes `entity_refs[]` (Shared Lib `EntityLinkRef`) onto summary `key_points`/`factual_claims` by **precise-only** surface/alias matching against the approved register — mirrors CL's node reconciler; **no entity-embedding rung** (§13.3 propose-only, Andreessen-45). Refs written by this pass, never the extraction LLM (R2.3). Idempotent (only changed files rewritten; a claim that resolves to nothing has its `entity_refs` removed). `-Status` (default `approved`), `-SummariesPath`, `-Force`, `-WhatIf` (t/3124) |
@@ -95,6 +96,7 @@ Get-Help <CmdletName> -Full                     # full docs for any cmdlet
 |--------|----------|
 | `Import-AITriadDocument` | Ingest a PDF/DOCX/HTML source |
 | `Save-AITSource` / `Find-AITSource` | Store/retrieve source records |
+| `Export-SourcesIndex` | Build `sources-index.json` (card fields + `content_sha256` + URL/provenance per doc) for hosts that can't read `ai-triad-sources`; byte-stable, writes only on change (t/4334) |
 | `Get-IntellectualLineage` | Trace a node's source lineage |
 | `Get-PovLineage` | POV-specific lineage |
 | `Get-IngestionPriority` | Score sources by ingestion value |
@@ -106,13 +108,18 @@ Get-Help <CmdletName> -Full                     # full docs for any cmdlet
 | Cmdlet | Use when |
 |--------|----------|
 | `Invoke-AIByUsage` | Config-driven AI dispatch by UsageID (reads `ai-usages.json`, renders templates, delegates to Invoke-AIApi) |
+| `Get-AITierModel` | Resolve a model tier (`basic`=fast/cheap, `advanced`=frontier) + backend to the currently-registered id from `ai-models.json` `debateTiers` — use as a drift-proof default (`[string]$Model = (Get-AITierModel -Tier basic)`) instead of a hardcoded literal (t/3564) |
+| `Build-NodeSourceIndex` | Build the derived belief-node→primary-source sidecar `taxonomy/Origin/source_index.json` by inverting summaries' node-citation links against live ids — deterministic, self-describing header (schemaVersion/inputHash/totals); `-WhatIf`/`-PassThru` to preview (t/3596) |
+| `Test-CitationLinkIntegrity` | Advisory referential-integrity gate (t/3598): verifies summary→node links resolve to live nodes of their class (belief/situation), every `source_index.json` `source_id` resolves to `<sources>/<id>/metadata.json` (chunk-suffix stripped), and the index isn't stale (header inputHash + key count). Returns per-leg pass/offenders; warn-only until the SO/TL blocking flip |
 | `Invoke-BatchSummary` | Batch-summarize documents from the queue |
 | `Invoke-POVSummary` | Summarize one document across all 3 POVs (writes `summaries/<doc-id>.json`) |
 | `Invoke-BDIWeightAssignment` | Assign BDI weights to nodes |
 | `Invoke-EdgeWeightEvaluation` | Score edge weights via AI |
 | `Invoke-VernacularBatch` | Generate vernacular descriptions |
+| `Invoke-DebateGroundingBatch` | Generate first-person camp-voice `graph_attributes.debate_grounding` for POV nodes (t/3366); skip-if-present, `-Force`/`-Id`/`-WhatIf`/`-Concurrency`, surgical upsert write |
 | `Invoke-AphorismBatch` | Backfill camp-voiced sober aphorisms (~3-8 words) on POV nodes — presentational only, never a scoring input; skips pillars/deprecated (t/1550) |
 | `New-SyntheticCorpus` | Generate synthetic training data |
+| `Get-SyntheticStatement` | Get the synthetic statements generated for a BDI element (node id); reads synthetic/corpus_<pov>.json, excludes pruned by default (-IncludePruned to include) |
 
 ### AI Call Log (t/3235)
 | Cmdlet | Use when |
@@ -125,6 +132,7 @@ Get-Help <CmdletName> -Full                     # full docs for any cmdlet
 | Cmdlet | Use when |
 |--------|----------|
 | `Test-TaxEditorHealth` | Production liveness/readiness check (supports `-MaxAttempts` polling for post-deploy waits, t/1491) |
+| `Test-TaxEditorInquiry` | Verifies the hosted inquiry flow returns REAL data, not an ADR-001 graceful-empty shell — POST→poll→assert `campVerdicts`/`calibration`/`grounding` count>0; needs a `-SessionCookie` (auth-only); empty-shell = loud `New-ActionableError` (t/3584) |
 | `Test-EmbeddingHealth` | Smoke-test `POST /api/embeddings/compute` in prod (anon session + x-request-id) — reports Healthy/status/duration/vector dims + a `Get-ServerLog`-traceable requestId on failure (t/2787) |
 | `Test-TaxEditorEndpoints` | Smoke-test 16 endpoints |
 | `Test-AnonymousDebateFlow` | End-to-end smoke test of the anonymous/free-tier user journey |
@@ -156,20 +164,26 @@ Get-Help <CmdletName> -Full                     # full docs for any cmdlet
 | `Disable-ContainerAppRevision` | Deactivate an ACA revision (stale cleanup or rollback tail); non-fatal on failure — matches deploy YAML's `\|\| true` semantics (t/1500 Phase 3) |
 | `Get-ContainerAppDiagnostics` | Combined revision-show + console + system logs for failure triage; polls 30s for logs to appear before declaring unavailable (t/1500 Phase 3) |
 | `Get-GitHubWorkflowRun` | Fetch a workflow run + per-job conclusions for a commit SHA or run ID (t/1499) |
-| `Get-CIFailureSummary` | One-call CI triage — pull failing Pester tests + real infra errors from a gh run log (t/2882) |
+| `Get-CIFailureSummary` | One-call CI triage — pull failing Pester and vitest tests (file, error, location) + real infra errors from a gh run log (t/2882, t/4271) |
 | `Remove-StaleContainerImages` | GHCR cleanup — paginate → filter → delete untagged image versions with `-WhatIf` (t/1492) |
 | `Get-TaxonomySnapshot` | Fetch the 11-file taxonomy + conflict snapshot from ai-triad-data with commit-SHA stamping (t/1493) |
 | `Test-TaxonomyDirContents` | Pre-embedding TAXONOMY_DIR validation — flags files whose `nodes` field would crash `Update-TaxEmbeddings` (dict/null instead of a list of objects); mirrors embed_taxonomy.py skip logic (t/1654) |
 | `Get-FlightRecorderDump` | Pull flight recorder from server |
 | `Get-LatestFlightRecorderDump` | Find the most recent *non-stub* flight recorder dump (>10KB) for triage — skips the tiny startup/shutdown stubs that can be newer than the real dump (t/1712) |
+| `Read-FlightRecorderDump` | Structured error/retry summary from a dump — error grouping by (component,type), retry-chain reconstruction with computed backoff intervals, preceding-warning lookback, client/server split (t/3726) |
+| `Invoke-DebateDiagnosis` | Structured debate-issue analysis from a dump — per-run phase/round progression, COMMIT-intervention receipt per POVer, derived closure status, deduped errors/warnings, best-effort steelman text scan (t/3768) |
+| `Measure-CodeComplexity` | McCabe (cyclomatic) complexity per function, AST-based over PS source — defaults to `scripts/`, filterable by `-MinComplexity` (p/550) |
+| `Update-ComplexityBaseline` | Generate/regenerate the complexity-ratchet baseline (`scripts/complexity-baseline.json`) — per-file `{max, countOver}`, offenders-only, write-only-downward (t/3829) |
+| `Test-ComplexityBudget` | Enforce the complexity-ratchet baseline — new over-threshold file or a baselined file regressing both fail; reads threshold from the baseline unless `-Threshold` is explicitly passed and must then match (t/3829) |
 | `Get-AICostReport` | Token/cost usage report |
 | `Get-ViteDevStatus` | Vite dev server diagnostic — port owner, working dir, HTTP health, main/worktree/orphan classification (t/2196) |
+| `Get-WorktreeMainRoot` | Resolves the true main-checkout root from inside any worktree (nested `.worktrees/<x>` or sibling `../wt-<x>`) via `git rev-parse --git-common-dir`; use when anchoring a sibling-relative path like a data-repo root, where the calling worktree's own directory is the wrong depth (t/3869) |
 | `Get-DebateSessionState` | Read phase, transcript length, run_id, and updated_at from a debate JSON on disk — one-liner for interrupted-turn recovery diagnosis (t/2330) |
 
 ### Config
 | Cmdlet | Use when |
 |--------|----------|
-| `Get-TriadConfig` / `Set-TriadConfig` | Read/write runtime config |
+| `Get-TriadConfig` / `Set-TriadConfig` / `Invoke-TriadConfigReload` | Read/write/reload runtime config on a **local** server. Hosted (staging/prod) answers with the Easy Auth sign-in page and the cmdlets fail; use the Runtime Config panel there (t/4370) |
 | `Register-AIBackend` | Configure AI backend credentials |
 | `Test-AIApiKey` | Verify an AI provider API key authenticates (auth-only probe of gemini/claude/groq/openai/azure; no token cost). Use `-All` to sweep every backend with a resolvable key. |
 | `Test-AIModelsConfig` | Validate `ai-models.json` — BOM, JSON parse, orphaned model refs in defaults/debateTiers/fallbackChains, incomplete `models[]` entries, and friendly-id-in-`apiModelId` (t/1705). Returns `{Pass; Issues}`; run in a Pester test / CI. |
@@ -179,6 +193,7 @@ Get-Help <CmdletName> -Full                     # full docs for any cmdlet
 |--------|----------|
 | `Assert-CleanDataTree` | Before a whole-file rewrite of a data-repo JSON, assert the target has no uncommitted changes — so a `ConvertFrom-Json \| ConvertTo-Json` (or Python `json.load`→`json.dump`) round-trip can't sweep concurrent working-tree state into the commit (t/2902; `-Force` downgrades the block to a warning). Also exposed as the opt-in `Write-Utf8NoBom -RequireCleanTree` switch. |
 | `Save-JsonNodeFieldEdits` | Use when a writer needs to set scalar `nodes[]` fields in a data-repo JSON without a whole-file round-trip. Reads fresh, splices ONLY the target fields via a re-parse-verified byte-preserving primitive, writes once through the guarded sink — so it cannot sweep concurrent WIP and is safe even on the perpetually-dirty BLOCK-tier `situations.json` (t/2916). Returns a summary (Applied + NotFound). Pair with explicit-path staging at commit. |
+| `Set-PovNodeTags` | Use when writing a POV node's `pov_tags` field (the t/3962 tagging writer). Validates the WHOLE batch against the registry in ONE call to the blocking gate `lib/schema/pov-tags-cli.ts` before writing anything — a bad tag anywhere refuses the entire batch, so a file is never left half-tagged (t/3969). Writes surgically via `Update-JsonNodePath -ArrayValue`. Supports `-WhatIf` and `-TargetPath` for dry-run / worktree writes. Returns `{Checked; Applied; NotFound}`. |
 
 **Centralized data-write guard (t/2902 Part 2).** Every data-of-record write in the module funnels through a guarded sink, so individual cmdlets need no per-callsite wiring:
 

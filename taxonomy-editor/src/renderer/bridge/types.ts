@@ -11,6 +11,31 @@
  * window.electronAPI directly.
  */
 
+import type { StopReason, ProviderCallDiagnostics } from '@lib/ai-client/types';
+import type { PovTagProposalsFile, ProposalDecision, ProposalStatus, ApplyProposalDecisionResult } from '@lib/schema/povTagProposals';
+import type { RecountPolicyMembersResult } from '@lib/policy/registryRecount';
+import type { RefreshResult, RefreshAccept } from '@lib/electron-shared/modelDiscovery';
+import type { SourceReference as _SourceReference, SourceCardMeta as _SourceCardMeta } from '@lib/sourceIndex/types';
+
+/**
+ * What the renderer may send to a model refresh (t/4031). No argument is a plain refresh, exactly as before.
+ * `accept` carries only what a person supplies: the exact proposal they were shown, their name and their reason.
+ * Who is authenticated is never the renderer's to say; the host sets that (TL t/4031#2, adjustment 3).
+ */
+export interface RefreshModelsRequest {
+  dryRun?: boolean;
+  accept?: Pick<RefreshAccept, 'proposal' | 'approvedBy' | 'reason'>;
+}
+
+/**
+ * t/4232 (SO e/297#4 C6): a call with no `accept` is coerced into a dry run rather than
+ * silently writing. `coerced` is present and true only when that coercion happened — a caller
+ * that explicitly asked for a dry run, or supplied `accept`, never gets `coerced: true`.
+ */
+export interface RefreshModelsResponse extends RefreshResult {
+  coerced?: boolean;
+}
+
 export interface GroundingSegment {
   startIndex: number;
   endIndex: number;
@@ -87,6 +112,8 @@ export type DebateDelta = _DebateDelta;
 // parity-identical by construction — this is the exact contract the server route already types against.
 import type { ANClaimInput as _ANClaimInput, RelevantTaxonomyResult as _RelevantTaxonomyResult } from '@lib/debate/relevanceSelection';
 export type ANClaimInput = _ANClaimInput;
+import type { TagSelection as _TagSelection } from '@lib/debate/types/session';
+export type TagSelection = _TagSelection;
 export type RelevantTaxonomyResult = _RelevantTaxonomyResult;
 
 /**
@@ -113,6 +140,9 @@ export interface FetchRelevantNodesPayload {
     /** Fetched caller-side (renderer: bridge `getGreatestHits`) and passed as an array. */
     greatestHitsList?: string[];
   };
+  /** POV tags (t/3957) — derived caller-side from `session.seat_tags[speaker]`; the selection
+   *  pipeline never reads `seat_tags` directly. Absent = today's untagged behavior, byte-identical. */
+  tagSelection?: TagSelection;
 }
 
 // t/3316 (t/3297 client half): per-claim taxonomy attribution moved server/main-side — the debate
@@ -141,6 +171,7 @@ export interface ClaimAttributionResponse {
 
 import type { OpEdSet, OpEdSetSummary, PovKey } from '../../../../lib/oped/types';
 import type { BriefPreset, ExportJobState, ExportErrorCode, BriefArtifactName } from '../../../../lib/brief/types';
+import type { TagSelection as OpEdTagSelection } from '@lib/schema/povTags';
 
 /** Op-Ed generation params (PR#2) — maps to New-OpEd cmdlet params; topic + voices
  *  travel separately in the payload (one New-OpEd call per selected voice). */
@@ -156,10 +187,58 @@ export interface CreateOpEdParams {
   maxGroundingNodes?: number;
   maxSituations?: number;
   voiceOnly?: boolean;
+  /** POV tag for ONE member (t/3960, t/3992). Validated by parseOpEdRequest on both create paths. */
+  tagSelection?: OpEdTagSelection;
 }
 export interface CreateOpEdPayload { topic: string; url?: string; params: CreateOpEdParams; voices: PovKey[] }
 /** One 3-stage progress tick from the Electron generation IPC (t/2575 `oped-progress`). */
 export interface OpEdProgressEvent { set_id: string; voice: string; stage: string; error?: string }
+
+// Inquiry (t/3582, T-inquiry) — client shapes of the T-inquiry REST API (server: routes/inquiry.ts,
+// t/3581). Field-for-field identical to the route contract (t/3582#1) so the two stay in lockstep.
+import type { InquiryResult as _InquiryResult, InquiryJobStatus as _InquiryJobStatus } from '../../../../lib/inquiry';
+export type InquiryResult = _InquiryResult;
+// t/3609: hoisted to lib/inquiry (single source of truth across server/main/renderer) — re-exported
+// here so existing `from '../bridge/types'` imports keep working unchanged. isInquiryTerminal
+// (a byte-identical duplicate of lib/inquiry's isTerminalStatus, confirmed by diff at e/196#9) is
+// dropped in favor of the canonical export; it had zero call sites.
+export type InquiryJobStatus = _InquiryJobStatus;
+export { isTerminalStatus } from '../../../../lib/inquiry';
+
+export interface StartInquiryRequest {
+  question: string;
+  fidelity: 'quick' | 'standard' | 'deep';
+  situationId?: string;
+  models?: { debaters?: string; evaluator?: string };
+  /** Optional POV tag for one camp (t/3965, picked in the Ask panel since t/4246). The server and the
+   *  desktop IPC both validate it with InquiryRequestSchema, which rejects an unregistered tag. */
+  tagSelection?: import('@lib/schema/povTags').TagSelection;
+}
+
+/** `done_truncated` is a DISTINCT terminal state (budget/ceiling truncation, fails closed by
+ *  design) — callers must treat it as terminal via `isTerminalStatus`, never a bare `=== 'done'`
+ *  (t/3582#1). */
+export interface InquiryStatusResponse {
+  jobId: string;
+  status: InquiryJobStatus;
+  progressPct: number;
+  terminationReason: string | null;
+  resultId: string | null;
+  error: string | null;
+  /** Present on `done` / `done_truncated` (including the cross-replica persisted-result fallback). */
+  result?: InquiryResult;
+}
+
+/** Cheap listing row for the "My Questions" history (t/3620). Field-for-field identical to the
+ *  server's `InquiryResultSummary` (storage/inquiryResultStore.ts) so the two stay in lockstep. */
+export interface InquiryResultSummary {
+  jobId: string;
+  question: string;
+  debateId: string | null;
+  truncated: boolean;
+  terminationReason?: string;
+  createdAt: string;
+}
 
 // Brief Export (t/2805, T7) — client shapes of the T6 REST API (server: routes/briefExports.ts).
 // Consumes T6's frozen job-state names, artifact names, and error taxonomy verbatim.
@@ -203,8 +282,12 @@ export interface BriefExportRecord {
   /** Human-readable failure reason (verify message / thrown error) — shown by the export
    *  dialog's list fallback so a failed export explains WHY, not just a code (t/2888). */
   reason?: string;
-  narratorModel: string;
-  narratorModelSource: string;
+  /** Populated on the server/web path only (src/server/briefExportJobs.ts,
+   *  briefExportStore.ts) — absent by design on desktop, where the main-process handler
+   *  never sets them (t/3532, TL ruling t/3532#3: this was a web-only concept incorrectly
+   *  typed as required on a type shared with the desktop bridge). */
+  narratorModel?: string;
+  narratorModelSource?: string;
   checkerModel?: string | null;
   formats: string[];
   artifacts: BriefArtifactName[];
@@ -243,12 +326,53 @@ export interface OrgFilters { type?: string; pov?: string }
 export interface GenerateTextOptions {
   signal?: AbortSignal;
   requestId?: string;
+  /** Caller-supplied stage/activity label (e.g. "brief", "Moderator is voicing each camp's
+   * story") surfaced on the bridge's ai.request/ai.response/ai.error flight-recorder events
+   * so a dump can attribute a slow/failed call to its call site without guessing from
+   * unrelated debate.lifecycle events (t/3519). Purely diagnostic — never sent to the provider. */
+  purpose?: string;
+  /** Caps provider output length for this call (e.g. Fable 5's opening brief, which
+   * otherwise hits the provider default ceiling and truncates mid-JSON, t/3524).
+   * Optional — omitted calls use the backend/model default. */
+  maxTokens?: number;
 }
 
-export type ViewMode = 'simple' | 'advanced';
+/**
+ * Single-object payload for the `generate-text` IPC call (t/3528). Replaces a positional
+ * parameter chain that grew to 6 args across `electron.d.ts` → `preload.cts` → the
+ * `generate-text` handler → `embeddings.generateText`, each restating the order by hand.
+ * `signal` and `purpose` (renderer-only concerns — see {@link GenerateTextOptions}) don't
+ * cross the IPC boundary and are deliberately excluded.
+ */
+export interface GenerateTextIpcPayload {
+  prompt: string;
+  model?: string;
+  timeoutMs?: number;
+  temperature?: number;
+  requestId?: string;
+  maxTokens?: number;
+}
 
-export interface UserPreferences {
-  viewMode: ViewMode;
+// Re-exported from the shared schema (t/3534) — single source of truth for both
+// read boundaries (ElectronMain get-preferences, ServerAPI GET /api/preferences),
+// so Electron and web can never silently diverge on the same preferences file.
+// Same names, same shape — zero renderer call-site churn.
+import type { ViewMode as _ViewMode, UserPreferences as _UserPreferences } from '@lib/userPreferencesSchema';
+export type ViewMode = _ViewMode;
+export type UserPreferences = _UserPreferences;
+
+/** t/3852: shared contract for the durable node-deletion audit log. Both the Electron
+ *  main-process writer and the server writer append this shape to node-delete-log.jsonl
+ *  under the resolved data root. */
+export interface NodeDeleteLogEntry {
+  nodeId: string;
+  pov: string;
+  label: string;
+  user: string;
+  /** Exhaustive counts (not sampled) of what dangles — see utils/danglingReferences.ts. */
+  danglingEdges: number;
+  danglingSituationRefs: number;
+  danglingChildren: number;
 }
 
 export interface AppAPI {
@@ -262,10 +386,29 @@ export interface AppAPI {
   setTaxonomyDir: (dirName: string) => Promise<void>;
 
   // --- Taxonomy CRUD ---
+  /** A plain read. It never moves the save's version cell, so use it for re-reads and viewers (t/4187). */
   loadTaxonomyFile: (pov: string) => Promise<unknown>;
+  /** The editor's load (initial load, refresh, POV switch): on web it also records the file's version, which the
+   *  next save sends as If-Match. Same result as loadTaxonomyFile on desktop (t/4187). */
+  loadTaxonomyFileForEdit: (pov: string) => Promise<unknown>;
+  /** loadTaxonomyFileForEdit for several files, all or nothing (t/4439): every file is read first, and the version
+   *  cells move only if every read succeeded, so a partial failure never leaves a cell ahead of the store's content.
+   *  Results are in `povs` order. Same as plain reads on desktop. */
+  loadTaxonomyFilesForEdit: (povs: readonly string[]) => Promise<unknown[]>;
+  /** Web: sends If-Match from the version cell; rejects with `code` 'WRITE_CONFLICT' (409) or
+   *  'BASE_VERSION_REQUIRED' (428) for the UI to offer a reload. Saves to one POV are serialized (t/4187). */
   saveTaxonomyFile: (pov: string, data: unknown) => Promise<void>;
   loadPolicyRegistry: () => Promise<unknown>;
+  /** t/4034: recount member_count / source_povs in policy_actions.json for these policy ids, from the POV
+   *  files on disk (lib/policy/registryRecount.ts). Returns written / unchanged / refused. */
+  recountPolicyMembers: (ids: string[]) => Promise<RecountPolicyMembersResult>;
   loadLineageCategories: () => Promise<unknown>;
+
+  /** t/3852: durable audit record for a node deletion — appended to node-delete-log.jsonl
+   *  under the data root (Electron: main-process writer via IPC; web: server endpoint).
+   *  Fail-safe like the AI call log: an IO/network failure must never block the delete it's
+   *  recording, so callers should not let a rejection here interrupt the delete flow. */
+  logNodeDeletion: (entry: NodeDeleteLogEntry) => Promise<void>;
   loadLineageInfo: () => Promise<Record<string, unknown>>;
   loadEdges: () => Promise<unknown>;
   getEdgeDetail: (index: number) => Promise<unknown>;
@@ -278,6 +421,9 @@ export interface AppAPI {
   saveEdges: (data: EdgesFile) => Promise<void>;
   buildNodeSourceIndex: () => Promise<unknown>;
   buildPolicySourceIndex: () => Promise<unknown>;
+  /** t/4334/t/4335: per-node source index — replaces buildNodeSourceIndex (whole-corpus)
+   *  for the Sources tab's actual use case (one node at a time). */
+  getNodeSources: (nodeId: string) => Promise<{ sources: _SourceReference[]; cards: Record<string, _SourceCardMeta>; indexVersion: number }>;
 
   // --- Conflict CRUD ---
   loadConflictFiles: () => Promise<unknown[]>;
@@ -305,11 +451,17 @@ export interface AppAPI {
   checkDataUpdates: () => Promise<unknown>;
   pullDataUpdates: () => Promise<unknown>;
   getChangedFiles: () => Promise<{ path: string; status: string }[]>;
+  /** t/4052: taxonomy/Origin/pov-tag-proposals.json, or null when absent. Read-only everywhere. */
+  loadPovTagProposals: () => Promise<PovTagProposalsFile | null>;
+  /** t/4052: record one review decision in the side file (never pov_tags). Desktop only: hosted web answers 405.
+   *  A refusal (`conflict`: someone reviewed it first; `invalid`: final fails the registry) comes back as a value. */
+  reviewPovTagProposal: (nodeId: string, decision: ProposalDecision, expectedStatus: ProposalStatus) => Promise<ApplyProposalDecisionResult>;
   getFileDiff: (filePath: string) => Promise<string>;
 
   // --- AI models & keys ---
   loadAIModels: () => Promise<unknown>;
-  refreshAIModels: () => Promise<unknown>;
+  /** t/4031: `opts` asks for a dry run or accepts a proposal; omit it for a plain refresh. */
+  refreshAIModels: (opts?: RefreshModelsRequest) => Promise<RefreshModelsResponse>;
   validateApiKey: (key: string, backend: string) => Promise<{ valid: boolean; error?: string }>;
   verifyStoredKeys: (backend: string) => Promise<{ results: { index: number; masked: string; valid: boolean; error?: string }[] }>;
   setApiKey: (key: string, backend?: string) => Promise<void>;
@@ -331,7 +483,27 @@ export interface AppAPI {
   importKeysFromSharing: (payload: { v: number; salt: string; iv: string; data: string; tag: string }, passphrase: string) => Promise<string[]>;
 
   // --- AI generation ---
-  generateText: (prompt: string, model?: string, timeoutMs?: number, temperature?: number, opts?: GenerateTextOptions) => Promise<{ text: string; tokenUsage?: { inputTokens: number; outputTokens: number; totalTokens: number } }>;
+  /** `stopReason` (t/3525) is the provider's normalized finish reason — 'max_tokens' means the
+   *  text is truncated and callers must not attempt to parse it as complete JSON. Undefined when
+   *  the backend hasn't reported one (web builds, until ServerAPI threads it through the REST
+   *  response) — never fabricated. */
+  /** `diagnostics` (t/3568 item 2) rides the resolved value on the SUCCESS path only — providers
+   *  throw before returning a ProviderResult on a non-2xx/timeout, so there is nothing to attach
+   *  on a rejected generateText call yet (see instrumentBridge.ts's extractResultMeta). */
+  /** `servedModel` (t/4048, e/268#6 condition 3) is the registry id that actually answered, set
+   *  only on success and never echoed from the request — absent means untracked (older backend
+   *  or an error path), never filled in from the requested model. Desktop always equals the
+   *  requested/defaulted model (no fallback chain there, e/275); web is unset until ServerAPI's
+   *  own `servedModel` lands (its chain in `aiBackends.ts` is where failover is real).
+   *
+   *  WHAT IT DOES NOT CLAIM: "answered" means which link of OUR model routing answered (failover
+   *  tracking). It does NOT verify that the PROVIDER served that model. Provider-side substitution
+   *  (sent X, provider reports Y) is detected separately by the `ai.model_identity` flight-recorder
+   *  event (t/3677, t/3731), not here. `ProviderResult.providerReportedModel` is deliberately NOT
+   *  the source: it is a raw provider string (a different namespace from registry ids), and it is
+   *  forensics-only. Reading it here would lapse its no-consumer exemption. So a run marked
+   *  'tracked' on this field is failover-tracked, NOT identity-verified (TL review, #3061). */
+  generateText: (prompt: string, model?: string, timeoutMs?: number, temperature?: number, opts?: GenerateTextOptions) => Promise<{ text: string; stopReason?: StopReason; tokenUsage?: { inputTokens: number; outputTokens: number; totalTokens: number }; diagnostics?: ProviderCallDiagnostics; servedModel?: string }>;
   generateTextWithSearch: (prompt: string, model?: string) => Promise<{
     text: string;
     searchQueries?: string[];
@@ -410,6 +582,25 @@ export interface AppAPI {
   exportDebateToFile: (session: unknown, format?: 'json' | 'markdown' | 'text' | 'pdf' | 'package', exportOptions?: { includeTaxonomyRefs?: boolean; includeReasoning?: boolean }) => Promise<{ cancelled: boolean; filePath?: string }>;
   loadDebateComments: (debateId: string) => Promise<unknown>;
   saveDebateComments: (debateId: string, data: unknown) => Promise<void>;
+
+  // --- Inquiry (t/3582 — "Ask a question"; both builds) ---
+  startInquiry: (request: StartInquiryRequest, idempotencyKey?: string) => Promise<{ jobId: string }>;
+  getInquiry: (jobId: string) => Promise<InquiryStatusResponse>;
+  /** "My Questions" history list (t/3620). Desktop may reject until the ElectronMain IPC leg
+   *  lands (t/3582 precedent — see electron-bridge.ts's rejectOpEdIpc pattern). */
+  listInquiries: () => Promise<InquiryResultSummary[]>;
+  /** Export an inquiry answer as JSON/MD/PDF (t/3624). Desktop rejects until the ElectronMain
+   *  IPC leg lands — no fake success (same precedent as listInquiries above). */
+  exportInquiryToFile: (
+    result: InquiryResult,
+    title: string,
+    format: 'json' | 'markdown' | 'pdf',
+  ) => Promise<{ cancelled: boolean; filePath?: string }>;
+  /** Public no-login share link (t/3626/t/3653, t/3654). Mirrors shareOpEdSet/unshareOpEdSet
+   *  exactly — desktop rejects (t/3654: hide the Share control on Electron entirely, per
+   *  rejectOpEdIpc precedent — same web-only posture as op-ed sharing). */
+  shareInquiry: (jobId: string) => Promise<{ shareId: string; url: string }>;
+  unshareInquiry: (jobId: string) => Promise<{ ok: boolean }>;
 
   // --- Brief Export (t/2805, T7 — client of the T6 REST API; web-only v1, Electron parity tracked) ---
   createBriefExport: (debateId: string, body: BriefExportRequest) => Promise<{ jobId: string }>;
@@ -494,14 +685,14 @@ export interface AppAPI {
   // --- Community Library ---
   listCommunityChats: () => Promise<unknown[]>;
   listCommunityDebates: () => Promise<unknown[]>;
-  submitToCommunity: (type: 'chat' | 'debate', itemData: unknown, note?: string) => Promise<{ submissionId: string }>;
+  submitToCommunity: (type: 'chat' | 'debate' | 'oped' | 'inquiry', itemData: unknown, note?: string) => Promise<{ submissionId: string }>;
   copyFromCommunity: (type: 'chats' | 'debates', communityId: string) => Promise<{ newId: string }>;
   loadCommunityDebateSession: (id: string) => Promise<unknown>;
   loadCommunityOpEd: (id: string) => Promise<OpEdSet>;
   loadCommunityChatSession: (id: string) => Promise<unknown>;
   // Submit to a remote community server. In Electron this is proxied through the main
   // process (net.fetch) so it is not blocked by browser CORS; baseUrl is the server origin.
-  communitySubmit: (baseUrl: string, payload: { type: 'chat' | 'debate' | 'oped'; data: unknown; note?: string }) => Promise<{ submissionId: string }>;
+  communitySubmit: (baseUrl: string, payload: { type: 'chat' | 'debate' | 'oped' | 'inquiry'; data: unknown; note?: string }) => Promise<{ submissionId: string }>;
 
   // --- Support cases ---
   createSupportCase: (payload: SupportCaseCreatePayload) => Promise<{ id: string }>;
@@ -658,5 +849,5 @@ export interface AppAPI {
   adminReviewStats: () => Promise<{ total: number; byDomain: Record<string, number> }>;
   adminReviewDetail: (groupId: string) => Promise<unknown>;
   adminReviewAction: (action: { domain: string; groupId: string; action: string; itemIds: string[]; reason?: string; edits?: Record<string, unknown> }) => Promise<void>;
-  adminRemoveCommunityItem: (type: 'chats' | 'debates' | 'opeds', id: string, reason?: string) => Promise<void>;
+  adminRemoveCommunityItem: (type: 'chats' | 'debates' | 'opeds' | 'inquiries', id: string, reason?: string) => Promise<void>;
 }

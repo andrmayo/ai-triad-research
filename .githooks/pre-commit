@@ -126,7 +126,7 @@ if [ "$gd" != "$cdir" ]; then
     A detached-HEAD commit is orphaned — lost on the next re-detach unless pushed.
 
   Create the worktree BRANCH-FIRST so commits land on a named PR branch:
-    git worktree add -b <type>/<slug>-t<ticket> ../wt-<ticket> origin/main
+    git worktree add -b <type>/<slug>-t<ticket> .worktrees/<name> origin/main
     #  …commit on the named branch…  →  git push origin <branch>  →  gh pr create
 
   Already detached with work to save? Name the branch in place, then commit:
@@ -142,6 +142,16 @@ fi
 branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || exit 0
 [ "$branch" = "main" ] || exit 0
 
+# ── Workflow-mode switch (t/3638) ────────────────────────────────────────────
+# In `direct` mode, skip ONLY the shared-`main` refusal below. The detached-HEAD-in-
+# worktree refusal (t/2009, above) is UNAFFECTED — it guards a different failure and
+# fires in BOTH modes. FAIL-SAFE: the reader defaults to `worktree` on any error; here we
+# additionally force `worktree` unless the helper printed exactly `direct`, so a missing or
+# broken helper TIGHTENS (keeps the refusal), never loosens.
+mode=$(sh "$_toplevel/.githooks/read-workflow-mode.sh" 2>/dev/null)
+[ "$mode" = "direct" ] || mode=worktree
+if [ "$mode" = "direct" ]; then exit 0; fi
+
 # Direct commit on the shared `main` checkout — refuse.
 cat >&2 <<'MSG'
 
@@ -149,7 +159,7 @@ cat >&2 <<'MSG'
     This strands work local-only and diverges `main` from `origin`.
 
   Land via /land-from-worktree instead (branch-first):
-    git worktree add -b <type>/<slug>-t<ticket> ../wt-<ticket> origin/main
+    git worktree add -b <type>/<slug>-t<ticket> .worktrees/<name> origin/main
     #  …commit on the named branch inside the worktree…
     git push origin <branch>   →   gh pr create   →   self-merge on green
 

@@ -4,6 +4,7 @@
 import './OverviewTabRouter.css';
 import React from 'react';
 import type { DebateSession, ArgumentNetworkNode, ArgumentNetworkEdge, CommitmentStore } from '../../../types/debate';
+import type { ElectronAPI } from '../../../types/electron';
 import type { TopicScope, TopicScopeRiskLevel } from '@lib/debate/types';
 import type { WeightHistoryEntry } from '../../../types/taxonomy';
 import { useTaxonomyStore } from '../../../hooks/useTaxonomyStore';
@@ -27,6 +28,7 @@ import { PovProgressionView } from '../../PovProgression/PovProgressionView';
 import { PromptDiffContent } from '../../chat/PromptDiffWindow';
 import { CommitmentsPanel } from './shared';
 import { TheoryLink } from '../../shared/TheoryLink';
+import { SteelmansPanel } from '../../shared/Steelman';
 
 declare const __COMPONENT_VERSIONS__: Record<string, string>;
 
@@ -76,7 +78,15 @@ function TopicScopeSection({ debate, effectiveOverviewTab }: { debate: DebateSes
   const scope = debate.topic.scope as TopicScope;
   return (
     <div className="ovr-topic-scope">
-      <h4 className="ovr-h4">Topic Scope <TheoryLink docPath="docs/topic-scope.md" size={12} /></h4>
+      <h4 className="ovr-h4">
+        Topic Scope <TheoryLink docPath="docs/topic-scope.md" size={12} />{' '}
+        <TheoryLink
+          docPath="docs/topic-scope-theory-of-success.md"
+          size={12}
+          label="Help: Topic Scope theory of success"
+          tooltip="Theory of Success & Operations"
+        />
+      </h4>
       <div className="ovr-mb-8">
         <span className="ovr-scope-prop">{scope.core_proposition}</span>
       </div>
@@ -537,7 +547,7 @@ function PromptDiffSection({ debate, effectiveOverviewTab, selectedEntry }: { de
 
 type FrRow = [string, string | number | null | undefined];
 type FrSection = { title: string; rows: FrRow[] };
-type FrEApi = { processVersions?: Record<string, string | undefined>; osRelease?: string; osPlatform?: string; osArch?: string } | undefined;
+type FrEApi = Pick<ElectronAPI, 'processVersions' | 'osRelease' | 'osPlatform' | 'osArch'> | undefined;
 type FrMem = { usedJSHeapSize: number; totalJSHeapSize: number } | undefined;
 type FrTaxState = ReturnType<typeof useTaxonomyStore.getState>;
 
@@ -644,7 +654,7 @@ function FrContextSection({ debate, effectiveOverviewTab }: { debate: DebateSess
   if (effectiveOverviewTab !== 'fr-context') return null;
   const taxState = useTaxonomyStore.getState();
   const mem = (performance as unknown as { memory?: { usedJSHeapSize: number; totalJSHeapSize: number } }).memory;
-  const eApi = (window as unknown as { electronAPI?: { processVersions?: Record<string, string | undefined>; osRelease?: string; osPlatform?: string; osArch?: string } }).electronAPI;
+  const eApi = (window as { electronAPI?: ElectronAPI }).electronAPI;
   const pv = eApi?.processVersions;
   const sections: FrSection[] = [
     buildAppSection(eApi),
@@ -1052,6 +1062,11 @@ export function OverviewTabRouter({
       {/* Adaptive Staging — signal telemetry, phase transitions, GC events */}
       {effectiveOverviewTab === 'adaptive' && (
         <AdaptiveStagingTab debate={debate} />
+      )}
+
+      {/* Steelmans — each debater's strongest restatement of an opponent, and whether it held (t/3514) */}
+      {effectiveOverviewTab === 'steelmans' && (
+        <SteelmansPanel debate={debate} />
       )}
 
       {/* Reflections — taxonomy edits proposed by debaters */}

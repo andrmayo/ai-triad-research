@@ -16,7 +16,13 @@ function Get-EntityReport {
         provenance-orphan: entities with an empty (or absent) source_refs array.
         Labeled explicitly in the output — this is NOT the same thing as a
         mention-orphan (an entity nothing in the corpus currently references);
-        that check is Phase 2.
+        that check is Phase 2. An entity whose source_refs_status is
+        'none-matched' is NOT an orphan: its sources were checked and none names
+        it (t/4404); it is reported under none-matched instead.
+
+        none-matched: entities whose source attribution found no doc in their list
+        that holds their quote or names them (source_refs_status = 'none-matched',
+        t/4404), for a human to review.
 
         dictionary-candidate: entities whose normalized name or alias EXACTLY
         collides with a dictionary term (colloquial_term or a standardized term's
@@ -28,8 +34,15 @@ function Get-EntityReport {
         here and reported instead of propagating), and dangling merged_into
         pointers (a target id absent from the store — resolves to $null, not a
         throw).
+
+        tombstone-status (t/4450): merge tombstones whose status is not 'deprecated'. The invariant is
+        merged_into set => deprecated (Import-Entity enforces it); a hit is a record written before it.
+
+        orphan-vector (t/4450): vectors in entity_embeddings.json whose record is absent, not approved,
+        or a merge tombstone. The scope is Test-EntityVectorEligible, the same predicate the extraction
+        vector index uses, so what is indexed and what is reported agree.
     .PARAMETER Report
-        Which section(s) to compute. Default 'all' (all four).
+        Which section(s) to compute. Default 'all'.
     .PARAMETER NearDuplicateThreshold
         Minimum cosine similarity to flag a pair as a near-duplicate. Default 0.60.
     .PARAMETER EntitiesPath
@@ -57,7 +70,7 @@ function Get-EntityReport {
     [OutputType([PSCustomObject])]
     param(
         [Parameter()]
-        [ValidateSet('near-duplicate', 'provenance-orphan', 'dictionary-candidate', 'merge-chain', 'relation-dag', 'all')]
+        [ValidateSet('near-duplicate', 'provenance-orphan', 'none-matched', 'dictionary-candidate', 'merge-chain', 'relation-dag', 'tombstone-status', 'orphan-vector', 'all')]
         [string]$Report = 'all',
 
         [Parameter()]
@@ -94,9 +107,12 @@ function Get-EntityReport {
     $Result = [PSCustomObject]@{
         NearDuplicate       = $null
         ProvenanceOrphan    = $null
+        NoneMatched         = $null
         DictionaryCandidate = $null
         MergeChainDefects   = $null
         RelationDag         = $null
+        TombstoneStatus     = $null
+        OrphanVector        = $null
     }
 
     # ── near-duplicate ──────────────────────────────────────────────────────────────
@@ -105,8 +121,12 @@ function Get-EntityReport {
         if (Test-Path $EmbPath) {
             $EmbStore = Get-Content -Raw -Path $EmbPath -Encoding utf8 | ConvertFrom-Json
             if ($EmbStore.PSObject.Properties['vectors']) {
+                # v1 (flat array) and v2 ({ name_vector, description_vector }) through the shared rule
+                # (Get-EntityNameVector, = nameVectorOf in lib/entities/entityVectors.ts). A v2 record cast
+                # straight to [double[]] threw, failing the default -Report all on the live store (t/4456).
                 foreach ($prop in $EmbStore.vectors.PSObject.Properties) {
-                    $Vectors[$prop.Name] = [double[]]@($prop.Value)
+                    $vec = Get-EntityNameVector -Stored $prop.Value
+                    if ($null -ne $vec -and $vec.Length -gt 0) { $Vectors[$prop.Name] = $vec }
                 }
             }
         }
@@ -139,6 +159,9 @@ function Get-EntityReport {
         $Orphans = [System.Collections.Generic.List[PSObject]]::new()
         foreach ($e in $Entities) {
             $refs = if ($e.PSObject.Properties['source_refs']) { @($e.source_refs) } else { @() }
+            # The first branching reader of source_refs_status (t/4404, T1): a checked-and-empty entity is not
+            # a provenance orphan.
+            if ($e.PSObject.Properties['source_refs_status'] -and [string]$e.source_refs_status -eq 'none-matched') { continue }
             if (@($refs | Where-Object { $_ }).Count -eq 0) {
                 $Orphans.Add([PSCustomObject]@{
                     Id     = [string]$e.id
@@ -150,6 +173,23 @@ function Get-EntityReport {
         $Result.ProvenanceOrphan = [PSCustomObject]@{
             Label   = 'provenance-orphan (empty source_refs) — NOT mention-orphan; true mention-orphan lands Phase 2.'
             Entities = @($Orphans)
+        }
+    }
+
+    # ── none-matched (t/4404) ────────────────────────────────────────────────────────
+    if ($WantAll -or $Report -eq 'none-matched') {
+        $None = [System.Collections.Generic.List[PSObject]]::new()
+        foreach ($e in $Entities) {
+            if (-not ($e.PSObject.Properties['source_refs_status'] -and [string]$e.source_refs_status -eq 'none-matched')) { continue }
+            $None.Add([PSCustomObject]@{
+                Id     = [string]$e.id
+                Name   = if ($e.PSObject.Properties['name']) { [string]$e.name } else { '' }
+                Status = if ($e.PSObject.Properties['status']) { [string]$e.status } else { '' }
+            })
+        }
+        $Result.NoneMatched = [PSCustomObject]@{
+            Label    = 'none-matched: no doc in the entity''s list holds its quote or names it (t/4404); review, not an orphan.'
+            Entities = @($None)
         }
     }
 
@@ -254,6 +294,43 @@ function Get-EntityReport {
             Label      = 'relation-dag (t/3170): target/acyclic/depth<=3 invariants over persisted relations[]. term:* existence deferred (Q4). Empty Violations = clean.'
             EdgeCount  = @($Edges).Count
             Violations = @($Violations)
+        }
+    }
+
+    # ── tombstone-status (t/4450): merged_into set => status 'deprecated' ─────────────────
+    if ($WantAll -or $Report -eq 'tombstone-status') {
+        $Bad = [System.Collections.Generic.List[PSObject]]::new()
+        foreach ($e in $Entities) {
+            $target = Get-EntityMergedIntoId $e
+            if (-not $target) { continue }
+            $status = if ($e.PSObject.Properties['status']) { [string]$e.status } else { '' }
+            if ($status -cne 'deprecated') {
+                $Bad.Add([PSCustomObject]@{ Id = [string]$e.id; Name = [string]$e.name; Status = $status; MergedInto = $target })
+            }
+        }
+        $Result.TombstoneStatus = [PSCustomObject]@{
+            Label    = 'tombstone-status (t/4450): records with merged_into set whose status is not deprecated. Empty = clean.'
+            Entities = @($Bad)
+        }
+    }
+
+    # ── orphan-vector (t/4450): vectors outside Test-EntityVectorEligible ─────────────────
+    if ($WantAll -or $Report -eq 'orphan-vector') {
+        $Orph = [System.Collections.Generic.List[PSObject]]::new()
+        if (Test-Path $EmbPath) {
+            $Emb = Get-Content -Raw -Path $EmbPath -Encoding utf8 | ConvertFrom-Json
+            if ($Emb.PSObject.Properties['vectors'] -and $null -ne $Emb.vectors) {
+                foreach ($prop in $Emb.vectors.PSObject.Properties) {
+                    $rec = if ($ById.ContainsKey($prop.Name)) { $ById[$prop.Name] } else { $null }
+                    if (Test-EntityVectorEligible $rec) { continue }
+                    $why = if ($null -eq $rec) { 'record-absent' } elseif (Get-EntityMergedIntoId $rec) { 'tombstone' } else { "status-$([string]$rec.status)" }
+                    $Orph.Add([PSCustomObject]@{ Id = $prop.Name; Reason = $why })
+                }
+            }
+        }
+        $Result.OrphanVector = [PSCustomObject]@{
+            Label   = 'orphan-vector (t/4450): vectors whose record is absent, not approved, or a merge tombstone (Test-EntityVectorEligible). Empty = clean.'
+            Vectors = @($Orph | Sort-Object Id)
         }
     }
 

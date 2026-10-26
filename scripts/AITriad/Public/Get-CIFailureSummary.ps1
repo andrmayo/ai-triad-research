@@ -10,9 +10,10 @@ function Get-CIFailureSummary {
         `gh run view --log | Select-String` passes. Resolves a run (explicit -RunId,
         latest failed run for -WorkflowFile, or the latest failed run), pulls the
         failed-step log via `gh run view --log-failed`, and returns a structured
-        summary: failed job names, failing Pester test names, the `[-]` failure lines
-        with their assertion detail (test-emitted), and the remaining `##[error]`
-        lines (real infrastructure errors).
+        summary: failed job names, failing Pester and vitest test names, the `[-]`
+        failure lines with their assertion detail (test-emitted), one VitestFailures
+        entry per vitest failure (File, TestName, Error, Location; t/4271), and the
+        remaining `##[error]` lines (real infrastructure errors).
     .PARAMETER RunId
         The GitHub Actions run id. If omitted, the latest failed run is used
         (optionally filtered by -WorkflowFile).
@@ -20,7 +21,7 @@ function Get-CIFailureSummary {
         Workflow file name (e.g. 'ci.yml') to scope the latest-failed-run lookup.
     .OUTPUTS
         [PSCustomObject] with RunId, FailedJobs, FailingTests, PesterFailureLines,
-        InfraErrorLines, FailedCount.
+        VitestFailures, InfraErrorLines, FailedCount.
     .EXAMPLE
         Get-CIFailureSummary
     .EXAMPLE
@@ -43,7 +44,7 @@ function Get-CIFailureSummary {
     Set-StrictMode -Version Latest
 
     if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-        throw (New-ActionableError `
+        throw (New-ActionableError -AsErrorRecord `
             -Goal 'Summarize a CI failure' `
             -Problem 'GitHub CLI (gh) was not found on PATH.' `
             -Location 'Get-CIFailureSummary' `
@@ -57,7 +58,7 @@ function Get-CIFailureSummary {
         $ListRaw = & gh @ListArgs 2>$null
         $Runs = if ($ListRaw) { @($ListRaw | ConvertFrom-Json) } else { @() }
         if ($Runs.Count -eq 0) {
-            throw (New-ActionableError `
+            throw (New-ActionableError -AsErrorRecord `
                 -Goal 'Summarize a CI failure' `
                 -Problem "No failed run found$(if ($WorkflowFile) { " for workflow '$WorkflowFile'" })." `
                 -Location 'Get-CIFailureSummary' `
@@ -88,7 +89,7 @@ function Get-CIFailureSummary {
         $Log = (& gh run view $RunId --log 2>$null) -join "`n"
     }
     if ([string]::IsNullOrWhiteSpace($Log)) {
-        throw (New-ActionableError `
+        throw (New-ActionableError -AsErrorRecord `
             -Goal 'Summarize a CI failure' `
             -Problem "Could not retrieve any log for run $RunId (empty output from gh run view)." `
             -Location 'Get-CIFailureSummary' `

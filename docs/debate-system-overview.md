@@ -484,6 +484,7 @@ The moderator operates in two stages with a strict authority boundary: the LLM i
 
 1. **Engine pre-computes trigger context** (deterministic): health score, trajectory modifier, adaptive persona modifiers, SLI breach state, burden per debater. Packaged as `TriggerEvaluationContext` via `computeTriggerEvaluationContext()`.
 2. **Stage 1 — Selection** (LLM call, advisory): receives trigger context + transcript, selects responder and focus point, recommends whether to intervene and which move to use. Output: `SelectionResult`.
+2b. **Engine floor** (deterministic, t/3513): when the LLM declines to intervene but a measured problem is present, `deriveEngineTrigger()` proposes one itself — CHALLENGE for an entrenched next speaker (two consecutive turns with a missed concession), PIN for an opponent claim left unanswered ≥ 6 debater turns (each claim pinned once), or CHALLENGE/PIN for a sustained SLI breach. It never overrides an LLM recommendation, skips socratic/talmudic modes, and its proposal goes through the same validation as the LLM's. Traces record `intervention_source: 'engine'`. Added because the LLM stopped recommending responsive moves on current models (0 across Aug–Sep 2026); see the `ENGINE_TRIGGER` row in the metric provenance register. A debate that reaches the concluding phase with zero responsive interventions records a `moderator-dormancy` WARN.
 3. **Engine validates** (deterministic, authoritative): `validateRecommendation()` checks budget, cooldown, phase, same-debater-consecutive rule, burden cap. Any failure suppresses the intervention with a logged `suppressed_reason`. The engine always has veto power.
 4. **Stage 2 — Generation** (LLM call, only when validated): composes the intervention text and packages response constraints.
 5. **Brief injection**: `buildInterventionBriefInjection()` injects the moderator's text and required response schema into the debater's next BRIEF stage.
@@ -761,7 +762,11 @@ Stored as `DialecticTrace[]` on `DebateSession.dialectic_traces`. Implementation
 
 ## Reflections
 
-After the debate concludes, each debater agent reflects on the debate using the full argument network, their commitment store, and convergence signals. The reflection prompt asks five questions:
+After the debate concludes, each debater agent reflects on the debate using the full argument network, their commitment store, and convergence signals.
+
+**Scope — engaged nodes only (t/3512).** The reflector receives only the nodes *this debate engaged*: injected into a turn, cited in `taxonomy_refs`, or referenced by an argument-network claim. Each carries a DEBATE RECORD (citation count, referencing claims, attacks and their strength), and the list is ranked by engagement so the nodes that carried the debate are reviewed first. A reflection turn's own refs never count as engagement. Passing the camp's entire POV file (207–361 nodes) is now an opt-in `fullTaxonomySweep`, rendered as a separate block that states the debate provides no evidence about those nodes. A camp with zero engaged nodes falls back to the full taxonomy and records a WARN. Before this, every camp saw its whole file, and edits landed on nodes the debate never touched.
+
+The reflection prompt asks five questions:
 
 1. **Arguments you could not adequately defend** — which taxonomy nodes had the lowest QBAF strength or were successfully attacked?
 2. **Concessions you made** — does the taxonomy reflect what you conceded?
@@ -787,7 +792,11 @@ Each proposed edit includes:
 
 All proposed edits require human review before taking effect. Descriptions must match the taxonomy's genus-differentia format with Encompasses/Excludes clauses. The edit limit is 3-5 per debater — quality over quantity.
 
-Implementation: `reflectionPrompt` in `lib/debate/prompts.ts`.
+**Evidence validation (t/3512).** Every edit to an existing node is checked against the argument network: at least one cited `evidence_entries` id must resolve to a claim whose `taxonomy_refs` include the node being edited. Transcript labels (`S13`), prose, and claims that reference a *different* node do not count. A failing edit is flagged `evidence_supported: false` with the reason, shown as "Unsupported by debate evidence" in the Reflections panel and diagnostics, skipped by Approve All, and refused by `applyReflectionEdit` unless a human explicitly overrides it (a second, differently-labeled click). New-node proposals are exempt — they have no node to have been engaged.
+
+The neutral post-debate refinement pass (`taxonomyRefinementPrompt`) already saw only referenced nodes; its 25-node cap is now applied *after* ranking by the same engagement score, so a heavily-cited-and-attacked node can no longer be cut in favour of an incidental one.
+
+Implementation: `reflectionPrompt` in `lib/debate/prompts.ts`; scope + validation in `lib/debate/reflectionScope.ts`.
 
 ## Argument Space Coverage
 
@@ -1043,11 +1052,15 @@ Five interventions address LLM-specific debate failure modes. All are non-blocki
 
 **Problem:** LLMs fabricate opponent positions when steelmanning — presenting a plausible-sounding but inaccurate version of what the opponent actually said.
 
-**Solution:** Claim extraction now outputs `steelman_of` (opponent name or null). When detected, NLI cross-encoder compares the steelman against the opponent's `commitments.asserted` (up to 10 most recent). If max entailment < 0.6, a `[Steelman check]` system entry surfaces the opponent's actual top-3 assertions.
+**Solution:** Claim extraction outputs `steelman_of` (the opponent's camp id, or null). When detected, NLI cross-encoder compares the steelman against the opponent's `commitments.asserted` (up to 10 most recent). If max entailment < 0.6, a `[Steelman check]` system entry surfaces the opponent's actual top-3 assertions.
 
-**New AN node field:** `steelman_of`.
+**Fix (t/3514):** until September 2026 this check never ran. The extraction prompt asked for the opponent's *name* ("Safetyist"), the validators looked commitments up by camp *id* ("safetyist"), and every lookup missed and was skipped silently — zero `[Steelman check]` entries in any debate. `steelman_of` is now normalized at ingestion (`lib/debate/steelman.ts`: ids, labels, persona names → camp id; claim/document ids and self-steelmans dropped with a WARN), the prompt asks for the camp id and states that a rebuttal or concession is not a steelman, and the validators tolerate legacy label values.
 
-**Graceful degradation:** CLI adapter lacks NLI — validation silently skips. UI path uses `api.nliClassify`.
+**AN node fields:** `steelman_of`; `steelman_check` — the persisted verdict (`faithful` / `diverges` / `unchecked` with a reason), max entailment, and the target assertion it best matches.
+
+**Display:** each steelman appears as a callout in its statement card in the debate transcript (verdict, the steelman text, and "closest thing the target actually said"), as a verdict badge in the diagnostics Claims views, and in a debate-wide **Steelmans** diagnostics tab with a faithful / misrepresents / unchecked summary.
+
+**Graceful degradation:** an adapter without NLI (the CLI) records `unchecked` with the reason rather than skipping silently. UI path uses `api.nliClassify`.
 
 ### 4. Position Drift Detection (Sycophancy Guard)
 

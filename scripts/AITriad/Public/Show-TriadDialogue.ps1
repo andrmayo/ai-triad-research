@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
+# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 # Licensed under the MIT License. See LICENSE file in the project root.
 
 function Show-TriadDialogue {
@@ -65,7 +65,7 @@ function Show-TriadDialogue {
 
         [ValidateScript({ Test-AIModelId $_ })]
         [ArgumentCompleter({ param($cmd, $param, $word) $script:ValidModelIds | Where-Object { $_ -like "$word*" } })]
-        [string]$Model = 'gemini-3.5-flash-lite',
+        [string]$Model = (Get-AITierModel -Tier basic),
 
         [string]$ApiKey,
 
@@ -107,14 +107,10 @@ function Show-TriadDialogue {
     # ── Step 1: Validate environment ──────────────────────────────────────────
     Write-Step 'Validating environment'
 
-    if     ($Model -match '^gemini') { $Backend = 'gemini' }
-    elseif ($Model -match '^claude') { $Backend = 'claude' }
-    elseif ($Model -match '^groq')   { $Backend = 'groq'   }
-        elseif ($Model -match '^openai') { $Backend = 'openai' }
-    else                             { $Backend = 'gemini'  }
-    $ResolvedKey = Resolve-AIApiKey -ExplicitKey $ApiKey -Backend $Backend
-    if ([string]::IsNullOrWhiteSpace($ResolvedKey)) {
-        Write-Fail 'No API key found. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or AI_API_KEY.'
+    # Backend from ai-models.json, never guessed; only the user's -ApiKey is forwarded (t/4087).
+    $KeyStatus = Get-AIModelKeyStatus -Model $Model -ApiKey $ApiKey
+    if (-not $KeyStatus.HasKey) {
+        Write-Fail "No API key found for the $($KeyStatus.Backend) backend. Set $($KeyStatus.EnvHint), or pass -ApiKey."
         throw 'No API key configured'
     }
 
@@ -154,6 +150,7 @@ function Show-TriadDialogue {
         $FilePath = Join-Path $TaxDir "$PovKey.json"
         if (-not (Test-Path $FilePath)) { continue }
         $FileData = Get-Content -Raw -Path $FilePath | ConvertFrom-Json
+        Set-TaxonomyDocumentSelectable -Document $FileData -Name $PovKey   # prompt only (t/4356)
         foreach ($Node in $FileData.nodes) {
             $AllNodes[$Node.id] = @{
                 POV         = $PovKey
@@ -310,7 +307,7 @@ DETAIL: $($AudDir.DetailInstruction)
         $TurnResult = Invoke-AIApi `
             -Prompt     $TurnPrompt `
             -Model      $Model `
-            -ApiKey     $ResolvedKey `
+            -ApiKey     $ApiKey `
             -Temperature 0.7 `
             -MaxTokens  2048 `
             -JsonMode `
@@ -332,11 +329,16 @@ DETAIL: $($AudDir.DetailInstruction)
                 return $Repaired | ConvertFrom-Json
             }
             catch {
-                Write-Warn "Repair failed for $AgentSpeaker"
-                return [PSCustomObject]@{
-                    content       = $ResponseText
-                    taxonomy_refs = @()
-                }
+                # t/3857: this used to fabricate a PSCustomObject carrying the raw unparsed text
+                # instead of $null -- a TRUTHY value, so the call site's `if ($Response)` check
+                # (which correctly treats a genuine $null from the sibling check above as failure)
+                # instead added the raw/corrupted text to the debate transcript as if it were the
+                # agent's real statement. Return $null, matching the sibling failure path, so the
+                # existing `if ($Response) {...} else { Write-Warn "...failed..." }` call-site
+                # logic -- not a new mechanism -- does its job. Write-Warning (a real stream) in
+                # place of Write-Warn (Write-Host wrapper, not capturable) per the capturability axis.
+                Write-Warning "Repair failed for $AgentSpeaker -- discarding unparseable response: $ResponseText"
+                return $null
             }
         }
     }
@@ -502,7 +504,7 @@ DETAIL: $($AudDir.DetailInstruction)
         $SynthResult = Invoke-AIApi `
             -Prompt     $SynthesisPrompt `
             -Model      $Model `
-            -ApiKey     $ResolvedKey `
+            -ApiKey     $ApiKey `
             -Temperature 0.3 `
             -MaxTokens  4096 `
             -JsonMode `

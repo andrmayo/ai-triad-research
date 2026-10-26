@@ -169,12 +169,12 @@ function parseJudgeVerdict(raw: string): JudgeVerdict {
 
 const MODEL_ALIASES: Record<string, string> = {
   haiku: 'claude-haiku-4-5',
-  sonnet: 'claude-sonnet-4',
+  sonnet: 'claude-sonnet-4-6',
   gemini: DEFAULT_MODEL,
   'gemini-flash': 'gemini-2.5-flash',
   'gemini-lite': DEFAULT_MODEL,
-  groq: 'groq-llama-3.3-70b-versatile',
-  llama: 'groq-llama-3.3-70b-versatile',
+  groq: 'groq-openai-gpt-oss-120b',
+  llama: 'groq-openai-gpt-oss-120b',
 };
 
 function resolveModelAlias(input: string): string {

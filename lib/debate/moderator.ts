@@ -30,7 +30,7 @@ const ALL_MOVES: InterventionMove[] = [
   'PIN', 'PROBE', 'CHALLENGE',
   'CLARIFY', 'CHECK', 'SUMMARIZE',
   'ACKNOWLEDGE', 'REVOICE',
-  'POLICY_CHALLENGE',
+  'POLICY_CHALLENGE', 'CRUX_FOCUS',
   'META-REFLECT',
   'COMPRESS', 'COMMIT',
 ];
@@ -580,10 +580,14 @@ export function updateModeratorState(
       state.consecutive_rise = 0;
     }
   }
+  const stateEventData: Record<string, unknown> = { round, phase, intervened: !!intervention, budget_remaining: state.budget_remaining, interventions_fired: state.interventions_fired };
+  if (phase === 'concluding') {
+    stateEventData.commit_received_count = new Set(state.intervention_history.filter(h => h.move === 'COMMIT').map(h => h.target)).size;
+  }
   getGlobalRecorder()?.record({
     type: 'debate.moderate', component: 'moderator', level: 'debug',
     message: `moderator state updated: round ${round}, phase ${phase}${intervention ? `, fired ${intervention.move} → ${intervention.target_debater}` : ', no intervention'}`,
-    data: { round, phase, intervened: !!intervention, budget_remaining: state.budget_remaining, interventions_fired: state.interventions_fired },
+    data: stateEventData,
   });
 }
 
@@ -1115,6 +1119,17 @@ export function extractContestedTerm(
   return bestWord;
 }
 
+/**
+ * Normalize crux_focused_ids for safe reads regardless of session origin.
+ * A session saved before t/3776 may have {} (JSON.stringify of a Set) — that
+ * value is truthy and passes nullish guards but has no array methods. This
+ * accessor returns the array when present-and-valid, [] otherwise.
+ */
+export function getFocusedIds(state?: Pick<ModeratorState, 'crux_focused_ids'>): string[] {
+  const v = state?.crux_focused_ids;
+  return Array.isArray(v) ? v : [];
+}
+
 export function detectCruxFocusTrigger(
   cruxTracker: ReadonlyArray<{ id: string; description: string; identified_turn: number; state: string; disagreement_type?: string; attacking_claim_ids: string[]; speakers_involved: SpeakerId[] }>,
   currentRound: number,
@@ -1126,14 +1141,14 @@ export function detectCruxFocusTrigger(
   if (state.rounds_since_last_intervention < state.required_gap) return null;
   if (state.budget_remaining <= 0) return null;
 
-  const focusedIds = state.crux_focused_ids ?? new Set<string>();
+  const focusedIds = getFocusedIds(state);
 
   let best: CruxFocusCandidate | null = null;
   let bestRoundsEngaged = 0;
 
   for (const crux of cruxTracker) {
     if (crux.state !== 'engaged') continue;
-    if (focusedIds.has(crux.id)) continue;
+    if (focusedIds.includes(crux.id)) continue;
 
     const roundsSinceIdentified = currentRound - crux.identified_turn;
     if (roundsSinceIdentified < 2) continue;

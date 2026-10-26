@@ -11,7 +11,7 @@
 
 import type { Router } from '../httpKit.js';
 import type { ServerCtx } from './context.js';
-import { json, error, param, query } from '../httpKit.js';
+import { json, error, param, query, statusForError, codeForError, requireBaseVersion } from '../httpKit.js';
 import { getGlobalRecorder } from '../../../../lib/flight-recorder/index.js';
 import * as fileIO from '../storage/fileIO.js';
 import { stripEdgeRationale, type EdgesData } from '../../../../lib/edges/stripEdgeRationale.js';
@@ -43,17 +43,28 @@ export function registerEdgesRoutes(r: Router, _ctx: ServerCtx): void {
   // ── Edges ──
 
   let edgesCache: unknown = null;
+  // t/4189: the version (git blob SHA) backing edgesCache — '' means "no file yet" or
+  // "loaded through a path that didn't carry a version" (readEdgesForSaveBaseline/legacy
+  // fallback), never a value a client's If-Match could spoof into passing.
+  let edgesCacheVersion = '';
 
   get('/api/edges', async (req, res) => {
-    edgesCache = await fileIO.readEdgesFile();
+    const loaded = await fileIO.readEdgesFileWithVersion();
+    edgesCache = loaded?.data ?? null;
+    edgesCacheVersion = loaded?.version ?? '';
     if (!edgesCache) { json(res, null); return; }
+    if (edgesCacheVersion) res.setHeader('ETag', `"${edgesCacheVersion}"`);
     // ?include=rationale returns the full payload (backwards-compat for scripts).
     if (query(req, 'include') === 'rationale') { json(res, edgesCache); return; }
     json(res, stripEdgeRationale(edgesCache));
   });
 
   get('/api/edges/:index', async (req, res) => {
-    if (!edgesCache) edgesCache = await fileIO.readEdgesFile();
+    if (!edgesCache) {
+      const loaded = await fileIO.readEdgesFileWithVersion();
+      edgesCache = loaded?.data ?? null;
+      edgesCacheVersion = loaded?.version ?? '';
+    }
     const data = edgesCache as EdgesData | null;
     const index = parseInt(param(req, 'index', '/api/edges/:index'), 10);
     if (!data?.edges || isNaN(index) || index < 0 || index >= data.edges.length) {
@@ -67,7 +78,9 @@ export function registerEdgesRoutes(r: Router, _ctx: ServerCtx): void {
   // PUT /api/edges). Persists via the existing fileIO.writeEdgesFile (atomic
   // temp→rename; not reinvented), then refreshes the module cache. Session'd write,
   // same gating as the sibling /api/edges/* writes (not public). Mirrors swap below.
-  put('/api/edges', async (_req, res, body) => {
+  put('/api/edges', async (req, res, body) => {
+    const baseSha = requireBaseVersion(req, res);
+    if (!baseSha) return;
     const data = body as EdgesData | null;
     if (!data || typeof data !== 'object' || !Array.isArray(data.edges)) {
       error(res, 'edges file must be an object with an edges array', 400);
@@ -81,8 +94,10 @@ export function registerEdgesRoutes(r: Router, _ctx: ServerCtx): void {
     try {
       const baseline = await fileIO.readEdgesForSaveBaseline();
       const merged = mergeEdgesPreservingRationale(data, baseline, onEdgeMergeWarn);
-      await fileIO.writeEdgesFile(merged);
+      const { version } = await fileIO.writeEdgesFile(merged, { baseSha });
       edgesCache = merged;
+      edgesCacheVersion = version;
+      if (version) res.setHeader('ETag', `"${version}"`);
       json(res, stripEdgeRationale(edgesCache));
     } catch (err) {
       getGlobalRecorder()?.record({
@@ -90,29 +105,80 @@ export function registerEdgesRoutes(r: Router, _ctx: ServerCtx): void {
         message: 'PUT /api/edges rationale-preserving save refused/failed',
         error: { name: (err as Error).name ?? 'Error', message: String((err as Error).message), stack: (err as Error).stack },
       });
-      error(res, (err as Error).message, 500);
+      error(res, (err as Error).message, statusForError(err), err, codeForError(err));
     }
   });
 
-  put('/api/edges/status', async (_req, res, body) => {
+  put('/api/edges/status', async (req, res, body) => {
+    const baseSha = requireBaseVersion(req, res);
+    if (!baseSha) return;
     const { index, status: s } = body as { index: number; status: string };
-    if (!edgesCache) edgesCache = await fileIO.readEdgesFile();
-    edgesCache = await fileIO.updateEdgeStatus(edgesCache, index, s);
-    json(res, stripEdgeRationale(edgesCache));
+    if (!edgesCache) {
+      const loaded = await fileIO.readEdgesFileWithVersion();
+      edgesCache = loaded?.data ?? null;
+    }
+    try {
+      const result = await fileIO.updateEdgeStatus(edgesCache, index, s, { baseSha });
+      edgesCache = result.data;
+      edgesCacheVersion = result.version;
+      if (result.version) res.setHeader('ETag', `"${result.version}"`);
+      json(res, stripEdgeRationale(edgesCache));
+    } catch (err) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'edges-route', level: 'error',
+        message: 'PUT /api/edges/status save refused/failed',
+        error: { name: (err as Error).name ?? 'Error', message: String((err as Error).message), stack: (err as Error).stack },
+      });
+      error(res, (err as Error).message, statusForError(err), err, codeForError(err));
+    }
   });
 
-  put('/api/edges/swap', async (_req, res, body) => {
+  put('/api/edges/swap', async (req, res, body) => {
+    const baseSha = requireBaseVersion(req, res);
+    if (!baseSha) return;
     const { index } = body as { index: number };
-    if (!edgesCache) edgesCache = await fileIO.readEdgesFile();
-    edgesCache = await fileIO.swapEdgeDirection(edgesCache, index);
-    json(res, stripEdgeRationale(edgesCache));
+    if (!edgesCache) {
+      const loaded = await fileIO.readEdgesFileWithVersion();
+      edgesCache = loaded?.data ?? null;
+    }
+    try {
+      const result = await fileIO.swapEdgeDirection(edgesCache, index, { baseSha });
+      edgesCache = result.data;
+      edgesCacheVersion = result.version;
+      if (result.version) res.setHeader('ETag', `"${result.version}"`);
+      json(res, stripEdgeRationale(edgesCache));
+    } catch (err) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'edges-route', level: 'error',
+        message: 'PUT /api/edges/swap save refused/failed',
+        error: { name: (err as Error).name ?? 'Error', message: String((err as Error).message), stack: (err as Error).stack },
+      });
+      error(res, (err as Error).message, statusForError(err), err, codeForError(err));
+    }
   });
 
-  put('/api/edges/bulk-status', async (_req, res, body) => {
+  put('/api/edges/bulk-status', async (req, res, body) => {
+    const baseSha = requireBaseVersion(req, res);
+    if (!baseSha) return;
     const { indices, status: s } = body as { indices: number[]; status: string };
-    if (!edgesCache) edgesCache = await fileIO.readEdgesFile();
-    edgesCache = await fileIO.bulkUpdateEdges(edgesCache, indices, s);
-    json(res, stripEdgeRationale(edgesCache));
+    if (!edgesCache) {
+      const loaded = await fileIO.readEdgesFileWithVersion();
+      edgesCache = loaded?.data ?? null;
+    }
+    try {
+      const result = await fileIO.bulkUpdateEdges(edgesCache, indices, s, { baseSha });
+      edgesCache = result.data;
+      edgesCacheVersion = result.version;
+      if (result.version) res.setHeader('ETag', `"${result.version}"`);
+      json(res, stripEdgeRationale(edgesCache));
+    } catch (err) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'edges-route', level: 'error',
+        message: 'PUT /api/edges/bulk-status save refused/failed',
+        error: { name: (err as Error).name ?? 'Error', message: String((err as Error).message), stack: (err as Error).stack },
+      });
+      error(res, (err as Error).message, statusForError(err), err, codeForError(err));
+    }
   });
 
   // ── Source indexes ──
@@ -120,12 +186,35 @@ export function registerEdgesRoutes(r: Router, _ctx: ServerCtx): void {
   let nodeSourceIndexCache: { value: unknown; builtAt: number } | null = null;
   const NODE_SOURCE_INDEX_TTL_MS = 60_000;
 
+  // t/4335: whole-corpus route, superseded by the per-node one below (t/4333's speed fix —
+  // this one lists all 911 summaries to render a single node, cold or on a 60s TTL expiry).
+  // Kept for one release with a WARN so a straggling caller is visible before removal.
   get('/api/node-source-index', async (_req, res) => {
     const now = Date.now();
     const fromCache = nodeSourceIndexCache !== null && (now - nodeSourceIndexCache.builtAt) < NODE_SOURCE_INDEX_TTL_MS;
     if (!fromCache) nodeSourceIndexCache = { value: await fileIO.buildNodeSourceIndex(), builtAt: now };
-    getGlobalRecorder()?.record({ type: 'system.info', component: 'node-source-index', level: 'info', message: 'node-source-index served', data: { source: fromCache ? 'cache' : 'compute' } });
+    getGlobalRecorder()?.record({
+      type: 'system.info', component: 'node-source-index', level: 'warn',
+      message: 'Deprecated whole-corpus /api/node-source-index called — use GET /api/node-source-index/:nodeId (t/4335)',
+      data: { source: fromCache ? 'cache' : 'compute' },
+    });
     json(res, nodeSourceIndexCache!.value);
+  });
+
+  // t/4334/t/4335: per-node, build-once/invalidate-on-change (not a TTL) — replaces the
+  // whole-corpus route above for the Sources tab's actual use case (one node at a time).
+  get('/api/node-source-index/:nodeId', async (req, res) => {
+    try {
+      const nodeId = param(req, 'nodeId', '/api/node-source-index/:nodeId');
+      json(res, await fileIO.getNodeSources(nodeId));
+    } catch (err) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'node-source-index', level: 'error',
+        message: 'Failed to build per-node source index',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+      error(res, String(err), 500, err);
+    }
   });
 
   get('/api/policy-source-index', async (_req, res) => {

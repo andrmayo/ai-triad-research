@@ -9,10 +9,13 @@ import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { DebateEngine, type DebateConfig, type DebateProgress } from './debateEngine.js';
+import type { DebateConfig, DebateProgress } from './debateEngine.js';
+import { runHeadlessDebate } from './headlessRunner.js';
 import { createCLIAdapter } from './aiAdapter.js';
 import { loadTaxonomy, resolveRepoRoot, resolveDataRoot, type LoadedTaxonomy } from './taxonomyLoader.js';
+import { resolvePoverInfo } from './soulDocLoader.js';
 import type { DebateSession } from './types.js';
+import { DebateSessionSchema } from './schemas.js';
 import { listDebateSessionsIndexed, updateDebateIndexEntry } from './debateIndex.js';
 import { getGlobalRecorder } from '../flight-recorder/index.js';
 import { assertSafeId, assertContainedIn } from '../electron-shared/safeId.js';
@@ -45,7 +48,7 @@ const activeDebates = new Map<string, ActiveDebate>();
 
 // ── Debate file helpers ─────────────────────────────────
 
-function loadDebateSession(id: string): unknown {
+function loadDebateSession(id: string): DebateSession {
   // H2 fix (t/2528): validate id before using it in a filesystem path.
   assertSafeId(id, 'debate id');
   const filePath = path.join(debatesDir, `debate-${id}.json`);
@@ -53,7 +56,24 @@ function loadDebateSession(id: string): unknown {
   if (!fs.existsSync(filePath)) {
     throw new Error(`Debate session not found: ${id}`);
   }
-  return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+  const raw: unknown = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+  return parseDebateSession(raw, filePath);
+}
+
+/** Apply DebateSessionSchema to a raw parsed object. Preserves unknown fields (.passthrough()),
+ *  validates soul_provenance on read. WARNs and returns raw on schema failure (t/4014). */
+function parseDebateSession(raw: unknown, source: string): DebateSession {
+  const result = DebateSessionSchema.safeParse(raw);
+  if (!result.success) {
+    getGlobalRecorder()?.record({
+      type: 'system.error',
+      component: 'mcp-server',
+      level: 'warn',
+      message: `DebateSessionSchema validation failed for ${source}: ${result.error.format()._errors.join('; ')} — returning raw session`,
+    });
+    return raw as DebateSession;
+  }
+  return result.data as unknown as DebateSession;
 }
 
 // ── MCP Server ──────────────────────────────────────────
@@ -129,6 +149,7 @@ server.tool(
           shell: false,
           timeout: 600_000,
           env: { ...process.env },
+          windowsHide: true,
         });
 
         let stdout = '';
@@ -154,7 +175,7 @@ server.tool(
 
       if (recentFiles.length > 0) {
         const sessionPath = path.join(debatesDir, recentFiles[0].name);
-        const session = JSON.parse(fs.readFileSync(sessionPath, 'utf-8'));
+        const session = parseDebateSession(JSON.parse(fs.readFileSync(sessionPath, 'utf-8')), sessionPath);
         return { content: [{ type: 'text', text: JSON.stringify({ session, output_path: sessionPath }, null, 2) }] };
       }
 
@@ -206,15 +227,15 @@ server.tool(
       pacing: params.pacing as DebateConfig['pacing'],
       signal: controller.signal,
       audience: params.audience as DebateConfig['audience'],
+      soulResolver: resolvePoverInfo,
     };
 
     const adapter = createCLIAdapter(repoRoot);
     const taxonomy = getTaxonomy();
-    const engine = new DebateEngine(config, adapter, taxonomy);
 
-    engine.run((p: DebateProgress) => {
+    runHeadlessDebate(config, adapter, taxonomy, (p: DebateProgress) => {
       state.progress = p;
-    }).then((session) => {
+    }).then(({ session }) => {
       state.result = session;
       state.status = controller.signal.aborted ? 'cancelled' : 'completed';
 

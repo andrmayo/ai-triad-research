@@ -47,8 +47,11 @@ import {
   topicScopeExtractionPrompt,
   improveDebateTopicPrompt,
   draftQualityCheckPrompt,
+  situationTopicSynthesisPrompt,
 } from './prompts.js';
-import type { OpeningStagePromptInput, StagePromptInput, SituationDebateInput } from './prompts.js';
+import type { OpeningStagePromptInput, StagePromptInput, SituationDebateInput, SituationTopicSynthesisInput } from './prompts.js';
+import { POVER_INFO } from './types.js';
+import type { BdiInterpretation } from './taxonomyTypes.js';
 import type { TopicScope } from './types.js';
 import type { TopicStructure } from './topicStructure.js';
 
@@ -64,6 +67,7 @@ function makeOpeningInput(overrides: Partial<OpeningStagePromptInput> = {}): Ope
   return {
     label: DEBATER.label,
     pov: DEBATER.pov,
+    soul: POVER_INFO['accelerationist'],
     personality: DEBATER.personality,
     topic: TOPIC,
     taxonomyContext: TAXONOMY_CONTEXT,
@@ -77,6 +81,7 @@ function makeStageInput(overrides: Partial<StagePromptInput> = {}): StagePromptI
   return {
     label: DEBATER.label,
     pov: DEBATER.pov,
+    soul: POVER_INFO['accelerationist'],
     personality: DEBATER.personality,
     topic: TOPIC,
     taxonomyContext: TAXONOMY_CONTEXT,
@@ -97,6 +102,31 @@ function makeSituationInput(): SituationDebateInput {
       safetyist: 'Workers need protection during transition.',
       skeptic: 'Displacement estimates are overblown.',
     },
+  };
+}
+
+const BDI_ACC: BdiInterpretation = {
+  belief: 'AI displaces routine tasks, not overall employment.',
+  desire: 'Accelerate productivity gains across all sectors.',
+  intention: 'Resist retraining mandates that slow adoption.',
+};
+const BDI_SAF: BdiInterpretation = {
+  belief: 'Structural unemployment risk is empirically underestimated.',
+  desire: 'Guarantee income security during economic transitions.',
+  intention: 'Enact federal retraining and safety-net programs.',
+};
+const BDI_SKP: BdiInterpretation = {
+  belief: 'Historical automation panics overstate displacement rates.',
+  desire: 'Preserve market flexibility without pre-emptive intervention.',
+  intention: 'Await evidence before committing to expensive policy.',
+};
+
+function makeSynthesisInput(overrides: Partial<SituationTopicSynthesisInput> = {}): SituationTopicSynthesisInput {
+  return {
+    label: 'AI Labor Displacement',
+    description: 'AI systems replacing human jobs at scale.',
+    interpretations: { accelerationist: BDI_ACC, safetyist: BDI_SAF, skeptic: BDI_SKP },
+    ...overrides,
   };
 }
 
@@ -203,6 +233,8 @@ describe('openingStatementPrompt', () => {
     const result = openingStatementPrompt(
       DEBATER.label, DEBATER.pov, DEBATER.personality,
       TOPIC, TAXONOMY_CONTEXT, '', true,
+      undefined, undefined, undefined, undefined, undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expectNonEmpty(result);
     expectContains(result, DEBATER.label, DEBATER.pov, '"statement"', '"taxonomy_refs"', '"my_claims"');
@@ -212,6 +244,8 @@ describe('openingStatementPrompt', () => {
     const result = openingStatementPrompt(
       DEBATER.label, DEBATER.pov, DEBATER.personality,
       TOPIC, TAXONOMY_CONTEXT, '', true, 'A paper about AI risk.',
+      undefined, undefined, undefined, undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expectContains(result, 'document');
   });
@@ -221,6 +255,8 @@ describe('openingStatementPrompt', () => {
       DEBATER.label, DEBATER.pov, DEBATER.personality,
       TOPIC, TAXONOMY_CONTEXT, '', true, undefined, undefined, undefined, undefined,
       [{ id: 'UC-1', text: 'AI will be beneficial' }],
+      undefined,
+      POVER_INFO['accelerationist'],
     );
     expectContains(result, 'USER-STATED POSITIONS', 'UC-1', 'AI will be beneficial');
   });
@@ -229,6 +265,8 @@ describe('openingStatementPrompt', () => {
     const result = openingStatementPrompt(
       DEBATER.label, DEBATER.pov, DEBATER.personality,
       TOPIC, TAXONOMY_CONTEXT, 'Sentinel spoke first', false,
+      undefined, undefined, undefined, undefined, undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expectContains(result, 'prior opening statements');
   });
@@ -237,6 +275,8 @@ describe('openingStatementPrompt', () => {
     const result = openingStatementPrompt(
       DEBATER.label, DEBATER.pov, DEBATER.personality,
       TOPIC, TAXONOMY_CONTEXT, '', true,
+      undefined, undefined, undefined, undefined, undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expectContains(result, 'RECALL', 'acc-beliefs-001');
   });
@@ -245,6 +285,8 @@ describe('openingStatementPrompt', () => {
     const result = openingStatementPrompt(
       DEBATER.label, DEBATER.pov, DEBATER.personality,
       TOPIC, TAXONOMY_CONTEXT, '', true, undefined, undefined, undefined, 'technical_researchers',
+      undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expectContains(result, 'senior ML researcher');
   });
@@ -255,6 +297,8 @@ describe('debateResponsePrompt', () => {
     const result = debateResponsePrompt(
       DEBATER.label, DEBATER.pov, DEBATER.personality,
       TOPIC, TAXONOMY_CONTEXT, TRANSCRIPT, 'What about safety?', 'Sentinel',
+      undefined, undefined, undefined, undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expectNonEmpty(result);
     expectContains(result, DEBATER.label, '"statement"', '"taxonomy_refs"', '"move_types"', '"my_claims"');
@@ -264,6 +308,8 @@ describe('debateResponsePrompt', () => {
     const result = debateResponsePrompt(
       DEBATER.label, DEBATER.pov, DEBATER.personality,
       TOPIC, TAXONOMY_CONTEXT, TRANSCRIPT, 'What about safety?', 'Sentinel',
+      undefined, undefined, undefined, undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expectContains(result, 'What about safety?');
   });
@@ -272,6 +318,8 @@ describe('debateResponsePrompt', () => {
     const result = debateResponsePrompt(
       DEBATER.label, DEBATER.pov, DEBATER.personality,
       TOPIC, TAXONOMY_CONTEXT, TRANSCRIPT, 'Q?', 'all',
+      undefined, undefined, undefined, undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expectContains(result, 'QUESTION TO THE PANEL');
   });
@@ -385,6 +433,8 @@ describe('crossRespondPrompt', () => {
     const result = crossRespondPrompt(
       DEBATER.label, DEBATER.pov, DEBATER.personality,
       TOPIC, TAXONOMY_CONTEXT, TRANSCRIPT, 'Focus on evidence.', 'Sentinel',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expectNonEmpty(result);
     expectContains(result, '"statement"', '"taxonomy_refs"', '"move_types"', '"my_claims"');
@@ -396,6 +446,8 @@ describe('crossRespondPrompt', () => {
       TOPIC, TAXONOMY_CONTEXT, TRANSCRIPT, 'Focus.', 'Sentinel',
       undefined, undefined, undefined,
       ['DISTINGUISH', 'COUNTEREXAMPLE'],
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expectContains(result, 'YOUR RECENT MOVES', 'DISTINGUISH', 'COUNTEREXAMPLE');
   });
@@ -407,6 +459,8 @@ describe('crossRespondPrompt', () => {
       undefined, undefined, undefined, undefined, undefined,
       ['acc-beliefs-001', 'acc-desires-001'],
       ['acc-beliefs-002', 'acc-desires-003', 'acc-intentions-001'],
+      undefined, undefined, undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expectContains(result, 'RECENT CITATIONS', 'acc-beliefs-001');
     expectContains(result, 'actually drew from');
@@ -417,6 +471,8 @@ describe('crossRespondPrompt', () => {
       DEBATER.label, DEBATER.pov, DEBATER.personality,
       TOPIC, TAXONOMY_CONTEXT, TRANSCRIPT, 'Focus.', 'Sentinel',
       undefined, undefined, undefined, undefined, 'concluding',
+      undefined, undefined, undefined, undefined, undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expectContains(result, 'CONCLUDING', 'position_update', 'convergence');
   });
@@ -427,6 +483,8 @@ describe('crossRespondPrompt', () => {
         DEBATER.label, DEBATER.pov, DEBATER.personality,
         TOPIC, TAXONOMY_CONTEXT, TRANSCRIPT, 'Focus.', 'Sentinel',
         undefined, undefined, undefined, undefined, phase,
+        undefined, undefined, undefined, undefined, undefined, undefined,
+        POVER_INFO['accelerationist'],
       );
       expectContains(result, 'INTEGRATE', 'CONCEDE-AND-PIVOT');
     }
@@ -438,6 +496,8 @@ describe('crossRespondPrompt', () => {
       TOPIC, TAXONOMY_CONTEXT, TRANSCRIPT, 'Focus.', 'Sentinel',
       undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       ['Weak steelman', 'Missing evidence'],
+      undefined, undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expectContains(result, 'PRIOR TURN FEEDBACK', 'Weak steelman', 'Missing evidence');
   });
@@ -1164,6 +1224,8 @@ describe('reflectionPrompt', () => {
       TOPIC,
       [{ id: 'acc-beliefs-001', category: 'Beliefs', label: 'Innovation', description: 'desc' }],
       TRANSCRIPT,
+      undefined, undefined, undefined, undefined, undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expectNonEmpty(result);
     expectContains(result, '"reflection_summary"', '"edits"', '"edit_type"', '"proposed_description"');
@@ -1173,6 +1235,8 @@ describe('reflectionPrompt', () => {
     const result = reflectionPrompt(
       DEBATER.label, DEBATER.pov, DEBATER.personality,
       TOPIC, [], TRANSCRIPT, 'AN-1 attacks AN-2',
+      undefined, undefined, undefined, undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expectContains(result, 'ARGUMENT NETWORK', 'AN-1 attacks AN-2');
   });
@@ -1181,6 +1245,8 @@ describe('reflectionPrompt', () => {
     const result = reflectionPrompt(
       DEBATER.label, DEBATER.pov, DEBATER.personality,
       TOPIC, [], TRANSCRIPT, undefined, 'Asserted: X, Conceded: Y',
+      undefined, undefined, undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expectContains(result, 'COMMITMENT STORE', 'Asserted: X, Conceded: Y');
   });
@@ -1189,6 +1255,8 @@ describe('reflectionPrompt', () => {
     const result = reflectionPrompt(
       DEBATER.label, DEBATER.pov, DEBATER.personality,
       TOPIC, [], TRANSCRIPT, undefined, undefined, 'High convergence at 0.85',
+      undefined, undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expectContains(result, 'CONVERGENCE SIGNALS', 'High convergence at 0.85');
   });
@@ -1204,6 +1272,8 @@ describe('reflectionPrompt', () => {
       TOPIC,
       [{ id: 'acc-beliefs-001', category: 'Beliefs', label: 'Innovation', description: 'desc' }],
       TRANSCRIPT,
+      undefined, undefined, undefined, undefined, undefined, undefined,
+      POVER_INFO['accelerationist'],
     );
     expect(result).not.toContain('For ADD, node_id MUST be null'); // old t/1564 rule retired
     expect(result).not.toContain('ADD: create a new node');        // old edit-type line retired
@@ -1556,5 +1626,97 @@ describe('draftQualityCheckPrompt — planned moves', () => {
     const result = draftQualityCheckPrompt(DRAFT, undefined, SPEAKER, POV, 'cross', 3);
     expect(result).not.toContain('PLANNED MOVES');
     expect(result).not.toContain('Do NOT flag');
+  });
+});
+
+// ── situationTopicSynthesisPrompt (t/3636) ───────────────────────
+
+describe('situationTopicSynthesisPrompt', () => {
+  it('emits belief/desire/intention lines for BDI interpretations', () => {
+    const result = situationTopicSynthesisPrompt(makeSynthesisInput());
+    expectContains(result, 'belief:', 'desire:', 'intention:');
+    expectContains(result, BDI_ACC.belief, BDI_SAF.desire, BDI_SKP.intention);
+  });
+
+  it('falls back to summary: for legacy string interpretations', () => {
+    const result = situationTopicSynthesisPrompt(makeSynthesisInput({
+      interpretations: {
+        accelerationist: 'Creative destruction.',
+        safetyist: 'Worker protection.',
+        skeptic: 'Overblown.',
+      },
+    }));
+    expectContains(result, 'summary: Creative destruction.', 'summary: Worker protection.');
+    expect(result).not.toContain('belief:');
+  });
+
+  it('typeHint switches by disagreementType', () => {
+    const def = situationTopicSynthesisPrompt(makeSynthesisInput({ disagreementType: 'definitional' }));
+    const str = situationTopicSynthesisPrompt(makeSynthesisInput({ disagreementType: 'structural' }));
+    const interp = situationTopicSynthesisPrompt(makeSynthesisInput({ disagreementType: 'interpretive' }));
+    expect(def).toContain('DEFINITIONAL');
+    expect(str).toContain('STRUCTURAL');
+    expect(interp).toContain('INTERPRETIVE');
+  });
+
+  it('includes assumes block only when non-empty', () => {
+    const with_ = situationTopicSynthesisPrompt(makeSynthesisInput({ assumes: ['AI replaces, not augments'] }));
+    const without = situationTopicSynthesisPrompt(makeSynthesisInput({ assumes: [] }));
+    expect(with_).toContain('CONTESTED ASSUMPTIONS');
+    expect(with_).toContain('AI replaces, not augments');
+    expect(without).not.toContain('CONTESTED ASSUMPTIONS');
+  });
+
+  it('includes conflictSummaries block only when non-empty', () => {
+    const with_ = situationTopicSynthesisPrompt(makeSynthesisInput({ conflictSummaries: ['2025 UAW strike over automation'] }));
+    const without = situationTopicSynthesisPrompt(makeSynthesisInput({ conflictSummaries: [] }));
+    expect(with_).toContain('DOCUMENTED REAL-WORLD CONFLICTS');
+    expect(without).not.toContain('DOCUMENTED REAL-WORLD CONFLICTS');
+  });
+
+  it('output-contract line is present', () => {
+    const result = situationTopicSynthesisPrompt(makeSynthesisInput());
+    expect(result).toContain('Respond ONLY with JSON');
+  });
+});
+
+// ── formatSituationDebateContext — BDI enrichment (t/3636) ───────
+
+describe('formatSituationDebateContext — BDI enrichment', () => {
+  it('emits full BDI lines when interpretations are BdiInterpretation', () => {
+    const result = formatSituationDebateContext({
+      id: 'sit-201',
+      label: 'AI Labor Displacement',
+      description: 'AI replacing jobs.',
+      interpretations: { accelerationist: BDI_ACC, safetyist: BDI_SAF, skeptic: BDI_SKP },
+    });
+    expectContains(result, 'belief:', 'desire:', 'intention:');
+    expectContains(result, BDI_ACC.belief, BDI_SAF.desire, BDI_SKP.intention);
+  });
+
+  it('falls back to flat line for legacy string interpretations', () => {
+    const input = makeSituationInput();
+    const result = formatSituationDebateContext(input);
+    expect(result).toContain('Accelerationist: Creative destruction drives new markets.');
+    expect(result).not.toContain('belief:');
+  });
+
+  it('emits DISAGREEMENT TYPE block when disagreementType set', () => {
+    const result = formatSituationDebateContext({
+      id: 'sit-201',
+      label: 'AI Labor Displacement',
+      description: 'AI replacing jobs.',
+      interpretations: { accelerationist: BDI_ACC, safetyist: BDI_SAF, skeptic: BDI_SKP },
+      disagreementType: 'structural',
+      interpretationDivergence: 0.72,
+    });
+    expect(result).toContain('DISAGREEMENT TYPE');
+    expect(result).toContain('structural');
+    expect(result).toContain('0.72');
+  });
+
+  it('omits DISAGREEMENT TYPE block when disagreementType absent', () => {
+    const result = formatSituationDebateContext(makeSituationInput());
+    expect(result).not.toContain('DISAGREEMENT TYPE');
   });
 });

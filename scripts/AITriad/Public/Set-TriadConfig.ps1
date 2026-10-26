@@ -11,6 +11,11 @@ function Set-TriadConfig {
         credentials (GITHUB_TOKEN). Supports -WhatIf/-Confirm (ConfirmImpact High),
         an optional pre-upload diff, and an optional reload after upload. Pair with
         Get-TriadConfig to download-edit-upload safely.
+
+        Works against a local server only. A hosted (Easy-Auth-fronted) deployment does not
+        accept the GITHUB_TOKEN bearer header and answers with its sign-in page; the cmdlet
+        then fails with an actionable error instead of reporting a successful upload (t/4370).
+        For staging or prod, sign in as an admin and use the Runtime Config panel.
     .PARAMETER InputPath
         Local path to the config JSON to upload. Default: ./runtime-config.json.
     .PARAMETER BaseUrl
@@ -54,7 +59,7 @@ function Set-TriadConfig {
     Set-StrictMode -Version Latest
 
     if (-not (Test-Path $InputPath)) {
-        throw (New-ActionableError `
+        throw (New-ActionableError -AsErrorRecord `
             -Goal 'Upload runtime config to taxonomy-editor' `
             -Problem "Config file not found: $InputPath" `
             -Location 'Set-TriadConfig' `
@@ -67,7 +72,7 @@ function Set-TriadConfig {
         $ConfigObj = $RawJson | ConvertFrom-Json -ErrorAction Stop
     }
     catch {
-        throw (New-ActionableError `
+        throw (New-ActionableError -AsErrorRecord `
             -Goal 'Parse local config file' `
             -Problem "Invalid JSON in $InputPath — $($_.Exception.Message)" `
             -Location 'Set-TriadConfig' `
@@ -82,7 +87,7 @@ function Set-TriadConfig {
         Where-Object { $_.MemberType -eq 'NoteProperty' -and $_.Name -notin $KnownSections } |
         ForEach-Object { $_.Name })
     if (@($UnknownKeys).Count -gt 0) {
-        throw (New-ActionableError `
+        throw (New-ActionableError -AsErrorRecord `
             -Goal 'Validate local config schema' `
             -Problem "Unknown config sections: $($UnknownKeys -join ', ')" `
             -Location 'Set-TriadConfig' `
@@ -97,6 +102,8 @@ function Set-TriadConfig {
         try {
             $Current = Invoke-RestMethod -Uri "$($Req.BaseUrl)/api/admin/config" `
                 -Method GET -Headers $Req.Headers -ErrorAction Stop
+            Assert-TriadConfigResponse -Response $Current -Goal 'Fetch current runtime config for diff' `
+                -Uri "$($Req.BaseUrl)/api/admin/config" -CallerName 'Set-TriadConfig'
             $CurrentJson = ($Current.config | ConvertTo-Json -Depth 10).Split("`n")
             $LocalJson = ($ConfigObj | ConvertTo-Json -Depth 10).Split("`n")
 
@@ -147,7 +154,7 @@ function Set-TriadConfig {
                elseif ($StatusCode) { "HTTP $StatusCode" }
                else { $_.Exception.Message }
 
-        throw (New-ActionableError `
+        throw (New-ActionableError -AsErrorRecord `
             -Goal 'Upload runtime config to taxonomy-editor' `
             -Problem "Config upload error: $Msg" `
             -Location 'Set-TriadConfig' `
@@ -155,6 +162,9 @@ function Set-TriadConfig {
                          'Check server logs for detailed validation errors',
                          "Endpoint: $($UploadParams.Uri)"))
     }
+
+    Assert-TriadConfigResponse -Response $Response -Goal 'Upload runtime config to taxonomy-editor' `
+        -Uri $UploadParams.Uri -CallerName 'Set-TriadConfig'
 
     Write-Output "Config uploaded successfully."
 

@@ -8,6 +8,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const { mockApi } = vi.hoisted(() => {
   const mockApi = {
     loadTaxonomyFile: vi.fn().mockResolvedValue({ nodes: [] }),
+    loadTaxonomyFileForEdit: vi.fn().mockResolvedValue({ nodes: [] }),
     saveTaxonomyFile: vi.fn().mockResolvedValue(undefined),
     loadPolicyRegistry: vi.fn().mockResolvedValue({ policies: [] }),
     loadConflictFiles: vi.fn().mockResolvedValue([]),
@@ -56,9 +57,15 @@ vi.mock('@lib/debate/validateNodeId', () => ({
   validatePovNodeId: vi.fn().mockReturnValue({ valid: true }),
 }));
 
+const { mockRecord, mockStripInvalidLogicalForm } = vi.hoisted(() => ({
+  mockRecord: vi.fn(),
+  // t/3250: loadAll calls this per node. t/3378: tests override this per-case to simulate strips.
+  mockStripInvalidLogicalForm: vi.fn().mockReturnValue({ removed: false }),
+}));
+
 vi.mock('@lib/flight-recorder/index', () => ({
   getGlobalRecorder: vi.fn().mockReturnValue({
-    record: vi.fn(),
+    record: mockRecord,
   }),
 }));
 
@@ -68,7 +75,7 @@ vi.mock('../utils/validation', () => ({
   conflictFileSchema: { safeParse: vi.fn().mockReturnValue({ success: true }) },
   extractPovErrors: vi.fn().mockReturnValue({}),
   extractConflictErrors: vi.fn().mockReturnValue({}),
-  stripInvalidLogicalForm: vi.fn().mockReturnValue({ removed: false }), // t/3250: loadAll calls this per node
+  stripInvalidLogicalForm: mockStripInvalidLogicalForm,
 }));
 
 vi.mock('../utils/similarity', () => ({
@@ -116,6 +123,11 @@ vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: false }));
 
 import { useTaxonomyStore } from './useTaxonomyStore';
 import type { PovTaxonomyFile, CrossCuttingFile, ConflictFile, PovNode, Edge, EdgesFile } from '../types/taxonomy';
+import { buildSituationBaseline } from '../utils/situationBdiGate';
+import { povTagMembershipErrors } from '../utils/povTagGate';
+
+/** A complete, compliant per-POV interpretation (t/3888). */
+const fullBdi = (tag: string) => ({ belief: `${tag} belief`, desire: `${tag} desire`, intention: `${tag} intention`, summary: `${tag} summary` });
 
 // ── Factories ──
 
@@ -175,6 +187,7 @@ function resetStore() {
     safetyist: null,
     skeptic: null,
     situations: null,
+    situationsBaseline: {},
     policyRegistry: null,
     conflicts: [],
     aggregatedCruxes: null,
@@ -852,6 +865,69 @@ describe('useTaxonomyStore', () => {
         expect(conflict.linked_taxonomy_nodes).not.toContain('acc-beliefs-001');
         expect(conflict.linked_taxonomy_nodes[0]).toMatch(/^saf-beliefs-/);
       });
+
+      // t/3972: POV tags are POV-scoped. The move used to spread `...oldNode`, carrying them into a POV
+      // where they're invalid (SO e/249#6 surviving vector). These assert tags DON'T survive the boundary.
+      describe('pov_tags (t/3972)', () => {
+        const stripWarn = () => mockRecord.mock.calls.find(([e]) => e.message?.includes('Cross-POV move stripped POV tags'));
+        const movedSafNode = () => useTaxonomyStore.getState().safetyist!.nodes.find(n => n.id.startsWith('saf-beliefs-'))!;
+
+        it('strips the tags, reports them, and WARNs naming the node and tags', () => {
+          useTaxonomyStore.setState({
+            accelerationist: makePovFile([makePovNode({ id: 'acc-beliefs-001', pov_tags: ['critical'] })]),
+            safetyist: makePovFile([]),
+            lastPovMoveReport: null,
+          });
+          useTaxonomyStore.getState().movePovNode('accelerationist', 'acc-beliefs-001', 'safetyist', 'Beliefs');
+
+          const moved = movedSafNode();
+          expect(moved).not.toHaveProperty('pov_tags'); // the negative assertion: absent, not just empty
+          expect(useTaxonomyStore.getState().lastPovMoveReport).toEqual({
+            fromId: 'acc-beliefs-001', toId: moved.id, sourcePov: 'accelerationist', targetPov: 'safetyist', strippedTags: ['critical'],
+          });
+          const [entry] = stripWarn()!;
+          expect(entry.level).toBe('warn');
+          expect(entry.data).toMatchObject({ from_id: 'acc-beliefs-001', to_id: moved.id, stripped_tags: ['critical'] });
+        });
+
+        it('reports a PowerShell-unrolled scalar as one stripped tag rather than dropping it silently', () => {
+          useTaxonomyStore.setState({
+            accelerationist: makePovFile([makePovNode({ id: 'acc-beliefs-001', pov_tags: 'critical' as unknown as string[] })]),
+            safetyist: makePovFile([]),
+          });
+          useTaxonomyStore.getState().movePovNode('accelerationist', 'acc-beliefs-001', 'safetyist', 'Beliefs');
+          expect(movedSafNode()).not.toHaveProperty('pov_tags');
+          expect(useTaxonomyStore.getState().lastPovMoveReport!.strippedTags).toEqual(['critical']);
+        });
+
+        it('an untagged node moves with an empty report and no WARN', () => {
+          useTaxonomyStore.setState({
+            accelerationist: makePovFile([makePovNode({ id: 'acc-beliefs-001' })]),
+            safetyist: makePovFile([]),
+          });
+          useTaxonomyStore.getState().movePovNode('accelerationist', 'acc-beliefs-001', 'safetyist', 'Beliefs');
+          expect(useTaxonomyStore.getState().lastPovMoveReport!.strippedTags).toEqual([]);
+          expect(stripWarn()).toBeUndefined();
+        });
+
+        it('a same-POV move through movePovNode keeps the tags (one-element array intact)', () => {
+          useTaxonomyStore.setState({
+            accelerationist: makePovFile([makePovNode({ id: 'acc-beliefs-001', pov_tags: ['critical'] })]),
+            lastPovMoveReport: null,
+          });
+          useTaxonomyStore.getState().movePovNode('accelerationist', 'acc-beliefs-001', 'accelerationist', 'Desires');
+          const moved = useTaxonomyStore.getState().accelerationist!.nodes.find(n => n.id.startsWith('acc-desires-'))!;
+          expect(moved.pov_tags).toEqual(['critical']);
+          expect(useTaxonomyStore.getState().lastPovMoveReport).toBeNull();
+          expect(stripWarn()).toBeUndefined();
+        });
+
+        it('clearPovMoveReport clears the report', () => {
+          useTaxonomyStore.setState({ lastPovMoveReport: { fromId: 'a', toId: 'b', sourcePov: 'accelerationist', targetPov: 'safetyist', strippedTags: ['x'] } });
+          useTaxonomyStore.getState().clearPovMoveReport();
+          expect(useTaxonomyStore.getState().lastPovMoveReport).toBeNull();
+        });
+      });
     });
   });
 
@@ -876,6 +952,15 @@ describe('useTaxonomyStore', () => {
         useTaxonomyStore.setState({ situations: null });
         expect(useTaxonomyStore.getState().createSituationNode()).toBe('');
       });
+
+      // t/3888: the flat '' it used to mint routed the editor to a free-text box that wrote prose.
+      it('mints the BDI shape for every POV, not a flat string', () => {
+        const newId = useTaxonomyStore.getState().createSituationNode();
+        const node = useTaxonomyStore.getState().situations!.nodes.find(n => n.id === newId)!;
+        for (const pov of ['accelerationist', 'safetyist', 'skeptic'] as const) {
+          expect(node.interpretations[pov]).toEqual({ belief: '', desire: '', intention: '', summary: '' });
+        }
+      });
     });
 
     describe('updateSituationNode', () => {
@@ -884,6 +969,15 @@ describe('useTaxonomyStore', () => {
         const node = useTaxonomyStore.getState().situations!.nodes.find(n => n.id === 'sit-001')!;
         expect(node.label).toBe('Updated situation');
         expect(useTaxonomyStore.getState().dirty.has('situations')).toBe(true);
+      });
+
+      // t/3888: the patch carries only the edited POV; the others keep their stored value.
+      it('merges interpretations per POV, leaving untouched POVs (even legacy flat ones) as stored', () => {
+        useTaxonomyStore.getState().updateSituationNode('sit-001', { interpretations: { safetyist: fullBdi('saf') } });
+        const node = useTaxonomyStore.getState().situations!.nodes.find(n => n.id === 'sit-001')!;
+        expect(node.interpretations.safetyist).toEqual(fullBdi('saf'));
+        expect(node.interpretations.accelerationist).toBe('acc view');
+        expect(node.interpretations.skeptic).toBe('skp view');
       });
     });
 
@@ -1088,6 +1182,42 @@ describe('useTaxonomyStore', () => {
         expect(useTaxonomyStore.getState().lookupPinnedData('unknown-999')).toBeNull();
       });
 
+      // t/3401: pol-* ids previously fell through every branch to null — the debate ref-popup
+      // showed "Node not found" for a policy reference. Both arms per the ticket's UAT triage.
+      describe('policy refs (t/3401)', () => {
+        it('resolves a pol-* id to the policy registry entry, with referencing nodes', () => {
+          useTaxonomyStore.setState({
+            accelerationist: makePovFile([
+              makePovNode({
+                id: 'acc-beliefs-001',
+                label: 'Acc Belief',
+                graph_attributes: { policy_actions: [{ policy_id: 'pol-001', action: 'Node action', framing: 'Node framing' }] } as never,
+              }),
+            ]),
+          });
+          const result = useTaxonomyStore.getState().lookupPinnedData('pol-001');
+          expect(result).not.toBeNull();
+          expect(result!.type).toBe('policy');
+          if (result!.type === 'policy') {
+            expect(result!.policy.action).toBe('Policy Action');
+            expect(result!.referencingNodes).toEqual([
+              { id: 'acc-beliefs-001', label: 'Acc Belief', pov: 'accelerationist', action: 'Node action', framing: 'Node framing' },
+            ]);
+          }
+        });
+
+        it('returns a policy with an empty referencingNodes list when no loaded node references it', () => {
+          const result = useTaxonomyStore.getState().lookupPinnedData('pol-001');
+          expect(result).not.toBeNull();
+          expect(result!.type).toBe('policy');
+          if (result!.type === 'policy') expect(result!.referencingNodes).toEqual([]);
+        });
+
+        it('returns null for an unknown pol-* id (graceful fallback persists)', () => {
+          expect(useTaxonomyStore.getState().lookupPinnedData('pol-does-not-exist')).toBeNull();
+        });
+      });
+
       it('returns structuredClone (not a reference)', () => {
         const result = useTaxonomyStore.getState().lookupPinnedData('acc-beliefs-001')!;
         if (result.type === 'pov') {
@@ -1198,7 +1328,7 @@ describe('useTaxonomyStore', () => {
       const skpFile = makePovFile([makePovNode({ id: 'skp-beliefs-001' })]);
       const sitFile = makeSituationsFile();
 
-      mockApi.loadTaxonomyFile.mockImplementation((pov: string) => {
+      mockApi.loadTaxonomyFileForEdit.mockImplementation((pov: string) => {
         if (pov === 'accelerationist') return Promise.resolve(accFile);
         if (pov === 'safetyist') return Promise.resolve(safFile);
         if (pov === 'skeptic') return Promise.resolve(skpFile);
@@ -1223,7 +1353,7 @@ describe('useTaxonomyStore', () => {
         if (state.loading) wasLoading = true;
       });
 
-      mockApi.loadTaxonomyFile.mockResolvedValue({ nodes: [] });
+      mockApi.loadTaxonomyFileForEdit.mockResolvedValue({ nodes: [] });
       mockApi.loadPolicyRegistry.mockResolvedValue({ policies: [] });
       await useTaxonomyStore.getState().loadAll();
 
@@ -1232,10 +1362,59 @@ describe('useTaxonomyStore', () => {
     });
 
     it('handles load failure gracefully', async () => {
-      mockApi.loadTaxonomyFile.mockRejectedValueOnce(new Error('Network error'));
+      mockApi.loadTaxonomyFileForEdit.mockRejectedValueOnce(new Error('Network error'));
       await useTaxonomyStore.getState().loadAll();
       expect(useTaxonomyStore.getState().loading).toBe(false);
       expect(useTaxonomyStore.getState().saveError).toBeTruthy();
+    });
+
+    // t/4208: call-target assertion moved to useTaxonomyStore.loadAllForEdit.test.ts (max-lines).
+  });
+
+  // t/3378: aggregate strip-count observability on top of the existing per-node WARN (t/3250) —
+  // a mass strip (the t/3375 class, 133 frames) should be visible without counting log lines.
+  describe('loadAll — logical_form strip summary (t/3378)', () => {
+    function mockOtherPovsEmpty(accFile: PovTaxonomyFile) {
+      mockApi.loadTaxonomyFileForEdit.mockImplementation((pov: string) => {
+        if (pov === 'accelerationist') return Promise.resolve(accFile);
+        return Promise.resolve({ nodes: [] });
+      });
+    }
+
+    it('emits an aggregate WARN with the strip count when frames are stripped on load', async () => {
+      const accFile = makePovFile([
+        makePovNode({ id: 'acc-beliefs-001' }),
+        makePovNode({ id: 'acc-beliefs-002' }),
+      ]);
+      mockOtherPovsEmpty(accFile);
+      mockStripInvalidLogicalForm.mockReturnValue({ removed: true, issue: 'bad frame' });
+
+      await useTaxonomyStore.getState().loadAll();
+
+      const summaryCall = mockRecord.mock.calls.find(([entry]) => entry.message?.includes('logical_form strip summary'));
+      expect(summaryCall).toBeTruthy();
+      expect(summaryCall![0]).toMatchObject({ level: 'warn', data: { pov: 'accelerationist', strippedCount: 2 } });
+    });
+
+    it('does not emit a strip summary on a clean load (no strips)', async () => {
+      mockOtherPovsEmpty(makePovFile([makePovNode()]));
+      mockStripInvalidLogicalForm.mockReturnValue({ removed: false });
+
+      await useTaxonomyStore.getState().loadAll();
+
+      const summaryCall = mockRecord.mock.calls.find(([entry]) => entry.message?.includes('logical_form strip summary'));
+      expect(summaryCall).toBeUndefined();
+    });
+
+    it('escalates to level "error" when the stripped count exceeds the systemic threshold (>5)', async () => {
+      const nodes = Array.from({ length: 6 }, (_, i) => makePovNode({ id: `acc-beliefs-${i}` }));
+      mockOtherPovsEmpty(makePovFile(nodes));
+      mockStripInvalidLogicalForm.mockReturnValue({ removed: true, issue: 'bad frame' });
+
+      await useTaxonomyStore.getState().loadAll();
+
+      const summaryCall = mockRecord.mock.calls.find(([entry]) => entry.message?.includes('logical_form strip summary'));
+      expect(summaryCall![0]).toMatchObject({ level: 'error', data: { strippedCount: 6 } });
     });
   });
 
@@ -1263,13 +1442,105 @@ describe('useTaxonomyStore', () => {
     });
 
     it('saves dirty situations file', async () => {
+      // t/3888: a real store always has the baseline that load sets. Without it every node looks
+      // new and is BDI-gated, and this fixture's flat (legacy) interpretations are refused.
+      const situations = makeSituationsFile();
       useTaxonomyStore.setState({
-        situations: makeSituationsFile(),
+        situations,
+        situationsBaseline: buildSituationBaseline(situations.nodes),
         dirty: new Set(['situations']),
       });
 
       await useTaxonomyStore.getState().save();
       expect(mockApi.saveTaxonomyFile).toHaveBeenCalledWith('situations', expect.any(Object));
+    });
+
+    // ── t/3888: BDI save gate on changed situations ──────────────────────────
+    describe('situation BDI gate (t/3888)', () => {
+      /** Load-equivalent state: file + the baseline loadAll would set, then dirty. */
+      function loadSituations(nodes: CrossCuttingFile['nodes']) {
+        const file = { ...makeSituationsFile(), nodes };
+        useTaxonomyStore.setState({ situations: file, situationsBaseline: buildSituationBaseline(nodes), dirty: new Set(['situations']) });
+      }
+      const sit = (id: string, interpretations: CrossCuttingFile['nodes'][number]['interpretations'], description = 'A situation that tests the gate.') =>
+        ({ id, label: `Label ${id}`, description, interpretations, linked_nodes: [], conflict_ids: [] });
+      const flat = { accelerationist: 'acc prose', safetyist: 'saf prose', skeptic: 'skp prose' };
+      const full = { accelerationist: fullBdi('acc'), safetyist: fullBdi('saf'), skeptic: fullBdi('skp') };
+
+      it('refuses a new situation left with empty B/D/I, names node/POV/fields, and writes nothing', async () => {
+        loadSituations([sit('sit-001', full)]);
+        const newId = useTaxonomyStore.getState().createSituationNode();
+
+        await useTaxonomyStore.getState().save();
+
+        expect(mockApi.saveTaxonomyFile).not.toHaveBeenCalled();
+        const { saveError, validationErrors } = useTaxonomyStore.getState();
+        expect(saveError).toContain(newId);
+        expect(saveError).toContain('accelerationist: belief, desire, intention are empty or a placeholder');
+        expect(validationErrors[`nodes.${newId}.interpretations.skeptic`]).toMatch(/belief, desire, intention/);
+      });
+
+      it('refuses a flat string written into a changed situation', async () => {
+        loadSituations([sit('sit-001', full)]);
+        const node = useTaxonomyStore.getState().situations!.nodes[0];
+        useTaxonomyStore.setState({ situations: { ...useTaxonomyStore.getState().situations!, nodes: [{ ...node, interpretations: { ...full, safetyist: 'flat prose' } }] } });
+
+        await useTaxonomyStore.getState().save();
+
+        expect(mockApi.saveTaxonomyFile).not.toHaveBeenCalled();
+        expect(useTaxonomyStore.getState().validationErrors['nodes.sit-001.interpretations.safetyist']).toMatch(/not broken into belief, desire and intention/);
+      });
+
+      it('refuses a null-sentinel placeholder and names only that field', async () => {
+        loadSituations([sit('sit-001', full)]);
+        useTaxonomyStore.getState().updateSituationNode('sit-001', { interpretations: { accelerationist: { ...fullBdi('acc'), desire: 'N/A' } } });
+
+        await useTaxonomyStore.getState().save();
+
+        expect(mockApi.saveTaxonomyFile).not.toHaveBeenCalled();
+        expect(useTaxonomyStore.getState().validationErrors['nodes.sit-001.interpretations.accelerationist']).toBe('accelerationist: desire is empty or a placeholder (N/A, TBD, none…)');
+      });
+
+      it('saves a complete BDI change and makes the saved state the new baseline', async () => {
+        loadSituations([sit('sit-001', full)]);
+        useTaxonomyStore.getState().updateSituationNode('sit-001', { interpretations: { skeptic: fullBdi('skp2') } });
+
+        await useTaxonomyStore.getState().save();
+
+        expect(mockApi.saveTaxonomyFile).toHaveBeenCalledWith('situations', expect.any(Object));
+        const { situations, situationsBaseline } = useTaxonomyStore.getState();
+        expect(situationsBaseline).toEqual(buildSituationBaseline(situations!.nodes));
+      });
+
+      // SO e/244#2 Q1, arm 2: an unchanged live flat node must not block an unrelated save.
+      it('lets an untouched legacy flat node through while another node changes', async () => {
+        loadSituations([sit('sit-001', flat), sit('sit-002', full)]);
+        useTaxonomyStore.getState().updateSituationNode('sit-002', { interpretations: { accelerationist: fullBdi('acc2') } });
+
+        await useTaxonomyStore.getState().save();
+
+        expect(mockApi.saveTaxonomyFile).toHaveBeenCalledWith('situations', expect.any(Object));
+      });
+
+      // SO Q1, condition 1: "changed" is defined over interpretations only.
+      it('does not gate a label-only edit of a legacy flat node', async () => {
+        loadSituations([sit('sit-001', flat)]);
+        useTaxonomyStore.getState().updateSituationNode('sit-001', { label: 'Renamed label' });
+
+        await useTaxonomyStore.getState().save();
+
+        expect(mockApi.saveTaxonomyFile).toHaveBeenCalledWith('situations', expect.any(Object));
+      });
+
+      it('exempts a [DEPRECATED] situation even when its flat interpretation changed', async () => {
+        loadSituations([sit('sit-154', flat, '[DEPRECATED] A situation that was retired.')]);
+        const node = useTaxonomyStore.getState().situations!.nodes[0];
+        useTaxonomyStore.setState({ situations: { ...useTaxonomyStore.getState().situations!, nodes: [{ ...node, interpretations: { ...flat, skeptic: 'edited prose' } }] } });
+
+        await useTaxonomyStore.getState().save();
+
+        expect(mockApi.saveTaxonomyFile).toHaveBeenCalledWith('situations', expect.any(Object));
+      });
     });
 
     it('saves dirty conflict files', async () => {
@@ -1310,10 +1581,198 @@ describe('useTaxonomyStore', () => {
       expect(useTaxonomyStore.getState().saveError).toBeTruthy();
     });
 
+    // t/4186/t/4197 WRITE_CONFLICT/BASE_VERSION_REQUIRED and pre-save-re-read-stays-plain tests
+    // moved to useTaxonomyStore.saveConflict.test.ts (t/4197, max-lines, p/775#45/#46).
+
     it('dismissSaveError clears error', () => {
       useTaxonomyStore.setState({ saveError: 'Some error' });
       useTaxonomyStore.getState().dismissSaveError();
       expect(useTaxonomyStore.getState().saveError).toBeNull();
+    });
+
+    // t/3376: a whole-file save must never persist a load-time strip of `logical_form`
+    // (t/3375: 133 acc frames silently deleted this way). Both-arms per the approved design.
+    describe('logical_form reattach-on-save (t/3376)', () => {
+      it('reattaches a logical_form present on disk but missing in memory before saving', async () => {
+        const memoryNode = makePovNode({ id: 'acc-beliefs-001' }); // no logical_form — stripped at load
+        const diskNode = { ...memoryNode, logical_form: { predicate: 'cost' } };
+        mockApi.loadTaxonomyFile.mockImplementation((pov: string) =>
+          pov === 'accelerationist' ? Promise.resolve(makePovFile([diskNode])) : Promise.resolve({ nodes: [] }),
+        );
+        useTaxonomyStore.setState({
+          accelerationist: makePovFile([memoryNode]),
+          dirty: new Set(['accelerationist']),
+        });
+
+        await useTaxonomyStore.getState().save();
+
+        const [, savedFile] = mockApi.saveTaxonomyFile.mock.calls.find(([pov]) => pov === 'accelerationist')!;
+        expect((savedFile as PovTaxonomyFile).nodes[0].logical_form).toEqual({ predicate: 'cost' });
+      });
+
+      it('leaves a node with a valid in-memory logical_form untouched (no reattach)', async () => {
+        const memoryLf = { predicate: 'keep-me' };
+        const memoryNode = { ...makePovNode({ id: 'acc-beliefs-001' }), logical_form: memoryLf };
+        // Disk carries a DIFFERENT value — proves the reattach only fires when memory is undefined.
+        const diskNode = { ...memoryNode, logical_form: { predicate: 'should-not-be-used' } };
+        mockApi.loadTaxonomyFile.mockImplementation((pov: string) =>
+          pov === 'accelerationist' ? Promise.resolve(makePovFile([diskNode])) : Promise.resolve({ nodes: [] }),
+        );
+        useTaxonomyStore.setState({
+          accelerationist: makePovFile([memoryNode]),
+          dirty: new Set(['accelerationist']),
+        });
+
+        await useTaxonomyStore.getState().save();
+
+        const [, savedFile] = mockApi.saveTaxonomyFile.mock.calls.find(([pov]) => pov === 'accelerationist')!;
+        expect((savedFile as PovTaxonomyFile).nodes[0].logical_form).toEqual(memoryLf);
+      });
+
+      it('fails open (but loud) when the re-read throws — the save still completes', async () => {
+        const memoryNode = makePovNode({ id: 'acc-beliefs-001' });
+        mockApi.loadTaxonomyFile.mockImplementation((pov: string) =>
+          pov === 'accelerationist' ? Promise.reject(new Error('network error')) : Promise.resolve({ nodes: [] }),
+        );
+        useTaxonomyStore.setState({
+          accelerationist: makePovFile([memoryNode]),
+          dirty: new Set(['accelerationist']),
+        });
+
+        await useTaxonomyStore.getState().save();
+
+        // Save is not aborted by the re-read failure — the original in-memory file still saves.
+        const [, savedFile] = mockApi.saveTaxonomyFile.mock.calls.find(([pov]) => pov === 'accelerationist')!;
+        expect((savedFile as PovTaxonomyFile).nodes[0]).toEqual(memoryNode);
+        expect(useTaxonomyStore.getState().saveError).toBeNull();
+        // Loud, not silent: a WARN is recorded for the skipped reattach (fallback-path logging).
+        const warnCall = mockRecord.mock.calls.find(([entry]) => entry.message?.includes('reattach-on-save') && entry.message?.includes('re-read'));
+        expect(warnCall).toBeTruthy();
+        expect(warnCall![0]).toMatchObject({ level: 'warn' });
+      });
+    });
+
+    // t/3955 (TL t/3955#4 cond 2): a tagged node survives each editor write path with its tags still an
+    // ARRAY. One-element arrays on purpose: that is the common case and where an unroll would show.
+    // Validation is mocked in this harness, so these test the write paths, not the tag rules.
+    describe('pov_tags round-trip (t/3955)', () => {
+      const tagged = () => makePovNode({ id: 'acc-beliefs-001', pov_tags: ['critical'] });
+      const savedNode = (id: string) => {
+        const [, f] = mockApi.saveTaxonomyFile.mock.calls.find(([pov]) => pov === 'accelerationist')!;
+        return (f as PovTaxonomyFile).nodes.find((n) => n.id === id)!;
+      };
+
+      it('survives save() unchanged, through the logical_form reattach step', async () => {
+        mockApi.loadTaxonomyFile.mockImplementation((pov: string) =>
+          pov === 'accelerationist' ? Promise.resolve(makePovFile([tagged()])) : Promise.resolve({ nodes: [] }),
+        );
+        // Tags already on disk at load are in the baseline (t/3973), as a real load would record them.
+        useTaxonomyStore.setState({ accelerationist: makePovFile([tagged()]), dirty: new Set(['accelerationist']), povTagsBaseline: { 'acc-beliefs-001': '["critical"]' } });
+        await useTaxonomyStore.getState().save();
+        expect(savedNode('acc-beliefs-001').pov_tags).toEqual(['critical']);
+      });
+
+      it('survives updatePovNode (an unrelated field edit) and the following save()', async () => {
+        useTaxonomyStore.setState({ accelerationist: makePovFile([tagged()]), povTagsBaseline: { 'acc-beliefs-001': '["critical"]' } });
+        useTaxonomyStore.getState().updatePovNode('accelerationist', 'acc-beliefs-001', { label: 'Renamed' });
+        const node = useTaxonomyStore.getState().accelerationist!.nodes[0];
+        expect(node.label).toBe('Renamed');
+        expect(node.pov_tags).toEqual(['critical']);
+        await useTaxonomyStore.getState().save();
+        expect(savedNode('acc-beliefs-001').pov_tags).toEqual(['critical']);
+      });
+
+      it('survives movePovNodeCategory (same POV, new id)', () => {
+        useTaxonomyStore.setState({ accelerationist: makePovFile([tagged()]) });
+        const newId = useTaxonomyStore.getState().movePovNodeCategory('accelerationist', 'acc-beliefs-001', 'Desires');
+        expect(newId).toBeTruthy();
+        const moved = useTaxonomyStore.getState().accelerationist!.nodes.find((n) => n.id === newId)!;
+        expect(moved.pov_tags).toEqual(['critical']);
+        expect(Array.isArray(moved.pov_tags)).toBe(true);
+      });
+    });
+
+    // t/3973: registry MEMBERSHIP is gated on nodes changed since load; STRUCTURAL problems block everywhere.
+    // These arms put 'critical' on an ACCELERATIONIST node: the committed registry has no accelerationist tags
+    // (only skeptic ones, t/3956), so the tag is unregistered ("orphaned") there.
+    describe('pov_tags save gate (t/3973)', () => {
+      const saveCalledFor = (pov: string) => mockApi.saveTaxonomyFile.mock.calls.some(([p]) => p === pov);
+      const orphanWarn = () => mockRecord.mock.calls.find(([e]) => e.message?.includes('unregistered POV tags already on nodes'));
+      const seed = (node: Partial<PovNode>, baseline: Record<string, string>) => useTaxonomyStore.setState({
+        accelerationist: makePovFile([makePovNode({ id: 'acc-beliefs-001', ...node })]),
+        dirty: new Set(['accelerationist']),
+        validationErrors: {},
+        povTagsBaseline: baseline,
+      });
+
+      it('an UNTOUCHED node with an orphaned tag still saves, and WARNs naming it', async () => {
+        seed({ pov_tags: ['critical'], label: 'Edited elsewhere in the file' }, { 'acc-beliefs-001': '["critical"]' });
+        await useTaxonomyStore.getState().save();
+        expect(useTaxonomyStore.getState().validationErrors).toEqual({});
+        expect(saveCalledFor('accelerationist')).toBe(true);
+        expect(orphanWarn()![0]).toMatchObject({ level: 'warn', data: { count: 1, nodes: [{ node_id: 'acc-beliefs-001' }] } });
+      });
+
+      it('an EDITED node given an unregistered tag is blocked, keyed to that node', async () => {
+        seed({ pov_tags: ['critical'] }, { 'acc-beliefs-001': 'null' });
+        await useTaxonomyStore.getState().save();
+        expect(useTaxonomyStore.getState().validationErrors['nodes.acc-beliefs-001.pov_tags']).toMatch(/not registered/);
+        expect(saveCalledFor('accelerationist')).toBe(false);
+        expect(orphanWarn()).toBeUndefined();
+      });
+
+      it('a NEW node (absent from the baseline) with an unregistered tag is blocked', async () => {
+        seed({ pov_tags: ['critical'] }, {});
+        await useTaxonomyStore.getState().save();
+        expect(useTaxonomyStore.getState().validationErrors['nodes.acc-beliefs-001.pov_tags']).toMatch(/not registered/);
+        expect(saveCalledFor('accelerationist')).toBe(false);
+      });
+
+      // Structural problems block via the SCHEMA on every node; that arm is proven against the real schema in
+      // utils/validation.povTags.test.ts (this harness mocks validation). Here: the membership gate never
+      // treats a structural problem as a forgivable orphan, so it can't WARN one through on an untouched node.
+      it('the gate never treats a STRUCTURAL problem as a forgivable orphan (no WARN, no membership error)', () => {
+        const scalar = makePovNode({ id: 'acc-beliefs-001', pov_tags: 'critical' as unknown as string[] });
+        expect(povTagMembershipErrors([scalar], { 'acc-beliefs-001': '"critical"' })).toEqual({});
+        expect(orphanWarn()).toBeUndefined();
+      });
+
+      // t/3984: the untouched orphans the gate lets through are shown to the user after the save.
+      it('a successful save records the untouched orphans for the notice, and never sets saveError', async () => {
+        seed({ pov_tags: ['critical'] }, { 'acc-beliefs-001': '["critical"]' });
+        await useTaxonomyStore.getState().save();
+        expect(useTaxonomyStore.getState().orphanedTagNodeIds).toEqual(['acc-beliefs-001']);
+        expect(useTaxonomyStore.getState().saveError).toBeNull();
+      });
+
+      it('a save with no orphans clears the notice', async () => {
+        useTaxonomyStore.setState({ orphanedTagNodeIds: ['stale-from-last-save'] });
+        seed({ pov_tags: [] }, { 'acc-beliefs-001': 'null' });
+        await useTaxonomyStore.getState().save();
+        expect(useTaxonomyStore.getState().orphanedTagNodeIds).toEqual([]);
+      });
+
+      it('a BLOCKED save leaves the notice untouched (the errors are what the user needs then)', async () => {
+        useTaxonomyStore.setState({ orphanedTagNodeIds: [] });
+        seed({ pov_tags: ['critical'] }, { 'acc-beliefs-001': 'null' }); // edited → blocked
+        await useTaxonomyStore.getState().save();
+        expect(saveCalledFor('accelerationist')).toBe(false);
+        expect(useTaxonomyStore.getState().orphanedTagNodeIds).toEqual([]);
+      });
+
+      it('the baseline refreshes after a successful save', async () => {
+        seed({ pov_tags: [] }, { 'acc-beliefs-001': 'null' });
+        await useTaxonomyStore.getState().save();
+        expect(saveCalledFor('accelerationist')).toBe(true);
+        expect(useTaxonomyStore.getState().povTagsBaseline['acc-beliefs-001']).toBe('[]');
+      });
+
+      it('an EDITED node with a REGISTERED tag passes the gate (registry injected; committed one is empty)', () => {
+        const registry = { version: 1, povs: { accelerationist: [{ id: 'critical', label: 'Critical', soul_doc: 'accelerationist.critical', description: 'd' }] } };
+        const node = makePovNode({ id: 'acc-beliefs-001', pov_tags: ['critical'] });
+        expect(povTagMembershipErrors([node], { 'acc-beliefs-001': 'null' }, registry)).toEqual({});
+        expect(povTagMembershipErrors([node], { 'acc-beliefs-001': 'null' })).toHaveProperty(['nodes.acc-beliefs-001.pov_tags']); // control: same edit, real (empty) registry
+      });
     });
 
     // t/2064: the post-save embedding refresh reports { staleNodeIds }; surface degradation

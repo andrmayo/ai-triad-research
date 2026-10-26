@@ -7,6 +7,9 @@
  */
 
 import { MOVE_EDGE_MAP } from '../helpers.js';
+import { POVER_INFO, type SpeakerId } from '../types.js';
+import { effectiveCamp } from './utils.js';
+import { normalizeVerdict } from '../types/factVerdict.js';
 
 const SUPPORT_SCHEMES = Object.entries(MOVE_EDGE_MAP)
   .filter(([, v]) => v.edgeType === 'support')
@@ -70,6 +73,8 @@ export function extractClaimsPrompt(
   priorClaims: PriorClaim[],
   audience?: string,
   topic?: string,
+  // isOpeningPhase defaults to false — steelman framing is only meaningful in opening statements (t/3765).
+  isOpeningPhase = false,
 ): string {
   const priorBlock = priorClaims.length > 0
     ? priorClaims.map(c => `  ${c.id} (${c.speaker}): ${c.text}`).join('\n')
@@ -133,6 +138,10 @@ For each claim, also classify:
   Beliefs: indicative ("X is/causes Y")
   Desires: deontic ("X ought to be the case")
   Intentions: instrumental ("Achieve X by means of Y")
+  SELF-CONTAINED: a reader who never saw the debate must understand the sentence on its own.
+    1. Nothing may point outside the sentence: no "it", "they", "this policy", "the speaker", "the proposal".
+    2. Replace a name a debater coined mid-debate with what it is, using only what the debate itself says it is; never add detail the debate does not give: "the attestation" -> "a mandatory data-processing attestation" (when the debate has said so), "the two-year verification test" -> "a two-year test comparing sampled data-practice attestations against actual practice".
+    3. Every date carries a year: "by 15 December 2025", never "by Dec. 15".
   Use controlled vocabulary terms where applicable. This field is used for taxonomy matching — precision matters.
 - "attribution_text": Rewrite this claim mirroring taxonomy node description format:
   "A [Belief|Desire|Intention] within [POV] discourse that [differentia]. Encompasses: [2-3 specific concepts from the claim]."
@@ -159,7 +168,9 @@ For each claim, also classify:
    "counter_evidence": "none" (no contradicting info in the source) | "minor" (some tension but not decisive) | "significant" (source contains strong counter-evidence),
    "ambiguity_resolved": "none" (the source makes a clear, unambiguous claim) | "acknowledged" (the source hedges or presents multiple readings, and this extraction preserves that uncertainty) | "collapsed" (the source hedges or presents multiple readings, but this extraction picks one and states it as settled)}
 - "specificity": "precise" (contains specific numbers, dates, named entities, or directly verifiable facts), "general" (broad empirical claim without specific verifiable details), or "abstract" (theoretical/normative, not empirically testable)
-- "steelman_of": null normally. Set to the opponent's name (e.g. "Accelerationist") ONLY when this claim deliberately presents the STRONGEST version of an opponent's position before critiquing it. A steelman means restating someone else's argument charitably — not attacking it.
+${isOpeningPhase
+  ? `- "steelman_of": null normally. Set to the opponent's camp id — exactly one of "accelerationist", "safetyist", "skeptic" — ONLY when this claim deliberately presents the STRONGEST version of that opponent's position, in terms its advocates would accept, before critiquing it. A steelman restates someone else's argument charitably. A claim that rebuts, dismisses, or concedes to the opponent is NOT a steelman, even when it names their position (e.g. "X's objection is baseless" is a rebuttal, not a steelman of X). Never use a claim id, document id, or the speaker's own camp.`
+  : `- "steelman_of": ALWAYS null. Steelman framing is only valid in opening statements, not in cross-respond turns.`}
 ${topic ? `- "topic_relevance": "on_topic" (directly engages the stated scope), "adjacent" (related but requires inference to connect), or "off_topic" (examples or framing contradict explicit topic constraints)
 ` : ''}${audience === 'policymakers' ? `
 - "political_salience": classify each claim's relevance to political decision-making:
@@ -193,16 +204,19 @@ Full example response:
 export function classifyClaimsPrompt(
   statement: string,
   speaker: string,
-  debaterClaims: { claim: string; targets: string[] }[],
+  debaterClaims: { claim: string; targets: string[]; steelman_of?: string }[],
   priorClaims: PriorClaim[],
   audience?: string,
+  // allowSteelman defaults to true for backward compatibility.
+  // Pass false on non-opening turns — steelman framing is only meaningful in opening statements (t/3759).
+  allowSteelman = true,
 ): string {
   const priorBlock = priorClaims.length > 0
     ? priorClaims.map(c => `  ${c.id} (${c.speaker}): ${c.text}`).join('\n')
     : '  (none yet)';
 
   const claimsBlock = debaterClaims
-    .map((c, i) => `  [${i + 1}] "${c.claim}"${c.targets.length > 0 ? ` → targets: ${c.targets.join(', ')}` : ' (standalone)'}`)
+    .map((c, i) => `  [${i + 1}] "${c.claim}"${c.targets.length > 0 ? ` → targets: ${c.targets.join(', ')}` : ' (standalone)'}${allowSteelman && c.steelman_of ? ` [STEELMAN of ${c.steelman_of} — set steelman_of: "${c.steelman_of}"]` : ''}`)
     .join('\n');
 
   return `The debater ${speaker} made the following statement and identified their key claims.
@@ -272,7 +286,9 @@ Also classify each claim:
   0.5-0.69: implicit premise or reading between the lines
   Below 0.5: do not include — you are editorializing beyond the statement
 - "specificity": "precise" (specific numbers, dates, named entities), "general" (broad empirical), or "abstract" (theoretical/normative)
-- "steelman_of": null normally. Set to opponent's name ONLY when this claim deliberately presents the strongest version of an opponent's position.
+${allowSteelman
+  ? `- "steelman_of": null normally. Set to the opponent's camp id ("accelerationist", "safetyist", or "skeptic") ONLY when this claim deliberately presents the strongest version of that opponent's position in terms its advocates would accept. A rebuttal, dismissal, or concession is NOT a steelman. IMPORTANT: a claim may have BOTH "responds_to" populated AND "steelman_of" set — when the debater charitably restates a prior speaker's position (in terms that speaker would accept) before diverging from it, set "steelman_of" to that speaker's camp even if "responds_to" is also populated with an edge to that speaker's node.`
+  : `- "steelman_of": ALWAYS null. Steelman framing is only valid in opening statements, not in cross-respond turns.`}
 ${audience === 'policymakers' ? `
 - "political_salience": classify each claim's relevance to political decision-making:
   "high" = Names a specific bill, agency, budget line, executive order, identifiable constituency, or references a specific court ruling or legal standard (e.g., Chevron deference, Section 230, strict liability standard). The claim could appear in a committee hearing or regulatory comment letter.
@@ -343,18 +359,19 @@ export function formatArgumentNetworkContext(
  *  Tier 2: Unaddressed claims targeting this agent.
  *  Tier 3: Recency (fallback). */
 export function formatEstablishedPoints(
-  allNodes: { id: string; text: string; speaker: string }[],
+  allNodes: { id: string; text: string; speaker: string; steelman_of?: string; verification_status?: string; verification_evidence?: string }[],
   currentSpeaker: string,
   maxPoints: number = 10,
   edges?: { source: string; target: string; type: 'supports' | 'attacks' }[],
 ): string {
   if (allNodes.length === 0) return '';
 
-  const otherClaims = allNodes.filter(n => n.speaker !== currentSpeaker);
-  if (otherClaims.length === 0) return '';
+  const otherClaims = allNodes.filter(n => effectiveCamp(n) !== currentSpeaker);
+  const ownSteelmans = allNodes.filter(n => effectiveCamp(n) === currentSpeaker && n.steelman_of != null);
+  if (otherClaims.length === 0 && ownSteelmans.length === 0) return '';
 
   // Identify this speaker's claim IDs
-  const myClaims = new Set(allNodes.filter(n => n.speaker === currentSpeaker).map(n => n.id));
+  const myClaims = new Set(allNodes.filter(n => effectiveCamp(n) === currentSpeaker).map(n => n.id));
   const otherIds = new Set(otherClaims.map(n => n.id));
 
   // Tier 1: Claims that directly respond to my claims (via edges)
@@ -385,7 +402,7 @@ export function formatEstablishedPoints(
   }
 
   // Build prioritized list
-  const result: { id: string; text: string; speaker: string; tag: string }[] = [];
+  const result: { id: string; text: string; speaker: string; steelman_of?: string; verification_status?: string; verification_evidence?: string; tag: string }[] = [];
 
   for (const c of otherClaims) {
     if (tier1.has(c.id)) {
@@ -406,16 +423,55 @@ export function formatEstablishedPoints(
 
   const capped = result.slice(0, maxPoints);
 
-  const lines = [
-    '',
-    '=== POINTS ALREADY ESTABLISHED BY OTHER DEBATERS ===',
-    'These points have already been made. Do NOT restate them in your own words.',
-    'If you agree, say so briefly ("as [name] noted") and move to what you can ADD.',
-    'If you disagree, attack the specific claim rather than restating it.',
-  ];
-  for (const c of capped) {
-    const tag = c.tag ? ` ${c.tag}` : '';
-    lines.push(`- ${c.id} (${c.speaker}):${tag} ${c.text}`);
+  const lines: string[] = [];
+
+  // Gift section — own-camp steelmans, rendered first (primacy)
+  if (ownSteelmans.length > 0) {
+    lines.push(
+      '',
+      '=== YOUR POSITION, AS CHARITABLY RESTATED BY ANOTHER DEBATER ===',
+      'Another debater has stated your camp\'s position in its strongest form. Treat it as a shared reference point and YOUR foundation — not an opponent\'s claim.',
+      '- If it represents you well: BUILD on it — adopt as common ground and advance, sharpen it, or add the evidence it lacks.',
+      '- If it subtly misframes or weakens your position: CORRECT the misframing and state the stronger version.',
+      '- Do NOT attack it as an opponent claim, and do NOT simply restate it.',
+    );
+    for (const c of ownSteelmans) {
+      const campLabel = `Charitable restatement of the ${POVER_INFO[c.steelman_of as Exclude<SpeakerId, 'user'>]?.label ?? c.steelman_of} position, authored by ${POVER_INFO[c.speaker as Exclude<SpeakerId, 'user'>]?.label ?? c.speaker}`;
+      lines.push(`- ${c.id} (${campLabel}): ${c.text}`);
+    }
+  }
+
+  if (capped.length > 0) {
+    const hasFactChecked = capped.some(c => {
+      const v = c.verification_status ? normalizeVerdict(c.verification_status) : undefined;
+      return v === 'false' || v === 'disputed';
+    });
+    lines.push(
+      '',
+      '=== POINTS ALREADY ESTABLISHED BY OTHER DEBATERS ===',
+      'These points have already been made. Do NOT restate them in your own words.',
+      'If you agree, say so briefly ("as [name] noted") and move to what you can ADD.',
+      'If you disagree, attack the specific claim rather than restating it.',
+    );
+    if (hasFactChecked) {
+      lines.push(
+        'Some points carry a fact-check tag. A point tagged [FACT-CHECKED FALSE] was checked against sources and found false — do NOT assert it as true or build on it; if it matters, note only that it was fact-checked false. A point tagged [FACT-CHECKED DISPUTED] has conflicting authoritative sources — you may engage it, but present it as contested, never as settled fact.',
+      );
+    }
+    for (const c of capped) {
+      const tag = c.tag ? ` ${c.tag}` : '';
+      const campLabel = c.steelman_of
+        ? `Charitable restatement of the ${POVER_INFO[c.steelman_of as Exclude<SpeakerId, 'user'>]?.label ?? c.steelman_of} position, authored by ${POVER_INFO[c.speaker as Exclude<SpeakerId, 'user'>]?.label ?? c.speaker}`
+        : (POVER_INFO[c.speaker as Exclude<SpeakerId, 'user'>]?.label ?? c.speaker);
+      const normalized = c.verification_status ? normalizeVerdict(c.verification_status) : undefined;
+      let factTag = '';
+      if (normalized === 'false' || normalized === 'disputed') {
+        const raw = (c.verification_evidence ?? '').replace(/\s+/g, ' ').trim();
+        const ev = raw ? ` — ${raw.length > 120 ? raw.slice(0, 119).trimEnd() + '…' : raw}` : '';
+        factTag = normalized === 'false' ? ` [FACT-CHECKED FALSE${ev}]` : ` [FACT-CHECKED DISPUTED${ev}]`;
+      }
+      lines.push(`- ${c.id} (${campLabel}):${tag}${factTag} ${c.text}`);
+    }
   }
 
   return lines.join('\n') + '\n';

@@ -11,6 +11,10 @@
 #         for any startup errors. Monitor costs against the $5/month target.
 
 name: Deploy to Azure
+# t/4130: a dispatch run's headSha is main's tip at dispatch time, NOT the deployed commit —
+# the deploy uses inputs.sha (resolved to a digest, stamped as DEPLOY_SHA). Show that in the
+# run list. Display string only (not a shell), so inputs.sha here carries no injection risk.
+run-name: Deploy to Azure (${{ inputs.environment }}, sha-${{ inputs.sha }})
 
 on:
   workflow_dispatch:
@@ -22,8 +26,8 @@ on:
         type: choice
         options:
           - production
-      image_tag:
-        description: 'Image tag to deploy (e.g., 0.8.0). Leave empty for latest tagged version.'
+      sha:
+        description: 'Commit SHA to deploy — the SAME sha built via Invoke-ContainerBuild.ps1 -Sha. The deploy resolves its PERMANENT sha-<commit> tag -> immutable @sha256 digest and pins the revision to it (t/3679, deploy-by-digest). Empty ABORTS with an actionable message; the deploy never falls back to :latest.'
         required: false
         default: ''
         type: string
@@ -37,7 +41,15 @@ on:
           - required
           - disabled
       staging_shared_read_only:
-        description: 'Mount staging shared volume read-only (true = RO flip for arm-A verification, t/2643)'
+        description: 'Mount staging shared volume read-only (false = documented override back to RW; RO is now the default, t/2643/t/4298)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      staging_load_test_size:
+        description: 'Prod-size staging (2 vCPU/4Gi, maxReplicas 3, HTTP scale rule) for the t/4180 load test (t/4203). Forces the RO shared-volume mount. Set back to false to revert — see t/4203 runbook note.'
         required: false
         default: 'false'
         type: choice
@@ -48,25 +60,42 @@ on:
 
 permissions:
   contents: read
-  packages: read
+  packages: read   # t/4170 SO C3 (p/682#28): packages:write is scoped to the tag-known-good job
+                   # only, not granted workflow-wide (every job, including preflight which
+                   # handles dispatch inputs, would otherwise get a token that can push/overwrite
+                   # images).
   id-token: write  # For Azure OIDC login
+  actions: read    # t/4194 SO C1: `gh run list` in the cross-workflow wait-gate step
+  issues: write    # t/4242 SO C2: ops-alert issue when the post-deploy AC2 check fails after the existing rollback gates
 
+# t/4194: SO C1 (p/682#16) — a SHARED concurrency group across both workflows was tried first, but
+# a GitHub Actions concurrency group only holds ONE pending run: a third arrival (prod running,
+# staging queued, a second prod dispatch arrives) REPLACES the queued one, silently dropping it —
+# trading the original race for a different silent-drop bug. Reverted to this workflow's own group
+# (self-serializes repeat dispatches of THIS workflow only); cross-workflow mutual exclusion is now
+# the explicit "Wait for a concurrent staging deploy" step below, not a shared GH-native group.
 concurrency:
   group: deploy-${{ inputs.environment }}
-  cancel-in-progress: true
+  # SO C1c (p/682#20): with per-workflow groups, a pending-run replacement only ever drops an
+  # OLDER run of THIS SAME workflow, which is what we want — so cancel-in-progress:false is safe
+  # and avoids cancelling a live Bicep apply or traffic shift mid-flight.
+  cancel-in-progress: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/taxonomy-editor
+  IMAGE_NAME: ai-rosetta-stone/taxonomy-editor
   RESOURCE_GROUP: ai-triad
   CONTAINER_APP_NAME: taxonomy-editor
 
 jobs:
   preflight:
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # SO C2 (t/4194): the `concurrency:` group is workflow-level, so this job
+                         # holds the shared slot too, before `deploy` even starts.
     outputs:
-      tag: ${{ steps.resolve_tag.outputs.tag }}
+      image_ref: ${{ steps.resolve_digest.outputs.image_ref }}
+      digest: ${{ steps.resolve_digest.outputs.digest }}
     steps:
       - name: Reject staging dispatches
         if: inputs.environment == 'staging'
@@ -76,57 +105,75 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
 
-      - name: Resolve image tag
-        id: resolve_tag
+      - name: Refuse to deploy without a complete IDENTITY_MAP (t/4326)
+        # An unset map deploys as '' and the ExpectedEnvVars gate stays green (it expects ''),
+        # while the smoke account loses read-only and the PI's GitHub loses admin: a silent
+        # fail-open. Fail closed here, before any Azure change (TL p/404#119).
+        shell: pwsh
         env:
-          INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
+          IDENTITY_MAP_VALUE: ${{ vars.IDENTITY_MAP }}
+        run: ./operations/devops/azure/Assert-IdentityMapConfigured.ps1 -Value $env:IDENTITY_MAP_VALUE -Mode Fail
+
+      - name: Resolve image digest from per-SHA tag (t/3679 — never :latest)
+        id: resolve_digest
+        shell: pwsh
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          if [ -n "$INPUT_IMAGE_TAG" ]; then
-            # M14: allowlist image_tag before writing to GITHUB_OUTPUT.
-            # Rejects shell metacharacters, $() subexpressions, newlines, etc.
-            # Static error message — never echo the raw input (newline = command injection).
-            if [[ ! "$INPUT_IMAGE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
-              echo "::error::image_tag is invalid — must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
-              exit 1
-            fi
-            echo "tag=$INPUT_IMAGE_TAG" >> $GITHUB_OUTPUT
-          else
-            TAG="${GITHUB_REF_NAME#v}"
-            if [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-              echo "tag=$TAG" >> $GITHUB_OUTPUT
-            else
-              echo "tag=latest" >> $GITHUB_OUTPUT
-            fi
-          fi
+          # t/3679 conditions 2/4/7: resolve the deploy commit's PERMANENT `sha-<commit>` tag to its
+          # immutable @sha256 digest (the TESTED artifact) — NEVER :latest. Fail-closed: empty / invalid /
+          # not-found / ambiguous each ABORT here with an actionable message (Resolve-ImageDigest.ps1),
+          # so this step also IS the image-existence gate (it throws when the tag is absent — replacing
+          # the old "Verify container image exists" step).
+          #
+          # SECURITY — M14 (.orca/docs/security-analysis-2026-08-12.md), BOTH halves, because this sink is
+          # in preflight BEFORE the production approval gate with workflow-level id-token: write:
+          #   (a) env-indirection — $INPUT_SHA is read from env, NEVER interpolated into the script text,
+          #       so an Actions-expression payload in `inputs.sha` cannot inject.
+          #   (b) allowlist — reject anything but a hex commit SHA up front (below). `sha` REPLACES
+          #       `image_tag`, whose M14 fix used env-indirection + a value allowlist; a SHA admits the
+          #       tighter ^[0-9a-fA-F]{7,40}$. Static error, never echo the raw value (M14: a newline could
+          #       inject a workflow command). This also gives an HONEST failure — a malformed sha dies here
+          #       saying so, not deep in the resolver as ImageTagNotFound or as a mangled gh-api query.
+          if ($env:INPUT_SHA -notmatch '^[0-9a-fA-F]{7,40}$') {
+            Write-Host "::error::sha input is invalid — it must be a hex commit SHA matching ^[0-9a-fA-F]{7,40}$. Dispatch with -f sha=<commit>."
+            exit 1
+          }
+          & ./operations/devops/Resolve-ImageDigest.ps1 -Sha $env:INPUT_SHA -GitHubOutput
 
       - name: Verify container-relevant CI passed for this commit
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          DEPLOY_SHA: ${{ inputs.sha }}
         run: |
-          echo "Checking CI status for ${{ github.sha }}..."
+          # t/3679: verify CI for the DEPLOYED commit (inputs.sha), not github.sha (the dispatch HEAD,
+          # which can differ from what we're deploying). $DEPLOY_SHA is validated upstream by the
+          # resolve_digest step (^[0-9a-fA-F]{7,40}$) and read from env, not interpolated inline.
+          echo "Checking CI status for ${DEPLOY_SHA}..."
 
           # Get the latest CI run for this commit (or its nearest ancestor).
           # Docs-only pushes to main are intentionally skipped by ci.yml paths-ignore
-          # (**.md, docs/**, deploy/azure/runbooks/**), so HEAD may have no CI run.
+          # (**.md, docs/**, deploy/azure/runbooks/**), so the commit may have no CI run.
           # Walk back up to 10 commits to find the last green ancestor — safe because
           # docs-only commits cannot affect the container image.
-          COMMITS=$(gh api "repos/${{ github.repository }}/commits?sha=${{ github.sha }}&per_page=10" \
+          COMMITS=$(gh api "repos/${GH_REPO}/commits?sha=${DEPLOY_SHA}&per_page=10" \
             --jq '.[].sha' 2>/dev/null || echo "")
           RUN_ID=""
           for COMMIT in $COMMITS; do
-            RUN_ID=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=${COMMIT}&per_page=1" \
+            RUN_ID=$(gh api "repos/${GH_REPO}/actions/workflows/ci.yml/runs?head_sha=${COMMIT}&per_page=1" \
               --jq '.workflow_runs[0].id // empty' 2>/dev/null || echo "")
             if [ -n "$RUN_ID" ]; then
-              if [ "$COMMIT" != "${{ github.sha }}" ]; then
-                echo "HEAD ${{ github.sha }} has no CI run (docs-only skip). Using ancestor ${COMMIT} (run ${RUN_ID})."
+              if [ "$COMMIT" != "${DEPLOY_SHA}" ]; then
+                echo "Commit ${DEPLOY_SHA} has no CI run (docs-only skip). Using ancestor ${COMMIT} (run ${RUN_ID})."
               fi
               break
             fi
           done
 
           if [ -z "$RUN_ID" ]; then
-            echo "::error::No CI run found for commit ${{ github.sha }} or recent ancestors. CI must run before deploying."
+            echo "::error::No CI run found for commit ${DEPLOY_SHA} or recent ancestors. CI must run before deploying."
             exit 1
           fi
 
@@ -148,7 +195,10 @@ jobs:
           # when no container-relevant files changed, meaning the deployed image is identical
           # to the last image that DID pass the container tests.
           for JOB in test-container; do
-            STATUS=$(gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs" \
+            # --paginate + per_page=100: the jobs API returns 30 per page by default and CI has
+            # more than 30 jobs (35 on 2026-10-06), so an unpaginated lookup could not see
+            # test-container and refused every deploy as "not found".
+            STATUS=$(gh api --paginate "repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100" \
               --jq ".jobs[] | select(.name == \"${JOB}\") | .conclusion // .status" 2>/dev/null || echo "")
             if [ "$STATUS" = "success" ] || [ "$STATUS" = "skipped" ]; then
               echo "  ${JOB}: ${STATUS}"
@@ -165,61 +215,164 @@ jobs:
           done
           echo "Container-relevant CI passed for this commit"
 
-      - name: Verify container image exists
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          Import-Module ./scripts/AITriad/AITriad.psm1 -Force
-          $Tag = "${{ steps.resolve_tag.outputs.tag }}"
-          Write-Host "Checking for image ghcr.io/${{ github.repository_owner }}/taxonomy-editor:$Tag..."
-          $Images = Get-TaxEditorImage -Last 100
-          $AllTags = @($Images | ForEach-Object { $_.Tags })
-          if ($AllTags -contains $Tag) {
-            Write-Host "Container image tag '$Tag' exists in GHCR"
-          } else {
-            Write-Host "::error::Container image tag '$Tag' not found in GHCR. Run the Container Image workflow first."
-            Write-Host "Available tags: $(($AllTags | Select-Object -First 5) -join ', ')"
-            exit 1
-          }
+      # NOTE (t/3679): "Verify container image exists" was REMOVED — the resolve_digest step above
+      # already fails-closed if the per-SHA tag is absent (it throws in Resolve-ImageDigest.ps1),
+      # so image existence is proven by successful digest resolution. A separate tag-existence check
+      # would be redundant and would reintroduce a `:latest`/tag-name code path this change retires.
 
   deploy:
     needs: [preflight]
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
+    timeout-minutes: 45  # SO C2 (t/4194, p/682#16): without this, a hung deploy holds the shared
+                         # concurrency group for up to GitHub's 6h default, blocking the other
+                         # workflow for the same window. 45m is generous over this job's observed
+                         # real runtime (health checks + smoke + persona matrix all have their own
+                         # shorter internal timeouts already).
+    outputs:
+      # t/4170: exposed so the separate tag-known-good job (packages:write, SO C3) can gate on
+      # the same success condition as the in-job post-deploy steps, without needing packages:write
+      # itself or re-running the gates.
+      image_accepted: ${{ steps.acceptance.outputs.accepted }}
+      persona_accepted: ${{ steps.persona.outputs.accepted }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+        with:
+          fetch-depth: 0  # t/4194: full history, so the refuse-older-than-running guard's
+                           # `git merge-base --is-ancestor` below can actually see both commits.
 
-      - name: Resolve image tag
-        id: resolve_tag
+      - name: Wait for a concurrent staging deploy to finish (t/4194 SO C1)
+        shell: pwsh
         env:
-          INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          if [ -n "$INPUT_IMAGE_TAG" ]; then
-            # M14: allowlist image_tag before writing to GITHUB_OUTPUT (same guard as preflight).
-            if [[ ! "$INPUT_IMAGE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
-              echo "::error::image_tag is invalid — must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
-              exit 1
-            fi
-            echo "tag=$INPUT_IMAGE_TAG" >> $GITHUB_OUTPUT
-          else
-            # Use the git tag name if triggered from a tag context, else 'latest'
-            TAG="${GITHUB_REF_NAME#v}"
-            if [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-              echo "tag=$TAG" >> $GITHUB_OUTPUT
-            else
-              echo "::warning::No explicit tag provided and not on a version ref — falling back to 'latest'"
-              echo "tag=latest" >> $GITHUB_OUTPUT
-            fi
-          fi
-          echo "Deploying image tag: $(cat $GITHUB_OUTPUT | grep tag= | cut -d= -f2)"
+          # t/4194 SO C1 (p/682#16, p/682#20): this workflow's Bicep apply reconciles BOTH the
+          # prod and staging Container Apps in one shot (t/2049/t/2047 landmine) — including
+          # re-pinning staging's traffic from a value captured BEFORE the apply. If
+          # deploy-staging.yml is concurrently mutating the staging app (new revision, traffic
+          # promote), this apply can stomp that promotion with its stale pre-apply capture, or
+          # vice versa. A single shared GH concurrency group was tried first and rejected: it
+          # holds only ONE pending run, so a third trigger silently REPLACES (drops) the queued
+          # one instead of serializing.
+          #
+          # SO C1a: a naive symmetric gate (both workflows wait for "any in-progress other-workflow
+          # run") deadlocks into the exact failure it's meant to prevent — a run sitting in ITS OWN
+          # wait step is itself in_progress, so two near-simultaneous dispatches see each other,
+          # both wait out the full budget, and both proceed together. Fixed by ORDER, not
+          # symmetry: wait only for an other-workflow run STARTED BEFORE this run. Exactly one of
+          # any two near-simultaneous runs then waits.
+          #
+          # SO C1e: `createdAt`/`created_at` is NOT re-set on a re-run — a `gh run rerun` of an old
+          # staging run would keep its original (old) timestamp and so never be seen as "earlier"
+          # than a genuinely later-dispatched prod run, defeating the order check on exactly
+          # staging's own recovery path. Use `startedAt` (gh run list) / `run_started_at` (API) —
+          # both ARE re-set on a re-run — instead.
+          #
+          # SO C1b: budgets are tied to the OTHER job's own timeout-minutes, with asymmetric
+          # failure modes. Prod waits up to staging's job timeout (30m = deploy-staging.yml's
+          # `timeout-minutes: 30`) and then FAILS OPEN (warns, proceeds) — prod is not held
+          # hostage to a hung staging run. (Staging's own gate, in deploy-staging.yml, waits up to
+          # PROD's 45m timeout and fails CLOSED — see that file for the asymmetric rationale.)
+          #
+          # SO C1d: a failed/empty `gh run list` is NOT the same as "zero other runs" — treat it as
+          # BUSY (keep polling) rather than proceeding, so a persistently unreachable API fails
+          # open/closed at the budget (per C1b), never on the first blip.
+          #
+          # RESIDUAL VECTOR (named, not closed; SO-accepted at p/682#20): this is TOCTOU, not a
+          # lock — a deploy-staging.yml run that starts in the instant after this poll's last
+          # check is not caught. Only an actual mutex (e.g. a blob lease, t/4179) closes that.
+          $MaxWaitSeconds = 1800  # SO C1b: matches deploy-staging.yml job's timeout-minutes: 30
+          $PollIntervalSeconds = 20
+          $Elapsed = 0
+          $OwnStartedAt = gh api "repos/$env:GH_REPO/actions/runs/$env:GITHUB_RUN_ID" --jq '.run_started_at'
+          if (-not $OwnStartedAt) {
+            Write-Host "::warning::t/4194 guard: could not resolve this run's own run_started_at via the API — skipping the order check (fail-open)."
+          } else {
+            while ($true) {
+              $Raw = gh run list --repo $env:GH_REPO --workflow deploy-staging.yml --status in_progress --json databaseId,startedAt 2>$null
+              $ApiOk = -not ($null -eq $Raw -or $Raw -eq '')
+              if ($ApiOk) {
+                $Others = @($Raw | ConvertFrom-Json)
+                $Earlier = @($Others | Where-Object { [datetimeoffset]$_.startedAt -lt [datetimeoffset]$OwnStartedAt })
+              } else {
+                # SO C1d: unknown, NOT zero — fall through to the elapsed/poll logic below as "busy".
+                $Earlier = $null
+              }
+              if ($ApiOk -and $Earlier.Count -eq 0) {
+                Write-Host "No EARLIER in-progress deploy-staging.yml run — proceeding."
+                break
+              }
+              if ($Elapsed -ge $MaxWaitSeconds) {
+                if ($ApiOk) {
+                  Write-Host "::warning::t/4194 guard: an earlier deploy-staging.yml run is still in progress after ${MaxWaitSeconds}s — proceeding anyway (fail-open, SO C1b; do not hold prod deploys hostage to a hung/long staging run)."
+                } else {
+                  Write-Host "::warning::t/4194 guard: 'gh run list' for deploy-staging.yml kept failing for ${MaxWaitSeconds}s — proceeding anyway (fail-open, SO C1b/C1d)."
+                }
+                break
+              }
+              if ($ApiOk) {
+                Write-Host "$($Earlier.Count) earlier deploy-staging.yml run(s) still in progress — waiting ${PollIntervalSeconds}s (elapsed ${Elapsed}s/${MaxWaitSeconds}s)..."
+              } else {
+                Write-Host "::warning::t/4194 guard: 'gh run list' for deploy-staging.yml returned nothing this poll (API error or rate limit) — treating as busy, not clear (SO C1d); retrying in ${PollIntervalSeconds}s..."
+              }
+              Start-Sleep -Seconds $PollIntervalSeconds
+              $Elapsed += $PollIntervalSeconds
+            }
+          }
+
+      - name: Show resolved image (digest-pinned, from preflight)
+        run: |
+          # t/3679: the immutable @sha256 ref was resolved + verified in preflight (resolve_digest).
+          # The deploy job consumes it via job output — no re-resolution, no tag/:latest code path here.
+          echo "Deploying digest-pinned image: ${{ needs.preflight.outputs.image_ref }}"
 
       - name: Log in to Azure
-        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c  # v3
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906  # v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Check sign-in secret drift (warn-only — t/4288)
+        # t/4288: this deploy is about to re-apply AAD/Google/GitHub client secrets from these
+        # GitHub Actions secrets. If the live container-app copy was changed by hand since the
+        # last deploy (the 2026-10-19 incident), this deploy would silently revert it. Never
+        # reads a value to a log — reads the live secret, masks it immediately, compares SHA-256
+        # hashes only. Warn-only: promotion to blocking is a separate T2 decision.
+        # SO C1 (e/320): checks BOTH taxonomy-editor and taxonomy-editor-staging by default — a
+        # single main.bicep apply writes both (same secret names, same Entra app registration;
+        # this is exactly what broke staging on 2026-10-19), regardless of which environment this
+        # job run targets.
+        shell: pwsh
+        continue-on-error: true
+        env:
+          AAD_CLIENT_SECRET: ${{ secrets.AAD_CLIENT_SECRET }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          # t/4418: the SAME source the Bicep apply writes (githubClientSecret below). GitHub forbids
+          # repo secret names starting GITHUB_, so secrets.GITHUB_CLIENT_SECRET was always empty and
+          # this step silently skipped GitHub on every deploy.
+          GH_OAUTH_CLIENT_SECRET: ${{ secrets.GH_OAUTH_CLIENT_SECRET }}
+        run: |
+          ./operations/devops/Test-SignInSecretDrift.ps1 `
+            -ResourceGroup '${{ env.RESOURCE_GROUP }}' `
+            -DeploySourceValues @{
+              'aad-client-secret'    = $env:AAD_CLIENT_SECRET
+              'google-client-secret' = $env:GOOGLE_CLIENT_SECRET
+              'github-client-secret' = $env:GH_OAUTH_CLIENT_SECRET
+            }
+
+      - name: Validate auth config — tokenStore safety (warn-only — t/4133)
+        # t/4133: tokenStore.enabled=true with no blob backing causes HTTP 500 for all signed-in
+        # users on replica recycle or platform roll (t/4132 incident). Checks live Azure state
+        # (not just the template) so ad-hoc CLI drift is also caught. Warn-only until
+        # gate-promotion flip PR; blocking upgrade is T2 (gate flip, separate PR).
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          ./operations/devops/Invoke-TokenStoreGateCheck.ps1 `
+            -ContainerAppName '${{ env.CONTAINER_APP_NAME }}' `
+            -ResourceGroup    '${{ env.RESOURCE_GROUP }}'
 
       - name: Capture current active revisions (traffic-pin + rollback targets)
         id: current_revision
@@ -253,14 +406,65 @@ jobs:
           Write-Host "Prod pin / rollback target: '$ProdRev'"
           Write-Host "Staging pin target:         '$StagingRev'"
 
-      - name: Preview Bicep changes (what-if)
+      - name: Refuse to deploy a commit older than the one running in prod (t/4194 prevention)
+        shell: pwsh
+        env:
+          # workflow-lint: direct ${{ inputs.* }} in run block content requires env: indirection
+          # (M14 shell-injection pattern, same convention as resolve_digest's INPUT_SHA above).
+          PROD_REV: ${{ steps.current_revision.outputs.revision }}
+          INPUT_SHA: ${{ inputs.sha }}
         run: |
+          # t/4194: the 10-14 rollback incident deployed an older commit over a newer one because
+          # a stale local state check was trusted instead of re-reading the live revision. This
+          # guard makes that class impossible at the workflow level: refuse the deploy outright if
+          # the requested SHA isn't a descendant of (or equal to) the SHA already running in prod.
+          # Decision logic lives in Get-DeployAgeVerdict.ps1 (Pester-tested) — SO C3 (p/682#16): a
+          # git ERROR exit code (merge-base can exit >1, e.g. 128, on a bad ref) must NOT be read the
+          # same as exit 1 ("confirmed not an ancestor"); only this step does the actual git calls.
+          Import-Module ./scripts/AITriad/AITriad.psm1 -Force -ErrorAction SilentlyContinue
+          . ./operations/devops/Get-DeployAgeVerdict.ps1
+          $ProdRev = $env:PROD_REV
+          $Requested = $env:INPUT_SHA
+          $ExitCode = $null
+          if ($ProdRev -match '--deploy-([0-9a-f]{7,40})-') {
+            $RunningFull = git rev-parse "$($Matches[1])^{commit}" 2>$null
+            if ($RunningFull) {
+              git merge-base --is-ancestor $RunningFull $Requested
+              $ExitCode = $LASTEXITCODE
+            }
+          }
+          $Verdict = Get-DeployAgeVerdict -ProdRevisionName $ProdRev -MergeBaseExitCode $ExitCode
+          switch ($Verdict.Action) {
+            'refuse' {
+              Write-Host "::error::t/4194 guard: refusing to deploy $Requested — it is NOT a descendant of the commit already running in prod (revision '$ProdRev', short SHA $($Verdict.RunningShort)). Deploying it would roll prod backward. If this is a deliberate rollback, use the rollback procedure (docs/runbooks), not a forward deploy."
+              exit 1
+            }
+            'warn-proceed' {
+              Write-Host "::warning::t/4194 guard: $($Verdict.Reason) — skipping the older-than-running check (fail-open)."
+            }
+            default {
+              Write-Host "t/4194 guard: $($Verdict.Reason) — proceeding."
+            }
+          }
+
+      - name: Preview Bicep changes (what-if)
+        env:
+          # t/4326: passed through env (not inlined) so bash never interprets the value.
+          IDENTITY_MAP_VALUE: ${{ vars.IDENTITY_MAP }}
+        run: |
+          # t/4326: legacy names may contain spaces (quoted below) but never quote/shell
+          # characters — arm-deploy re-tokenises its parameter string on double quotes, and the
+          # ExpectedEnvVars gate embeds the value in a PowerShell single-quoted literal.
+          if printf '%s' "$IDENTITY_MAP_VALUE" | grep -q "[\"'\`\$]"; then
+            echo "::error::vars.IDENTITY_MAP contains a quote, backtick or \$ — not supported (t/4326)."
+            exit 1
+          fi
           echo "Previewing infrastructure changes..."
           RESULT=$(az deployment group what-if \
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --template-file deploy/azure/main.bicep \
             --parameters \
-              containerImage=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.resolve_tag.outputs.tag }} \
+              containerImage=${{ needs.preflight.outputs.image_ref }} \
               trafficPinRevisionName=${{ steps.current_revision.outputs.revision }} \
               trafficPinRevisionNameStaging=${{ steps.current_revision.outputs.staging_revision }} \
               googleClientId=${{ secrets.GOOGLE_CLIENT_ID }} \
@@ -270,6 +474,7 @@ jobs:
               authDisabled=${{ inputs.auth_mode == 'disabled' && '1' || '' }} \
               authOptional=${{ inputs.auth_mode == 'optional' && '1' || '' }} \
               adminUsers=${{ vars.ADMIN_USERS }} \
+              identityMap="$IDENTITY_MAP_VALUE" \
               aadClientId=${{ secrets.AAD_CLIENT_ID }} \
               aadClientSecret=${{ secrets.AAD_CLIENT_SECRET }} \
               aadIssuer=common \
@@ -283,6 +488,7 @@ jobs:
               geminiPaidKey=${{ secrets.GEMINI_PAID_KEY }} \
               budgetAlertEmail=${{ vars.ALERT_EMAIL }} \
               stagingSharedReadOnly=${{ inputs.staging_shared_read_only == 'true' && 'true' || 'false' }} \
+              stagingLoadTestSize=${{ inputs.staging_load_test_size == 'true' && 'true' || 'false' }} \
             --no-pretty-print 2>&1) || true
           echo "$RESULT"
 
@@ -306,7 +512,7 @@ jobs:
           resourceGroupName: ${{ env.RESOURCE_GROUP }}
           template: deploy/azure/main.bicep
           parameters: >-
-            containerImage=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.resolve_tag.outputs.tag }}
+            containerImage=${{ needs.preflight.outputs.image_ref }}
             googleClientId=${{ secrets.GOOGLE_CLIENT_ID }}
             googleClientSecret=${{ secrets.GOOGLE_CLIENT_SECRET }}
             githubClientId=${{ secrets.GH_OAUTH_CLIENT_ID }}
@@ -314,6 +520,7 @@ jobs:
             authDisabled=${{ inputs.auth_mode == 'disabled' && '1' || '' }}
             authOptional=${{ inputs.auth_mode == 'optional' && '1' || '' }}
             adminUsers=${{ vars.ADMIN_USERS }}
+            identityMap="${{ vars.IDENTITY_MAP }}"
             aadClientId=${{ secrets.AAD_CLIENT_ID }}
             aadClientSecret=${{ secrets.AAD_CLIENT_SECRET }}
             aadIssuer=common
@@ -329,12 +536,23 @@ jobs:
             trafficPinRevisionName=${{ steps.current_revision.outputs.revision }}
             trafficPinRevisionNameStaging=${{ steps.current_revision.outputs.staging_revision }}
             stagingSharedReadOnly=${{ inputs.staging_shared_read_only == 'true' && 'true' || 'false' }}
+            stagingLoadTestSize=${{ inputs.staging_load_test_size == 'true' && 'true' || 'false' }}
 
       # NOTE: the current active revision is now captured BEFORE the Bicep apply
       # (see "Capture current active revisions" above) so it can be passed as the
       # traffic pin. steps.current_revision.outputs.revision remains the rollback
       # target below — and, with the pin, that revision holds 100% throughout the
       # deploy, so it can never drop to 0% / go stale / be GC'd mid-deploy (t/2047).
+
+      - name: Validate auth config — tokenStore safety post-apply (warn-only — t/4133)
+        # Second check: verifies the DEPLOYED state, not just the pre-apply live state.
+        # Catches a Bicep template that re-enables tokenStore without backing (t/4132).
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          ./operations/devops/Invoke-TokenStoreGateCheck.ps1 `
+            -ContainerAppName '${{ env.CONTAINER_APP_NAME }}' `
+            -ResourceGroup    '${{ env.RESOURCE_GROUP }}'
 
       # SYNC WITH main.bicep: analyticsContainer, stagingAnalyticsContainer,
       # userContentContainer, stagingUserContentContainer, communityContainer,
@@ -363,18 +581,65 @@ jobs:
         shell: pwsh
         run: |
           Import-Module ./scripts/AITriad/AITriad.psm1 -Force
+          . ./operations/devops/Get-RevisionDeactivationVerdict.ps1
           Write-Host "Deactivating stale revisions to free resources..."
           # t/2050: NEVER deactivate the captured rollback target. With the t/2049
           # pin it stays at 100% (not stale) so it should never appear here, but we
           # guard explicitly so no reorder or transient split can strand the
           # rollback target the way t/2047 did.
+          #
+          # t/4242: a sibling bug in deploy-staging.yml deactivated the revision traffic was
+          # pinned to. Get-ContainerAppRevision -Mode Stale already filters trafficWeight==0, but
+          # that's exactly the single live read t/4242 showed can be stale (Azure read-after-write
+          # propagation lag, t/4242#1) — a revision's `trafficWeight` is itself DERIVED from the
+          # app's ingress traffic config, so re-reading the same derived field alone (SO review,
+          # p/682#33) isn't enough. Every candidate that survives the cheap name-based exclusion
+          # below gets a fresh re-check against BOTH independently-sourced inputs — `revision
+          # show`'s own trafficWeight AND a fresh read of the ingress traffic config (the routing
+          # source) — immediately before the actual deactivate call. (No -ServingRevisionName
+          # here, unlike staging: this step runs BEFORE this run's own new revision is deployed —
+          # steps.new_revision hasn't executed yet — so there is no "this run's serving revision"
+          # to exclude by name yet. $Protected, the already-serving rollback target, is the only
+          # name-based guard that applies here.)
           $Protected = @('${{ steps.current_revision.outputs.revision }}') | Where-Object { $_ }
           $Stale = @(Get-ContainerAppRevision -Mode Stale `
             -AppName '${{ env.CONTAINER_APP_NAME }}' `
             -ResourceGroup '${{ env.RESOURCE_GROUP }}')
           foreach ($Rev in $Stale) {
             if ($Protected -contains $Rev.Name) {
-              Write-Host "Skipping protected rollback target: $($Rev.Name)"
+              Write-Host "Skipping $($Rev.Name): name-excluded (protected rollback target), no Azure call needed"
+              continue
+            }
+            # Raw `az` call, NOT Get-ContainerAppRevision -Mode Fqdn: that cmdlet initialises
+            # TrafficWeight=0 when the field is absent (SO review key risk #3) — exactly what C3
+            # must NOT do. Read the raw JSON and apply our own null-safe extraction instead.
+            $FreshRaw = az containerapp revision show `
+              --name '${{ env.CONTAINER_APP_NAME }}' -g '${{ env.RESOURCE_GROUP }}' --revision $Rev.Name `
+              -o json | ConvertFrom-Json
+            $App = az containerapp show --name '${{ env.CONTAINER_APP_NAME }}' -g '${{ env.RESOURCE_GROUP }}' -o json `
+              | ConvertFrom-Json
+            $TrafficEntries = $null
+            $LatestRevisionName = $null
+            if ($App.PSObject.Properties['properties']) {
+              if ($App.properties.PSObject.Properties['configuration'] -and
+                  $App.properties.configuration.PSObject.Properties['ingress'] -and
+                  $App.properties.configuration.ingress.PSObject.Properties['traffic']) {
+                $TrafficEntries = @($App.properties.configuration.ingress.traffic)
+              }
+              if ($App.properties.PSObject.Properties['latestRevisionName']) {
+                $LatestRevisionName = $App.properties.latestRevisionName
+              }
+            }
+            $Ingress = Get-IngressTrafficWeightForRevision -RevisionName $Rev.Name `
+              -TrafficEntries $TrafficEntries -LatestRevisionName $LatestRevisionName
+            $FreshWeight = if ($FreshRaw.properties.PSObject.Properties['trafficWeight']) { $FreshRaw.properties.trafficWeight } else { $null }
+            $FreshActive = if ($FreshRaw.properties.PSObject.Properties['active']) { [bool]$FreshRaw.properties.active } else { $false }
+            $FreshVerdict = Get-RevisionDeactivationVerdict -RevisionName $Rev.Name `
+              -TrafficWeight $FreshWeight -Active $FreshActive `
+              -IngressWeight $Ingress.IngressWeight -IsLatestRevisionWithTraffic $Ingress.IsLatestRevisionWithTraffic `
+              -ProtectedNames $Protected
+            if ($FreshVerdict.Action -ne 'deactivate') {
+              Write-Host "Skipping $($Rev.Name) on fresh re-check: $($FreshVerdict.Reason)"
               continue
             }
             Disable-ContainerAppRevision -RevisionName $Rev.Name `
@@ -386,19 +651,63 @@ jobs:
       - name: Deploy new revision (0% traffic)
         id: new_revision
         shell: pwsh
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+          IMAGE_REF: ${{ needs.preflight.outputs.image_ref }}
+          RESOLVED_DIGEST: ${{ needs.preflight.outputs.digest }}
         run: |
           Import-Module ./scripts/AITriad/AITriad.psm1 -Force
-          $ShortSha = '${{ github.sha }}'.Substring(0, 7)
+          # t/3679: deploy the DIGEST-PINNED ref (…@sha256:<digest>), not a tag — a pod recycle re-pulls
+          # IDENTICAL bytes. DEPLOY_SHA and the revision suffix encode the DEPLOYED commit ($INPUT_SHA),
+          # NOT github.sha (the dispatch HEAD, which can differ — the t/3278/t/3110 misleading-marker trap).
+          # IMAGE_DIGEST + IMAGE_DEPLOYED_AT are stamped as env for the DETECT half (ServerAPI surfaces them
+          # on /health, t/3679#7). IMAGE_DEPLOYED_AT is DEPLOY-time (not container start) so a recycle WITHOUT
+          # a deploy shows the SAME timestamp — the out-of-band-revision-creation signal (condition 6).
+          # DEPLOY_TAG carries the per-SHA tag for continuity (the resolved artifact reference).
+          $ShortSha = $env:INPUT_SHA.Substring(0, [Math]::Min(7, $env:INPUT_SHA.Length))
           $Epoch = ([string]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()))[-5..-1] -join ''
           $Suffix = "deploy-$ShortSha-$Epoch"
+          $DeployedAt = [DateTimeOffset]::UtcNow.ToString('o')
           $Result = New-ContainerAppRevision `
-            -ImageRef '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.resolve_tag.outputs.tag }}' `
+            -ImageRef $env:IMAGE_REF `
             -RevisionSuffix $Suffix `
-            -EnvVars @{ DEPLOY_SHA = '${{ github.sha }}'; DEPLOY_TAG = '${{ steps.resolve_tag.outputs.tag }}' } `
+            -EnvVars @{
+              DEPLOY_SHA        = $env:INPUT_SHA
+              DEPLOY_TAG        = "sha-$($env:INPUT_SHA)"
+              IMAGE_DIGEST      = $env:RESOLVED_DIGEST
+              IMAGE_DEPLOYED_AT = $DeployedAt
+            } `
             -AppName '${{ env.CONTAINER_APP_NAME }}' `
             -ResourceGroup '${{ env.RESOURCE_GROUP }}'
           Add-Content -Path $env:GITHUB_OUTPUT -Value "suffix=$Suffix"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "revision=$($Result.RevisionName)"
+
+      - name: Assert revision is digest-pinned to the intended image (t/3679 condition 3)
+        shell: pwsh
+        env:
+          EXPECTED_REF: ${{ needs.preflight.outputs.image_ref }}
+        run: |
+          # t/3679 §5 established ACA rejects an UNRESOLVABLE digest at provision time (New-ContainerAppRevision
+          # above would already have thrown, atomically). This step covers the OTHER case condition 3 names —
+          # a resolvable-but-WRONG digest — by asserting the created revision's resolved image ref EQUALS the
+          # intended @sha256 ref (VALUE equality, per condition 3 "compare the value, not the form" — an
+          # @sha256-shape check would pass on the wrong digest). Fail-closed: a mismatch or a Failed
+          # provisioning state ABORTS here, before any traffic shift. (Readiness is gated by the health
+          # check below; this asserts identity, not liveness.)
+          $Rev = '${{ steps.new_revision.outputs.revision }}'
+          $Info = az containerapp revision show `
+            --name '${{ env.CONTAINER_APP_NAME }}' -g '${{ env.RESOURCE_GROUP }}' --revision $Rev `
+            --query '{prov:properties.provisioningState, image:properties.template.containers[0].image}' -o json | ConvertFrom-Json
+          Write-Host "New revision $Rev — provisioningState=$($Info.prov) image=$($Info.image)"
+          if ($Info.prov -eq 'Failed') {
+            Write-Host "::error::t/3679: new revision provisioningState is 'Failed' — NOT proceeding (fail-closed)."
+            exit 1
+          }
+          if ($Info.image -ne $env:EXPECTED_REF) {
+            Write-Host "::error::t/3679: new revision image '$($Info.image)' != intended '$($env:EXPECTED_REF)' — digest-pin MISMATCH, NOT proceeding (fail-closed)."
+            exit 1
+          }
+          Write-Host "t/3679 assert OK: revision is digest-pinned to '$($env:EXPECTED_REF)' (value-equal), provisioningState=$($Info.prov)."
 
       - name: Health check new revision
         id: health_check
@@ -415,17 +724,38 @@ jobs:
 
           $BaseUrl = if ([string]::IsNullOrWhiteSpace($RevFqdn)) { "${{ steps.deploy.outputs.appUrl }}" } else { "https://$RevFqdn" }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "base_url=$BaseUrl"
-          # Unified check (t/1495): server-up (/health) and data-loaded (/healthz)
-          # in one probe per attempt, instead of two sequential phases with
-          # separate budgets. 42 attempts x 10s = 7 min, matching the prior
-          # combined worst-case budget (5 min server-start + 2 min data-load).
-          # -TimeoutSec 15 preserves the original curl --max-time 15 protection
-          # against Envoy 504 gateway hangs turning this into a multi-hour wait.
-          $Result = Test-TaxEditorHealth -BaseUrl $BaseUrl -TimeoutSec 15 -MaxAttempts 42 -RetryIntervalSec 10
+          # SO C1 (t/4513, e/364#2): base_url falls back to the APP url (the OLD, still-serving
+          # revision) when the revision-specific FQDN lookup returns nothing. The mount probe below
+          # must never reuse that fallback — probing the app url would hit the sibling revision's
+          # already-warm mount and pass on attempt 1, vacuously, which is exactly the t/4504 shape
+          # (looks healthy, isn't the revision being deployed). is_revision_url says whether base_url
+          # is actually revision-specific.
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "is_revision_url=$(-not [string]::IsNullOrWhiteSpace($RevFqdn))"
 
-          if ($Result.Healthy) {
+          # Unified check (t/1495): server-up (/health) and data-loaded (/healthz) in one probe per round.
+          # t/4158: a bounded loop that also reads the revision's own state and log, so a revision that can
+          # never start (ActivationFailed, or the GitHub App token-mint 404 of the 2026-10-12 attempt 2) fails
+          # on the first round that shows it, with the cause named, instead of holding the job for 20+ min.
+          # The 7-minute wall clock matches the prior combined budget (5 min server start + 2 min data load).
+          # -TimeoutSec 15 keeps the protection against Envoy 504 gateway hangs.
+          # The loop lives in Wait-RevisionActivation (unit-tested; shared with deploy-staging.yml, SO C3).
+          . ./operations/devops/Get-RevisionActivationVerdict.ps1
+          $Rev     = '${{ steps.new_revision.outputs.revision }}'
+          $App     = '${{ env.CONTAINER_APP_NAME }}'
+          $Rg      = '${{ env.RESOURCE_GROUP }}'
+          $Verdict = Wait-RevisionActivation -TimeoutSeconds 420 -IntervalSeconds 15 `
+            -GetState   { az containerapp revision show -n $App -g $Rg --revision $Rev --query '{r:properties.runningState,h:properties.healthState}' -o json 2>$null | ConvertFrom-Json } `
+            -GetLogTail { (az containerapp logs show -n $App -g $Rg --revision $Rev --tail 60 --format text 2>$null) -join "`n" } `
+            -Probe      { Test-TaxEditorHealth -BaseUrl $BaseUrl -TimeoutSec 15 -MaxAttempts 1 }
+          $Result      = $Verdict.Result
+          $LastRefusal = $Verdict.LastRefusal   # SO C2: named if the step times out
+
+          if ($Verdict.Verdict -eq 'healthy') {
             Add-Content -Path $env:GITHUB_OUTPUT -Value "healthy=true"
             Write-Host "Health check passed — server up and taxonomy data loaded"
+          } elseif ($Verdict.Verdict -eq 'failed') {
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "healthy=false"
+            Write-Host "::error::Revision $Rev cannot start ($($Verdict.Cause)): $($Verdict.Message)"
           } else {
             Add-Content -Path $env:GITHUB_OUTPUT -Value "healthy=false"
             $ServerCheck = $Result.Checks | Where-Object { $_.Endpoint -eq '/health' }
@@ -437,11 +767,100 @@ jobs:
             } else {
               Write-Host "::error::Health check failed for an unexpected reason"
             }
+            if ($LastRefusal) {
+              Write-Host "::error::Last GitHub refusal seen in the revision log: $LastRefusal (transient refusals are not fatal on their own; t/4158 SO C1/C2)"
+            }
           }
+
+          # t/4249: exit 0 UNCONDITIONALLY — SO C1 (p/682#40): this step is designed to always
+          # report step-success and carry the real signal through steps.health_check.outputs.healthy
+          # only. "Collect failure diagnostics" (below) has no always(), so if THIS step reports
+          # failure, GitHub's implicit success() ANDs into that condition and skips it — losing the
+          # diagnostics on exactly the runs that need them. Get-HealthCheckExitCode (returns 1 on a
+          # non-healthy verdict) belongs to the staging step, which has no such downstream step to
+          # break. Never call it here. The fix for 39061815653 is `exit 0` always reaching this
+          # line cleanly — never a leftover $LASTEXITCODE from a native call made above.
+          exit 0
+
+      - name: Mount readiness probe (t/4513)
+        # t/4513 (TL design review, t/4513#1, head c469a125): /health and /healthz (the health check
+        # above) don't read any arbitrary taxonomy file, so they passed cleanly on revision `-10951`
+        # (t/4504) -- health passed at 10:36:38, the smoke failed at 10:36:47, while the failing
+        # reads happened 49-90s after revision creation. A brand-new replica's Azure Files
+        # (azureFile) SMB mount attach has a short propagation window the health check cannot see.
+        # Bounded retry (Get-MountReadinessVerdict.ps1) closes that gap before the smoke runs: a
+        # transient attach race clears within the bound; a real missing/broken mount does not, and
+        # fails the deploy the same way an unhealthy health check does (t/4249 — no silent skip).
+        # Runs only when the health check itself passed; a failed health check already fails the
+        # deploy on its own.
+        #
+        # TL condition 1: budget >= 120s (observed window was 49-90s) -- 13 attempts x 10s = 130s.
+        # TL condition 2: probe exactly what -10951's smoke failed on (/api/taxonomy/accelerationist,
+        # /api/entities, /api/organizations), using the SAME success test the smoke's data-presence
+        # phase uses (Invoke-SmokeDataPresencePhase / Test-DataPresenceAssertion: anonymous session,
+        # application/json, > 0 rows) -- not a bare HTTP 200, which a JSON `[]`/interstitial would
+        # pass despite carrying no usable data.
+        id: mount_probe
+        if: steps.health_check.outputs.healthy == 'true'
+        shell: pwsh
+        run: |
+          Import-Module ./scripts/AITriad/AITriad.psm1 -Force
+          . ./operations/devops/Get-MountReadinessVerdict.ps1
+
+          # SO C1 (t/4513, e/364#2): fail closed when health_check couldn't resolve a
+          # revision-specific FQDN. base_url would then be the APP url, which routes to the OLD,
+          # still-serving revision -- probing it would pass on attempt 1 against the sibling's
+          # already-warm mount, vacuously, the exact t/4504 shape (looks healthy, isn't this
+          # revision). Never probe the fallback; name the cause and stop before probing.
+          if ('${{ steps.health_check.outputs.is_revision_url }}' -ne 'true') {
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "ready=false"
+            Write-Host "::error::Mount readiness probe: no revision-specific FQDN was resolved for this revision -- base_url would fall back to the app url (the OLD serving revision), which this probe refuses to test. Treating as not-ready (fail-closed, SO C1, t/4513)."
+            exit 0
+          }
+
+          $BaseUrl = '${{ steps.health_check.outputs.base_url }}'
+          $RevisionCreatedAt = Get-Date  # closest available proxy; the step runs immediately after revision creation
+
+          $Routes = @(
+            @{ Path = '/api/entities';                  Field = '';      Label = 'entities' }
+            @{ Path = '/api/organizations';             Field = '';      Label = 'organizations' }
+            @{ Path = '/api/taxonomy/accelerationist';  Field = 'nodes'; Label = 'taxonomy nodes' }
+          )
+          $Probe = {
+            try {
+              $DataSession = New-AnonymousWebSession -BaseUrl $BaseUrl -TimeoutSec 15
+              foreach ($R in $Routes) {
+                $Params = @{ BaseUrl = $BaseUrl; Path = $R.Path; Method = 'GET'; TimeoutSec = 15; ExpectJson = $true }
+                if ($DataSession) { $Params.Session = $DataSession }
+                $Check  = Invoke-RemoteCheck @Params
+                $Assert = Test-DataPresenceAssertion -Body $Check.Body -ContentType $Check.ContentType `
+                  -CountField $R.Field -Label $R.Label
+                if (-not $Assert.Pass) {
+                  Write-Host "mount-readiness probe: $($R.Label) not ready — $($Assert.Reason)"
+                  return $false
+                }
+              }
+              return $true
+            } catch {
+              Write-Host "mount-readiness probe error (treated as not-ready): $($_.Exception.Message)"
+              return $false
+            }
+          }
+          $Verdict = Wait-MountReady -Probe $Probe -MaxAttempts 13 -IntervalSeconds 10
+          $ElapsedSec = [math]::Round(((Get-Date) - $RevisionCreatedAt).TotalSeconds, 1)
+          if ($Verdict.Verdict -eq 'ready') {
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "ready=true"
+            Write-Host "Mount readiness probe passed after $($Verdict.Attempts) attempt(s), ~${ElapsedSec}s since this step started — post this on t/4513 (TL condition 3, live-fire)"
+          } else {
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "ready=false"
+            Write-Host "::error::Mount readiness probe failed after $($Verdict.Attempts) attempt(s) (~${ElapsedSec}s) — entities/organizations/taxonomy never all returned real data. See t/4504/t/4513."
+          }
+          $global:LASTEXITCODE = 0
+          exit 0
 
       - name: Acceptance tests — full smoke (pre-traffic shift)
         id: acceptance
-        if: steps.health_check.outputs.healthy == 'true'
+        if: steps.health_check.outputs.healthy == 'true' && steps.mount_probe.outputs.ready == 'true'
         shell: pwsh
         run: |
           Import-Module ./scripts/AITriad/AITriad.psm1 -Force
@@ -574,10 +993,12 @@ jobs:
               WEBSITE_AUTH_ENABLED               = 'true'
               HOME                               = '/home/aitriad'
               AI_TRIAD_DATA_ROOT                 = '/mnt/shared'
-              TAXONOMY_CACHE_DIR                 = '/mnt/shared'
+              TAXONOMY_CACHE_DIR                 = '/home/aitriad/.cache/taxonomy-github-api'  # t/4298/t/4299/t/4300 — deliberately NOT /mnt/shared, see main.bicep baseEnv comment
+              MAX_REPLICAS                       = '1'  # t/4176 — must equal main.bicep maxReplicas (AI RPM + rate limits divide by it)
               AUTH_OPTIONAL                      = '${{ inputs.auth_mode == 'optional' && '1' || '' }}'
               AUTH_DISABLED                      = '${{ inputs.auth_mode == 'disabled' && '1' || '' }}'
               ADMIN_USERS                        = '${{ vars.ADMIN_USERS }}'
+              IDENTITY_MAP                       = '${{ vars.IDENTITY_MAP }}'  # t/4326 — must match main.bicep baseEnv (identityMap param)
               GIT_SYNC_ENABLED                   = '1'
               GITHUB_REPO                        = '${{ vars.SYNC_GITHUB_REPO }}'
               GITHUB_APP_ID                      = '${{ vars.SYNC_GITHUB_APP_ID }}'
@@ -586,8 +1007,15 @@ jobs:
               AZURE_KEYVAULT_URL                 = '${{ steps.deploy.outputs.keyVaultUri }}'
               AZURE_STORAGE_ACCOUNT_URL          = '${{ steps.deploy.outputs.storageAccountBlobUrl }}'
               EMBEDDING_WORKER_OFFLOAD           = '1'  # t/3165 durable close — gate verifies the offload flag is deployed
-              GROUNDING_RECONCILE_INLINE         = '1'  # t/3163 G8a — gate verifies the staged inline-reconcile flag is deployed
-              GROUNDING_SWEEP_ENABLED            = '1'  # t/3163 G8b — gate verifies the staged sweep-enable flag is deployed
+              EMBEDDING_WORKER_POOL_SIZE         = '1'  # t/4263 SO C3 — one worker at 1.5 vCPU; must match main.bicep baseEnv
+              OVERLAY_CONFLICT_STATE_ENABLED     = '1'  # t/4312/#3467, PI-approved (p/331#2174) — gate verifies the overlay-conflict fence is armed
+              READ_ONLY_PRINCIPALS               = 'github:ai-triad-smoke,github:github-344897154'  # t/4296 G1 + t/4326 SO C2 — smoke stays read-only mapped or unmapped; must match main.bicep baseEnv
+              # GROUNDING_RECONCILE_INLINE removed (t/4298): gated on the grounding_reconcile_inline
+              # feature flag, which is OFF — G8a has never run, the env var is read by nothing.
+              # GROUNDING_SWEEP_ENABLED removed (t/4298): the sweep is unconditionally refused on
+              # hosted (t/3333 guard, decideSweepArm -> 'blocked-github-api'), so this gate was
+              # certifying a flag that could only ever no-op. See main.bicep's baseEnv comment.
+              # DATA_ROOT_VALIDATION_ENFORCE retired in t/3309 step-3 — /readyz warm-gate replaces the boot hard-fail (co-landed with the server.ts exit(1) removal).
             } `
             -CheckFirewall `
             -StorageAccountName '${{ steps.deploy.outputs.storageAccountName }}' `
@@ -655,7 +1083,7 @@ jobs:
       - name: Collect failure diagnostics
         # t/3148: warm_gate is a peer failure trigger — a warm-timeout (warm=='false') collects
         # diagnostics on the same footing as an acceptance/persona failure.
-        if: steps.health_check.outputs.healthy != 'true' || steps.acceptance.outputs.accepted == 'false' || steps.persona.outputs.accepted == 'false' || steps.warm_gate.outputs.warm == 'false'
+        if: steps.health_check.outputs.healthy != 'true' || steps.mount_probe.outputs.ready == 'false' || steps.acceptance.outputs.accepted == 'false' || steps.persona.outputs.accepted == 'false' || steps.warm_gate.outputs.warm == 'false'
         continue-on-error: true
         shell: pwsh
         run: |
@@ -676,15 +1104,15 @@ jobs:
           else { Write-Host '(no system logs available)' }
 
       - name: Re-authenticate before rollback
-        if: always() && (steps.health_check.outputs.healthy != 'true' || steps.acceptance.outputs.accepted == 'false' || steps.persona.outputs.accepted == 'false' || steps.warm_gate.outputs.warm == 'false') && steps.current_revision.outputs.revision != ''
-        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c  # v3
+        if: always() && (steps.health_check.outputs.healthy != 'true' || steps.mount_probe.outputs.ready == 'false' || steps.acceptance.outputs.accepted == 'false' || steps.persona.outputs.accepted == 'false' || steps.warm_gate.outputs.warm == 'false') && steps.current_revision.outputs.revision != ''
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906  # v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Rollback on failure
-        if: always() && (steps.health_check.outputs.healthy != 'true' || steps.acceptance.outputs.accepted == 'false' || steps.persona.outputs.accepted == 'false' || steps.warm_gate.outputs.warm == 'false') && steps.current_revision.outputs.revision != ''
+        if: always() && (steps.health_check.outputs.healthy != 'true' || steps.mount_probe.outputs.ready == 'false' || steps.acceptance.outputs.accepted == 'false' || steps.persona.outputs.accepted == 'false' || steps.warm_gate.outputs.warm == 'false') && steps.current_revision.outputs.revision != ''
         shell: pwsh
         run: |
           Import-Module ./scripts/AITriad/AITriad.psm1 -Force
@@ -709,9 +1137,171 @@ jobs:
           exit 1
 
       - name: Fail if unhealthy (no previous revision to rollback to)
-        if: (steps.health_check.outputs.healthy != 'true' || steps.acceptance.outputs.accepted == 'false' || steps.persona.outputs.accepted == 'false' || steps.warm_gate.outputs.warm == 'false') && steps.current_revision.outputs.revision == ''
+        if: (steps.health_check.outputs.healthy != 'true' || steps.mount_probe.outputs.ready == 'false' || steps.acceptance.outputs.accepted == 'false' || steps.persona.outputs.accepted == 'false' || steps.warm_gate.outputs.warm == 'false') && steps.current_revision.outputs.revision == ''
         run: |
           echo "::error::Health check failed and no previous revision exists for rollback"
+          exit 1
+
+      - name: Earlier-rollback signal (t/4309 C1)
+        # The EXACT SAME expression the "Rollback on failure" step's own `if:` uses (plus the
+        # current_revision guard that step also requires) -- never a separate guess, per the SO
+        # condition. If this is true, that step has ALREADY shifted traffic back and disabled the
+        # new revision before AC2 even runs below (AC2's own `if:` is only acceptance/persona,
+        # not health_check/warm_gate -- SO key risk #1, the gap in the original proposal).
+        id: earlier_rollback
+        if: always()
+        run: |
+          echo "fired=${{ (steps.health_check.outputs.healthy != 'true' || steps.mount_probe.outputs.ready == 'false' || steps.acceptance.outputs.accepted == 'false' || steps.persona.outputs.accepted == 'false' || steps.warm_gate.outputs.warm == 'false') && steps.current_revision.outputs.revision != '' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Post-deploy verification — serving revision active + /health 200 (t/4242 AC2)
+        id: ac2
+        if: steps.acceptance.outputs.accepted == 'true' && steps.persona.outputs.accepted == 'true'
+        shell: pwsh
+        env:
+          CHECK_REVISION: ${{ steps.earlier_rollback.outputs.fired == 'true' && steps.current_revision.outputs.revision || steps.new_revision.outputs.revision }}
+        run: |
+          # t/4309: if an earlier gate already rolled back, AC2 must check the REVISION THAT'S
+          # ACTUALLY SERVING NOW (current_revision, restored), not new_revision (inactive/disabled
+          # by that rollback) -- otherwise this always reports "failed" post-rollback, every time.
+          Set-StrictMode -Version Latest
+          $Rev = $env:CHECK_REVISION
+          $Info = az containerapp revision show `
+            --name '${{ env.CONTAINER_APP_NAME }}' -g '${{ env.RESOURCE_GROUP }}' --revision $Rev `
+            --query '{active:properties.active,weight:properties.trafficWeight}' -o json | ConvertFrom-Json
+          $Reason = $null
+          if (-not [bool]$Info.active) {
+            $Reason = "serving revision '$Rev' is NOT active after deploy"
+          } elseif ([int]$Info.weight -ne 100) {
+            # SO C4: 100 assumes no canary split (two revisions both > 0% at once) — true today.
+            # If canary deploys are introduced, this check needs to change to "the expected split",
+            # not a flat 100.
+            $Reason = "serving revision '$Rev' traffic weight is $($Info.weight), not 100"
+          } else {
+            Import-Module ./scripts/AITriad/AITriad.psm1 -Force
+            $Health = Test-TaxEditorHealth -BaseUrl '${{ steps.deploy.outputs.appUrl }}' -TimeoutSec 15 -MaxAttempts 3 -RetryIntervalSec 10
+            if (-not $Health.Healthy) {
+              $Reason = "/health did not return a healthy 200 after deploy. Detail: $($Health | ConvertTo-Json -Depth 3 -Compress)"
+            }
+          }
+          if ($Reason) {
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "failed=true"
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "reason=$Reason"
+            Write-Host "::error::t/4242 AC2 FAILED: $Reason"
+          } else {
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "failed=false"
+            Write-Host "t/4242 AC2 verified: '$Rev' active at weight 100, /health 200"
+          }
+
+      - name: AC2 rollback verdict (t/4309 C1)
+        id: ac2_verdict
+        if: always() && steps.ac2.outputs.failed == 'true'
+        shell: pwsh
+        run: |
+          . ./operations/devops/Get-PostDeployRollbackVerdict.ps1
+          $v = Get-PostDeployRollbackVerdict -Ac2Failed $true `
+            -EarlierRollbackFired ('${{ steps.earlier_rollback.outputs.fired }}' -eq 'true') `
+            -IsPostRollbackRecheck $false
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "action=$($v.Action)"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "reason=$($v.Reason)"
+          Write-Host "::notice::t/4309 AC2 rollback verdict: $($v.Action) — $($v.Reason)"
+
+      - name: Re-authenticate before AC2 rollback (t/4309)
+        if: always() && steps.ac2_verdict.outputs.action == 'rollback'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906  # v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Rollback for AC2 failure (t/4309 C2, C3a)
+        # SO review (e/361#2, C3a): the actual Azure calls live in Invoke-Ac2Rollback.ps1 now,
+        # not inline here -- so this step is the SAME code the -DryRun live proof (t/4309#7)
+        # exercised, not a copy of it. This step also absorbs what used to be the separate
+        # "AC2 recheck after rollback" step -- the script does both in one call.
+        id: ac2_rollback
+        if: always() && steps.ac2_verdict.outputs.action == 'rollback'
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $result = ./operations/devops/Invoke-Ac2Rollback.ps1 `
+            -TargetRevision '${{ steps.current_revision.outputs.revision }}' `
+            -NewRevisionToDisable '${{ steps.new_revision.outputs.revision }}' `
+            -AppUrl '${{ steps.deploy.outputs.appUrl }}' `
+            -AppName '${{ env.CONTAINER_APP_NAME }}' `
+            -ResourceGroup '${{ env.RESOURCE_GROUP }}'
+          # SO review (e/361#5, C5): the output-writing itself is extracted and Pester-tested
+          # (operations/devops/Write-Ac2RollbackOutput.ps1) -- RecheckFailed is $null on the
+          # unrecoverable-target and catch paths, and a bare .ToString() on that throws under
+          # Set-StrictMode, which would have made every unrecoverable rollback LOOK like a
+          # script crash instead of writing the real reason.
+          . ./operations/devops/Write-Ac2RollbackOutput.ps1
+          Write-Ac2RollbackOutput -Result $result -OutputPath $env:GITHUB_OUTPUT
+          # Never fail this step's own exit code on a bad outcome -- the sev-1 step (gated on
+          # these outputs, plus `steps.ac2_rollback.outcome == 'failure'` as a last-resort
+          # catch-all) is what alerts + exits 1. Invoke-Ac2Rollback.ps1 itself only throws on a
+          # truly unexpected condition outside its own try/catch (e.g. the script file missing).
+
+      - name: AC2 recheck verdict (t/4309 C1)
+        id: ac2_recheck_verdict
+        if: always() && steps.ac2_rollback.outcome == 'success' && steps.ac2_rollback.outputs.target_unrecoverable == 'false'
+        shell: pwsh
+        run: |
+          . ./operations/devops/Get-PostDeployRollbackVerdict.ps1
+          $v = Get-PostDeployRollbackVerdict -Ac2Failed ('${{ steps.ac2_rollback.outputs.recheck_failed }}' -eq 'true') `
+            -EarlierRollbackFired $false -IsPostRollbackRecheck $true
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "action=$($v.Action)"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "reason=$($v.Reason)"
+
+      - name: Ops-alert — AC2 rollback succeeded (t/4309, informational)
+        if: always() && steps.ac2_verdict.outputs.action == 'rollback' && steps.ac2_recheck_verdict.outputs.action == 'none'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REV: ${{ steps.new_revision.outputs.revision }}
+          RESTORED: ${{ steps.current_revision.outputs.revision }}
+          REASON: ${{ steps.ac2_verdict.outputs.reason }}
+        run: |
+          set -uo pipefail
+          gh label create "prod-ac2-alert" --color B60205 --description 'Prod post-deploy serving-revision check failed (t/4242 AC2)' --force >/dev/null 2>&1 || true
+          TITLE="⚠️ Prod AC2 failed on $REV — auto-rolled back to $RESTORED"
+          BODY=$(printf '**t/4242 AC2 check failed; t/4309 auto-rollback fired and succeeded.**\n\n- Failed revision: `%s`\n- Restored revision: `%s` (recheck passed)\n- Reason: %s\n- Run: %s/%s/actions/runs/%s\n\nProd is healthy again on the prior revision. Investigate why `%s` failed AC2 before redeploying it.' "$REV" "$RESTORED" "$REASON" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$REV")
+          EXISTING=$(gh issue list --label "prod-ac2-alert" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --label "prod-ac2-alert,alert-escalated" --body "$BODY"
+          fi
+          echo "::error::t/4242 AC2 failed, t/4309 rollback succeeded — $REASON"
+          exit 1
+
+      - name: Sev-1 alert — AC2 failure could not be resolved by rollback (t/4309)
+        # Fires when: (a) AC2 failed with an earlier gate having already rolled back this run, or
+        # (b) the AC2-triggered rollback's own recheck still fails, or (c) the rollback target
+        # itself couldn't be reactivated, or (d) the recheck STEP ITSELF failed (an az error or
+        # timeout, distinct from "ran clean and found the revision unhealthy") -- SO review
+        # (e/360#5): without arm (d), a failing recheck step means ac2_recheck_verdict is skipped
+        # (its `if:` needs outcome == 'success'), so NEITHER alert path fires and the job goes red
+        # with no alert issue at all -- the exact "silent red" shape this session's own
+        # gate-signal-integrity fixes exist to close. In every case, rolling back again would not
+        # help -- a revision rollback can't fix an app-level cause (authConfig/ingress/secrets, SO
+        # key risk #3), so the message says so explicitly to stop a responder from re-attempting it.
+        if: always() && (steps.ac2_verdict.outputs.action == 'stop-alert-sev1' || steps.ac2_recheck_verdict.outputs.action == 'stop-alert-sev1' || steps.ac2_rollback.outputs.target_unrecoverable == 'true' || steps.ac2_rollback.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REV: ${{ steps.new_revision.outputs.revision }}
+          CURRENT: ${{ steps.current_revision.outputs.revision }}
+          REASON: ${{ steps.ac2_recheck_verdict.outputs.reason || steps.ac2_verdict.outputs.reason }}
+        run: |
+          set -uo pipefail
+          gh label create "prod-ac2-sev1" --color B60205 --description 'Prod AC2 failure unresolved by rollback (t/4309) -- sev-1' --force >/dev/null 2>&1 || true
+          TITLE="🚨 SEV-1: Prod AC2 failed and rollback did not resolve it ($REV)"
+          BODY=$(printf '**t/4309: AC2 failed and an automatic rollback could not resolve it. Traffic is left as-is.**\n\n- New revision: `%s`\n- Current/rollback-target revision: `%s`\n- Reason: %s\n- Run: %s/%s/actions/runs/%s\n\n**A revision rollback was attempted (or was already attempted by an earlier gate) and did not fix this.** The cause is likely app-level (authConfig, ingress, secrets) rather than something a revision rollback reverts -- do not re-attempt a rollback without investigating first. Verify prod state directly (production-release.md).\n\n**t/4492: this is a real AC2 failure.** Per the mandatory-review trigger named in that ticket, this run must be reviewed against the auto-rollback design once resolved -- record the review there.' "$REV" "$CURRENT" "$REASON" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          EXISTING=$(gh issue list --label "prod-ac2-sev1" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --label "prod-ac2-sev1,alert-escalated" --body "$BODY"
+          fi
+          echo "::error::t/4309 SEV-1 — $REASON"
           exit 1
 
       - name: Post-deploy verification (traffic shifted)
@@ -731,3 +1321,107 @@ jobs:
             Write-Host "::warning::Post-deploy smoke had $($Fails.Count) failure(s) — app is live but some endpoints may need attention"
           }
 
+      - name: Prod/staging digest parity (warn-only, t/4194 prevention item 3)
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          ./operations/devops/Test-ProdStagingDigestParity.ps1 `
+            -ProdApp '${{ env.CONTAINER_APP_NAME }}' `
+            -StagingApp '${{ env.CONTAINER_APP_NAME }}-staging' `
+            -ResourceGroup '${{ env.RESOURCE_GROUP }}'
+
+      - name: ALLOWED_ORIGINS matches each app's own ingress FQDN (warn-only, t/4407 — SO follow-up to #3665)
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          ./operations/devops/Test-AllowedOriginsFqdnParity.ps1 `
+            -Apps '${{ env.CONTAINER_APP_NAME }}', '${{ env.CONTAINER_APP_NAME }}-staging' `
+            -ResourceGroup '${{ env.RESOURCE_GROUP }}'
+
+
+  # ── tag-known-good: t/4170 ask 2 ──────────────────────────────────────────
+  # Set-TaxEditorKnownGood was manual-only and never actually run, consistently, across the org
+  # move — so the documented known-good rollback (Restore-TaxEditorKnownGood) had no target
+  # (t/4170 ask 1, confirmed not a cleanup bug: Remove-StaleContainerImages only deletes
+  # UNTAGGED versions). This job makes it part of every successful deploy instead of a manual
+  # step nobody remembers to run.
+  #
+  # SO C3 (t/4170, p/682#28): a SEPARATE job, not a step in `deploy`, so packages:write (needed
+  # to PUT the known-good tag via the GHCR OCI API) is scoped to only the one job that needs it —
+  # NOT granted workflow-wide to every job, including `preflight`, which handles dispatch inputs.
+  #
+  # Gated on deploy's own success + the same acceptance/persona outputs the in-job post-deploy
+  # steps use (exposed via `deploy`'s `outputs:` block, SO C3), so this never runs on a deploy
+  # that didn't actually promote traffic.
+  tag-known-good:
+    needs: [preflight, deploy]
+    runs-on: ubuntu-latest
+    # t/4273: same environment as `deploy`, so azure/login presents the environment OIDC subject
+    # the federated credential matches. Without it the subject is ref-form and login fails AADSTS700213.
+    # If `production` ever gains required reviewers, this job will wait for its own second approval.
+    environment: ${{ inputs.environment }}
+    # Flipped on (t/4091 digest's own "then runs warn-only" plan): C1 (the cmdlet fix, PR #3340,
+    # p/682#28) merged 2026-10-17 03:18Z. Caught by Azure (p/241#64) via health-monitor's
+    # known-good-liveness job correctly reporting "missing" since 04:55Z — not a wiring bug, the
+    # disable switch was simply never removed after its own trigger condition landed. Checkable
+    # fact, acted on directly (Pre-Authorized-Trigger Discipline).
+    if: needs.deploy.result == 'success' && needs.deploy.outputs.image_accepted == 'true' && needs.deploy.outputs.persona_accepted == 'true'
+    timeout-minutes: 10
+    continue-on-error: true  # SO C3: a checkout/login/module-import failure must not fail the
+                              # job and turn an otherwise-successful deploy run red.
+    permissions:
+      # SO C3: job-level `permissions:` REPLACES the workflow-level set, it does not merge with
+      # it — `packages: write` alone would leave this job with no `id-token`/`contents`, and
+      # azure/login (OIDC) would fail. All three are required here.
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+
+      - name: Log in to Azure
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906  # v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set known-good image tag and assert it resolves to the deployed digest
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DEPLOYED_IMAGE_REF: ${{ needs.preflight.outputs.image_ref }}
+        run: |
+          # WARN-ONLY (continue-on-error on the job's only real step, via try/catch + exit 0
+          # below): a GHCR tagging hiccup here must never redden an otherwise-successful deploy.
+          # t/4170 ask 3 (Worker, health-monitor.yml) is the liveness backstop that alerts if
+          # known-good goes missing or stale across real deploys — that is the mechanism that
+          # catches a PERSISTENT failure of this step, not this step's own exit code.
+          #
+          # SO C1 (owner: PowerShell, scripts/AITriad/Public/Set-TaxEditorKnownGood.ps1, tracked
+          # separately): the cmdlet must select the 100%-traffic revision (not Active[0], which is
+          # order-dependent across a 0%/100% split) and handle digest refs (prod deploys by
+          # digest, t/3679) by fetching the manifest BY DIGEST rather than treating the raw hex as
+          # a tag name. Until that lands, this step's try/catch below is expected to warn on every
+          # run — tracked on t/4170, not silently masked here.
+          Import-Module ./scripts/AITriad/AITriad.psm1 -Force
+          $DeployedDigest = ($env:DEPLOYED_IMAGE_REF -split '@')[-1]
+          try {
+            $Result = Set-TaxEditorKnownGood -ResourceGroup '${{ env.RESOURCE_GROUP }}' -AppName '${{ env.CONTAINER_APP_NAME }}' -Confirm:$false
+
+            # SO C2: assert known-good resolves to the digest actually serving traffic — "any
+            # known-good exists" can't fail and proves nothing (e.g. a stale prior tag surviving
+            # a failed PUT would pass that check).
+            $Check = @(Get-TaxEditorImage -Last 20 | Where-Object { $_.IsKnownGood })
+            if ($Check.Count -eq 0) {
+              Write-Host "::warning::t/4170: known-good was set (cmdlet returned $($Result | ConvertTo-Json -Compress)) but no image reports IsKnownGood on re-check (GHCR propagation lag, or a real failure)."
+            } elseif ($Check[0].Digest -ne $DeployedDigest) {
+              Write-Host "::warning::t/4170: known-good resolves to $($Check[0].Digest), which does NOT match the digest serving 100% traffic ($DeployedDigest)."
+            } else {
+              Write-Host "t/4170: known-good resolves to the deployed digest ($DeployedDigest) — confirmed."
+            }
+          } catch {
+            Write-Host "::warning::t/4170: Set-TaxEditorKnownGood failed: $($_.Exception.Message) — deploy succeeded, but the known-good rollback target was NOT updated this deploy."
+          }

@@ -52,6 +52,7 @@ import {
   shouldFirePolicyChallenge,
   detectCruxFocusTrigger,
   buildCruxFocusInterventionText,
+  getFocusedIds,
 } from './moderator.js';
 
 import {
@@ -66,6 +67,7 @@ import {
   formatUnansweredClaimsHint,
   formatSpecifyHint,
 } from './argumentNetwork.js';
+import { effectiveCamp } from './argumentNetwork/utils.js';
 
 import { parseAIJson } from './helpers.js';
 import { parseJsonRobust, formatRecentTranscript, getMoveName } from './helpers.js';
@@ -74,7 +76,8 @@ import type { TurnPipelineInput } from './turnPipeline.js';
 import type { GenerateOptions } from './aiAdapter.js';
 import { validateTurn, resolveTurnValidationConfig } from './turnValidator.js';
 import { getGlobalRecorder } from '../flight-recorder/index.js';
-import { resolveBackend } from '../ai-client/registry.js';
+import { applyEngineFloor, checkModeratorDormancy, recordEnginePin } from './moderatorEngineTriggers.js';
+import { inferBackend } from '../ai-client/registry.js';
 import { DEFAULT_TEMPERATURE } from '../ai-client/defaults.js';
 import { runPropositionalGate } from './revoiceGate.js';
 
@@ -82,7 +85,8 @@ const SLOW_BACKEND_TIMEOUT_MS = 180_000;
 const DEFAULT_TIMEOUT_MS = 60_000;
 
 function moderatorTimeoutMs(model: string): number {
-  const backend = resolveBackend(model);
+  // An estimate, so an unknown id gets the default timeout rather than throwing (t/4101).
+  const backend = inferBackend(model);
   return backend === 'deepseek' ? SLOW_BACKEND_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
 }
 
@@ -236,7 +240,7 @@ function buildQbafContext(an: { nodes: ArgumentNetworkNode[]; edges: ArgumentNet
       const unscoredTag = n.scoring_method === 'unscored' ? ' [unscored]' : '';
       const bdiTag = n.bdi_category ? ` ${n.bdi_category[0].toUpperCase()}` : '';
       const confTag = n.bdi_confidence != null && n.bdi_confidence < 0.5 ? ' [low-confidence]' : '';
-      return `- ${n.id} (${poverInfo[n.speaker]?.label ?? n.speaker},${bdiTag}, strength ${n.computed_strength!.toFixed(2)}${unscoredTag}${confTag}): ${n.text}`;
+      return `- ${n.id} (${poverInfo[effectiveCamp(n)]?.label ?? effectiveCamp(n)},${bdiTag}, strength ${n.computed_strength!.toFixed(2)}${unscoredTag}${confTag}): ${n.text}`;
     }).join('\n');
 }
 
@@ -388,6 +392,19 @@ export async function runModeratorSelection(
   const concludingTarget = phase === 'concluding' && input.dialecticalStyle !== 'socratic'
     ? getConcludingResponder(modState, activePovers, transcript as TranscriptEntry[])
     : null;
+
+  if (phase === 'concluding' && input.dialecticalStyle !== 'socratic') {
+    const commitReceivedBy = [...new Set(modState.intervention_history.filter(h => h.move === 'COMMIT').map(h => h.target))];
+    getGlobalRecorder()?.record({
+      type: 'debate.closure_eligible', component: 'orchestration', level: 'info',
+      message: `closure_eligible: ${commitReceivedBy.length}/${activePovers.length} povers committed`,
+      data: {
+        commit_received_by: commitReceivedBy,
+        total_povers: activePovers.length,
+        eligible: concludingTarget === null,
+      },
+    });
+  }
 
   let responder: Exclude<SpeakerId, 'user'> | null = null;
   let focusPoint = 'Continue the discussion';
@@ -569,55 +586,63 @@ export async function runModeratorSelection(
       ? detectCruxFocusTrigger(input.cruxTracker, round, modState, activePovers, input.claimTexts)
       : null;
     if (cruxCandidate) {
-      const targetPov = cruxCandidate.speakersInvolved[0] as Exclude<SpeakerId, 'user'>;
-      responder = targetPov;
-      focusPoint = `Address this unresolved crux directly: ${cruxCandidate.description}`;
-      addressing = targetPov;
-      selectionResultObj = {
-        responder: targetPov,
-        addressing: targetPov as SpeakerId,
-        focus_point: focusPoint,
-        agreement_detected: false,
-        intervene: true,
-        suggested_move: 'CRUX_FOCUS' as InterventionMove,
-        target_debater: targetPov,
-        trigger_reasoning: `CRUX_FOCUS: ${cruxCandidate.disagreementType} crux "${cruxCandidate.description}" engaged for ${cruxCandidate.roundsEngaged} rounds without resolution`,
-      };
-      engineValidation = validateRecommendation(selectionResultObj as SelectionResult, modState);
-      if (engineValidation.proceed) {
-        const interventionText = buildCruxFocusInterventionText(
-          cruxCandidate, poverInfo[targetPov]?.label ?? targetPov,
-        );
-        activeIntervention = buildIntervention(
-          engineValidation, interventionText,
-          `CRUX_FOCUS: ${cruxCandidate.disagreementType} crux engaged ${cruxCandidate.roundsEngaged} rounds`,
-          { signal: 'crux_focus_trigger', node_id: cruxCandidate.cruxId, round },
-        );
-        interventionBriefInjection = buildInterventionBriefInjection(
-          activeIntervention, poverInfo[responder]?.label ?? responder,
-        );
-        callbacks.addEntry({
-          type: 'intervention',
-          speaker: 'moderator',
-          content: interventionText,
-          taxonomy_refs: [],
-          addressing: engineValidation.validated_target,
-          intervention_metadata: {
-            family: activeIntervention.family,
-            move: activeIntervention.move,
-            force: activeIntervention.force,
-            burden: activeIntervention.burden,
-            target_debater: activeIntervention.target_debater,
-            trigger_reason: activeIntervention.trigger_reason,
-            source_evidence: activeIntervention.source_evidence,
-          },
-        });
-        // Track this crux as focused — fires at most once per crux
-        modState.crux_focused_ids ??= new Set<string>();
-        modState.crux_focused_ids.add(cruxCandidate.cruxId);
-        callbacks.progress('debate', undefined, `Moderator: CRUX_FOCUS (${cruxCandidate.disagreementType}) → ${poverInfo[targetPov]?.label}`);
+      try {
+        const targetPov = cruxCandidate.speakersInvolved[0] as Exclude<SpeakerId, 'user'>;
+        responder = targetPov;
+        focusPoint = `Address this unresolved crux directly: ${cruxCandidate.description}`;
+        addressing = targetPov;
+        selectionResultObj = {
+          responder: targetPov,
+          addressing: targetPov as SpeakerId,
+          focus_point: focusPoint,
+          agreement_detected: false,
+          intervene: true,
+          suggested_move: 'CRUX_FOCUS' as InterventionMove,
+          target_debater: targetPov,
+          trigger_reasoning: `CRUX_FOCUS: ${cruxCandidate.disagreementType} crux "${cruxCandidate.description}" engaged for ${cruxCandidate.roundsEngaged} rounds without resolution`,
+        };
+        engineValidation = validateRecommendation(selectionResultObj as SelectionResult, modState);
+        if (engineValidation.proceed) {
+          const interventionText = buildCruxFocusInterventionText(
+            cruxCandidate, poverInfo[targetPov]?.label ?? targetPov,
+          );
+          activeIntervention = buildIntervention(
+            engineValidation, interventionText,
+            `CRUX_FOCUS: ${cruxCandidate.disagreementType} crux engaged ${cruxCandidate.roundsEngaged} rounds`,
+            { signal: 'crux_focus_trigger', node_id: cruxCandidate.cruxId, round },
+          );
+          interventionBriefInjection = buildInterventionBriefInjection(
+            activeIntervention, poverInfo[responder]?.label ?? responder,
+          );
+          callbacks.addEntry({
+            type: 'intervention',
+            speaker: 'moderator',
+            content: interventionText,
+            taxonomy_refs: [],
+            addressing: engineValidation.validated_target,
+            intervention_metadata: {
+              family: activeIntervention.family,
+              move: activeIntervention.move,
+              force: activeIntervention.force,
+              burden: activeIntervention.burden,
+              target_debater: activeIntervention.target_debater,
+              trigger_reason: activeIntervention.trigger_reason,
+              source_evidence: activeIntervention.source_evidence,
+            },
+          });
+          // Track this crux as focused — fires at most once per crux.
+          // getFocusedIds normalizes any {} from pre-fix saved sessions before we push.
+          const existingFocused = getFocusedIds(modState);
+          if (!existingFocused.includes(cruxCandidate.cruxId)) existingFocused.push(cruxCandidate.cruxId);
+          modState.crux_focused_ids = existingFocused;
+          callbacks.progress('debate', undefined, `Moderator: CRUX_FOCUS (${cruxCandidate.disagreementType}) → ${poverInfo[targetPov]?.label}`);
+        }
+        return true;
+      } catch (err) {
+        getGlobalRecorder()?.record({ type: 'ai.error', component: 'orchestration', level: 'warn', message: 'Moderator CRUX_FOCUS generation failed', error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack } });
+        callbacks.warn('Moderator CRUX_FOCUS generation', err, 'Proceeding without CRUX_FOCUS intervention');
+        return false;
       }
-      return true;
     }
     return false;
   })()) {
@@ -752,9 +777,19 @@ export async function runModeratorSelection(
         };
       }
 
+      // ── Engine floor + dormancy check (t/3513) — see moderatorEngineTriggers.ts ──
+      selectionResultObj = applyEngineFloor(selectionResultObj, {
+        round, phase, moderatorMode, dialecticalStyle: input.dialecticalStyle,
+        responder: selectionResultObj.responder ?? activePovers[0],
+        convergenceSignals: convergenceSignals ?? [], unansweredLedger: unansweredLedger ?? [],
+        modState, labelOf: id => poverInfo[id]?.label ?? id,
+      });
+      checkModeratorDormancy(modState, phase);
+
       // ── Engine validation (deterministic) ──
       if (selectionResultObj.intervene) {
         engineValidation = validateRecommendation(selectionResultObj as SelectionResult, modState);
+        if (engineValidation.proceed) recordEnginePin(selectionResultObj, modState);
 
         if (engineValidation.proceed) {
           try {

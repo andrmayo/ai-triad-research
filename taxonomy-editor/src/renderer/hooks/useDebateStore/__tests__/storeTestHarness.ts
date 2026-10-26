@@ -17,6 +17,7 @@ import { vi, beforeEach, afterEach } from 'vitest';
 const { mockApi, mockTaxonomyState, mockPromptConfigState } = vi.hoisted(() => {
   const mockApi = {
     generateText: vi.fn().mockResolvedValue({ text: '{}' }),
+    hasApiKey: vi.fn().mockResolvedValue(true),
     generateTextWithSearch: vi.fn().mockResolvedValue({ text: '', searchQueries: [], citations: [] }),
     onGenerateTextProgress: vi.fn().mockReturnValue(() => {}),
     listDebateSessions: vi.fn().mockResolvedValue([]),
@@ -108,6 +109,7 @@ vi.mock('../../../prompts/debate', () => ({
   midDebateGapPrompt: vi.fn().mockReturnValue('mock-gap-prompt'),
   crossCuttingNodePrompt: vi.fn().mockReturnValue('mock-cc-prompt'),
   formatSituationDebateContext: vi.fn().mockReturnValue('mock-situation-context'),
+  situationTopicSynthesisPrompt: vi.fn().mockReturnValue('mock-situation-topic-synthesis-prompt'),
 }));
 
 vi.mock('../../../prompts/argumentNetwork', () => ({
@@ -169,7 +171,10 @@ vi.mock('@lib/debate/nodeIdUtils', () => ({
   nodeTypeFromId: vi.fn().mockReturnValue('pov'),
 }));
 
-vi.mock('@lib/debate/qbaf', () => ({
+// t/4044: partial (real constants such as DEFAULT_ATTACK_WEIGHTS kept) so tests can run the real
+// extractCalibrationData over a created session; the mocked function is unchanged.
+vi.mock(import('@lib/debate/qbaf'), async (importOriginal) => ({
+  ...(await importOriginal()),
   computeQbafStrengths: vi.fn().mockReturnValue({ strengths: new Map() }),
 }));
 
@@ -247,8 +252,19 @@ vi.mock('@lib/debate/turnPipeline', () => ({
   runTurnPipeline: vi.fn().mockResolvedValue({}),
   assemblePipelineResult: vi.fn().mockReturnValue({}),
   runOpeningPipeline: vi.fn().mockResolvedValue({}),
+  // t/3521: clarificationSlice.ts now calls this instead of runOpeningPipeline directly —
+  // the floor + repair-retry sequence moved into lib/debate/turnPipeline/opening.ts, single
+  // source of truth shared with the engine path.
+  runOpeningPipelineWithRepair: vi.fn().mockResolvedValue({}),
   assembleOpeningPipelineResult: vi.fn().mockReturnValue({}),
   getOpeningRepairHints: vi.fn().mockReturnValue([]),
+  // t/3518 Phase 2: openingBriefTimeoutFloor is retired — clarificationSlice.ts now computes
+  // briefTimeoutMs via @lib/ai-client's getModelMinTimeout (a real, unmocked pure function
+  // reading the bundled ai-models.json), so there's no predicate left here to re-implement.
+  // DEFAULT_BRIEF_TIMEOUT_MS is a real constant (not a function) that the slice still imports
+  // from this module — mirror its actual value rather than mask it, or every real import of
+  // it from a mocked module throws "no export defined on the mock" at runtime.
+  DEFAULT_BRIEF_TIMEOUT_MS: 120_000,
 }));
 
 vi.mock('@lib/debate/topicCritique', () => ({
@@ -265,17 +281,24 @@ vi.mock('@lib/debate/topicCritique', () => ({
   formatLineageContext: vi.fn().mockReturnValue(''),
 }));
 
-vi.mock('@lib/debate/prompts', () => ({
+// t/4044: partial (real PROMPT_VERSION kept), as for qbaf above; the mocked prompt builders are unchanged.
+vi.mock(import('@lib/debate/prompts'), async (importOriginal) => ({
+  ...(await importOriginal()),
   decomposeResolutionPrompt: vi.fn().mockReturnValue('mock-decompose-prompt'),
   topicScopeExtractionPrompt: vi.fn().mockReturnValue('mock-scope-prompt'),
   setTopicScope: vi.fn(),
   synthExtractPrompt: vi.fn().mockReturnValue('mock-synth-extract-prompt'),
   synthMapPrompt: vi.fn().mockReturnValue('mock-synth-map-prompt'),
   synthEvaluatePrompt: vi.fn().mockReturnValue('mock-synth-evaluate-prompt'),
+  narrativeVoicingPrompt: vi.fn().mockReturnValue('mock-narrative-voicing-prompt'),
 }));
 
 vi.mock('@lib/debate/phaseTransitions', () => ({
   loadProvisionalWeights: vi.fn().mockReturnValue({}),
+  // t/3937: by default the caps are the preset, so existing loop-count tests keep their meaning.
+  // adaptiveLoopCap.test.ts swaps in the real implementations via vi.importActual.
+  effectiveRoundCap: vi.fn((config: { maxTotalRounds: number }) => config.maxTotalRounds),
+  maxTurnCeiling: vi.fn((config: { maxTotalRounds: number }) => config.maxTotalRounds),
   initPhaseState: vi.fn().mockReturnValue({ current_phase: 'confrontation', rounds_in_phase: 0, total_rounds_elapsed: 0 }),
   evaluatePhaseTransition: vi.fn().mockReturnValue({ action: 'continue', reason: 'test' }),
   advanceRound: vi.fn().mockReturnValue({ current_phase: 'confrontation', rounds_in_phase: 1, total_rounds_elapsed: 1, argumentation_exit_threshold: 0.6, concluding_exit_threshold: 0.7 }),
@@ -393,6 +416,7 @@ vi.stubGlobal('XMLHttpRequest', blockNetwork('XMLHttpRequest'));
 // ── Import the store under test ─────────────────────────────
 
 import { useDebateStore } from '../../useDebateStore';
+import { __resetRunLeasesForTests, __setRunLeaseTimingForTests } from '../shared/debateRunLease';
 
 // ── Helpers ─────────────────────────────────────────────────
 
@@ -459,6 +483,11 @@ function makeSession(overrides: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   resetStore();
+  // Run leases (t/3917) are module state: a lease leaked by one test would refuse the next
+  // test's run. settleMs 0 keeps the cross-window settle window off the timer queue, so
+  // fake-timer suites aren't blocked on it.
+  __resetRunLeasesForTests();
+  __setRunLeaseTimingForTests({ settleMs: 0 });
   idCounter = 0;
   vi.clearAllMocks();
   vi.mocked(generateId).mockImplementation(() => `test-id-${++idCounter}`);

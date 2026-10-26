@@ -26,7 +26,9 @@ JSON output goes to stdout.
 
 import argparse
 import json
+import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -48,6 +50,103 @@ NLI_CONFIDENCE_MARGIN = 1.0
 # Resolved at runtime via --taxonomy-dir or .aitriad.json
 TAXONOMY_DIR: Path = _FALLBACK_TAXONOMY_DIR
 EMBEDDINGS_FILE: Path = _FALLBACK_TAXONOMY_DIR / "embeddings.json"
+# t/3898: the resolved data root (env var / .aitriad.json / fallback), exposed so
+# a parity test can compare it directly against Get-DataRoot (PS).
+DATA_ROOT: Path = _SCRIPT_DIR.parent
+
+
+def _resolve_worktree_main_root(path):
+    """Port of Get-WorktreeMainRoot (PS, t/3869/t/3899): resolve the true
+    main-checkout root for the git worktree containing `path`, via
+    `git rev-parse --git-common-dir`. This returns the main checkout's .git
+    directory regardless of whether `path` is a nested worktree (.worktrees/x,
+    one level too deep for a sibling-relative path like "../ai-triad-data") or a
+    sibling worktree or a plain checkout -- same algorithm as the PS cmdlet, so
+    the two can't silently diverge.
+
+    Returns a resolved Path, or None if unresolvable (git unavailable, or `path`
+    isn't a git checkout at all -- e.g. a PyPI/standalone install). Callers fail
+    over to their own existing anchor in that case.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    common_dir = result.stdout.strip()
+    if not common_dir:
+        return None
+    common_path = Path(common_dir)
+    if not common_path.is_absolute():
+        common_path = (Path(path) / common_path).resolve()
+    return common_path.parent
+
+
+def _resolve_data_root():
+    """Resolve the data root: env var > .aitriad.json > script-parent fallback.
+
+    t/3898: mirrors Get-DataRoot (PS)'s priority exactly (root AGENTS.md, Two-Repo
+    Split) — `embed_taxonomy.py` previously never read `AI_TRIAD_DATA_ROOT` at all,
+    so with the env var set, embeddings silently read a different checkout than
+    every other step. Logs which source won (fallback-path logging, root AGENTS.md).
+
+    t/3899: a relative `data_root` in `.aitriad.json` is now anchored at the true
+    main-checkout root (via `_resolve_worktree_main_root`), not the immediate
+    checkout directory — mirrors Get-DataRoot's t/3869 fix. From a nested worktree
+    (.worktrees/<x>), anchoring at the worktree's own dir is one level too deep for
+    a sibling-relative path, and silently misses the data repo.
+
+    Returns (resolved_path, cfg_dict_or_None). cfg is returned too so the caller can
+    read taxonomy_dir/conflicts_dir without re-reading/re-parsing the file.
+    """
+    config_path = _SCRIPT_DIR.parent / ".aitriad.json"
+    cfg = None
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            cfg = None  # fall through to default
+
+    env_root = os.environ.get("AI_TRIAD_DATA_ROOT", "").strip()
+    if env_root:
+        env_path = Path(env_root)
+        resolved = env_path.resolve() if env_path.exists() else env_path
+        print(f"embed_taxonomy: data root resolved via env:AI_TRIAD_DATA_ROOT -> {resolved}", file=sys.stderr)
+        return resolved, cfg
+
+    if cfg is not None:
+        data_root = cfg.get("data_root", ".")
+        base_path = Path(data_root)
+        if base_path.is_absolute():
+            base = base_path
+        else:
+            main_root = _resolve_worktree_main_root(_SCRIPT_DIR.parent)
+            if main_root is None:
+                print(
+                    "embed_taxonomy: git worktree-main-root resolution failed (not a "
+                    f"git checkout, or git unavailable) -- falling back to anchoring "
+                    f"relative data_root '{data_root}' at the script-parent dir "
+                    f"({_SCRIPT_DIR.parent}); this is WRONG from inside a nested "
+                    f"worktree (t/3899)",
+                    file=sys.stderr,
+                )
+                anchor = _SCRIPT_DIR.parent
+            else:
+                anchor = main_root
+            base = anchor / base_path
+        resolved = base.resolve()
+        print(f"embed_taxonomy: data root resolved via .aitriad.json -> {resolved}", file=sys.stderr)
+        return resolved, cfg
+
+    resolved = _SCRIPT_DIR.parent.resolve()
+    print(f"embed_taxonomy: data root resolved via default (script-parent fallback) -> {resolved}", file=sys.stderr)
+    return resolved, cfg
 
 
 def _resolve_taxonomy_dir(override=None, conflicts_override=None):
@@ -59,39 +158,23 @@ def _resolve_taxonomy_dir(override=None, conflicts_override=None):
     when generate ran from an unusual cwd/worktree. Precedence for conflicts:
     explicit `conflicts_override` (--conflicts-dir) > .aitriad.json > fallback.
     """
-    global TAXONOMY_DIR, EMBEDDINGS_FILE, CONFLICTS_DIR
+    global TAXONOMY_DIR, EMBEDDINGS_FILE, CONFLICTS_DIR, DATA_ROOT
 
-    data_base = _SCRIPT_DIR.parent  # fallback
-    cfg_conflicts = None
+    DATA_ROOT, cfg = _resolve_data_root()
+    tax_dir = cfg.get("taxonomy_dir", "taxonomy/Origin") if cfg else "taxonomy/Origin"
+    conflicts_dir = cfg.get("conflicts_dir", "conflicts") if cfg else "conflicts"
 
-    # Always read config (independent of --taxonomy-dir) so conflicts resolve
-    # against the configured data root, not the script-parent fallback.
-    config_path = _SCRIPT_DIR.parent / ".aitriad.json"
-    if config_path.exists():
-        try:
-            cfg = json.loads(config_path.read_text(encoding="utf-8"))
-            data_root = cfg.get("data_root", ".")
-            tax_dir = cfg.get("taxonomy_dir", "taxonomy/Origin")
-            conflicts_dir = cfg.get("conflicts_dir", "conflicts")
-            base = Path(data_root) if Path(data_root).is_absolute() else (_SCRIPT_DIR.parent / data_root)
-            data_base = base.resolve()
-            cfg_conflicts = (base / conflicts_dir).resolve()
-            if not override:
-                TAXONOMY_DIR = (base / tax_dir).resolve()
-        except (json.JSONDecodeError, OSError):
-            pass  # fall through to default
-
-    if override:
+    if not override:
+        TAXONOMY_DIR = (DATA_ROOT / tax_dir).resolve()
+    else:
         TAXONOMY_DIR = Path(override).resolve()
 
     EMBEDDINGS_FILE = TAXONOMY_DIR / "embeddings.json"
 
     if conflicts_override:
         CONFLICTS_DIR = Path(conflicts_override).resolve()
-    elif cfg_conflicts is not None:
-        CONFLICTS_DIR = cfg_conflicts
     else:
-        CONFLICTS_DIR = data_base / "conflicts"
+        CONFLICTS_DIR = (DATA_ROOT / conflicts_dir).resolve()
     return TAXONOMY_DIR
 
 

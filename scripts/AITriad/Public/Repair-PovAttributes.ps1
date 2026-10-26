@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
+# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 # Licensed under the MIT License. See LICENSE file in the project root.
 
 function Repair-PovAttributes {
@@ -57,7 +57,7 @@ function Repair-PovAttributes {
 
         [ValidateScript({ Test-AIModelId $_ })]
         [ArgumentCompleter({ param($cmd, $param, $word) $script:ValidModelIds | Where-Object { $_ -like "$word*" } })]
-        [string]$Model = 'gemini-3.5-flash-lite',
+        [string]$Model = (Get-AITierModel -Tier basic),
 
         [string]$ApiKey,
 
@@ -89,12 +89,13 @@ function Repair-PovAttributes {
     foreach ($PovName in $PovFiles) {
         $FilePath = Join-Path $TaxDir "$PovName.json"
         if (-not (Test-Path $FilePath)) { continue }
-        $Data = Get-Content $FilePath -Raw | ConvertFrom-Json
+        $Data = Read-PovTaxonomyFile -Path $FilePath   # shape-preserving read for the canonical write (t/4356)
         $TaxData[$PovName] = $Data
 
         foreach ($Node in $Data.nodes) {
             if ($Node.PSObject.Properties['children'] -and $Node.children -and @($Node.children).Count -gt 0) { continue }
             if ($Category -and $Node.category -ne $Category) { continue }
+            if (Test-TaxonomyNodeSuperseded $Node) { continue }   # no AI repair of a retired node; $Data keeps it (t/4356)
 
             $HasGA = $Node.PSObject.Properties['graph_attributes'] -and $null -ne $Node.graph_attributes
             $MissingFields = [System.Collections.Generic.List[string]]::new()
@@ -171,12 +172,9 @@ function Repair-PovAttributes {
     }
 
     # ── Resolve API key ───────────────────────────────────────────────────────
-    if ($Model -match '^gemini') { $Backend = 'gemini' }
-    elseif ($Model -match '^claude') { $Backend = 'claude' }
-    elseif ($Model -match '^openai') { $Backend = 'openai' }
-    else { $Backend = 'gemini' }
-    $ResolvedKey = Resolve-AIApiKey -ExplicitKey $ApiKey -Backend $Backend
-    if ([string]::IsNullOrWhiteSpace($ResolvedKey)) {
+    # Backend from ai-models.json, never guessed; only the user's -ApiKey is forwarded (t/4087).
+    $KeyStatus = Get-AIModelKeyStatus -Model $Model -ApiKey $ApiKey
+    if (-not $KeyStatus.HasKey) {
         Write-Warning "No API key — cannot generate attributes"
         return
     }
@@ -201,7 +199,7 @@ Generate missing graph_attributes for these taxonomy nodes. For each node, provi
 
 FIELD DEFINITIONS:
 - epistemic_type: one of: empirical_claim, normative_prescription, causal_mechanism, definitional, predictive, methodological
-- rhetorical_strategy: comma-separated list from: techno_optimism, inevitability_framing, fear_appeal, evidence_based, rights_based, precautionary, pragmatic, systemic_critique, cost_benefit
+- rhetorical_strategy: comma-separated list from: structural_critique, appeal_to_evidence, precautionary_framing, moral_imperative, cost_benefit_analysis, techno_optimism, credibility_framing, analogical_reasoning, appeal_to_fear, inevitability_framing, appeal_to_authority, appeal_to_justice, appeal_to_sovereignty, rights_based, pragmatic_framing, systemic_critique
 - node_scope: one of: narrow_technical, domain_specific, cross_domain, systemic
 - intellectual_lineage: array of 2-5 intellectual traditions (e.g., ["Effective Altruism", "Longtermism"])
 - steelman_vulnerability: object with per-opponent-POV vulnerabilities:
@@ -220,7 +218,7 @@ No markdown fences, no explanation.
 "@
 
         try {
-            $Result = Invoke-AIApi -Prompt $Prompt -Model $Model -ApiKey $ResolvedKey `
+            $Result = Invoke-AIApi -Prompt $Prompt -Model $Model -ApiKey $ApiKey `
                 -Temperature 0.3 -MaxTokens 8192 -JsonMode -TimeoutSec 60
             if (-not $Result -or -not $Result.Text) {
                 Write-Warning "  No response for batch $BatchNum"
@@ -273,8 +271,7 @@ No markdown fences, no explanation.
     if ($TotalFixed -gt 0 -and -not $WhatIfPreference) {
         foreach ($PovName in $TaxData.Keys) {
             $FilePath = Join-Path $TaxDir "$PovName.json"
-            Assert-DataWriteAllowed -Path $FilePath  # t/2902
-            $TaxData[$PovName] | ConvertTo-Json -Depth 20 | Set-Content -Path $FilePath -Encoding UTF8
+            Write-PovTaxonomyFile -Path $FilePath -Data $TaxData[$PovName]   # canonical TS format (t/4356)
         }
         Write-Host "`nSaved taxonomy files" -ForegroundColor Green
     }

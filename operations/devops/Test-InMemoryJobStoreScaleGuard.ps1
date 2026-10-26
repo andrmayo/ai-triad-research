@@ -4,19 +4,36 @@
 
 <#
 .SYNOPSIS
-    CI gate: fails if maxReplicas > 1 while any in-memory job store is still in use.
+    CI gate: fails if maxReplicas > 1 while any in-memory single-replica store is still in use,
+    and fails closed (t/4310) if maxReplicas > 1 with zero markers and no recorded attestation.
 .DESCRIPTION
     Reads deploy/azure/main.bicep and checks the taxonomy-editor maxReplicas value.
-    Greps all *.ts files under taxonomy-editor/src/server/** for the @INMEMORY_JOB_STORE
-    marker. If ANY file carries the marker and maxReplicas > 1, the gate fails — raising
-    the replica count while any job store is per-process in-memory reinstates the t/2884
-    cross-replica 404 race. When ALL marked stores are migrated to shared blob storage
-    (t/2885), remove their @INMEMORY_JOB_STORE markers and this gate passes unconditionally.
+    Greps all *.ts files under taxonomy-editor/src/server/** for either in-memory marker:
+      @INMEMORY_JOB_STORE            — per-process job store (blob-migration track, t/2885)
+      @INMEMORY_CACHE_SINGLE_REPLICA — in-memory cache that must not span replicas (t/3504)
+    If ANY file carries either marker and maxReplicas > 1, the gate fails — raising the
+    replica count while any per-process in-memory store is active reinstates cross-replica
+    data-isolation bugs. Remove a marker only when the corresponding store has been migrated
+    to a shared/replica-safe backend.
+
+    t/4310 (t/4181 prevention): the gate used to pass UNCONDITIONALLY when zero markers were
+    found, regardless of maxReplicas. After t/4177/t/4179 removed the last markers, the gate
+    went silent — nothing would have stopped maxReplicas > 1 even though a different store
+    (overlayCommitScheduler.ts) was still unsafe across replicas, because that store never
+    carried either marker. A gate whose input (the marker set) can disappear and then pass is
+    its own failure class (Class 8 / route-enumeration, docs/CodeReview/failure-classes.md).
+
+    Fixed: when maxReplicas > 1 and ZERO markers are found, the gate now fails UNLESS an
+    explicit `@REPLICA_SAFE_ATTESTED: t/NNNN` line is present next to the `maxReplicas capped
+    at` comment in main.bicep. "No markers" must be a recorded decision (naming the ticket
+    where the replica-safety review happened), never a default. A marker present and
+    maxReplicas > 1 still fails regardless of any attestation — the attestation only covers
+    the "we checked and found nothing" case, not "we found something and are ignoring it".
 .PARAMETER BicepPath
     Path to deploy/azure/main.bicep. Defaults to the canonical repo location.
 .PARAMETER ServerDir
-    Directory to search for @INMEMORY_JOB_STORE markers. Defaults to
-    taxonomy-editor/src/server. All *.ts files are checked recursively.
+    Directory to search for in-memory markers. Defaults to taxonomy-editor/src/server.
+    All *.ts files are checked recursively.
 .PARAMETER JobStorePath
     Legacy single-file mode: checks only one .ts file for the marker. Superseded by
     -ServerDir (multi-file directory scan). Provided for backward compatibility with
@@ -34,39 +51,61 @@ $ErrorActionPreference = 'Stop'
 
 # ── 1. Check for in-memory store markers ─────────────────────────────────────
 # Single-file legacy mode (-JobStorePath) or directory scan (-ServerDir, default).
+$markerPattern = '@INMEMORY_JOB_STORE|@INMEMORY_CACHE_SINGLE_REPLICA'
 if ($JobStorePath) {
-    $markedFiles = @(if ((Select-String -Path $JobStorePath -Pattern '@INMEMORY_JOB_STORE' -Quiet) -eq $true) {
+    $markedFiles = @(if ((Select-String -Path $JobStorePath -Pattern $markerPattern -Quiet) -eq $true) {
         [System.IO.FileInfo]$JobStorePath
     })
 } else {
     $markedFiles = @(Get-ChildItem -Path $ServerDir -Recurse -Filter '*.ts' |
-        Where-Object { Select-String -Path $_.FullName -Pattern '@INMEMORY_JOB_STORE' -Quiet })
+        Where-Object { Select-String -Path $_.FullName -Pattern $markerPattern -Quiet })
 }
 
-if ($markedFiles.Count -eq 0) {
-    Write-Host "InMemoryJobStore scale guard: no @INMEMORY_JOB_STORE markers found — all stores migrated. Gate passes unconditionally."
-    return
-}
-
-# ── 2. Extract taxonomy-editor maxReplicas from main.bicep ────────────────────
-# NOTE: the regex anchors on the literal string 'maxReplicas capped at 1' — that
-# string is load-bearing for this gate (Gate Co-Location, t/2885). Rewording the
-# cap comment in main.bicep requires updating the regex here.
+# ── 2. Extract taxonomy-editor maxReplicas (and any attestation) from main.bicep ──
+# NOTE: the regex anchors on the literal string 'maxReplicas capped at' (followed by the
+# number) — that string is load-bearing for this gate (Gate Co-Location, t/2885; widened
+# from 'capped at 1' when the cap was raised to 5, t/4176). Rewording the cap comment in
+# main.bicep requires updating the regex here. The match span is widened just enough to also
+# capture a `@REPLICA_SAFE_ATTESTED:` line placed between the cap comment and the
+# maxReplicas: line (t/4310) — the same span, not a second independent search, so an
+# attestation anywhere else in the file never counts.
 $bicepContent = Get-Content -Path $BicepPath -Raw
 
-$match = [regex]::Match($bicepContent, 'maxReplicas capped at 1[\s\S]*?maxReplicas:\s*(\d+)')
+$match = [regex]::Match($bicepContent, 'maxReplicas capped at \d+[\s\S]*?maxReplicas:\s*(\d+)')
 if (-not $match.Success) {
     throw "InMemoryJobStore scale guard: could not parse taxonomy-editor maxReplicas from $BicepPath. Ensure the t/2885 cap comment and maxReplicas line are present and intact."
 }
 $maxReplicas = [int]$match.Groups[1].Value
 
+$attestMatch = [regex]::Match($match.Value, '@REPLICA_SAFE_ATTESTED:\s*(\S*)')
+$hasAttestMarker = $attestMatch.Success
+$attestTicket = $attestMatch.Groups[1].Value
+$attestIsValid = $hasAttestMarker -and ($attestTicket -match '^t/\d+$')
+
 # ── 3. Enforce the invariant ──────────────────────────────────────────────────
-if ($maxReplicas -gt 1) {
+if ($maxReplicas -gt 1 -and $markedFiles.Count -gt 0) {
     $fileList = ($markedFiles | Select-Object -ExpandProperty Name) -join ', '
-    Write-Host "::error::InMemoryJobStore scale guard FAILED: maxReplicas=$maxReplicas but @INMEMORY_JOB_STORE markers present in: $fileList"
-    Write-Host "::error::Raising maxReplicas above 1 while any job store is per-process in-memory reinstates the cross-replica 404 race (POST on replica A, GET poll on replica B → 404)."
-    Write-Host "::error::Migrate ALL marked stores to shared blob storage and remove their @INMEMORY_JOB_STORE markers before scaling out. See t/2885."
-    throw "InMemoryJobStore scale guard FAILED: maxReplicas=$maxReplicas with in-memory stores still in use: $fileList"
+    Write-Host "::error::InMemory scale guard FAILED: maxReplicas=$maxReplicas but single-replica markers present in: $fileList"
+    Write-Host "::error::Raising maxReplicas above 1 while any per-process in-memory store is active reinstates cross-replica 404 race (POST on replica A, GET poll on replica B → 404)."
+    Write-Host "::error::Migrate ALL marked stores to shared/replica-safe backends and remove their markers before scaling out. See t/2885, t/3504."
+    throw "InMemory scale guard FAILED: maxReplicas=$maxReplicas with in-memory stores still in use: $fileList"
 }
 
-Write-Host "InMemoryJobStore scale guard: maxReplicas=$maxReplicas, @INMEMORY_JOB_STORE present in $($markedFiles.Count) file(s) ($($markedFiles.Name -join ', ')) — invariant holds. Gate passes."
+if ($maxReplicas -gt 1 -and $markedFiles.Count -eq 0 -and -not $attestIsValid) {
+    if ($hasAttestMarker) {
+        Write-Host "::error::InMemory scale guard FAILED: maxReplicas=$maxReplicas, zero markers found, but the @REPLICA_SAFE_ATTESTED line is malformed (no valid t/NNNN ticket ref: got '$attestTicket')."
+    } else {
+        Write-Host "::error::InMemory scale guard FAILED: maxReplicas=$maxReplicas, zero @INMEMORY_JOB_STORE/@INMEMORY_CACHE_SINGLE_REPLICA markers found, and no @REPLICA_SAFE_ATTESTED: t/NNNN recorded (t/4310)."
+    }
+    Write-Host "::error::Zero markers is not proof of replica-safety by itself (t/4181: overlayCommitScheduler.ts was unsafe across replicas and never carried either marker)."
+    Write-Host "::error::Add '// @REPLICA_SAFE_ATTESTED: t/NNNN' next to the 'maxReplicas capped at' comment in $BicepPath, naming the ticket where the replica-safety review was done, before raising maxReplicas."
+    throw "InMemory scale guard FAILED: maxReplicas=$maxReplicas with zero markers and no valid replica-safety attestation."
+}
+
+if ($maxReplicas -le 1) {
+    Write-Host "InMemory scale guard: maxReplicas=$maxReplicas — invariant holds regardless of markers. Gate passes."
+    return
+}
+
+# maxReplicas > 1, zero markers, valid attestation.
+Write-Host "InMemory scale guard: maxReplicas=$maxReplicas, zero single-replica markers, attested replica-safe per $attestTicket. Gate passes."

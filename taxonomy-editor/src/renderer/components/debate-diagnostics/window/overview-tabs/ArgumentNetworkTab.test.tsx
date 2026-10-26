@@ -1,9 +1,10 @@
 // Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 // Licensed under the MIT License. See LICENSE file in the project root.
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
-import { ArgumentNetworkTab } from './ArgumentNetworkTab';
+import { ArgumentNetworkTab, collectConfidenceImpacts } from './ArgumentNetworkTab';
+import { useTaxonomyStore } from '../../../../hooks/useTaxonomyStore';
 import type { OverviewTab } from '../types';
 
 // ---------------------------------------------------------------------------
@@ -157,6 +158,26 @@ describe('ArgumentNetworkTab', () => {
     expect(screen.getByText('Third claim')).toBeInTheDocument();
   });
 
+  it('minimap places a steelman node in the steelmanned camp\'s arc/color, not the speaker\'s (t/3781)', () => {
+    const nodes = [
+      { ...makeNode('n1', 'e1', 'Safetyist claim'), speaker: 'safetyist' },
+      { ...makeNode('n2', 'e2', 'Steelman of skeptic'), speaker: 'accelerationist', steelman_of: 'skeptic' },
+    ];
+
+    const { container } = render(
+      <ArgumentNetworkTab
+        {...makeProps({ an: { nodes, edges: [] } })}
+      />,
+    );
+
+    const circles = container.querySelectorAll('.ant-minimap-wrap circle');
+    expect(circles).toHaveLength(2);
+    const fills = Array.from(circles).map(c => c.getAttribute('fill'));
+    // n2 is authored by accelerationist but steelmans skeptic — must render skeptic's color, never accelerationist's.
+    expect(fills[0]).toBe('var(--color-saf)');
+    expect(fills[1]).toBe('var(--color-skp)');
+  });
+
   it('shows filter select with All, Unattributed, Novel, and Anchored options', () => {
     render(<ArgumentNetworkTab {...makeProps()} />);
 
@@ -181,5 +202,40 @@ describe('ArgumentNetworkTab', () => {
       );
     }).not.toThrow();
     expect(screen.getByTestId('inode-n1')).toBeInTheDocument();
+  });
+});
+
+// t/4361: an old debate's confidence-history impacts must still surface for a node that's since
+// been superseded (t/4355 holds superseded nodes out of state.<pov>.nodes).
+describe('collectConfidenceImpacts — includes superseded nodes', () => {
+  afterEach(() => {
+    vi.mocked(useTaxonomyStore.getState).mockReturnValue({} as any);
+  });
+
+  it('counts history impacts from both selectable and superseded nodes for the same debate', () => {
+    vi.mocked(useTaxonomyStore.getState).mockReturnValue({
+      accelerationist: {
+        nodes: [{
+          id: 'acc-beliefs-001', label: 'Selectable node',
+          confidence_history: [{ date: '2026-01-01', value: 0.6, delta: 0.1, reason: 'debate-1 turn' }],
+        }],
+      },
+      safetyist: { nodes: [] },
+      skeptic: { nodes: [] },
+      supersededNodes: {
+        accelerationist: [{
+          index: 0,
+          node: {
+            id: 'acc-beliefs-002', label: 'Superseded node', superseded_by: 'acc-beliefs-003',
+            priority_history: [{ date: '2026-01-02', value: 0.4, delta: -0.2, reason: 'debate-1 turn' }],
+          },
+        }],
+        safetyist: [], skeptic: [],
+      },
+    } as any);
+
+    const impacts = collectConfidenceImpacts('debate-1');
+
+    expect(impacts.map(i => i.nodeId).sort()).toEqual(['acc-beliefs-001', 'acc-beliefs-002']);
   });
 });

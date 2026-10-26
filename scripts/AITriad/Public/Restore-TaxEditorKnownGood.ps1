@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
+﻿# Copyright (c) 2026 Jeffrey Snover. All rights reserved.
 # Licensed under the MIT License. See LICENSE file in the project root.
 
 function Restore-TaxEditorKnownGood {
@@ -11,9 +11,9 @@ function Restore-TaxEditorKnownGood {
         post-deploy health check and auto-rollback on failure.
         Supports -WhatIf/-Confirm.
     .PARAMETER Package
-        GitHub package in owner/name format. Default: jpsnover/taxonomy-editor.
+        GitHub package in owner/name format. Default: ai-rosetta-stone/taxonomy-editor.
     .PARAMETER Registry
-        Container registry + image path. Default: ghcr.io/jpsnover/taxonomy-editor.
+        Container registry + image path. Default: ghcr.io/ai-rosetta-stone/taxonomy-editor.
     .PARAMETER ResourceGroup
         Azure resource group name. Default: ai-triad.
     .PARAMETER AppName
@@ -44,10 +44,10 @@ function Restore-TaxEditorKnownGood {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     param(
         [Parameter()]
-        [string]$Package = 'jpsnover/taxonomy-editor',
+        [string]$Package = 'ai-rosetta-stone/taxonomy-editor',
 
         [Parameter()]
-        [string]$Registry = 'ghcr.io/jpsnover/taxonomy-editor',
+        [string]$Registry = 'ghcr.io/ai-rosetta-stone/taxonomy-editor',
 
         [Parameter()]
         [string]$ResourceGroup = 'ai-triad',
@@ -75,7 +75,8 @@ function Restore-TaxEditorKnownGood {
             -Problem 'No image tagged known-good found in GHCR' `
             -Location $CallerName `
             -NextSteps @('Run Set-TaxEditorKnownGood to tag an image first',
-                         'Run Get-TaxEditorImage to inspect available images'))
+                         'Run Get-TaxEditorImage to inspect available images') `
+            -AsErrorRecord)
     }
 
     $KgImage = $KnownGoodImages[0]
@@ -111,6 +112,7 @@ function Restore-TaxEditorKnownGood {
         NewRevision      = $DeployResult.NewRevision
         PreviousRevision = $DeployResult.PreviousRevision
         HealthCheck      = $DeployResult.HealthCheck
+        SkippedDeactivations = if ($DeployResult.PSObject.Properties['SkippedDeactivations']) { @($DeployResult.SkippedDeactivations) } else { @() }
         AppName          = $AppName
         ResourceGroup    = $ResourceGroup
         Timestamp        = (Get-Date).ToString('o')

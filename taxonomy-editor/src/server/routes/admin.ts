@@ -16,7 +16,7 @@ import type { ServerCtx } from './context.js';
 import { json, error, param, query } from '../httpKit.js';
 import { getGlobalRecorder } from '../../../../lib/flight-recorder/index.js';
 import { log } from '../logger.js';
-import { getDataRoot, getStateRoot, getProjectRoot, rotateApiKeyMaterial, STORAGE_MODE, getPaidGeminiFallbackKey, setPaidGeminiFallbackKey, deletePaidGeminiFallbackKey } from '../config.js';
+import { getStateRoot, getProjectRoot, rotateApiKeyMaterial, STORAGE_MODE, getPaidGeminiFallbackKey, setPaidGeminiFallbackKey, deletePaidGeminiFallbackKey } from '../config.js';
 import { loadUsageRegistry } from '../../../../lib/ai-client/usageTypes.js';
 import { getConfig, getConfigState, writeConfig, forceReload as reloadRuntimeConfig, diffFromDefaults } from '../runtimeConfig.js';
 import { requireAdmin, getReviewQueue, getReviewStats, getReviewDetail, executeReviewAction } from '../community/admin/reviewRegistry.js';
@@ -28,10 +28,15 @@ import { getRollbackStatus } from '../rollbackStatus.js';
 import { getErrorSummaryCached, type ErrorEntry } from '../errorAggregation.js';
 import { writeDump, isValidDumpId } from '../flightRecorderDumps.js';
 import * as community from '../community/community.js';
+import { findUnreachableAllowlistEntries } from '../identityAllowlistCheck.js';
+import { getReadOnlyPrincipalEntries } from '../readOnlyGuard.js';
 import * as fileIO from '../storage/fileIO.js';
 import * as supportStore from '../support/supportStore.js';
 import { isCaseStatus } from '../support/types.js';
 import { FEEDBACK_CATEGORIES, isFeedbackCategory, paginateFeedback } from '../storage/feedbackStore.js';
+import { backfillOwnOpedShares } from '../storage/opedShareStore.js';
+import * as allowlistStore from '../storage/allowlistStore.js';
+import type { AllowlistEntry, AdminAllowlistResponse } from '../../../../lib/allowlist/types.js';
 
 // Small server.ts helpers the moved admin handlers call. server.ts keeps its own
 // copies (used by the staying support-user endpoints / key-masking); duplicated
@@ -73,6 +78,95 @@ function notifyFeedbackWebhook(rating: string, userId: string, entry: { text: st
 export function registerAdminRoutes(r: Router, ctx: ServerCtx): void {
   const { get, post, put, del } = r;
   const { serverRecorder, ensureSessionBranch, appendServerLogs } = ctx;
+
+  // t/3484 (t/3483 arc): one-time backfill — mint shareIds + write public projections for ALL existing
+  // community op-eds so GET /api/public/opeds (t/3481) lists every set and the count>0 deploy AC becomes
+  // satisfiable. Admin-gated; idempotent + safe to re-run (Server Community's backfillCommunityOpedShares
+  // skips malformed/empty items with a WARN, one stable shareId per item). Returns the run tally.
+  post('/api/admin/community/opeds/backfill-shares', async (_req, res) => {
+    if (!requireAdmin(res)) return;
+    try {
+      json(res, await community.backfillCommunityOpedShares());
+    } catch (err) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'server', level: 'error',
+        message: 'Community op-ed share backfill failed',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+      error(res, String(err), 500, err);
+    }
+  });
+
+  // t/3490: one-time backfill — re-project every existing own-share public op-ed
+  // (users/{id}/oped-shares.json registries) so it picks up the schema_version 2
+  // BDI grounding embed (t/3488). Admin-gated; idempotent (publishOpedShare fully
+  // overwrites), safe to re-run. Returns the run tally + per-item skip reasons.
+  post('/api/admin/opeds/backfill-own-shares', async (_req, res) => {
+    if (!requireAdmin(res)) return;
+    try {
+      json(res, await backfillOwnOpedShares());
+    } catch (err) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'server', level: 'error',
+        message: 'Own op-ed share backfill failed',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+      error(res, String(err), 500, err);
+    }
+  });
+
+  // t/3498 (t/3495 epic — admin-managed shared Gemini key): admin CRUD for the
+  // allowlist gating access to the admin's registered paid Gemini key. `userId`
+  // is the authoritative membership key (SO cond 4, t/3495#2) — accepted
+  // directly from the caller (TL t/3498#2/#4: server-side email→userId
+  // derivation is wrong for GitHub principals, whose derived id doesn't match
+  // their email in any way). `email` is audit-display only.
+  get('/api/admin/allowlist', (_req, res) => {
+    if (!requireAdmin(res)) return;
+    try {
+      const response: AdminAllowlistResponse = { entries: allowlistStore.getEntries() };
+      json(res, response);
+    } catch (err) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'server', level: 'error', message: 'Failed to list admin allowlist',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+      error(res, String(err), 500, err);
+    }
+  });
+
+  post('/api/admin/allowlist', async (_req, res, body) => {
+    if (!requireAdmin(res)) return;
+    try {
+      const { userId, email } = (body ?? {}) as { userId?: string; email?: string };
+      if (!userId || typeof userId !== 'string') { error(res, 'userId is required', 400); return; }
+      if (!email || typeof email !== 'string') { error(res, 'email is required', 400); return; }
+      const entry: AllowlistEntry = { userId, email, addedAt: new Date().toISOString() };
+      await allowlistStore.addEntry(entry);
+      json(res, entry);
+    } catch (err) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'server', level: 'error', message: 'Failed to add admin allowlist entry',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+      error(res, String(err), 500, err);
+    }
+  });
+
+  del('/api/admin/allowlist/:userId', async (req, res) => {
+    if (!requireAdmin(res)) return;
+    try {
+      const userId = param(req, 'userId', '/api/admin/allowlist/:userId');
+      await allowlistStore.removeEntry(userId);
+      json(res, { ok: true });
+    } catch (err) {
+      getGlobalRecorder()?.record({
+        type: 'system.error', component: 'server', level: 'error', message: 'Failed to remove admin allowlist entry',
+        error: { name: (err as Error).name ?? 'Error', message: String(err), stack: (err as Error).stack },
+      });
+      error(res, String(err), 500, err);
+    }
+  });
 
   // Full flag definitions (admin only).
   get('/api/admin/flags', (_req, res) => {
@@ -148,7 +242,7 @@ export function registerAdminRoutes(r: Router, ctx: ServerCtx): void {
       const { dumpId } = (body ?? {}) as { dumpId?: string };
       if (!isValidDumpId(dumpId)) { error(res, 'dumpId must be a UUID-safe string', 400); return; }
       const ndjson = appendServerLogs(serverRecorder.buildDump('manual').ndjson);
-      const filePath = await writeDump(getDataRoot(), 'server', dumpId, ndjson);
+      const filePath = await writeDump(getStateRoot(), 'server', dumpId, ndjson); // t/4372 (t/4264): class-A writable state, never getDataRoot()
       log.fr.info({ filePath, dumpId }, 'Correlated server dump written');
       json(res, { ok: true, filename: path.basename(filePath), dumpId });
     } catch (err) {
@@ -577,6 +671,9 @@ export function registerAdminRoutes(r: Router, ctx: ServerCtx): void {
       const { items: feedback } = await fileIO.listFeedbackEntries();
       const recentErrors = [...errors].sort(sortDesc).slice(0, 5);
       const recentFeedback = [...feedback].sort(sortDesc).slice(0, 5);
+      // t/4505: admin-only, so names/reasons (operator config) are safe here — the public
+      // /health exposes only the count.
+      const unreachableIdentityAllowlistEntries = findUnreachableAllowlistEntries(community.getAdminUsers(), getReadOnlyPrincipalEntries());
 
       json(res, {
         status: 'ok',
@@ -586,6 +683,8 @@ export function registerAdminRoutes(r: Router, ctx: ServerCtx): void {
         feedbackCount: feedback.length,
         recentFeedback,
         storageMode: STORAGE_MODE,
+        identityAllowlistUnreachable: unreachableIdentityAllowlistEntries.length,
+        identityAllowlistUnreachableEntries: unreachableIdentityAllowlistEntries,
       });
     } catch (err) {
       getGlobalRecorder()?.record({

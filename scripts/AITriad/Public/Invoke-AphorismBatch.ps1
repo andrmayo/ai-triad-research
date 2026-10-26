@@ -66,7 +66,7 @@ function Invoke-AphorismBatch {
     if (-not $TaxonomyPath) { $TaxonomyPath = Get-TaxonomyDir }
 
     if (-not (Test-Path $TaxonomyPath)) {
-        throw (New-ActionableError `
+        throw (New-ActionableError -AsErrorRecord `
             -Goal 'Generate POV node aphorisms' `
             -Problem "Taxonomy directory not found: $TaxonomyPath" `
             -Location 'Invoke-AphorismBatch' `
@@ -107,6 +107,11 @@ function Invoke-AphorismBatch {
 
             if ($null -ne $Id -and @($Id).Count -gt 0 -and ($Node.id -notin $Id)) {
                 $SkippedByIdFilter++
+                $NodeIndex++
+                continue
+            }
+            if (Test-TaxonomyNodeSuperseded $Node) {   # no AI call for a retired node; the file keeps it (t/4356)
+                Write-Verbose "Skipping $($Node.id): superseded by $($Node.superseded_by)"
                 $NodeIndex++
                 continue
             }
@@ -289,7 +294,7 @@ function Invoke-AphorismBatch {
         $FileResults = $Results[$FilePath]
         if ($FileResults.Count -eq 0) { continue }
 
-        $TaxData = Get-Content $FilePath -Raw | ConvertFrom-Json
+        $TaxData = Read-PovTaxonomyFile -Path $FilePath   # shape-preserving read for the canonical write (t/4356)
         $NodesArray = @($TaxData.nodes)
         foreach ($Idx in $FileResults.Keys) {
             $Entry = $FileResults[$Idx]
@@ -306,8 +311,7 @@ function Invoke-AphorismBatch {
         }
 
         if ($PSCmdlet.ShouldProcess($FilePath, 'Save aphorisms')) {
-            Assert-DataWriteAllowed -Path $FilePath  # t/2902
-            $TaxData | ConvertTo-Json -Depth 20 | Set-Content -Path $FilePath -Encoding UTF8
+            Write-PovTaxonomyFile -Path $FilePath -Data $TaxData   # canonical TS format (t/4356)
             $FileName = Split-Path $FilePath -Leaf
             Write-Verbose "Updated $($FileResults.Count) nodes in $FileName"
         }

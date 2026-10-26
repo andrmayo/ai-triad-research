@@ -110,11 +110,13 @@ export default defineConfig({
     rendererNodeBuiltinGate(),
     react(),
     ...(isWeb ? [VitePWA({
-      registerType: 'autoUpdate',
+      // t/4387: 'prompt', not 'autoUpdate' + skipWaiting/clientsClaim. A new service worker waits until the
+      // user reloads from UpdatePrompt, so an open tab is never taken over mid-session (its later lazy chunks
+      // would come from the new build) and never auto-reloads over unsaved edits. UpdatePrompt also re-checks
+      // for a new sw.js hourly and on returning to the tab; without that, a long-lived tab never saw deploys.
+      registerType: 'prompt',
       workbox: {
         navigateFallbackDenylist: [/^\/api\//, /^\/.auth\//],
-        skipWaiting: true,
-        clientsClaim: true,
         globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
         maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
         runtimeCaching: [
@@ -193,8 +195,13 @@ export default defineConfig({
       '@lib/embeddings': path.resolve(import.meta.dirname, '../lib/embeddings'),
       '@lib/chat': path.resolve(import.meta.dirname, '../lib/chat'),
       '@lib/organizations': path.resolve(import.meta.dirname, '../lib/organizations'),
+      '@lib/inquiry': path.resolve(import.meta.dirname, '../lib/inquiry'),
       '@lib/entities': path.resolve(import.meta.dirname, '../lib/entities'),
       '@lib/policy': path.resolve(import.meta.dirname, '../lib/policy'),
+      '@lib/sourceIndex': path.resolve(import.meta.dirname, '../lib/sourceIndex'),
+      '@lib/oped': path.resolve(import.meta.dirname, '../lib/oped'),
+      '@lib/schema': path.resolve(import.meta.dirname, '../lib/schema'), // t/3955: validatePovTags for the renderer save schema
+      '@lib/userPreferencesSchema': path.resolve(import.meta.dirname, '../lib/userPreferencesSchema.ts'),
       // Allow lib/ files to resolve packages from taxonomy-editor's node_modules
       'zod': path.resolve(import.meta.dirname, 'node_modules/zod'),
       'jszip': path.resolve(import.meta.dirname, 'node_modules/jszip'),
@@ -245,12 +252,21 @@ export default defineConfig({
       '../../../lib/ai-config/**/*.test.ts',
       '../../../lib/embeddings/**/*.test.ts', // t/2060 — mock-based (fake onnxruntime-node), no native addon/model needed
       '../../../lib/brief/**/*.test.ts',     // t/2800 — brief export pipeline (extract + schema utils)
+      '../../../lib/schema/**/*.test.ts',    // t/3453 — schema-of-record drift comparator + extractors (fixture-based, no ai-triad-data)
+      '../../../lib/inquiry/**/*.test.ts',   // t/3574 — inquiry result contract (Zod schemas + parseInquiryResult), fixture-based, no ai-triad-data
+      '../../../lib/policy/**/*.test.ts',    // t/4034 — policy registry recount (pure, fixture-based, no ai-triad-data)
+      '../../../lib/sourceIndex/**/*.test.ts', // t/4334 — canonical-doc-id algorithm (pure, fixture-based, Electron/web parity)
+      '../../../lib/data-formats/**/*.test.ts', // t/4353 — file-writers registry shape + every writer path exists
+      '../../../lib/test-support/**/*.test.ts', // t/4461 — test-run data-root write guard (mocked temp root only)
       '../../../lib/*.test.ts',
       // translation tests excluded — depend on ai-triad-data dictionary not available in CI
     ],
     globals: false,
     environment: 'jsdom',
-    setupFiles: ['./test-setup.ts'],
+    // future-clock-setup.ts (t/4279) is a no-op unless FUTURE_CLOCK_OFFSET_DAYS is set —
+    // only the weekly future-clock-weekly.yml workflow sets it, so this is a no-op on every
+    // other run (PR, push, local dev).
+    setupFiles: ['./test-setup.ts', './future-clock-setup.ts'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'text-summary', 'lcov'],

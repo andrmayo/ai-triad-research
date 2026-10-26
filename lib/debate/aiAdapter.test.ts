@@ -83,10 +83,15 @@ function zaiOkBody(text = 'Hello from Z.AI') {
 
 // ── Mock flight recorder ─────────────────────────────────
 
-const { mockRecord } = vi.hoisted(() => ({ mockRecord: vi.fn() }));
+const { mockRecord, mockAddContextContributor } = vi.hoisted(() => ({
+  mockRecord: vi.fn(),
+  // attachServedIdentitySummary (t/4023) checks for this method and emits a second
+  // ai.model_identity event when absent — provide it to keep the count at exactly 1.
+  mockAddContextContributor: vi.fn(),
+}));
 
 vi.mock('../flight-recorder/index.js', () => ({
-  getGlobalRecorder: () => ({ record: mockRecord }),
+  getGlobalRecorder: () => ({ record: mockRecord, addContextContributor: mockAddContextContributor }),
 }));
 
 // ── Mock fs to control registry loading ─────────────────
@@ -141,6 +146,7 @@ beforeEach(() => {
   mockExistsSync.mockReset();
   mockReadFileSync.mockReset();
   mockRecord.mockReset();
+  mockAddContextContributor.mockReset();
 
   mockExistsSync.mockReturnValue(true);
   mockReadFileSync.mockReturnValue(JSON.stringify(makeRegistry()));
@@ -558,6 +564,16 @@ describe('aiAdapter', () => {
       expect((fetchOpts.headers as Record<string, string>)['x-goog-api-key']).toBe('universal-key');
     });
 
+    it('REFUSES AI_API_KEY for a non-gemini backend: names ZAI_API_KEY, and nothing is sent (t/4105)', async () => {
+      process.env.AI_API_KEY = 'universal-key'; // no ZAI_API_KEY
+      const mod = await getModule();
+      const adapter = mod.createCLIAdapter('/fake/root');
+      await expect(runWithTimers(adapter.generateText('test', 'zai-glm-5-2')))
+        .rejects.toThrow(/fallback for the gemini backend only/);
+      const sentKey = mockFetch.mock.calls.some(([, opts]) => JSON.stringify((opts as RequestInit | undefined)?.headers ?? {}).includes('universal-key'));
+      expect(sentKey).toBe(false);
+    });
+
     it('throws ActionableError when no API key is available', async () => {
       const mod = await getModule();
       const adapter = mod.createCLIAdapter('/fake/root');
@@ -605,6 +621,29 @@ describe('aiAdapter', () => {
 
       const fetchUrl = mockFetch.mock.calls[0][0] as string;
       expect(fetchUrl).toContain('api.anthropic.com');
+    });
+
+    // t/3942: a Claude safety refusal (HTTP 200, stop_reason "refusal", often no content) used to
+    // normalize to 'other' and return as an empty debate turn. It must raise the content-policy error.
+    it('raises the content-policy ActionableError on a Claude refusal instead of returning empty text', async () => {
+      process.env.ANTHROPIC_API_KEY = 'test-key'; // no other keys: the fallback chain cannot answer
+      mockFetch.mockImplementation(async () => freshResponse({ content: [], stop_reason: 'refusal', usage: { input_tokens: 10, output_tokens: 0 } }, 200));
+
+      const mod = await getModule();
+      const adapter = mod.createCLIAdapter('/fake/root');
+      await expect(runWithTimers(adapter.generateText('test', 'claude-sonnet-4-5')))
+        .rejects.toThrow(/content policy \(refusal\)/);
+      const errorEvents = mockRecord.mock.calls.map(c => c[0] as { type: string; message: string }).filter(e => e.type === 'ai.error');
+      expect(errorEvents.some(e => e.message.includes('refusal'))).toBe(true);
+    });
+
+    it('other arm: a normal Claude end_turn response still returns its text', async () => {
+      process.env.ANTHROPIC_API_KEY = 'test-key';
+      mockFetch.mockImplementation(async () => freshResponse({ ...claudeOkBody('fine'), stop_reason: 'end_turn' }, 200));
+
+      const mod = await getModule();
+      const adapter = mod.createCLIAdapter('/fake/root');
+      await expect(adapter.generateText('test', 'claude-sonnet-4-5')).resolves.toBe('fine');
     });
 
     it('routes groq models to Groq API', async () => {
@@ -656,16 +695,14 @@ describe('aiAdapter', () => {
       expect(fetchUrl).toContain('api.anthropic.com');
     });
 
-    it('defaults unknown model IDs (no known prefix) to gemini backend', async () => {
+    it('REFUSES an unknown model id (no known prefix) instead of defaulting to gemini (t/4101)', async () => {
       process.env.GEMINI_API_KEY = 'test-key';
       mockFetch.mockImplementation(async () => freshResponse(geminiOkBody(), 200));
 
       const mod = await getModule();
       const adapter = mod.createCLIAdapter('/fake/root');
-      await adapter.generateText('test', 'totally-unknown-model');
-
-      const fetchUrl = mockFetch.mock.calls[0][0] as string;
-      expect(fetchUrl).toContain('generativelanguage.googleapis.com');
+      await expect(runWithTimers(adapter.generateText('test', 'totally-unknown-model'))).rejects.toThrow(/refusing to guess/);
+      expect(mockFetch).not.toHaveBeenCalled();
     });
 
     it('maps registered model ID to correct apiModelId', async () => {
@@ -1146,4 +1183,70 @@ describe('aiAdapter', () => {
       expect(userContent).toContain('"result"');
     });
   });
+
+  // ── Served-identity classifier integration (t/4017) ─────
+  // Verifies that aiAdapter passes the loaded registry as identityRegistry to callProvider,
+  // enabling the Phase-3 divergence classifier (t/3731) on the CLI path.
+
+  describe('served-identity classifier integration (t/4017)', () => {
+    // Identity tracker lives in module scope; ensure a fresh import for each test
+    // independent of outer afterEach timing (t/4112).
+    beforeEach(() => { vi.resetModules(); });
+    it('warns on divergent served identity and reports registryPresent on firstSeen', async () => {
+      // Registry with two distinct Gemini entries so the classifier can detect divergence.
+      const divergentRegistry = makeRegistry({
+        models: [
+          { id: 'gemini-3.5-flash', apiModelId: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash', backend: 'gemini' },
+          { id: 'gemini-3.5-flash-lite', apiModelId: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite', backend: 'gemini' },
+        ],
+        fallbackChains: {},
+      });
+      mockReadFileSync.mockReturnValue(JSON.stringify(divergentRegistry));
+      process.env.GEMINI_API_KEY = 'test-key';
+
+      // Provider serves gemini-3.5-flash-lite when we sent gemini-3.5-flash (load-bearing fixture, t/3731#11).
+      mockFetch.mockResolvedValue(freshResponse({
+        ...geminiOkBody('response text'),
+        modelVersion: 'gemini-3.5-flash-lite',
+      }));
+
+      const mod = await getModule();
+      const adapter = mod.createCLIAdapter('/fake/root');
+      await adapter.generateText('test prompt', 'gemini-3.5-flash');
+
+      const identityEvents = mockRecord.mock.calls
+        .map(([e]: [{ type: string; level: string; data?: Record<string, unknown> }]) => e)
+        .filter(e => e.type === 'ai.model_identity');
+
+      expect(identityEvents).toHaveLength(1);
+      expect(identityEvents[0].level).toBe('warn');
+      expect(identityEvents[0].data).toMatchObject({
+        state: 'divergent',
+        firstSeen: true,
+        registryPresent: true,
+      });
+    });
+
+    it('emits info (not warn) when served id matches sent id', async () => {
+      process.env.GEMINI_API_KEY = 'test-key';
+      // Provider echoes back the same model id — agree state, stays info.
+      mockFetch.mockResolvedValue(freshResponse({
+        ...geminiOkBody(),
+        modelVersion: 'gemini-2.5-flash',
+      }));
+
+      const mod = await getModule();
+      const adapter = mod.createCLIAdapter('/fake/root');
+      await adapter.generateText('test', 'gemini-2.5-flash');
+
+      const identityEvents = mockRecord.mock.calls
+        .map(([e]: [{ type: string; level: string; data?: Record<string, unknown> }]) => e)
+        .filter(e => e.type === 'ai.model_identity');
+
+      expect(identityEvents).toHaveLength(1);
+      expect(identityEvents[0].level).toBe('info');
+      expect(identityEvents[0].data).toMatchObject({ state: 'agree' });
+    });
+  });
+
 });

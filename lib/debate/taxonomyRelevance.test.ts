@@ -349,6 +349,30 @@ describe('selectRelevantSituationNodes — divergence penalty', () => {
   });
 });
 
+// ── selectRelevantSituationNodes — out-of-coverage guard (t/3412) ──────
+
+describe('selectRelevantSituationNodes — out-of-coverage guard', () => {
+  function makeSit(id: string): SituationNode {
+    return { id, label: `Sit ${id}`, description: `Desc ${id}`, interpretations: { accelerationist: 'i', safetyist: 'i', skeptic: 'i' }, linked_nodes: [], conflict_ids: [] };
+  }
+
+  it('injects 0 situations when top score is far below threshold (out-of-coverage)', () => {
+    // threshold=0.48, margin=0.15 → fires when top < 0.33
+    const nodes = [makeSit('sit-001'), makeSit('sit-002'), makeSit('sit-003')];
+    const scores = new Map([['sit-001', 0.20], ['sit-002', 0.18], ['sit-003', 0.15]]);
+    const result = selectRelevantSituationNodes(nodes, scores, 0.48, 3, 15);
+    expect(result).toHaveLength(0);
+  });
+
+  it('still backfills to min when scores are within margin of threshold', () => {
+    // top=0.40, threshold=0.48, margin=0.15 → 0.40 >= 0.33 → backfill applies
+    const nodes = [makeSit('sit-001'), makeSit('sit-002'), makeSit('sit-003')];
+    const scores = new Map([['sit-001', 0.40], ['sit-002', 0.38], ['sit-003', 0.35]]);
+    const result = selectRelevantSituationNodes(nodes, scores, 0.48, 3, 15);
+    expect(result).toHaveLength(3);
+  });
+});
+
 // ── filterByTopicConstraints — discipline boost ─────────────────
 
 describe('filterByTopicConstraints — discipline boost', () => {
@@ -475,6 +499,91 @@ describe('filterByTopicConstraints — discipline boost', () => {
     expect(result.nodes[1].node.id).toBe('acc-beliefs-002');
     // 3 matches (labor, economics, employment) × 0.1 = 1.3× boost → 0.5 × 1.3 = 0.65
     expect(result.nodes[1].score).toBeCloseTo(0.65);
+  });
+});
+
+// ── filterByTopicConstraints — embedding-based off-scope demotion (t/3608) ───
+
+function makeEmbScoredNode(id: string, label: string, description: string, score: number): ScoredPovNode {
+  return { node: { ...makeNode(id), label, description }, score };
+}
+
+function makeEmbScope(overrides: Partial<TopicScope> = {}): TopicScope {
+  return {
+    core_proposition: 'test', constraint_confidence: 'explicit',
+    relevant_disciplines: ['labor', 'economics', 'employment'],
+    on_scope_evidence: [], key_tensions: [],
+    off_scope_topics: ['nuclear risk'],
+    drift_signatures: ['a', 'b'],
+    excluded_scenarios: [],
+    explicit_qualifiers: [],
+    risk_level: undefined as any,
+    ...overrides,
+  };
+}
+
+function makeEmbeddings(nodeId: string, vector: number[]): Record<string, { pov: string; vector: number[] }> {
+  return { [nodeId]: { pov: 'acc', vector } };
+}
+
+describe('filterByTopicConstraints — embedding off-scope demotion', () => {
+  it('demotes node when cosine similarity exceeds threshold', () => {
+    // Two identical vectors → cosine = 1.0 (well above default 0.35)
+    const vec = [1, 0, 0];
+    const nodes: ScoredPovNode[] = [
+      makeEmbScoredNode('acc-beliefs-001', 'Nuclear weapons policy', 'Nuclear deterrence and arms control', 0.7),
+    ];
+    const scope = makeEmbScope({ off_scope_topics: ['nuclear risk'] });
+    const result = filterByTopicConstraints(nodes, scope, undefined, [vec], makeEmbeddings('acc-beliefs-001', vec));
+    expect(result.demoted).toHaveLength(1);
+    expect(result.demoted[0].reason).toMatch(/embedding similarity/);
+  });
+
+  it('does NOT demote node when cosine similarity is below threshold', () => {
+    // Orthogonal vectors → cosine = 0 (well below 0.35)
+    const offVec = [1, 0, 0];
+    const nodeVec = [0, 1, 0];
+    const nodes: ScoredPovNode[] = [
+      makeEmbScoredNode('acc-beliefs-001', 'Labor markets', 'Workforce economics', 0.7),
+    ];
+    const scope = makeEmbScope({ off_scope_topics: ['nuclear risk'] });
+    const result = filterByTopicConstraints(nodes, scope, undefined, [offVec], makeEmbeddings('acc-beliefs-001', nodeVec));
+    expect(result.demoted).toHaveLength(0);
+  });
+
+  it('falls back to keyword stems when no offScopeVectors provided', () => {
+    // Original stem-match path: ≥3 terms → demote
+    const nodes: ScoredPovNode[] = [
+      makeEmbScoredNode('acc-beliefs-001', 'Nuclear bioweapons risk catastrophe', 'Nuclear bioweapons risk catastrophe details', 0.7),
+    ];
+    const scope = makeEmbScope({ off_scope_topics: ['nuclear risk', 'bioweapons', 'catastrophe'] });
+    const result = filterByTopicConstraints(nodes, scope, undefined);
+    expect(result.demoted).toHaveLength(1);
+    expect(result.demoted[0].reason).toMatch(/off-scope topic terms/);
+  });
+
+  it('uses max similarity across multiple off_scope_topic vectors', () => {
+    const highVec = [1, 0, 0];
+    const lowVec = [0, 1, 0];
+    const nodeVec = [1, 0, 0]; // matches highVec perfectly
+    const nodes: ScoredPovNode[] = [
+      makeEmbScoredNode('acc-beliefs-001', 'Test node', 'Test description', 0.6),
+    ];
+    const scope = makeEmbScope({ off_scope_topics: ['topic A', 'topic B'] });
+    // offScopeVectors: [lowVec, highVec] — max sim = 1.0 (from highVec)
+    const result = filterByTopicConstraints(nodes, scope, undefined, [lowVec, highVec], makeEmbeddings('acc-beliefs-001', nodeVec));
+    expect(result.demoted).toHaveLength(1);
+  });
+
+  it('skips demotion (conservative) when node has no embedding in nodeEmbeddings', () => {
+    const offVec = [1, 0, 0];
+    const nodes: ScoredPovNode[] = [
+      makeEmbScoredNode('acc-beliefs-001', 'Nuclear risk weapons', 'Nuclear weapons arms control', 0.7),
+    ];
+    const scope = makeEmbScope({ off_scope_topics: ['nuclear risk'] });
+    // nodeEmbeddings doesn't include acc-beliefs-001 → no demotion
+    const result = filterByTopicConstraints(nodes, scope, undefined, [offVec], {});
+    expect(result.demoted).toHaveLength(0);
   });
 });
 

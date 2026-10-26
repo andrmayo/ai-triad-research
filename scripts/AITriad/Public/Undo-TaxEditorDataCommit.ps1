@@ -13,7 +13,7 @@ function Undo-TaxEditorDataCommit {
     .PARAMETER Sha
         The full or short SHA of the commit to revert.
     .PARAMETER Repo
-        GitHub repo in owner/name format. Default: jpsnover/ai-triad-data.
+        GitHub repo in owner/name format. Default: AI-Rosetta-Stone/ai-triad-data.
     .EXAMPLE
         Undo-TaxEditorDataCommit -Sha 'abc1234'
     .EXAMPLE
@@ -39,7 +39,7 @@ function Undo-TaxEditorDataCommit {
         [string]$Sha,
 
         [Parameter()]
-        [string]$Repo = 'jpsnover/ai-triad-data'
+        [string]$Repo = 'AI-Rosetta-Stone/ai-triad-data'
     )
 
     Set-StrictMode -Version Latest
@@ -52,7 +52,7 @@ function Undo-TaxEditorDataCommit {
 
     $Parents = @($Commit.parents)
     if ($Parents.Count -ne 1) {
-        throw (New-ActionableError `
+        throw (New-ActionableError -AsErrorRecord `
             -Goal "Revert commit '$Sha'" `
             -Problem "Cannot revert merge commits ($($Parents.Count) parents)" `
             -Location $CallerName `
@@ -65,7 +65,7 @@ function Undo-TaxEditorDataCommit {
     $ChangedFiles = @($Commit.files)
 
     if ($ChangedFiles.Count -eq 0) {
-        throw (New-ActionableError `
+        throw (New-ActionableError -AsErrorRecord `
             -Goal "Revert commit '$Sha'" `
             -Problem 'Commit has no file changes to revert' `
             -Location $CallerName `
@@ -88,7 +88,7 @@ function Undo-TaxEditorDataCommit {
         $Conflicts = @($RevertFiles | Where-Object { $_ -in $SubsequentFiles })
 
         if (@($Conflicts).Count -gt 0) {
-            throw (New-ActionableError `
+            throw (New-ActionableError -AsErrorRecord `
                 -Goal "Revert commit '$Sha'" `
                 -Problem "Conflict: files modified in both the target and later commits: $($Conflicts -join ', ')" `
                 -Location $CallerName `
