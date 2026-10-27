@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+if [ ! -d "../ai-triad-data/taxonomy" ]; then
+  echo "==> Sibling data repo (../ai-triad-data) is missing"
+  exit 1
+fi
+
+# Load powershell module (and make cmdlets available), then use cmdlets
+# `Get-Tax | Measure-Object` should show several hundred nodes (785 POV nodes as of 2026-07)
+pwsh -c 'Import-Module ./scripts/AITriad/AITriad.psm1; Install-AIDependencies -Fix; Get-Tax | Measure-Object'
+
+# Setting up pwsh profile to auto-import AITriad module
+PROFILE_PATH="$(pwsh -NoLogo -NoProfile -c '$PROFILE')"
+mkdir -p "$(dirname "$PROFILE_PATH")"
+IMPORT_LINE="Import-Module './scripts/AITriad/AITriad.psm1'"
+if ! grep -qF "$IMPORT_LINE" "$PROFILE_PATH" 2>/dev/null; then
+  echo "$IMPORT_LINE" >>"$PROFILE_PATH"
+fi
+
+echo "==> pnpm install (offline, from warm store)"
+if ! pnpm install --frozen-lockfile --offline --store-dir /pnpm/store; then
+  echo "==> WARN: offline install failed (pnpm-store volume missing a package the lockfile needs), falling back to a networked install to refresh the store" >&2
+  pnpm install --frozen-lockfile --store-dir /pnpm/store
+fi
+
+if [ -z "${GEMINI_API_KEY:-}${ANTHROPIC_API_KEY:-}${GROQ_API_KEY:-}${AI_API_KEY:-}" ]; then
+  echo "==> No AI API key set. Set GEMINI_API_KEY (or ANTHROPIC_API_KEY/GROQ_API_KEY/AI_API_KEY)"
+  echo "    in a .env file next to compose.yaml, then restart the container."
+fi
+
+echo "==> Bootstrap complete."
