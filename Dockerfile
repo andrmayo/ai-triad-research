@@ -26,3 +26,6 @@ WORKDIR /workspaces/ai-triad-research
 # Copy just the lockfile so this layer only rebuilds when deps change
 COPY pnpm-lock.yaml ./
 RUN pnpm fetch --store-dir /pnpm/store && chown -R node:node /pnpm/store
+
+# Make tests available
+RUN pwsh -NoProfile -c "Install-Module Pester -Force -Scope AllUsers"
