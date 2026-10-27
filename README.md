@@ -1,13 +1,11 @@
 # AI Triad Research
 
-**Status:** Private **Fellowship:** Berkman Klein Center, 2026
+**Status:** Private
+**Fellowship:** Berkman Klein Center, 2026
 
 ## Purpose
 
-Multi-perspective research platform for AI policy and safety literature.
-Organizes sources through a four-POV taxonomy (accelerationist, safetyist,
-skeptic, situations), ingests documents, generates AI-powered summaries, and
-detects factual conflicts across viewpoints.
+Multi-perspective research platform for AI policy and safety literature. Organizes sources through a four-POV taxonomy (accelerationist, safetyist, skeptic, situations), ingests documents, generates AI-powered summaries, and detects factual conflicts across viewpoints.
 
 ## Repository Structure
 
@@ -201,11 +199,9 @@ The file `.aitriad.json` tells the code where to find data:
 }
 ```
 
-Note: source documents resolve under `sources_root` (a separate repo), not
-`data_root`.
+Note: source documents resolve under `sources_root` (a separate repo), not `data_root`.
 
 **Override with environment variable:**
-
 ```powershell
 $env:AI_TRIAD_DATA_ROOT = "/path/to/custom/data"
 ```
@@ -236,8 +232,7 @@ Show-POViewer          # or: POViewer
 Show-SummaryViewer     # or: SummaryViewer
 ```
 
-The Taxonomy Editor includes an integrated Edge Browser (toolbar panel) — the
-standalone Edge Viewer has been retired.
+The Taxonomy Editor includes an integrated Edge Browser (toolbar panel) — the standalone Edge Viewer has been retired.
 
 ### Core Workflow
 
@@ -280,20 +275,14 @@ Show-AITriadHelp
 | `NEO4J_PASSWORD` | No | Neo4j password (default: aitriad2026) |
 
 Use `Register-AIBackend` to configure keys via a GUI, or set them manually.
-Settings are persisted to `~/.aitriad-env` — add `. ~/.aitriad-env` to your
-shell profile.
+Settings are persisted to `~/.aitriad-env` — add `. ~/.aitriad-env` to your shell profile.
 
 ## AI Model Configuration
 
-Models are configured in `ai-models.json` (single source of truth for both
-PowerShell and Electron). The Taxonomy Editor Settings dialog includes a
-**Refresh Models** button that queries provider APIs (Gemini, Groq) and probes
-Claude model candidates to discover available models.
+Models are configured in `ai-models.json` (single source of truth for both PowerShell and Electron). The Taxonomy Editor Settings dialog includes a **Refresh Models** button that queries provider APIs (Gemini, Groq) and probes Claude model candidates to discover available models.
 
-Supported backends: **Google Gemini** (free tier available), **Anthropic
-Claude**, **Groq** (free tier available).
+Supported backends: **Google Gemini** (free tier available), **Anthropic Claude**, **Groq** (free tier available).
 
 ## Taxonomy Version
 
-Current version is tracked in `TAXONOMY_VERSION` (in the data repo). Bumping it
-triggers CI batch re-summarization.
+Current version is tracked in `TAXONOMY_VERSION` (in the data repo). Bumping it triggers CI batch re-summarization.
